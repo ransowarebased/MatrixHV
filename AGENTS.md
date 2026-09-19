@@ -43,3 +43,10 @@ All AI agents and contributors working on this repository must strictly adhere t
 - **Generated artifacts are not versioned**: Files produced under `builds/` must remain ignored by Git unless the user explicitly requests otherwise.
 - **Tests**: Source-level and host-runnable tests belong under `tests/`.
 - **Temporary compiler output**: Cargo target directories may use temporary locations or `builds/.cargo-target`; do not place compiler caches in source directories.
+
+---
+
+## 6. Repository Architecture & File Directory Map
+For the canonical architectural layout, components, and responsibilities across the MatrixHV repository, refer directly to [README.md](README.md).
+
+
