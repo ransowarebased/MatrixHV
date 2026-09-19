@@ -7,6 +7,7 @@ use uefi::Status;
 use uefi::boot::{self, EventNotifyFn, EventType, Tpl};
 
 use super::vt_controls::{self, VmxControlsError};
+use super::vt_ept::{self, EptError};
 use super::vt_guest;
 use super::vt_vmcs::{self, VmcsError, VmcsRegion, vmwrite};
 use super::vt_vmcs_fields::*;
@@ -67,8 +68,7 @@ const HYPERV_HYPERCALL_MSR: u32 = 0x4000_0001;
 const HYPERV_VP_INDEX_MSR: u32 = 0x4000_0002;
 const HYPERV_REFERENCE_TSC_MSR: u32 = 0x4000_0021;
 const HYPERV_APIC_FREQUENCY_MSR: u32 = 0x4000_0023;
-const HYPERV_REFERENCE_TIME_MSR_SPAN: u32 =
-    HYPERV_APIC_FREQUENCY_MSR - HYPERV_REFERENCE_TSC_MSR;
+const HYPERV_REFERENCE_TIME_MSR_SPAN: u32 = HYPERV_APIC_FREQUENCY_MSR - HYPERV_REFERENCE_TSC_MSR;
 const HYPERV_VP_ASSIST_MSR: u32 = 0x4000_0073;
 const HYPERV_SIMP_MSR: u32 = 0x4000_0083;
 const HYPERV_SINT3_MSR: u32 = 0x4000_0093;
@@ -135,6 +135,7 @@ pub enum ResidentProbeError {
     Vmxon(VmxonError),
     Vmcs(VmcsError),
     Controls(VmxControlsError),
+    Ept(EptError),
     Paging(HostPagingError),
     CodeTooLarge(usize),
     InvalidCodeLayout,
@@ -161,6 +162,12 @@ impl From<VmcsError> for ResidentProbeError {
 impl From<VmxControlsError> for ResidentProbeError {
     fn from(value: VmxControlsError) -> Self {
         Self::Controls(value)
+    }
+}
+
+impl From<EptError> for ResidentProbeError {
+    fn from(value: EptError) -> Self {
+        Self::Ept(value)
     }
 }
 
@@ -687,6 +694,7 @@ pub fn probe() -> Result<ResidentProbeReport, ResidentProbeError> {
 pub fn status_from_error(error: &ResidentProbeError) -> Status {
     match error {
         ResidentProbeError::Allocation(status)
+        | ResidentProbeError::Ept(EptError::Allocation(status))
         | ResidentProbeError::Vmxon(VmxonError::Allocation(status))
         | ResidentProbeError::Vmcs(VmcsError::Allocation(status))
         | ResidentProbeError::Paging(HostPagingError::Allocation(status))
@@ -895,6 +903,7 @@ pub fn run_windows_boot(
     let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
     vmcs_region.write_revision_id(revision_id);
     let vmcs_physical_address = vmcs_region.physical_address();
+    let ept = vt_ept::IdentityEpt::build()?;
     let session = vt_vmxon::enter_vmx_root().map_err(ResidentProbeError::Vmxon)?;
 
     let host_space = host_address_space
@@ -911,7 +920,8 @@ pub fn run_windows_boot(
         return Err(ResidentProbeError::Vmcs(VmcsError::Vmptrld(load_result)));
     }
 
-    let _controls = vt_controls::configure_resident_boot(msr_bitmap.physical_address())?;
+    let _controls =
+        vt_controls::configure_resident_boot(msr_bitmap.physical_address(), ept.ept_pointer())?;
     configure_resident_msr_switch(&resident_msr_state)?;
     configure_resident_host(host_space.host_cr3, &tables, root_segments)?;
     let guest_rsp = guest_stack.physical_address() + guest_stack.byte_len() as u64;
@@ -942,6 +952,7 @@ pub fn run_windows_boot(
     let final_clear = unsafe { vt_vmcs::vmclear(vmcs_physical_address) };
     host_address_space.restore_source_cr3();
     drop(session);
+    let _ = &ept;
     if final_clear != VmxInstructionResult::Succeeded {
         return Err(ResidentProbeError::Vmclear(final_clear));
     }

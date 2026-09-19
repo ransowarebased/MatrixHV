@@ -16,6 +16,7 @@ pub const IA32_VMX_CR0_FIXED1: u32 = 0x487;
 pub const IA32_VMX_CR4_FIXED0: u32 = 0x488;
 pub const IA32_VMX_CR4_FIXED1: u32 = 0x489;
 pub const IA32_VMX_PROCBASED_CTLS2: u32 = 0x48b;
+pub const IA32_VMX_EPT_VPID_CAP: u32 = 0x48c;
 pub const IA32_VMX_TRUE_PINBASED_CTLS: u32 = 0x48d;
 pub const IA32_VMX_TRUE_PROCBASED_CTLS: u32 = 0x48e;
 pub const IA32_VMX_TRUE_EXIT_CTLS: u32 = 0x48f;

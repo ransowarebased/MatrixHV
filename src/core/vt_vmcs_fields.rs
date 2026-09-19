@@ -25,6 +25,7 @@ pub const MSR_BITMAP: u64 = 0x2004;
 pub const VM_EXIT_MSR_STORE_ADDR: u64 = 0x2006;
 pub const VM_EXIT_MSR_LOAD_ADDR: u64 = 0x2008;
 pub const VM_ENTRY_MSR_LOAD_ADDR: u64 = 0x200a;
+pub const EPT_POINTER: u64 = 0x201a;
 pub const XSS_EXITING_BITMAP: u64 = 0x202c;
 
 pub const PIN_BASED_VM_EXEC_CONTROL: u64 = 0x4000;

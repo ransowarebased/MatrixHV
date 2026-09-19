@@ -33,6 +33,7 @@ pub enum VmxControlsError {
     Vmcs(VmcsError),
     HostAddressSpaceSizeUnavailable,
     Ia32eGuestModeUnavailable,
+    EptUnavailable,
     EptUnexpectedlyRequired,
     MsrBitmapsUnavailable,
     RdtscpUnavailable,
@@ -48,14 +49,17 @@ impl From<VmcsError> for VmxControlsError {
 }
 
 pub fn configure() -> Result<VmxControls, VmxControlsError> {
-    configure_internal(PIN_BASED_NMI_EXITING, 0, 0, 0, 0, 1 << 6, None)
+    configure_internal(PIN_BASED_NMI_EXITING, 0, 0, 0, 0, 1 << 6, None, None)
 }
 
-pub fn configure_resident_boot(msr_bitmap: u64) -> Result<VmxControls, VmxControlsError> {
+pub fn configure_resident_boot(
+    msr_bitmap: u64,
+    ept_pointer: u64,
+) -> Result<VmxControls, VmxControlsError> {
     configure_internal(
         0,
         CPU_BASED_USE_MSR_BITMAPS | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
-        SECONDARY_ENABLE_RDTSCP | SECONDARY_ENABLE_XSAVES,
+        SECONDARY_ENABLE_EPT | SECONDARY_ENABLE_RDTSCP | SECONDARY_ENABLE_XSAVES,
         VM_EXIT_SAVE_IA32_PAT
             | VM_EXIT_LOAD_IA32_PAT
             | VM_EXIT_SAVE_IA32_EFER
@@ -63,6 +67,7 @@ pub fn configure_resident_boot(msr_bitmap: u64) -> Result<VmxControls, VmxContro
         VM_ENTRY_LOAD_IA32_PAT | VM_ENTRY_LOAD_IA32_EFER,
         0,
         Some(msr_bitmap),
+        Some(ept_pointer),
     )
 }
 
@@ -74,6 +79,7 @@ fn configure_internal(
     desired_entry: u32,
     exception_bitmap: u64,
     msr_bitmap: Option<u64>,
+    ept_pointer: Option<u64>,
 ) -> Result<VmxControls, VmxControlsError> {
     let basic = unsafe { msr::read(msr::IA32_VMX_BASIC) };
     let use_true_controls = basic & IA32_VMX_BASIC_TRUE_CTLS != 0;
@@ -116,7 +122,12 @@ fn configure_internal(
     if vm_entry & VM_ENTRY_IA32E_MODE_GUEST == 0 {
         return Err(VmxControlsError::Ia32eGuestModeUnavailable);
     }
-    if secondary_processor_based & SECONDARY_ENABLE_EPT != 0 {
+    if desired_secondary & SECONDARY_ENABLE_EPT != 0
+        && secondary_processor_based & SECONDARY_ENABLE_EPT == 0
+    {
+        return Err(VmxControlsError::EptUnavailable);
+    }
+    if secondary_processor_based & SECONDARY_ENABLE_EPT != 0 && ept_pointer.is_none() {
         return Err(VmxControlsError::EptUnexpectedlyRequired);
     }
     if desired_secondary & SECONDARY_ENABLE_RDTSCP != 0
@@ -165,6 +176,9 @@ fn configure_internal(
 
     if let Some(bitmap) = msr_bitmap {
         vmwrite(MSR_BITMAP, bitmap)?;
+    }
+    if secondary_processor_based & SECONDARY_ENABLE_EPT != 0 {
+        vmwrite(EPT_POINTER, ept_pointer.unwrap())?;
     }
     vmwrite(EXCEPTION_BITMAP, exception_bitmap)?;
     vmwrite(PAGE_FAULT_ERROR_CODE_MASK, 0)?;
