@@ -1,6 +1,8 @@
+pub mod exit_handlers;
 pub mod vt_controls;
 pub mod vt_entry;
 pub mod vt_exit_reason;
+pub mod vt_exits;
 pub mod vt_guest;
 pub mod vt_host;
 pub mod vt_init;

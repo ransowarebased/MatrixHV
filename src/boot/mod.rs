@@ -128,5 +128,55 @@ pub fn run() -> Result<(), Status> {
         }
     }
 
+    logger::phase("vmx.dispatch_probe.start");
+    match hv_core::vt_init::probe_vmexit_dispatcher() {
+        Ok(report) => {
+            let diagnostics = report.diagnostics;
+            logger::info(format_args!(
+                "dispatcher proof vmcs_pa={:#x} exits={} cpuid={} vmcall={} resumes={} failure={} cpuid_input={:#x}/{:#x} cpuid_rip={:#x}/{:#x} vmcall_rip={:#x}/{:#x}",
+                report.vmcs_physical_address,
+                diagnostics.exit_count,
+                diagnostics.cpuid_count,
+                diagnostics.vmcall_count,
+                diagnostics.resume_count,
+                diagnostics.failure_code,
+                diagnostics.cpuid_leaf,
+                diagnostics.cpuid_subleaf,
+                diagnostics.cpuid_rip,
+                report.cpuid_rip_expected,
+                diagnostics.vmcall_rip,
+                report.vmcall_rip_expected
+            ));
+            logger::info(format_args!(
+                "dispatcher guest-state cpuid eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} final eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} rsp={:#x}/{:#x}",
+                diagnostics.cpuid_eax,
+                diagnostics.cpuid_ebx,
+                diagnostics.cpuid_ecx,
+                diagnostics.cpuid_edx,
+                diagnostics.final_eax,
+                diagnostics.final_ebx,
+                diagnostics.final_ecx,
+                diagnostics.final_edx,
+                diagnostics.final_rsp,
+                report.guest.rsp
+            ));
+            logger::info(format_args!(
+                "dispatcher host/guest vmxon_pa={:#x} host_tr={:#x} guest_rip={:#x} primary={:#x} secondary={:#x}",
+                report.vmxon.region_physical_address,
+                report.host.tr_selector,
+                report.guest.rip,
+                report.controls.primary_processor_based,
+                report.controls.secondary_processor_based
+            ));
+            logger::phase("vmx.dispatch_probe.ok");
+        }
+        Err(error) => {
+            log::error!("VM-exit dispatcher probe failed: {error:?}");
+            logger::error(format_args!("dispatcher error={error:?}"));
+            logger::phase("vmx.dispatch_probe.failed");
+            return Err(Status::DEVICE_ERROR);
+        }
+    }
+
     loaders::veracrypt::start()
 }

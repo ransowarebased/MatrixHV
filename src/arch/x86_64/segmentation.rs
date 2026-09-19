@@ -64,7 +64,15 @@ pub fn capture() -> SegmentationState {
 }
 
 pub fn vmx_usable_tr(current: SegmentState) -> SegmentState {
-    if current.selector != 0 && current.access_rights & (1 << 16) == 0 {
+    let access = current.access_rights;
+    let valid_busy_tss = current.selector != 0
+        && current.selector & 0x4 == 0
+        && access & (1 << 16) == 0
+        && access & 0xf == 0xb
+        && access & 0x10 == 0
+        && access & 0x80 != 0
+        && current.base != 0;
+    if valid_busy_tss {
         return current;
     }
 
