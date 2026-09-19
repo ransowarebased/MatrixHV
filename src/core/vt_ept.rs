@@ -25,6 +25,7 @@ const EPT_2MB_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 const EPT_1GB_PAGE_SIZE: u64 = 1024 * 1024 * 1024;
 const EPT_512GB_PAGE_SIZE: u64 = 512 * EPT_1GB_PAGE_SIZE;
 const EPT_ENTRY_COUNT: usize = 512;
+const EPT_PROTECTION_TABLE_PAGES: usize = 128;
 
 const EPT_CAP_PAGE_WALK_LENGTH_4: u64 = 1 << 6;
 const EPT_CAP_MEMORY_TYPE_UC: u64 = 1 << 8;
@@ -50,17 +51,55 @@ pub enum EptError {
     FourLevelWalkUnavailable,
     UncacheableUnavailable,
     WriteBackUnavailable,
+    InvalidProtectionAddress(u64),
+    InvalidPageTable,
+    ProtectionTableCapacityExceeded,
 }
 
 pub struct IdentityEpt {
-    _pages: Vec<ResidentPages>,
+    pages: Vec<ResidentPages>,
+    protection_pool: ProtectionTablePool,
+    root: TablePage,
     ept_pointer: u64,
+    mapped_end: u64,
 }
 
 #[derive(Clone, Copy)]
 struct TablePage {
     physical_address: u64,
     entries: NonNull<u64>,
+}
+
+struct ProtectionTablePool {
+    pages: ResidentPages,
+    used_pages: usize,
+}
+
+impl ProtectionTablePool {
+    fn allocate() -> Result<Self, EptError> {
+        let pages = ResidentPages::allocate(EPT_PROTECTION_TABLE_PAGES, AddressConstraint::Any)
+            .map_err(EptError::Allocation)?;
+        Ok(Self {
+            pages,
+            used_pages: 0,
+        })
+    }
+
+    fn allocate_table(&mut self) -> Result<TablePage, EptError> {
+        if self.used_pages >= self.pages.pages() {
+            return Err(EptError::ProtectionTableCapacityExceeded);
+        }
+        let page_offset = self.used_pages * PAGE_SIZE;
+        self.used_pages += 1;
+        let physical_address = self.pages.physical_address() + page_offset as u64;
+        let entries = unsafe {
+            NonNull::new_unchecked(self.pages.pointer().as_ptr().add(page_offset).cast::<u64>())
+        };
+        Ok(TablePage {
+            physical_address,
+            entries,
+        })
+    }
 }
 
 impl IdentityEpt {
@@ -76,6 +115,7 @@ impl IdentityEpt {
             return Err(EptError::WriteBackUnavailable);
         }
         let large_pages_supported = capabilities & EPT_CAP_2MB_PAGE != 0;
+        let protection_pool = ProtectionTablePool::allocate()?;
 
         let memory_map = boot::memory_map(MemoryType::LOADER_DATA)
             .map_err(|error| EptError::Allocation(error.status()))?;
@@ -181,13 +221,86 @@ impl IdentityEpt {
         }
 
         Ok(Self {
-            _pages: pages,
+            pages,
+            protection_pool,
+            root,
             ept_pointer,
+            mapped_end,
         })
     }
 
     pub fn ept_pointer(&self) -> u64 {
         self.ept_pointer
+    }
+
+    pub fn deny_guest_access(
+        &mut self,
+        physical_address: u64,
+        page_count: usize,
+    ) -> Result<(), EptError> {
+        if physical_address & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(EptError::InvalidProtectionAddress(physical_address));
+        }
+        for page_index in 0..page_count {
+            let page_address = physical_address
+                .checked_add((page_index * PAGE_SIZE) as u64)
+                .ok_or(EptError::AddressOverflow)?;
+            self.deny_guest_access_page(page_address)?;
+        }
+        Ok(())
+    }
+
+    pub fn deny_guest_access_to_tables(&mut self) -> Result<(), EptError> {
+        for page_index in 0..self.pages.len() {
+            let physical_address = self.pages[page_index].physical_address();
+            let page_count = self.pages[page_index].pages();
+            self.deny_guest_access(physical_address, page_count)?;
+        }
+        let protection_pool_address = self.protection_pool.pages.physical_address();
+        let protection_pool_pages = self.protection_pool.pages.pages();
+        self.deny_guest_access(protection_pool_address, protection_pool_pages)?;
+        Ok(())
+    }
+
+    fn deny_guest_access_page(&mut self, physical_address: u64) -> Result<(), EptError> {
+        if physical_address >= self.mapped_end {
+            return Err(EptError::InvalidProtectionAddress(physical_address));
+        }
+
+        let pml4_index = ((physical_address / EPT_512GB_PAGE_SIZE) & 0x1ff) as usize;
+        let pdpt_index = ((physical_address / EPT_1GB_PAGE_SIZE) & 0x1ff) as usize;
+        let pd_index = ((physical_address / EPT_2MB_PAGE_SIZE) & 0x1ff) as usize;
+        let pt_index = ((physical_address / PAGE_SIZE as u64) & 0x1ff) as usize;
+
+        let pml4_entry = read_entry(self.root, pml4_index);
+        let pdpt = table_from_entry(pml4_entry)?;
+        let pdpt_entry = read_entry(pdpt, pdpt_index);
+        if pdpt_entry & EPT_LARGE_PAGE != 0 {
+            return Err(EptError::InvalidPageTable);
+        }
+        let pd = table_from_entry(pdpt_entry)?;
+        let pd_entry = read_entry(pd, pd_index);
+        let pt = if pd_entry & EPT_LARGE_PAGE != 0 {
+            let pt = self.protection_pool.allocate_table()?;
+            let base_address = (pd_entry & EPT_ADDRESS_MASK) & !(EPT_2MB_PAGE_SIZE - 1);
+            let leaf_attributes = pd_entry & (EPT_PERMISSIONS | (0x7 << EPT_MEMORY_TYPE_SHIFT));
+            for page_index in 0..EPT_ENTRY_COUNT {
+                let page_address = base_address + (page_index * PAGE_SIZE) as u64;
+                write_entry(
+                    pt,
+                    page_index,
+                    (page_address & EPT_ADDRESS_MASK) | leaf_attributes,
+                );
+            }
+            write_entry(pd, pd_index, table_entry(pt.physical_address));
+            pt
+        } else {
+            table_from_entry(pd_entry)?
+        };
+
+        let leaf = read_entry(pt, pt_index);
+        write_entry(pt, pt_index, leaf & !EPT_PERMISSIONS);
+        Ok(())
     }
 }
 
@@ -207,6 +320,23 @@ fn write_entry(table: TablePage, index: usize, value: u64) {
     unsafe {
         table.entries.as_ptr().add(index).write(value);
     }
+}
+
+fn read_entry(table: TablePage, index: usize) -> u64 {
+    debug_assert!(index < EPT_ENTRY_COUNT);
+    unsafe { table.entries.as_ptr().add(index).read() }
+}
+
+fn table_from_entry(entry: u64) -> Result<TablePage, EptError> {
+    if entry & EPT_PERMISSIONS == 0 || entry & EPT_LARGE_PAGE != 0 {
+        return Err(EptError::InvalidPageTable);
+    }
+    let physical_address = entry & EPT_ADDRESS_MASK;
+    let entries = NonNull::new(physical_address as *mut u64).ok_or(EptError::InvalidPageTable)?;
+    Ok(TablePage {
+        physical_address,
+        entries,
+    })
 }
 
 fn table_entry(physical_address: u64) -> u64 {

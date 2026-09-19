@@ -2,6 +2,7 @@ use core::arch::global_asm;
 use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use uefi::Status;
 use uefi::boot::{self, EventNotifyFn, EventType, Tpl};
@@ -37,6 +38,8 @@ const CPUID_EXIT_REASON: u64 = 10;
 const RDMSR_EXIT_REASON: u64 = 31;
 const WRMSR_EXIT_REASON: u64 = 32;
 const XSETBV_EXIT_REASON: u64 = 55;
+const EPT_VIOLATION_EXIT_REASON: u64 = 48;
+const EPT_TEST_READ_ACCESS: u64 = 1;
 const IA32_TSC_MSR: u32 = 0x10;
 const IA32_PLATFORM_ID_MSR: u32 = 0x17;
 const IA32_APIC_BASE_MSR: u32 = 0x1b;
@@ -114,6 +117,12 @@ const VMREAD_FAILED_MESSAGE_LEN: usize = b"[MATRIXHV][RESIDENT] HV:VMREAD_FAILED
 const VMWRITE_FAILED_MESSAGE_LEN: usize = b"[MATRIXHV][RESIDENT] HV:VMWRITE_FAILED".len();
 const VMRESUME_FAILED_MESSAGE_LEN: usize =
     b"[MATRIXHV][RESIDENT] HV:VMRESUME_FAILED error=0x".len();
+const EPT_TEST_VIOLATION_MESSAGE_LEN: usize =
+    b"[MATRIXHV][RESIDENT] HV:EPT_VIOLATION_TEST gpa=0x".len();
+const EPT_UNEXPECTED_VIOLATION_MESSAGE_LEN: usize =
+    b"[MATRIXHV][RESIDENT] HV:EPT_VIOLATION_UNEXPECTED gpa=0x".len();
+const EPT_VIOLATION_RIP_LEN: usize = b" rip=0x".len();
+const EPT_VIOLATION_READ_LEN: usize = b" access=read qual=0x".len();
 const STATE_REASON_LEN: usize = b" reason=0x".len();
 const STATE_RIP_LEN: usize = b" rip=0x".len();
 const STATE_INSTRUCTION_LEN_LEN: usize = b" len=0x".len();
@@ -128,6 +137,7 @@ const STATE_NEWLINE_LEN: usize = b"\r\n".len();
 pub const RESIDENT_VMCALL_START_CHECKPOINT: u64 = 0x4856_5354_4152_5421;
 pub const RESIDENT_VMCALL_STOP: u64 = 0x4856_5354_4f50_2121;
 const RESIDENT_STOP_UNSUPPORTED_EXIT: u64 = 0x4856_554e_5355_5050;
+static EPT_TEST_PAGE_GPA: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResidentProbeError {
@@ -215,9 +225,11 @@ pub struct ResidentBootReport {
     pub post_start_exit_count: u64,
     pub post_ebs_exit_count: u64,
     pub post_va_exit_count: u64,
+    pub ept_test_violation_seen: u64,
     pub last_reason: u64,
     pub last_instruction_len: u64,
     pub last_qualification: u64,
+    pub last_guest_physical_address: u64,
     pub last_guest_rax: u64,
     pub last_guest_rcx: u64,
     pub last_guest_rdx: u64,
@@ -242,6 +254,10 @@ struct ResidentBootContext {
     expected_host_cr3: u64,
     initial_guest_cr3: u64,
     event_context: u64,
+    ept_test_gpa: u64,
+    ept_probe_fault_rip: u64,
+    ept_probe_resume_rip: u64,
+    ept_test_violation_seen: u64,
     exit_count: u64,
     cpuid_count: u64,
     rdmsr_count: u64,
@@ -255,6 +271,7 @@ struct ResidentBootContext {
     last_reason: u64,
     last_instruction_len: u64,
     last_qualification: u64,
+    last_guest_physical_address: u64,
     last_guest_rax: u64,
     last_guest_rcx: u64,
     last_guest_rdx: u64,
@@ -266,18 +283,29 @@ struct ResidentBootContext {
     canary_end: u64,
     original_gdtr: [u8; 10],
     original_idtr: [u8; 10],
-    alignment_padding: [u8; 20],
+    alignment_padding: [u8; 28],
     root_fx_state: [u8; 512],
 }
 
 impl ResidentBootContext {
-    fn new(expected_host_cr3: u64, initial_guest_cr3: u64, event_context: u64) -> Self {
+    fn new(
+        expected_host_cr3: u64,
+        initial_guest_cr3: u64,
+        event_context: u64,
+        ept_test_gpa: u64,
+        ept_probe_fault_rip: u64,
+        ept_probe_resume_rip: u64,
+    ) -> Self {
         Self {
             root_rsp: 0,
             return_rip: 0,
             expected_host_cr3,
             initial_guest_cr3,
             event_context,
+            ept_test_gpa,
+            ept_probe_fault_rip,
+            ept_probe_resume_rip,
+            ept_test_violation_seen: 0,
             exit_count: 0,
             cpuid_count: 0,
             rdmsr_count: 0,
@@ -291,6 +319,7 @@ impl ResidentBootContext {
             last_reason: 0,
             last_instruction_len: 0,
             last_qualification: 0,
+            last_guest_physical_address: 0,
             last_guest_rax: 0,
             last_guest_rcx: 0,
             last_guest_rdx: 0,
@@ -302,7 +331,7 @@ impl ResidentBootContext {
             canary_end: BOOT_CONTEXT_CANARY_END,
             original_gdtr: [0; 10],
             original_idtr: [0; 10],
-            alignment_padding: [0; 20],
+            alignment_padding: [0; 28],
             root_fx_state: [0; 512],
         }
     }
@@ -312,6 +341,13 @@ const BCTX_ROOT_RSP: usize = core::mem::offset_of!(ResidentBootContext, root_rsp
 const BCTX_RETURN_RIP: usize = core::mem::offset_of!(ResidentBootContext, return_rip);
 const BCTX_EXPECTED_HOST_CR3: usize = core::mem::offset_of!(ResidentBootContext, expected_host_cr3);
 const BCTX_EVENT_CONTEXT: usize = core::mem::offset_of!(ResidentBootContext, event_context);
+const BCTX_EPT_TEST_GPA: usize = core::mem::offset_of!(ResidentBootContext, ept_test_gpa);
+const BCTX_EPT_PROBE_FAULT_RIP: usize =
+    core::mem::offset_of!(ResidentBootContext, ept_probe_fault_rip);
+const BCTX_EPT_PROBE_RESUME_RIP: usize =
+    core::mem::offset_of!(ResidentBootContext, ept_probe_resume_rip);
+const BCTX_EPT_TEST_VIOLATION_SEEN: usize =
+    core::mem::offset_of!(ResidentBootContext, ept_test_violation_seen);
 const BCTX_EXIT_COUNT: usize = core::mem::offset_of!(ResidentBootContext, exit_count);
 const BCTX_CPUID_COUNT: usize = core::mem::offset_of!(ResidentBootContext, cpuid_count);
 const BCTX_RDMSR_COUNT: usize = core::mem::offset_of!(ResidentBootContext, rdmsr_count);
@@ -329,6 +365,8 @@ const BCTX_LAST_INSTRUCTION_LEN: usize =
     core::mem::offset_of!(ResidentBootContext, last_instruction_len);
 const BCTX_LAST_QUALIFICATION: usize =
     core::mem::offset_of!(ResidentBootContext, last_qualification);
+const BCTX_LAST_GUEST_PHYSICAL_ADDRESS: usize =
+    core::mem::offset_of!(ResidentBootContext, last_guest_physical_address);
 const BCTX_LAST_GUEST_RAX: usize = core::mem::offset_of!(ResidentBootContext, last_guest_rax);
 const BCTX_LAST_GUEST_RCX: usize = core::mem::offset_of!(ResidentBootContext, last_guest_rcx);
 const BCTX_LAST_GUEST_RDX: usize = core::mem::offset_of!(ResidentBootContext, last_guest_rdx);
@@ -703,6 +741,10 @@ pub fn status_from_error(error: &ResidentProbeError) -> Status {
     }
 }
 
+pub fn ept_test_page_gpa() -> u64 {
+    EPT_TEST_PAGE_GPA.load(Ordering::Acquire)
+}
+
 pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError> {
     let mut code = ResidentCode::allocate()?;
     let mut context_pages = ResidentPages::allocate(1, AddressConstraint::Any)
@@ -847,6 +889,8 @@ fn configure_resident_msr_switch(msr_state: &ResidentPages) -> Result<(), VmcsEr
 pub fn run_windows_boot(
     entry_rip: u64,
     event_context: u64,
+    ept_probe_fault_rip: u64,
+    ept_probe_resume_rip: u64,
 ) -> Result<ResidentBootReport, ResidentProbeError> {
     if size_of::<ResidentBootContext>() > PAGE_SIZE
         || core::mem::offset_of!(ResidentBootContext, root_fx_state) & 0xf != 0
@@ -868,6 +912,15 @@ pub fn run_windows_boot(
         .map_err(ResidentProbeError::Allocation)?;
     let resident_msr_state = ResidentPages::allocate(1, AddressConstraint::Any)
         .map_err(ResidentProbeError::Allocation)?;
+    let ept_test_page = ResidentPages::allocate(1, AddressConstraint::Any)
+        .map_err(ResidentProbeError::Allocation)?;
+    unsafe {
+        ept_test_page
+            .pointer()
+            .as_ptr()
+            .cast::<u64>()
+            .write(0x4550_5454_4553_5431);
+    }
     unsafe {
         msr_bitmap
             .pointer()
@@ -903,12 +956,27 @@ pub fn run_windows_boot(
     let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
     vmcs_region.write_revision_id(revision_id);
     let vmcs_physical_address = vmcs_region.physical_address();
-    let ept = vt_ept::IdentityEpt::build()?;
+    let mut ept = vt_ept::IdentityEpt::build()?;
     let session = vt_vmxon::enter_vmx_root().map_err(ResidentProbeError::Vmxon)?;
 
     let host_space = host_address_space
         .clone_current()
         .map_err(ResidentProbeError::Paging)?;
+    ept.deny_guest_access(code.pages.physical_address(), code.pages.pages())?;
+    ept.deny_guest_access(tables.pages.physical_address(), tables.pages.pages())?;
+    ept.deny_guest_access(context_pages.physical_address(), context_pages.pages())?;
+    ept.deny_guest_access(host_stack.physical_address(), host_stack.pages())?;
+    ept.deny_guest_access(msr_bitmap.physical_address(), msr_bitmap.pages())?;
+    ept.deny_guest_access(
+        resident_msr_state.physical_address(),
+        resident_msr_state.pages(),
+    )?;
+    ept.deny_guest_access(host_space.arena_physical_address, host_space.arena_pages)?;
+    ept.deny_guest_access(vmcs_physical_address, 1)?;
+    ept.deny_guest_access(session.report().region_physical_address, 1)?;
+    ept.deny_guest_access(ept_test_page.physical_address(), ept_test_page.pages())?;
+    ept.deny_guest_access_to_tables()?;
+    EPT_TEST_PAGE_GPA.store(ept_test_page.physical_address(), Ordering::Release);
     let clear_result = unsafe { vt_vmcs::vmclear(vmcs_physical_address) };
     if clear_result != VmxInstructionResult::Succeeded {
         drop(session);
@@ -936,6 +1004,9 @@ pub fn run_windows_boot(
             host_space.host_cr3,
             guest.cr3,
             event_context,
+            ept_test_page.physical_address(),
+            ept_probe_fault_rip,
+            ept_probe_resume_rip,
         ));
     }
     let host_rsp = (host_stack.physical_address() + host_stack.byte_len() as u64 - 8) & !0xf;
@@ -945,6 +1016,7 @@ pub fn run_windows_boot(
 
     let raw_path =
         unsafe { matrixhv_resident_boot_run_asm(context, host_rsp, code.dispatch_entry) };
+    EPT_TEST_PAGE_GPA.store(0, Ordering::Release);
     if raw_path == 0 {
         tables.pages.preserve();
     }
@@ -986,9 +1058,11 @@ pub fn run_windows_boot(
         post_start_exit_count: result.post_start_exit_count,
         post_ebs_exit_count: result.post_ebs_exit_count,
         post_va_exit_count: result.post_va_exit_count,
+        ept_test_violation_seen: result.ept_test_violation_seen,
         last_reason: result.last_reason,
         last_instruction_len: result.last_instruction_len,
         last_qualification: result.last_qualification,
+        last_guest_physical_address: result.last_guest_physical_address,
         last_guest_rax: result.last_guest_rax,
         last_guest_rcx: result.last_guest_rcx,
         last_guest_rdx: result.last_guest_rdx,
@@ -1358,6 +1432,8 @@ global_asm!(
     "test eax, 0x80000000",
     "jnz .Lresident_dispatch_unsupported",
     "and eax, 0xffff",
+    "cmp eax, {ept_violation_reason}",
+    "je .Lresident_dispatch_ept_violation",
     "cmp eax, {cpuid_reason}",
     "je .Lresident_dispatch_cpuid",
     "cmp eax, {vmcall_reason}",
@@ -1369,6 +1445,56 @@ global_asm!(
     "cmp eax, {xsetbv_reason}",
     "je .Lresident_dispatch_xsetbv",
     "jmp .Lresident_dispatch_unsupported",
+    ".Lresident_dispatch_ept_violation:",
+    "mov rax, {guest_physical_address}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "mov qword ptr [r12 + {b_last_guest_physical_address}], r11",
+    "mov r10, r11",
+    "and r10, -4096",
+    "cmp r10, qword ptr [r12 + {b_ept_test_gpa}]",
+    "jne .Lresident_dispatch_ept_unexpected",
+    "mov r10, qword ptr [r12 + {b_last_guest_rip}]",
+    "cmp r10, qword ptr [r12 + {b_ept_probe_fault_rip}]",
+    "jne .Lresident_dispatch_ept_unexpected",
+    "mov r10, qword ptr [r12 + {b_last_qualification}]",
+    "and r10d, 7",
+    "cmp r10, {ept_test_read_access}",
+    "jne .Lresident_dispatch_ept_unexpected",
+    "mov qword ptr [r12 + {b_ept_test_violation_seen}], 1",
+    "lea rsi, [rip + .Lept_test_violation_message]",
+    "mov r9d, {ept_test_violation_message_len}",
+    "call .Lresident_serial_write",
+    "mov rax, qword ptr [r12 + {b_last_guest_physical_address}]",
+    "call .Lresident_serial_hex64",
+    "lea rsi, [rip + .Lept_violation_rip]",
+    "mov r9d, {ept_violation_rip_len}",
+    "call .Lresident_serial_write",
+    "mov rax, qword ptr [r12 + {b_last_guest_rip}]",
+    "call .Lresident_serial_hex64",
+    "lea rsi, [rip + .Lept_violation_read]",
+    "mov r9d, {ept_violation_read_len}",
+    "call .Lresident_serial_write",
+    "mov rax, qword ptr [r12 + {b_last_qualification}]",
+    "call .Lresident_serial_hex64",
+    "lea rsi, [rip + .Lstate_newline]",
+    "mov r9d, {state_newline_len}",
+    "call .Lresident_serial_write",
+    "mov r10, qword ptr [r12 + {b_ept_probe_resume_rip}]",
+    "mov rax, {guest_rip}",
+    "vmwrite rax, r10",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "jmp .Lresident_dispatch_resume",
+    ".Lresident_dispatch_ept_unexpected:",
+    "lea rsi, [rip + .Lept_unexpected_violation_message]",
+    "mov r9d, {ept_unexpected_violation_message_len}",
+    "call .Lresident_serial_write",
+    "mov rax, qword ptr [r12 + {b_last_guest_physical_address}]",
+    "call .Lresident_serial_hex64",
+    "call .Lresident_serial_state",
+    "jmp .Lresident_dispatch_halt",
     ".Lresident_dispatch_cpuid:",
     "inc qword ptr [r12 + {b_cpuid_count}]",
     "mov eax, dword ptr [rsp + 0]",
@@ -1957,6 +2083,18 @@ global_asm!(
     ".Lvmresume_failed_message:",
     ".ascii \"[MATRIXHV][RESIDENT] HV:VMRESUME_FAILED error=0x\"",
     ".Lvmresume_failed_message_end:",
+    ".Lept_test_violation_message:",
+    ".ascii \"[MATRIXHV][RESIDENT] HV:EPT_VIOLATION_TEST gpa=0x\"",
+    ".Lept_test_violation_message_end:",
+    ".Lept_unexpected_violation_message:",
+    ".ascii \"[MATRIXHV][RESIDENT] HV:EPT_VIOLATION_UNEXPECTED gpa=0x\"",
+    ".Lept_unexpected_violation_message_end:",
+    ".Lept_violation_rip:",
+    ".ascii \" rip=0x\"",
+    ".Lept_violation_rip_end:",
+    ".Lept_violation_read:",
+    ".ascii \" access=read qual=0x\"",
+    ".Lept_violation_read_end:",
     ".Lstate_reason:",
     ".ascii \" reason=0x\"",
     ".Lstate_reason_end:",
@@ -2006,6 +2144,7 @@ global_asm!(
     guest_cr4 = const GUEST_CR4,
     vm_entry_msr_load_addr = const VM_ENTRY_MSR_LOAD_ADDR,
     guest_rip = const GUEST_RIP,
+    guest_physical_address = const GUEST_PHYSICAL_ADDRESS,
     exit_reason = const VM_EXIT_REASON,
     exit_instruction_len = const VM_EXIT_INSTRUCTION_LEN,
     exit_qualification = const EXIT_QUALIFICATION,
@@ -2015,6 +2154,8 @@ global_asm!(
     boot_canary_end = const BOOT_CONTEXT_CANARY_END,
     event_magic = const EVENT_CONTEXT_MAGIC,
     event_canary = const EVENT_CONTEXT_CANARY,
+    ept_violation_reason = const EPT_VIOLATION_EXIT_REASON,
+    ept_test_read_access = const EPT_TEST_READ_ACCESS,
     cpuid_reason = const CPUID_EXIT_REASON,
     vmcall_reason = const VMCALL_EXIT_REASON,
     rdmsr_reason = const RDMSR_EXIT_REASON,
@@ -2062,6 +2203,10 @@ global_asm!(
     unsupported_stop = const RESIDENT_STOP_UNSUPPORTED_EXIT,
     b_expected_host_cr3 = const BCTX_EXPECTED_HOST_CR3,
     b_event_context = const BCTX_EVENT_CONTEXT,
+    b_ept_test_gpa = const BCTX_EPT_TEST_GPA,
+    b_ept_probe_fault_rip = const BCTX_EPT_PROBE_FAULT_RIP,
+    b_ept_probe_resume_rip = const BCTX_EPT_PROBE_RESUME_RIP,
+    b_ept_test_violation_seen = const BCTX_EPT_TEST_VIOLATION_SEEN,
     b_exit_count = const BCTX_EXIT_COUNT,
     b_cpuid_count = const BCTX_CPUID_COUNT,
     b_rdmsr_count = const BCTX_RDMSR_COUNT,
@@ -2075,6 +2220,7 @@ global_asm!(
     b_last_reason = const BCTX_LAST_REASON,
     b_last_instruction_len = const BCTX_LAST_INSTRUCTION_LEN,
     b_last_qualification = const BCTX_LAST_QUALIFICATION,
+    b_last_guest_physical_address = const BCTX_LAST_GUEST_PHYSICAL_ADDRESS,
     b_last_rax = const BCTX_LAST_GUEST_RAX,
     b_last_rcx = const BCTX_LAST_GUEST_RCX,
     b_last_rdx = const BCTX_LAST_GUEST_RDX,
@@ -2100,6 +2246,10 @@ global_asm!(
     vmread_failed_message_len = const VMREAD_FAILED_MESSAGE_LEN,
     vmwrite_failed_message_len = const VMWRITE_FAILED_MESSAGE_LEN,
     vmresume_failed_message_len = const VMRESUME_FAILED_MESSAGE_LEN,
+    ept_test_violation_message_len = const EPT_TEST_VIOLATION_MESSAGE_LEN,
+    ept_unexpected_violation_message_len = const EPT_UNEXPECTED_VIOLATION_MESSAGE_LEN,
+    ept_violation_rip_len = const EPT_VIOLATION_RIP_LEN,
+    ept_violation_read_len = const EPT_VIOLATION_READ_LEN,
     state_reason_len = const STATE_REASON_LEN,
     state_rip_len = const STATE_RIP_LEN,
     state_instruction_len_len = const STATE_INSTRUCTION_LEN_LEN,

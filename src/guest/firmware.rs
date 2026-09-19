@@ -85,6 +85,14 @@ pub fn start_entry_address() -> u64 {
     matrixhv_windows_start_guest_asm as *const () as usize as u64
 }
 
+pub fn ept_probe_fault_address() -> u64 {
+    core::ptr::addr_of!(matrixhv_windows_ept_probe_fault) as u64
+}
+
+pub fn ept_probe_resume_address() -> u64 {
+    core::ptr::addr_of!(matrixhv_windows_ept_probe_resume) as u64
+}
+
 pub fn result_name(result: u64) -> &'static str {
     match result {
         BOOT_STAGE_LOCATE_OK => "locate_sfs_ok",
@@ -152,6 +160,12 @@ pub extern "efiapi" fn matrixhv_windows_start_guest_stage() -> u64 {
 
         unsafe {
             matrixhv_windows_start_checkpoint_asm();
+        }
+        let ept_test_page_gpa = vt_resident::ept_test_page_gpa();
+        if ept_test_page_gpa != 0 {
+            unsafe {
+                matrixhv_windows_ept_probe_asm(ept_test_page_gpa);
+            }
         }
         return match boot::start_image(child_handle) {
             Ok(()) => BOOT_STAGE_START_IMAGE_RETURNED,
@@ -243,6 +257,9 @@ unsafe extern "efiapi" {
     fn matrixhv_real_boot_guest_asm();
     fn matrixhv_windows_start_guest_asm();
     fn matrixhv_windows_start_checkpoint_asm();
+    fn matrixhv_windows_ept_probe_asm(physical_address: u64);
+    static matrixhv_windows_ept_probe_fault: u8;
+    static matrixhv_windows_ept_probe_resume: u8;
 }
 
 global_asm!(
@@ -254,6 +271,18 @@ global_asm!(
     "add rsp, 32",
     "vmcall",
     "ud2",
+);
+
+global_asm!(
+    ".text",
+    ".globl matrixhv_windows_ept_probe_asm",
+    ".globl matrixhv_windows_ept_probe_fault",
+    ".globl matrixhv_windows_ept_probe_resume",
+    "matrixhv_windows_ept_probe_asm:",
+    "matrixhv_windows_ept_probe_fault:",
+    "mov rax, qword ptr [rcx]",
+    "matrixhv_windows_ept_probe_resume:",
+    "ret",
 );
 
 global_asm!(

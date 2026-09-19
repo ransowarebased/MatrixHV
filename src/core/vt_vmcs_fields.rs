@@ -76,6 +76,7 @@ pub const CR0_READ_SHADOW: u64 = 0x6004;
 pub const CR4_READ_SHADOW: u64 = 0x6006;
 
 pub const EXIT_QUALIFICATION: u64 = 0x6400;
+pub const GUEST_PHYSICAL_ADDRESS: u64 = 0x2400;
 
 pub const GUEST_CR0: u64 = 0x6800;
 pub const GUEST_CR3: u64 = 0x6802;

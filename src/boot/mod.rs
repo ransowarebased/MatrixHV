@@ -326,10 +326,12 @@ pub fn run() -> Result<(), Status> {
     match hv_core::vt_resident::run_windows_boot(
         firmware::start_entry_address(),
         residency_events.context_physical_address,
+        firmware::ept_probe_fault_address(),
+        firmware::ept_probe_resume_address(),
     ) {
         Ok(report) => {
             logger::error(format_args!(
-                "windows_start_vcpu returned unexpectedly raw_path={} vm_instruction_error={:#x} host_cr3={:#x} guest_cr3={:#x} exits={} cpuid={} rdmsr={} wrmsr={} xsetbv={} vmcall={} checkpoint={} post_start={} post_ebs={} post_va={} last_reason={:#x} len={} qual={:#x} rip={:#x} last_guest_cr3={:#x} last_host_cr3={:#x} stop_result={:#x}",
+                "windows_start_vcpu returned unexpectedly raw_path={} vm_instruction_error={:#x} host_cr3={:#x} guest_cr3={:#x} exits={} cpuid={} rdmsr={} wrmsr={} xsetbv={} vmcall={} checkpoint={} post_start={} post_ebs={} post_va={} ept_test={} last_reason={:#x} len={} qual={:#x} gpa={:#x} rip={:#x} last_guest_cr3={:#x} last_host_cr3={:#x} stop_result={:#x}",
                 report.raw_path,
                 report.vm_instruction_error,
                 report.host_cr3,
@@ -344,9 +346,11 @@ pub fn run() -> Result<(), Status> {
                 report.post_start_exit_count,
                 report.post_ebs_exit_count,
                 report.post_va_exit_count,
+                report.ept_test_violation_seen,
                 report.last_reason,
                 report.last_instruction_len,
                 report.last_qualification,
+                report.last_guest_physical_address,
                 report.last_guest_rip,
                 report.last_guest_cr3,
                 report.last_host_cr3,
