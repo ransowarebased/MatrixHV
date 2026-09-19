@@ -18,6 +18,8 @@ use crate::memory::paging::{HostAddressSpace, HostPagingError};
 use crate::memory::resident::{
     AddressConstraint, PAGE_SIZE, RESIDENT_CODE_MEMORY_TYPE, RESIDENT_MEMORY_TYPE, ResidentPages,
 };
+use crate::nested::nested_capabilities::NestedVmxCapabilities;
+use crate::nested::nested_state::NestedVmxState;
 use crate::smp::per_cpu::ResidentCpuResources;
 
 const GUEST_STACK_PAGES: usize = 4;
@@ -36,15 +38,19 @@ const EVENT_CONTEXT_MAGIC: u64 = 0x4856_4556_454e_5431;
 const EVENT_CONTEXT_CANARY: u64 = 0x4856_4556_4341_4e59;
 const VMCALL_EXIT_REASON: u64 = 18;
 const CPUID_EXIT_REASON: u64 = 10;
+const VMXOFF_EXIT_REASON: u64 = 26;
+const VMXON_EXIT_REASON: u64 = 27;
 const RDMSR_EXIT_REASON: u64 = 31;
 const WRMSR_EXIT_REASON: u64 = 32;
 const XSETBV_EXIT_REASON: u64 = 55;
 const EPT_VIOLATION_EXIT_REASON: u64 = 48;
 const EPT_TEST_READ_ACCESS: u64 = 1;
 const IA32_TSC_MSR: u32 = 0x10;
+const IA32_TSC_ADJUST_MSR: u32 = 0x3b;
 const IA32_PLATFORM_ID_MSR: u32 = 0x17;
 const IA32_APIC_BASE_MSR: u32 = 0x1b;
 const IA32_FEATURE_CONTROL_MSR: u32 = 0x3a;
+const IA32_VMX_BASIC_MSR: u32 = 0x480;
 const IA32_BIOS_SIGN_ID_MSR: u32 = 0x8b;
 const IA32_MTRRCAP_MSR: u32 = 0xfe;
 const IA32_ARCH_CAPABILITIES_MSR: u32 = 0x10a;
@@ -60,9 +66,15 @@ const IA32_MTRR_FIX16K_80000_MSR: u32 = 0x258;
 const IA32_MTRR_FIX16K_A0000_MSR: u32 = 0x259;
 const IA32_MTRR_FIX4K_C0000_MSR: u32 = 0x268;
 const IA32_MTRR_FIX4K_F8000_MSR: u32 = 0x26f;
+const IA32_MC0_CTL2_MSR: u32 = 0x280;
 const IA32_MTRR_DEF_TYPE_MSR: u32 = 0x2ff;
 const IA32_MC0_CTL_MSR: u32 = 0x400;
 const IA32_MC0_STATUS_MSR: u32 = 0x401;
+const MSR_PKG_ENERGY_STATUS: u32 = 0x611;
+const MSR_RAPL_POWER_UNIT: u32 = 0x606;
+const MSR_DRAM_ENERGY_STATUS: u32 = 0x619;
+const MSR_PP0_ENERGY_STATUS: u32 = 0x639;
+const MSR_PP1_ENERGY_STATUS: u32 = 0x641;
 const MACHINE_CHECK_BANK_MSR_STRIDE: u32 = 4;
 const HYPERV_FEATURES_CPUID_LEAF: u32 = 0x4000_0003;
 const HYPERV_GUEST_IDLE_ACCESS_MASK: u32 = !(1 << 10);
@@ -134,9 +146,14 @@ const STATE_RAX_LEN: usize = b" rax=0x".len();
 const STATE_RCX_LEN: usize = b" rcx=0x".len();
 const STATE_RDX_LEN: usize = b" rdx=0x".len();
 const STATE_NEWLINE_LEN: usize = b"\r\n".len();
+const NESTED_VMXON_MESSAGE_LEN: usize = b"[MATRIXHV][NESTED] VMXON cpu=0x".len();
+const NESTED_VMXOFF_MESSAGE_LEN: usize = b"[MATRIXHV][NESTED] VMXOFF cpu=0x".len();
+const NESTED_POINTER_MESSAGE_LEN: usize = b" pointer=0x".len();
+const NESTED_FAILURE_MESSAGE_LEN: usize = b"[MATRIXHV][NESTED] PROBE_FAILED".len();
 
 pub const RESIDENT_VMCALL_START_CHECKPOINT: u64 = 0x4856_5354_4152_5421;
 pub const RESIDENT_VMCALL_STOP: u64 = 0x4856_5354_4f50_2121;
+pub const RESIDENT_VMCALL_NESTED_PROBE_FAILED: u64 = 0x4856_4e56_4d46_4149;
 const RESIDENT_STOP_UNSUPPORTED_EXIT: u64 = 0x4856_554e_5355_5050;
 static EPT_TEST_PAGE_GPA: AtomicU64 = AtomicU64::new(0);
 
@@ -238,6 +255,12 @@ pub struct ResidentBootReport {
     pub last_guest_cr3: u64,
     pub last_host_cr3: u64,
     pub stop_result: u64,
+    pub cpuid_presence: u64,
+    pub cpuid_leaf1_count: u64,
+    pub cpuid_hypervisor_count: u64,
+    pub cpuid_leaf1_ecx: u64,
+    pub cpuid_hypervisor_eax: u64,
+    pub nested: NestedVmxState,
 }
 
 #[repr(C, align(16))]
@@ -286,9 +309,16 @@ struct ResidentBootContext {
     ap_started: u64,
     init_count: u64,
     sipi_count: u64,
+    cpuid_presence: u64,
+    cpuid_leaf1_count: u64,
+    cpuid_hypervisor_count: u64,
+    cpuid_leaf1_ecx: u64,
+    cpuid_hypervisor_eax: u64,
+    tsc_adjust: u64,
+    nested: NestedVmxState,
     original_gdtr: [u8; 10],
     original_idtr: [u8; 10],
-    alignment_padding: [u8; 28],
+    alignment_padding: [u8; 36],
     root_fx_state: [u8; 512],
 }
 
@@ -300,6 +330,7 @@ impl ResidentBootContext {
         ept_test_gpa: u64,
         ept_probe_fault_rip: u64,
         ept_probe_resume_rip: u64,
+        nested: NestedVmxState,
     ) -> Self {
         Self {
             root_rsp: 0,
@@ -338,9 +369,16 @@ impl ResidentBootContext {
             ap_started: 0,
             init_count: 0,
             sipi_count: 0,
+            cpuid_presence: u64::from(crate::boot::config::current().cpuid_presence),
+            cpuid_leaf1_count: 0,
+            cpuid_hypervisor_count: 0,
+            cpuid_leaf1_ecx: 0,
+            cpuid_hypervisor_eax: 0,
+            tsc_adjust: 0,
+            nested,
             original_gdtr: [0; 10],
             original_idtr: [0; 10],
-            alignment_padding: [0; 28],
+            alignment_padding: [0; 36],
             root_fx_state: [0; 512],
         }
     }
@@ -385,9 +423,45 @@ const BCTX_LAST_HOST_CR3: usize = core::mem::offset_of!(ResidentBootContext, las
 const BCTX_STOP_RESULT: usize = core::mem::offset_of!(ResidentBootContext, stop_result);
 const BCTX_CANARY_START: usize = core::mem::offset_of!(ResidentBootContext, canary_start);
 const BCTX_CANARY_END: usize = core::mem::offset_of!(ResidentBootContext, canary_end);
+const BCTX_CPUID_PRESENCE: usize = core::mem::offset_of!(ResidentBootContext, cpuid_presence);
+const BCTX_CPUID_LEAF1_COUNT: usize = core::mem::offset_of!(ResidentBootContext, cpuid_leaf1_count);
+const BCTX_CPUID_HYPERVISOR_COUNT: usize =
+    core::mem::offset_of!(ResidentBootContext, cpuid_hypervisor_count);
+const BCTX_CPUID_LEAF1_ECX: usize = core::mem::offset_of!(ResidentBootContext, cpuid_leaf1_ecx);
+const BCTX_CPUID_HYPERVISOR_EAX: usize =
+    core::mem::offset_of!(ResidentBootContext, cpuid_hypervisor_eax);
+const BCTX_TSC_ADJUST: usize = core::mem::offset_of!(ResidentBootContext, tsc_adjust);
+const BCTX_NESTED_FEATURE_CONTROL: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, feature_control);
+const BCTX_NESTED_VMX_BASIC: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_basic);
+const BCTX_NESTED_EXPOSE_VMX: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, expose_vmx);
+const BCTX_NESTED_VMXON_OPERAND: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmxon_operand);
+const BCTX_NESTED_VMXON_REGION: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmxon_region);
+const BCTX_NESTED_CURRENT_VMCS: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, current_vmcs);
+const BCTX_NESTED_LAST_OPERAND: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, last_operand);
+const BCTX_NESTED_INSTRUCTION_ERROR: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, instruction_error);
+const BCTX_NESTED_VMXON_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmxon_count);
+const BCTX_NESTED_VMXOFF_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmxoff_count);
+const BCTX_NESTED_FAILURE_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, failure_count);
+const BCTX_NESTED_ACTIVE: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, active);
+const BCTX_NESTED_PROBE_COMPLETE: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, probe_complete);
 const BCTX_ORIGINAL_GDTR: usize = core::mem::offset_of!(ResidentBootContext, original_gdtr);
 const BCTX_ORIGINAL_IDTR: usize = core::mem::offset_of!(ResidentBootContext, original_idtr);
 const BCTX_ROOT_FX_STATE: usize = core::mem::offset_of!(ResidentBootContext, root_fx_state);
+const _: () = assert!(BCTX_ROOT_FX_STATE & 0xf == 0);
+const _: () = assert!(size_of::<ResidentBootContext>() <= PAGE_SIZE);
 
 const EVENT_CTX_MAGIC: usize = core::mem::offset_of!(ResidentEventContext, magic);
 const EVENT_CTX_EBS_SEEN: usize =
@@ -954,6 +1028,7 @@ pub fn run_windows_boot(
     allow_low_msr_passthrough(&msr_bitmap, IA32_MCG_CTL_MSR);
     let machine_check_bank_count = unsafe { msr::read(IA32_MCG_CAP_MSR) } as u32 & 0xff;
     for bank in 0..machine_check_bank_count {
+        allow_low_msr_passthrough(&msr_bitmap, IA32_MC0_CTL2_MSR + bank);
         allow_low_msr_passthrough(
             &msr_bitmap,
             IA32_MC0_CTL_MSR + bank * MACHINE_CHECK_BANK_MSR_STRIDE,
@@ -994,7 +1069,10 @@ pub fn run_windows_boot(
         guest_stack,
         host_stack,
         resident_msr_state,
+        nested_vmxon_page,
     } = cpu_resources;
+    let nested_vmxon_operand = nested_vmxon_page.physical_address() + 8;
+    let nested_vmxon_region = nested_vmxon_page.physical_address();
     let vmcs_physical_address = vmcs_region.physical_address();
     let session = vt_vmxon::enter_vmx_root_with_region(vmx_basic, vmxon_region)
         .map_err(ResidentProbeError::Vmxon)?;
@@ -1029,6 +1107,11 @@ pub fn run_windows_boot(
             ept_test_page.physical_address(),
             ept_probe_fault_rip,
             ept_probe_resume_rip,
+            NestedVmxState::new(
+                NestedVmxCapabilities::vmxon_vmxoff(vmx_basic),
+                nested_vmxon_operand,
+                nested_vmxon_region,
+            ),
         ));
     }
     let host_rsp = (host_stack.physical_address() + host_stack.byte_len() as u64 - 8) & !0xf;
@@ -1053,6 +1136,7 @@ pub fn run_windows_boot(
             .as_ptr()
             .cast::<ResidentBootContext>();
         let started = unsafe { core::ptr::addr_of!((*ap_context).ap_started).read_volatile() };
+        let nested = unsafe { core::ptr::addr_of!((*ap_context).nested).read_volatile() };
         crate::runtime::logger::info(format_args!(
             "smp resident processor={} started={} status={:?} vmxon={:#x} vmcs={:#x} host_stack={:#x} context={:#x} host_cr3={:#x} ept={:#x}",
             processor_number,
@@ -1065,7 +1149,27 @@ pub fn run_windows_boot(
             host_space.host_cr3,
             ept.ept_pointer()
         ));
-        if result.is_err() || started != 1 {
+        crate::runtime::logger::info(format_args!(
+            "nested AP processor={} operand={:#x} region={:#x} vmxon={} vmxoff={} active={} failures={} complete={} cpuid_leaf1_ecx={:#x} cpuid_hypervisor_eax={:#x}",
+            processor_number,
+            nested.vmxon_operand,
+            nested.vmxon_region,
+            nested.vmxon_count,
+            nested.vmxoff_count,
+            nested.active,
+            nested.failure_count,
+            nested.probe_complete,
+            unsafe { core::ptr::addr_of!((*ap_context).cpuid_leaf1_ecx).read_volatile() },
+            unsafe { core::ptr::addr_of!((*ap_context).cpuid_hypervisor_eax).read_volatile() }
+        ));
+        if result.is_err()
+            || started != 1
+            || nested.vmxon_count != 1
+            || nested.vmxoff_count != 1
+            || nested.active != 0
+            || nested.failure_count != 0
+            || nested.probe_complete != 1
+        {
             resident_startup_halt();
         }
     }
@@ -1134,6 +1238,12 @@ pub fn run_windows_boot(
         last_guest_cr3: result.last_guest_cr3,
         last_host_cr3: result.last_host_cr3,
         stop_result: result.stop_result,
+        cpuid_presence: result.cpuid_presence,
+        cpuid_leaf1_count: result.cpuid_leaf1_count,
+        cpuid_hypervisor_count: result.cpuid_hypervisor_count,
+        cpuid_leaf1_ecx: result.cpuid_leaf1_ecx,
+        cpuid_hypervisor_eax: result.cpuid_hypervisor_eax,
+        nested: result.nested,
     };
     let _ = &host_tables.pages;
     Ok(report)
@@ -1165,10 +1275,13 @@ impl ResidentApLaunch<'_> {
         &mut self,
         guest_rsp: u64,
         guest_rip: u64,
-    ) -> Result<(), ResidentProbeError> {
+    ) -> Result<u64, ResidentProbeError> {
         let segments = segmentation::capture();
+        let nested_vmxon_operand = self.resources.nested_vmxon_operand();
+        let nested_vmxon_region = self.resources.nested_vmxon_region();
+        let vmx_basic = vt_vmxon::vmx_basic();
         let session = vt_vmxon::enter_vmx_root_with_borrowed_region(
-            vt_vmxon::vmx_basic(),
+            vmx_basic,
             &mut self.resources.vmxon_region,
         )
         .map_err(ResidentProbeError::Vmxon)?;
@@ -1191,8 +1304,19 @@ impl ResidentApLaunch<'_> {
             .pointer()
             .as_ptr()
             .cast::<ResidentBootContext>();
-        let mut state =
-            ResidentBootContext::new(self.host_cr3, guest.cr3, self.event_context, 0, 0, 0);
+        let mut state = ResidentBootContext::new(
+            self.host_cr3,
+            guest.cr3,
+            self.event_context,
+            0,
+            0,
+            0,
+            NestedVmxState::new(
+                NestedVmxCapabilities::vmxon_vmxoff(vmx_basic),
+                nested_vmxon_operand,
+                nested_vmxon_region,
+            ),
+        );
         state.processor_number = self.processor_number as u64;
         let host_rsp = (self.resources.host_stack.physical_address()
             + self.resources.host_stack.byte_len() as u64
@@ -1206,7 +1330,7 @@ impl ResidentApLaunch<'_> {
         vmwrite(HOST_RIP, self.dispatch_entry)?;
         // The successful guest continuation returns to firmware without dropping this root session.
         core::mem::forget(session);
-        Ok(())
+        Ok(nested_vmxon_operand)
     }
 }
 
@@ -1385,6 +1509,7 @@ global_asm!(
     "vmwrite rax, r8",
     "jc .Lresident_boot_rip_fail",
     "jz .Lresident_boot_rip_fail",
+    "mov rax, qword ptr [rcx + {b_nested_vmxon_operand}]",
     "vmlaunch",
     "jc .Lresident_boot_fail_invalid",
     "jz .Lresident_boot_fail_valid",
@@ -1426,6 +1551,7 @@ global_asm!(
     b_gdtr = const BCTX_ORIGINAL_GDTR,
     b_idtr = const BCTX_ORIGINAL_IDTR,
     b_fx = const BCTX_ROOT_FX_STATE,
+    b_nested_vmxon_operand = const BCTX_NESTED_VMXON_OPERAND,
 );
 
 global_asm!(
@@ -1579,6 +1705,10 @@ global_asm!(
     "je .Lresident_ap_cr_access",
     "cmp eax, {ept_violation_reason}",
     "je .Lresident_dispatch_ept_violation",
+    "cmp eax, {vmxon_reason}",
+    "je .Lresident_dispatch_vmxon",
+    "cmp eax, {vmxoff_reason}",
+    "je .Lresident_dispatch_vmxoff",
     "cmp eax, {cpuid_reason}",
     "je .Lresident_dispatch_cpuid",
     "cmp eax, {vmcall_reason}",
@@ -1641,6 +1771,120 @@ global_asm!(
     "call .Lresident_serial_hex64",
     "call .Lresident_serial_state",
     "jmp .Lresident_dispatch_halt",
+    ".Lresident_dispatch_vmxon:",
+    "inc qword ptr [r12 + {b_nested_vmxon_count}]",
+    "mov r10, qword ptr [rsp + 0]",
+    "cmp r10, qword ptr [r12 + {b_nested_vmxon_operand}]",
+    "jne .Lresident_nested_vmfail_invalid",
+    "mov r11, qword ptr [r10]",
+    "mov qword ptr [r12 + {b_nested_last_operand}], r11",
+    "cmp r11, qword ptr [r12 + {b_nested_vmxon_region}]",
+    "jne .Lresident_nested_vmfail_invalid",
+    "test r11, 0xfff",
+    "jnz .Lresident_nested_vmfail_invalid",
+    "mov edx, dword ptr [r11]",
+    "mov eax, dword ptr [r12 + {b_nested_vmx_basic}]",
+    "and eax, 0x7fffffff",
+    "cmp edx, eax",
+    "jne .Lresident_nested_vmfail_invalid",
+    "mov rax, {guest_cr4}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "test r11, 0x2000",
+    "jz .Lresident_nested_inject_ud",
+    "mov rax, {guest_cs_selector}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "test r11b, 3",
+    "jnz .Lresident_nested_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_feature_control}]",
+    "and r11d, 5",
+    "cmp r11d, 5",
+    "jne .Lresident_nested_inject_gp",
+    "cmp qword ptr [r12 + {b_nested_active}], 0",
+    "jne .Lresident_nested_vmfail_invalid",
+    "mov qword ptr [r12 + {b_nested_active}], 1",
+    "mov qword ptr [r12 + {b_nested_current_vmcs}], -1",
+    "mov qword ptr [r12 + {b_nested_instruction_error}], 0",
+    "lea rsi, [rip + .Lnested_vmxon_message]",
+    "mov r9d, {nested_vmxon_message_len}",
+    "call .Lresident_serial_write",
+    "mov rax, qword ptr [r12 + {b_processor_number}]",
+    "call .Lresident_serial_hex64",
+    "lea rsi, [rip + .Lnested_pointer_message]",
+    "mov r9d, {nested_pointer_message_len}",
+    "call .Lresident_serial_write",
+    "mov rax, qword ptr [r12 + {b_nested_last_operand}]",
+    "call .Lresident_serial_hex64",
+    "lea rsi, [rip + .Lstate_newline]",
+    "mov r9d, {state_newline_len}",
+    "call .Lresident_serial_write",
+    "jmp .Lresident_nested_succeed",
+    ".Lresident_dispatch_vmxoff:",
+    "inc qword ptr [r12 + {b_nested_vmxoff_count}]",
+    "cmp qword ptr [r12 + {b_nested_active}], 1",
+    "jne .Lresident_nested_inject_ud",
+    "mov rax, {guest_cs_selector}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "test r11b, 3",
+    "jnz .Lresident_nested_inject_gp",
+    "mov qword ptr [r12 + {b_nested_active}], 0",
+    "mov qword ptr [r12 + {b_nested_current_vmcs}], -1",
+    "mov qword ptr [r12 + {b_nested_instruction_error}], 0",
+    "mov qword ptr [r12 + {b_nested_probe_complete}], 1",
+    "lea rsi, [rip + .Lnested_vmxoff_message]",
+    "mov r9d, {nested_vmxoff_message_len}",
+    "call .Lresident_serial_write",
+    "mov rax, qword ptr [r12 + {b_processor_number}]",
+    "call .Lresident_serial_hex64",
+    "lea rsi, [rip + .Lnested_pointer_message]",
+    "mov r9d, {nested_pointer_message_len}",
+    "call .Lresident_serial_write",
+    "mov rax, qword ptr [r12 + {b_nested_last_operand}]",
+    "call .Lresident_serial_hex64",
+    "lea rsi, [rip + .Lstate_newline]",
+    "mov r9d, {state_newline_len}",
+    "call .Lresident_serial_write",
+    "jmp .Lresident_nested_succeed",
+    ".Lresident_nested_vmfail_invalid:",
+    "inc qword ptr [r12 + {b_nested_failure_count}]",
+    "mov rax, {guest_rflags}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "and r11, -66",
+    "or r11, 1",
+    "vmwrite rax, r11",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "call .Lresident_advance_guest_rip",
+    "jmp .Lresident_dispatch_resume",
+    ".Lresident_nested_succeed:",
+    "mov rax, {guest_rflags}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "and r11, -66",
+    "vmwrite rax, r11",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "call .Lresident_advance_guest_rip",
+    "jmp .Lresident_dispatch_resume",
+    ".Lresident_nested_inject_ud:",
+    "inc qword ptr [r12 + {b_nested_failure_count}]",
+    "mov rax, {vm_entry_intr_info_field}",
+    "mov r10d, 0x80000306",
+    "vmwrite rax, r10",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "jmp .Lresident_dispatch_resume",
+    ".Lresident_nested_inject_gp:",
+    "inc qword ptr [r12 + {b_nested_failure_count}]",
+    "jmp .Lresident_dispatch_inject_gp",
     ".Lresident_dispatch_cpuid:",
     "inc qword ptr [r12 + {b_cpuid_count}]",
     "mov eax, dword ptr [rsp + 0]",
@@ -1651,14 +1895,31 @@ global_asm!(
     "mov qword ptr [rsp + 24], rbx",
     "mov qword ptr [rsp + 8], rcx",
     "mov qword ptr [rsp + 16], rdx",
+    "cmp r8d, 0x40000000",
+    "jb .Lresident_dispatch_cpuid_standard",
+    "cmp r8d, 0x4fffffff",
+    "ja .Lresident_dispatch_cpuid_standard",
+    "inc qword ptr [r12 + {b_cpuid_hypervisor_count}]",
+    "cmp qword ptr [r12 + {b_cpuid_presence}], 0",
+    "jne .Lresident_dispatch_cpuid_hypervisor_present",
+    "mov qword ptr [rsp + 0], 0",
+    "mov qword ptr [rsp + 24], 0",
+    "mov qword ptr [rsp + 8], 0",
+    "mov qword ptr [rsp + 16], 0",
+    "mov qword ptr [r12 + {b_cpuid_hypervisor_eax}], 0",
+    "jmp .Lresident_dispatch_cpuid_advance",
+    ".Lresident_dispatch_cpuid_hypervisor_present:",
+    "mov r10d, dword ptr [rsp + 0]",
+    "mov qword ptr [r12 + {b_cpuid_hypervisor_eax}], r10",
     "cmp r8d, {hyperv_features_leaf}",
-    "jne .Lresident_dispatch_cpuid_standard",
+    "jne .Lresident_dispatch_cpuid_advance",
     "and dword ptr [rsp + 0], {hyperv_guest_idle_access_mask}",
     "and dword ptr [rsp + 16], {hyperv_guest_idle_feature_mask}",
     "jmp .Lresident_dispatch_cpuid_advance",
     ".Lresident_dispatch_cpuid_standard:",
     "cmp r8d, 1",
     "jne .Lresident_dispatch_cpuid_advance",
+    "inc qword ptr [r12 + {b_cpuid_leaf1_count}]",
     "mov r10d, dword ptr [rsp + 8]",
     "and r10d, {cpuid_vmx_clear_mask}",
     "and r10d, {cpuid_osxsave_clear_mask}",
@@ -1670,7 +1931,19 @@ global_asm!(
     "jz .Lresident_dispatch_cpuid_osxsave_ready",
     "or r10d, {cpuid_osxsave_set_mask}",
     ".Lresident_dispatch_cpuid_osxsave_ready:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_cpuid_vmx_ready",
+    "or r10d, {cpuid_vmx_set_mask}",
+    ".Lresident_dispatch_cpuid_vmx_ready:",
+    "cmp qword ptr [r12 + {b_cpuid_presence}], 0",
+    "je .Lresident_dispatch_cpuid_presence_hidden",
+    "or r10d, {cpuid_hypervisor_set_mask}",
+    "jmp .Lresident_dispatch_cpuid_presence_ready",
+    ".Lresident_dispatch_cpuid_presence_hidden:",
+    "and r10d, {cpuid_hypervisor_clear_mask}",
+    ".Lresident_dispatch_cpuid_presence_ready:",
     "mov qword ptr [rsp + 8], r10",
+    "mov qword ptr [r12 + {b_cpuid_leaf1_ecx}], r10",
     ".Lresident_dispatch_cpuid_advance:",
     "call .Lresident_advance_guest_rip",
     "jmp .Lresident_dispatch_resume",
@@ -1679,15 +1952,29 @@ global_asm!(
     "mov ecx, dword ptr [rsp + 8]",
     "cmp ecx, {tsc_msr}",
     "je .Lresident_dispatch_rdmsr_passthrough",
+    "cmp ecx, {tsc_adjust_msr}",
+    "je .Lresident_dispatch_rdmsr_tsc_adjust",
     "cmp ecx, {platform_id_msr}",
     "je .Lresident_dispatch_rdmsr_passthrough",
     "cmp ecx, {apic_base_msr}",
     "je .Lresident_dispatch_rdmsr_passthrough",
     "cmp ecx, {feature_control_msr}",
-    "je .Lresident_dispatch_rdmsr_passthrough",
+    "je .Lresident_dispatch_rdmsr_feature_control",
+    "cmp ecx, {vmx_basic_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_basic",
     "cmp ecx, {bios_sign_id_msr}",
     "je .Lresident_dispatch_rdmsr_passthrough",
     "cmp ecx, {mtrrcap_msr}",
+    "je .Lresident_dispatch_rdmsr_passthrough",
+    "cmp ecx, {pkg_energy_status_msr}",
+    "je .Lresident_dispatch_rdmsr_passthrough",
+    "cmp ecx, {rapl_power_unit_msr}",
+    "je .Lresident_dispatch_rdmsr_passthrough",
+    "cmp ecx, {dram_energy_status_msr}",
+    "je .Lresident_dispatch_rdmsr_passthrough",
+    "cmp ecx, {pp0_energy_status_msr}",
+    "je .Lresident_dispatch_rdmsr_passthrough",
+    "cmp ecx, {pp1_energy_status_msr}",
     "je .Lresident_dispatch_rdmsr_passthrough",
     "cmp ecx, {mtrr_physbase0_msr}",
     "jb .Lresident_dispatch_rdmsr_after_variable_mtrr",
@@ -1742,7 +2029,33 @@ global_asm!(
     "je .Lresident_dispatch_inject_gp",
     "cmp ecx, {kernel_gs_base_msr}",
     "je .Lresident_dispatch_rdmsr_kernel_gs_base",
+    "cmp ecx, 0x480",
+    "jb .Lresident_dispatch_rdmsr_not_vmx",
+    "cmp ecx, 0x490",
+    "jbe .Lresident_dispatch_inject_gp",
+    ".Lresident_dispatch_rdmsr_not_vmx:",
     "jmp .Lresident_dispatch_unsupported",
+    ".Lresident_dispatch_rdmsr_tsc_adjust:",
+    "mov r11, qword ptr [r12 + {b_tsc_adjust}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_feature_control:",
+    "mov r11, qword ptr [r12 + {b_nested_feature_control}]",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "jne .Lresident_dispatch_rdmsr_nested_value",
+    "and r11, -5",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_basic:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_basic}]",
+    ".Lresident_dispatch_rdmsr_nested_value:",
+    "mov eax, r11d",
+    "mov qword ptr [rsp + 0], rax",
+    "shr r11, 32",
+    "mov eax, r11d",
+    "mov qword ptr [rsp + 16], rax",
+    "call .Lresident_advance_guest_rip",
+    "jmp .Lresident_dispatch_resume",
     ".Lresident_dispatch_rdmsr_fixed_mtrr:",
     "mov r10d, ecx",
     "mov ecx, {mtrrcap_msr}",
@@ -1819,6 +2132,10 @@ global_asm!(
     ".Lresident_dispatch_wrmsr:",
     "inc qword ptr [r12 + {b_wrmsr_count}]",
     "mov ecx, dword ptr [rsp + 8]",
+    "cmp ecx, {tsc_msr}",
+    "je .Lresident_dispatch_wrmsr_tsc",
+    "cmp ecx, {tsc_adjust_msr}",
+    "je .Lresident_dispatch_wrmsr_tsc_adjust",
     "cmp ecx, {bios_sign_id_msr}",
     "je .Lresident_dispatch_wrmsr_passthrough",
     "cmp ecx, {mtrr_def_type_msr}",
@@ -1876,6 +2193,13 @@ global_asm!(
     "je .Lresident_dispatch_wrmsr_fs_base",
     "cmp ecx, {kernel_gs_base_msr}",
     "je .Lresident_dispatch_wrmsr_kernel_gs_base",
+    "cmp ecx, {feature_control_msr}",
+    "je .Lresident_dispatch_inject_gp",
+    "cmp ecx, 0x480",
+    "jb .Lresident_dispatch_wrmsr_not_vmx",
+    "cmp ecx, 0x490",
+    "jbe .Lresident_dispatch_inject_gp",
+    ".Lresident_dispatch_wrmsr_not_vmx:",
     "cmp ecx, {efer_msr}",
     "jne .Lresident_dispatch_unsupported",
     "mov eax, dword ptr [rsp + 0]",
@@ -1884,6 +2208,45 @@ global_asm!(
     "or rax, rdx",
     "mov r11, rax",
     "mov rax, {guest_efer}",
+    "vmwrite rax, r11",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "call .Lresident_advance_guest_rip",
+    "jmp .Lresident_dispatch_resume",
+    ".Lresident_dispatch_wrmsr_tsc:",
+    "mov r10d, dword ptr [rsp + 0]",
+    "mov r11d, dword ptr [rsp + 16]",
+    "shl r11, 32",
+    "or r10, r11",
+    "rdtsc",
+    "shl rdx, 32",
+    "or rax, rdx",
+    "sub r10, rax",
+    "mov r11, r10",
+    "mov rax, {tsc_offset}",
+    "vmread rdx, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "sub r11, rdx",
+    "add qword ptr [r12 + {b_tsc_adjust}], r11",
+    "vmwrite rax, r10",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "call .Lresident_advance_guest_rip",
+    "jmp .Lresident_dispatch_resume",
+    ".Lresident_dispatch_wrmsr_tsc_adjust:",
+    "mov r10d, dword ptr [rsp + 0]",
+    "mov r11d, dword ptr [rsp + 16]",
+    "shl r11, 32",
+    "or r10, r11",
+    "mov r11, qword ptr [r12 + {b_tsc_adjust}]",
+    "mov qword ptr [r12 + {b_tsc_adjust}], r10",
+    "sub r10, r11",
+    "mov rax, {tsc_offset}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "add r11, r10",
     "vmwrite rax, r11",
     "jc .Lresident_dispatch_vmwrite_failed",
     "jz .Lresident_dispatch_vmwrite_failed",
@@ -1976,6 +2339,9 @@ global_asm!(
     "mov r11, {stop_magic}",
     "cmp rax, r11",
     "je .Lresident_dispatch_stop",
+    "mov r11, {nested_probe_failed_magic}",
+    "cmp rax, r11",
+    "je .Lresident_dispatch_nested_probe_failed",
     "jmp .Lresident_dispatch_unsupported",
     ".Lresident_dispatch_start_checkpoint:",
     "mov qword ptr [r12 + {b_start_checkpoint_seen}], 1",
@@ -2002,6 +2368,12 @@ global_asm!(
     ".Lresident_dispatch_post_ebs_stop:",
     "lea rsi, [rip + .Lpost_ebs_stop_message]",
     "mov r9d, {post_ebs_stop_message_len}",
+    "call .Lresident_serial_write",
+    "call .Lresident_serial_state",
+    "jmp .Lresident_dispatch_halt",
+    ".Lresident_dispatch_nested_probe_failed:",
+    "lea rsi, [rip + .Lnested_failure_message]",
+    "mov r9d, {nested_failure_message_len}",
     "call .Lresident_serial_write",
     "call .Lresident_serial_state",
     "jmp .Lresident_dispatch_halt",
@@ -2263,6 +2635,18 @@ global_asm!(
     ".Lept_violation_read:",
     ".ascii \" access=read qual=0x\"",
     ".Lept_violation_read_end:",
+    ".Lnested_vmxon_message:",
+    ".ascii \"[MATRIXHV][NESTED] VMXON cpu=0x\"",
+    ".Lnested_vmxon_message_end:",
+    ".Lnested_vmxoff_message:",
+    ".ascii \"[MATRIXHV][NESTED] VMXOFF cpu=0x\"",
+    ".Lnested_vmxoff_message_end:",
+    ".Lnested_pointer_message:",
+    ".ascii \" pointer=0x\"",
+    ".Lnested_pointer_message_end:",
+    ".Lnested_failure_message:",
+    ".ascii \"[MATRIXHV][NESTED] PROBE_FAILED\"",
+    ".Lnested_failure_message_end:",
     ".Lstate_reason:",
     ".ascii \" reason=0x\"",
     ".Lstate_reason_end:",
@@ -2362,6 +2746,7 @@ global_asm!(
     guest_sysenter_cs = const GUEST_SYSENTER_CS,
     guest_sysenter_esp = const GUEST_SYSENTER_ESP,
     guest_sysenter_eip = const GUEST_SYSENTER_EIP,
+    tsc_offset = const TSC_OFFSET,
     guest_cr4 = const GUEST_CR4,
     vm_entry_msr_load_addr = const VM_ENTRY_MSR_LOAD_ADDR,
     guest_rip = const GUEST_RIP,
@@ -2377,17 +2762,26 @@ global_asm!(
     event_canary = const EVENT_CONTEXT_CANARY,
     ept_violation_reason = const EPT_VIOLATION_EXIT_REASON,
     ept_test_read_access = const EPT_TEST_READ_ACCESS,
+    vmxon_reason = const VMXON_EXIT_REASON,
+    vmxoff_reason = const VMXOFF_EXIT_REASON,
     cpuid_reason = const CPUID_EXIT_REASON,
     vmcall_reason = const VMCALL_EXIT_REASON,
     rdmsr_reason = const RDMSR_EXIT_REASON,
     wrmsr_reason = const WRMSR_EXIT_REASON,
     xsetbv_reason = const XSETBV_EXIT_REASON,
     tsc_msr = const IA32_TSC_MSR,
+    tsc_adjust_msr = const IA32_TSC_ADJUST_MSR,
     platform_id_msr = const IA32_PLATFORM_ID_MSR,
     apic_base_msr = const IA32_APIC_BASE_MSR,
     feature_control_msr = const IA32_FEATURE_CONTROL_MSR,
+    vmx_basic_msr = const IA32_VMX_BASIC_MSR,
     bios_sign_id_msr = const IA32_BIOS_SIGN_ID_MSR,
     mtrrcap_msr = const IA32_MTRRCAP_MSR,
+    pkg_energy_status_msr = const MSR_PKG_ENERGY_STATUS,
+    rapl_power_unit_msr = const MSR_RAPL_POWER_UNIT,
+    dram_energy_status_msr = const MSR_DRAM_ENERGY_STATUS,
+    pp0_energy_status_msr = const MSR_PP0_ENERGY_STATUS,
+    pp1_energy_status_msr = const MSR_PP1_ENERGY_STATUS,
     sysenter_cs_msr = const IA32_SYSENTER_CS_MSR,
     sysenter_esp_msr = const IA32_SYSENTER_ESP_MSR,
     sysenter_eip_msr = const IA32_SYSENTER_EIP_MSR,
@@ -2416,11 +2810,15 @@ global_asm!(
     fs_base_msr = const IA32_FS_BASE_MSR,
     kernel_gs_base_msr = const IA32_KERNEL_GS_BASE_MSR,
     cpuid_vmx_clear_mask = const !(1_u32 << 5),
+    cpuid_vmx_set_mask = const 1_u32 << 5,
     cpuid_osxsave_set_mask = const 1_u32 << 27,
     cpuid_osxsave_clear_mask = const !(1_u32 << 27),
+    cpuid_hypervisor_set_mask = const 1_u32 << 31,
+    cpuid_hypervisor_clear_mask = const !(1_u32 << 31),
     cr4_osxsave_mask = const 1_u64 << 18,
     start_checkpoint_magic = const RESIDENT_VMCALL_START_CHECKPOINT,
     stop_magic = const RESIDENT_VMCALL_STOP,
+    nested_probe_failed_magic = const RESIDENT_VMCALL_NESTED_PROBE_FAILED,
     unsupported_stop = const RESIDENT_STOP_UNSUPPORTED_EXIT,
     b_expected_host_cr3 = const BCTX_EXPECTED_HOST_CR3,
     b_event_context = const BCTX_EVENT_CONTEXT,
@@ -2451,6 +2849,25 @@ global_asm!(
     b_stop_result = const BCTX_STOP_RESULT,
     b_canary_start = const BCTX_CANARY_START,
     b_canary_end = const BCTX_CANARY_END,
+    b_cpuid_presence = const BCTX_CPUID_PRESENCE,
+    b_cpuid_leaf1_count = const BCTX_CPUID_LEAF1_COUNT,
+    b_cpuid_hypervisor_count = const BCTX_CPUID_HYPERVISOR_COUNT,
+    b_cpuid_leaf1_ecx = const BCTX_CPUID_LEAF1_ECX,
+    b_cpuid_hypervisor_eax = const BCTX_CPUID_HYPERVISOR_EAX,
+    b_tsc_adjust = const BCTX_TSC_ADJUST,
+    b_nested_feature_control = const BCTX_NESTED_FEATURE_CONTROL,
+    b_nested_vmx_basic = const BCTX_NESTED_VMX_BASIC,
+    b_nested_expose_vmx = const BCTX_NESTED_EXPOSE_VMX,
+    b_nested_vmxon_operand = const BCTX_NESTED_VMXON_OPERAND,
+    b_nested_vmxon_region = const BCTX_NESTED_VMXON_REGION,
+    b_nested_current_vmcs = const BCTX_NESTED_CURRENT_VMCS,
+    b_nested_last_operand = const BCTX_NESTED_LAST_OPERAND,
+    b_nested_instruction_error = const BCTX_NESTED_INSTRUCTION_ERROR,
+    b_nested_vmxon_count = const BCTX_NESTED_VMXON_COUNT,
+    b_nested_vmxoff_count = const BCTX_NESTED_VMXOFF_COUNT,
+    b_nested_failure_count = const BCTX_NESTED_FAILURE_COUNT,
+    b_nested_active = const BCTX_NESTED_ACTIVE,
+    b_nested_probe_complete = const BCTX_NESTED_PROBE_COMPLETE,
     event_magic_offset = const EVENT_CTX_MAGIC,
     event_ebs_seen = const EVENT_CTX_EBS_SEEN,
     event_va_seen = const EVENT_CTX_VA_SEEN,
@@ -2471,6 +2888,10 @@ global_asm!(
     ept_unexpected_violation_message_len = const EPT_UNEXPECTED_VIOLATION_MESSAGE_LEN,
     ept_violation_rip_len = const EPT_VIOLATION_RIP_LEN,
     ept_violation_read_len = const EPT_VIOLATION_READ_LEN,
+    nested_vmxon_message_len = const NESTED_VMXON_MESSAGE_LEN,
+    nested_vmxoff_message_len = const NESTED_VMXOFF_MESSAGE_LEN,
+    nested_pointer_message_len = const NESTED_POINTER_MESSAGE_LEN,
+    nested_failure_message_len = const NESTED_FAILURE_MESSAGE_LEN,
     state_reason_len = const STATE_REASON_LEN,
     state_rip_len = const STATE_RIP_LEN,
     state_instruction_len_len = const STATE_INSTRUCTION_LEN_LEN,

@@ -6,6 +6,9 @@ use crate::hv_core::vt_resident::{
 use crate::hv_core::vt_vmcs::VmcsRegion;
 use crate::hv_core::vt_vmxon::{self, VmxonRegion};
 use crate::memory::resident::{AddressConstraint, ResidentPages};
+use crate::nested::nested_capabilities::NestedVmxCapabilities;
+
+const NESTED_VMXON_OPERAND_OFFSET: u64 = 8;
 
 pub(crate) struct ResidentCpuResources {
     pub(crate) vmxon_region: VmxonRegion,
@@ -15,6 +18,7 @@ pub(crate) struct ResidentCpuResources {
     pub(crate) guest_stack: ResidentPages,
     pub(crate) host_stack: ResidentPages,
     pub(crate) resident_msr_state: ResidentPages,
+    pub(crate) nested_vmxon_page: ResidentPages,
 }
 
 impl ResidentCpuResources {
@@ -32,6 +36,17 @@ impl ResidentCpuResources {
             .map_err(ResidentProbeError::Allocation)?;
         let resident_msr_state = ResidentPages::allocate(1, AddressConstraint::Any)
             .map_err(ResidentProbeError::Allocation)?;
+        let nested_vmxon_page = ResidentPages::allocate(1, AddressConstraint::Any)
+            .map_err(ResidentProbeError::Allocation)?;
+        let capabilities = NestedVmxCapabilities::vmxon_vmxoff(vmx_basic);
+        unsafe {
+            let page = nested_vmxon_page.pointer().as_ptr();
+            page.write_bytes(0, nested_vmxon_page.byte_len());
+            page.cast::<u32>().write(capabilities.revision_id);
+            page.add(NESTED_VMXON_OPERAND_OFFSET as usize)
+                .cast::<u64>()
+                .write(nested_vmxon_page.physical_address());
+        }
 
         Ok(Self {
             vmxon_region,
@@ -41,7 +56,16 @@ impl ResidentCpuResources {
             guest_stack,
             host_stack,
             resident_msr_state,
+            nested_vmxon_page,
         })
+    }
+
+    pub(crate) fn nested_vmxon_operand(&self) -> u64 {
+        self.nested_vmxon_page.physical_address() + NESTED_VMXON_OPERAND_OFFSET
+    }
+
+    pub(crate) fn nested_vmxon_region(&self) -> u64 {
+        self.nested_vmxon_page.physical_address()
     }
 
     pub(crate) fn deny_guest_access(&self, ept: &mut IdentityEpt) -> Result<(), EptError> {

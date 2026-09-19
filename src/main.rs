@@ -10,6 +10,7 @@ mod guest;
 #[path = "core/mod.rs"]
 mod hv_core;
 mod memory;
+mod nested;
 mod runtime;
 mod smp;
 

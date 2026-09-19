@@ -5,6 +5,7 @@ use super::vt_vmcs_fields::*;
 
 const IA32_VMX_BASIC_TRUE_CTLS: u64 = 1 << 55;
 const PIN_BASED_NMI_EXITING: u32 = 1 << 3;
+const CPU_BASED_USE_TSC_OFFSETTING: u32 = 1 << 3;
 const CPU_BASED_USE_MSR_BITMAPS: u32 = 1 << 28;
 const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
@@ -38,6 +39,7 @@ pub enum VmxControlsError {
     UnrestrictedGuestUnavailable,
     EptUnexpectedlyRequired,
     MsrBitmapsUnavailable,
+    TscOffsettingUnavailable,
     RdtscpUnavailable,
     XsavesUnavailable,
     PatControlsUnavailable,
@@ -60,7 +62,9 @@ pub fn configure_resident_boot(
 ) -> Result<VmxControls, VmxControlsError> {
     configure_internal(
         0,
-        CPU_BASED_USE_MSR_BITMAPS | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
+        CPU_BASED_USE_TSC_OFFSETTING
+            | CPU_BASED_USE_MSR_BITMAPS
+            | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
         SECONDARY_ENABLE_EPT | SECONDARY_ENABLE_RDTSCP | SECONDARY_ENABLE_XSAVES,
         VM_EXIT_SAVE_IA32_PAT
             | VM_EXIT_LOAD_IA32_PAT
@@ -160,6 +164,11 @@ fn configure_internal(
         && primary_processor_based & CPU_BASED_USE_MSR_BITMAPS == 0
     {
         return Err(VmxControlsError::MsrBitmapsUnavailable);
+    }
+    if desired_primary & CPU_BASED_USE_TSC_OFFSETTING != 0
+        && primary_processor_based & CPU_BASED_USE_TSC_OFFSETTING == 0
+    {
+        return Err(VmxControlsError::TscOffsettingUnavailable);
     }
     if desired_secondary & SECONDARY_ENABLE_XSAVES != 0
         && secondary_processor_based & SECONDARY_ENABLE_XSAVES == 0

@@ -38,7 +38,7 @@ unsafe extern "efiapi" fn matrixhv_ap_prepare(
 ) -> u64 {
     let launch = unsafe { &mut *argument };
     match launch.prepare(guest_rsp, guest_rip) {
-        Ok(()) => 1,
+        Ok(nested_vmxon_operand) => nested_vmxon_operand,
         Err(error) => {
             crate::runtime::logger::error(format_args!("smp resident AP prepare error={error:?}"));
             0
@@ -93,7 +93,21 @@ global_asm!(
     "pop rcx",
     "call matrixhv_ap_launch_failed",
     ".Lap_guest_return:",
+    "vmxon [rax]",
+    "jna .Lap_nested_probe_failed",
+    "vmxoff",
+    "jna .Lap_nested_probe_failed",
+    "mov eax, 1",
+    "xor ecx, ecx",
+    "cpuid",
+    "mov eax, 0x40000000",
+    "xor ecx, ecx",
+    "cpuid",
     "mov rax, 0x4856415052454144",
+    "vmcall",
+    "jmp .Lap_restore",
+    ".Lap_nested_probe_failed:",
+    "mov rax, {nested_probe_failed}",
     "vmcall",
     ".Lap_restore:",
     "fxrstor64 [rsp + 32]",
@@ -108,4 +122,5 @@ global_asm!(
     "pop rbx",
     "popfq",
     "ret",
+    nested_probe_failed = const crate::hv_core::vt_resident::RESIDENT_VMCALL_NESTED_PROBE_FAILED,
 );
