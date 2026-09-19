@@ -295,7 +295,7 @@ pub fn run() -> Result<(), Status> {
     logger::phase("vmx.real_boot_vcpu.ok");
 
     logger::phase("vmx.residency_events.arm.start");
-    match hv_core::vt_resident::arm_residency_events() {
+    let residency_events = match hv_core::vt_resident::arm_residency_events() {
         Ok(report) => {
             logger::info(format_args!(
                 "residency_events code_pa={:#x} context_pa={:#x} code_type={} data_type={} ebs_event={:#x} va_event={:#x}",
@@ -307,13 +307,59 @@ pub fn run() -> Result<(), Status> {
                 report.virtual_address_change_event
             ));
             logger::phase("vmx.residency_events.armed");
+            report
         }
         Err(error) => {
             logger::error(format_args!("residency_events error={error:?}"));
             logger::phase("vmx.residency_events.failed");
             return Err(hv_core::vt_resident::status_from_error(&error));
         }
-    }
+    };
 
-    loaders::veracrypt::start()
+    firmware::reset_report();
+    logger::phase("vmx.windows_start_vcpu.start");
+    logger::info(format_args!(
+        "windows_start_vcpu entry={:#x} residency_context={:#x}",
+        firmware::start_entry_address(),
+        residency_events.context_physical_address
+    ));
+    match hv_core::vt_resident::run_windows_boot(
+        firmware::start_entry_address(),
+        residency_events.context_physical_address,
+    ) {
+        Ok(report) => {
+            logger::error(format_args!(
+                "windows_start_vcpu returned unexpectedly raw_path={} vm_instruction_error={:#x} host_cr3={:#x} guest_cr3={:#x} exits={} cpuid={} rdmsr={} wrmsr={} xsetbv={} vmcall={} checkpoint={} post_start={} post_ebs={} post_va={} last_reason={:#x} len={} qual={:#x} rip={:#x} last_guest_cr3={:#x} last_host_cr3={:#x} stop_result={:#x}",
+                report.raw_path,
+                report.vm_instruction_error,
+                report.host_cr3,
+                report.initial_guest_cr3,
+                report.exit_count,
+                report.cpuid_count,
+                report.rdmsr_count,
+                report.wrmsr_count,
+                report.xsetbv_count,
+                report.vmcall_count,
+                report.start_checkpoint_seen,
+                report.post_start_exit_count,
+                report.post_ebs_exit_count,
+                report.post_va_exit_count,
+                report.last_reason,
+                report.last_instruction_len,
+                report.last_qualification,
+                report.last_guest_rip,
+                report.last_guest_cr3,
+                report.last_host_cr3,
+                report.stop_result
+            ));
+            logger::phase("vmx.windows_start_vcpu.unexpected_return");
+            Err(Status::DEVICE_ERROR)
+        }
+        Err(error) => {
+            logger::error(format_args!("windows_start_vcpu error={error:?}"));
+            logger::phase("vmx.windows_start_vcpu.failed");
+            logger::phase("boot.native_fallback.after_vmlaunch_failure");
+            loaders::veracrypt::start()
+        }
+    }
 }

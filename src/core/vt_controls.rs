@@ -5,10 +5,19 @@ use super::vt_vmcs_fields::*;
 
 const IA32_VMX_BASIC_TRUE_CTLS: u64 = 1 << 55;
 const PIN_BASED_NMI_EXITING: u32 = 1 << 3;
+const CPU_BASED_USE_MSR_BITMAPS: u32 = 1 << 28;
 const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
+const SECONDARY_ENABLE_RDTSCP: u32 = 1 << 3;
+const SECONDARY_ENABLE_XSAVES: u32 = 1 << 20;
 const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
+const VM_EXIT_SAVE_IA32_PAT: u32 = 1 << 18;
+const VM_EXIT_LOAD_IA32_PAT: u32 = 1 << 19;
+const VM_EXIT_SAVE_IA32_EFER: u32 = 1 << 20;
+const VM_EXIT_LOAD_IA32_EFER: u32 = 1 << 21;
 const VM_ENTRY_IA32E_MODE_GUEST: u32 = 1 << 9;
+const VM_ENTRY_LOAD_IA32_PAT: u32 = 1 << 14;
+const VM_ENTRY_LOAD_IA32_EFER: u32 = 1 << 15;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VmxControls {
@@ -25,6 +34,11 @@ pub enum VmxControlsError {
     HostAddressSpaceSizeUnavailable,
     Ia32eGuestModeUnavailable,
     EptUnexpectedlyRequired,
+    MsrBitmapsUnavailable,
+    RdtscpUnavailable,
+    XsavesUnavailable,
+    PatControlsUnavailable,
+    EferControlsUnavailable,
 }
 
 impl From<VmcsError> for VmxControlsError {
@@ -34,6 +48,33 @@ impl From<VmcsError> for VmxControlsError {
 }
 
 pub fn configure() -> Result<VmxControls, VmxControlsError> {
+    configure_internal(PIN_BASED_NMI_EXITING, 0, 0, 0, 0, 1 << 6, None)
+}
+
+pub fn configure_resident_boot(msr_bitmap: u64) -> Result<VmxControls, VmxControlsError> {
+    configure_internal(
+        0,
+        CPU_BASED_USE_MSR_BITMAPS | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
+        SECONDARY_ENABLE_RDTSCP | SECONDARY_ENABLE_XSAVES,
+        VM_EXIT_SAVE_IA32_PAT
+            | VM_EXIT_LOAD_IA32_PAT
+            | VM_EXIT_SAVE_IA32_EFER
+            | VM_EXIT_LOAD_IA32_EFER,
+        VM_ENTRY_LOAD_IA32_PAT | VM_ENTRY_LOAD_IA32_EFER,
+        0,
+        Some(msr_bitmap),
+    )
+}
+
+fn configure_internal(
+    desired_pin: u32,
+    desired_primary: u32,
+    desired_secondary: u32,
+    desired_exit: u32,
+    desired_entry: u32,
+    exception_bitmap: u64,
+    msr_bitmap: Option<u64>,
+) -> Result<VmxControls, VmxControlsError> {
     let basic = unsafe { msr::read(msr::IA32_VMX_BASIC) };
     let use_true_controls = basic & IA32_VMX_BASIC_TRUE_CTLS != 0;
 
@@ -58,16 +99,16 @@ pub fn configure() -> Result<VmxControls, VmxControlsError> {
         msr::IA32_VMX_ENTRY_CTLS
     };
 
-    let pin_based = adjust_control(PIN_BASED_NMI_EXITING, pin_msr);
-    let primary_processor_based = adjust_control(0, proc_msr);
+    let pin_based = adjust_control(desired_pin, pin_msr);
+    let primary_processor_based = adjust_control(desired_primary, proc_msr);
     let secondary_processor_based =
         if primary_processor_based & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS != 0 {
-            adjust_control(0, msr::IA32_VMX_PROCBASED_CTLS2)
+            adjust_control(desired_secondary, msr::IA32_VMX_PROCBASED_CTLS2)
         } else {
             0
         };
-    let vm_exit = adjust_control(VM_EXIT_HOST_ADDRESS_SPACE_SIZE, exit_msr);
-    let vm_entry = adjust_control(VM_ENTRY_IA32E_MODE_GUEST, entry_msr);
+    let vm_exit = adjust_control(VM_EXIT_HOST_ADDRESS_SPACE_SIZE | desired_exit, exit_msr);
+    let vm_entry = adjust_control(VM_ENTRY_IA32E_MODE_GUEST | desired_entry, entry_msr);
 
     if vm_exit & VM_EXIT_HOST_ADDRESS_SPACE_SIZE == 0 {
         return Err(VmxControlsError::HostAddressSpaceSizeUnavailable);
@@ -77,6 +118,35 @@ pub fn configure() -> Result<VmxControls, VmxControlsError> {
     }
     if secondary_processor_based & SECONDARY_ENABLE_EPT != 0 {
         return Err(VmxControlsError::EptUnexpectedlyRequired);
+    }
+    if desired_secondary & SECONDARY_ENABLE_RDTSCP != 0
+        && secondary_processor_based & SECONDARY_ENABLE_RDTSCP == 0
+    {
+        return Err(VmxControlsError::RdtscpUnavailable);
+    }
+    if desired_primary & CPU_BASED_USE_MSR_BITMAPS != 0
+        && primary_processor_based & CPU_BASED_USE_MSR_BITMAPS == 0
+    {
+        return Err(VmxControlsError::MsrBitmapsUnavailable);
+    }
+    if desired_secondary & SECONDARY_ENABLE_XSAVES != 0
+        && secondary_processor_based & SECONDARY_ENABLE_XSAVES == 0
+    {
+        return Err(VmxControlsError::XsavesUnavailable);
+    }
+    let desired_pat_exit = desired_exit & (VM_EXIT_SAVE_IA32_PAT | VM_EXIT_LOAD_IA32_PAT);
+    let desired_pat_entry = desired_entry & VM_ENTRY_LOAD_IA32_PAT;
+    if vm_exit & desired_pat_exit != desired_pat_exit
+        || vm_entry & desired_pat_entry != desired_pat_entry
+    {
+        return Err(VmxControlsError::PatControlsUnavailable);
+    }
+    let desired_efer_exit = desired_exit & (VM_EXIT_SAVE_IA32_EFER | VM_EXIT_LOAD_IA32_EFER);
+    let desired_efer_entry = desired_entry & VM_ENTRY_LOAD_IA32_EFER;
+    if vm_exit & desired_efer_exit != desired_efer_exit
+        || vm_entry & desired_efer_entry != desired_efer_entry
+    {
+        return Err(VmxControlsError::EferControlsUnavailable);
     }
 
     vmwrite(PIN_BASED_VM_EXEC_CONTROL, u64::from(pin_based))?;
@@ -93,7 +163,10 @@ pub fn configure() -> Result<VmxControls, VmxControlsError> {
     vmwrite(VM_EXIT_CONTROLS, u64::from(vm_exit))?;
     vmwrite(VM_ENTRY_CONTROLS, u64::from(vm_entry))?;
 
-    vmwrite(EXCEPTION_BITMAP, 1 << 6)?;
+    if let Some(bitmap) = msr_bitmap {
+        vmwrite(MSR_BITMAP, bitmap)?;
+    }
+    vmwrite(EXCEPTION_BITMAP, exception_bitmap)?;
     vmwrite(PAGE_FAULT_ERROR_CODE_MASK, 0)?;
     vmwrite(PAGE_FAULT_ERROR_CODE_MATCH, 0)?;
     vmwrite(CR3_TARGET_COUNT, 0)?;
@@ -101,6 +174,9 @@ pub fn configure() -> Result<VmxControls, VmxControlsError> {
     vmwrite(VM_EXIT_MSR_LOAD_COUNT, 0)?;
     vmwrite(VM_ENTRY_MSR_LOAD_COUNT, 0)?;
     vmwrite(VM_ENTRY_INTR_INFO_FIELD, 0)?;
+    if secondary_processor_based & SECONDARY_ENABLE_XSAVES != 0 {
+        vmwrite(XSS_EXITING_BITMAP, 0)?;
+    }
     vmwrite(CR0_GUEST_HOST_MASK, 0)?;
     vmwrite(CR4_GUEST_HOST_MASK, 0)?;
     vmwrite(CR0_READ_SHADOW, 0)?;

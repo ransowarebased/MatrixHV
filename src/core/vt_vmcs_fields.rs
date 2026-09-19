@@ -17,7 +17,15 @@ pub const HOST_TR_SELECTOR: u64 = 0x0c0c;
 
 pub const VMCS_LINK_POINTER: u64 = 0x2800;
 pub const GUEST_IA32_DEBUGCTL: u64 = 0x2802;
+pub const GUEST_IA32_PAT: u64 = 0x2804;
 pub const GUEST_IA32_EFER: u64 = 0x2806;
+pub const HOST_IA32_PAT: u64 = 0x2c00;
+pub const HOST_IA32_EFER: u64 = 0x2c02;
+pub const MSR_BITMAP: u64 = 0x2004;
+pub const VM_EXIT_MSR_STORE_ADDR: u64 = 0x2006;
+pub const VM_EXIT_MSR_LOAD_ADDR: u64 = 0x2008;
+pub const VM_ENTRY_MSR_LOAD_ADDR: u64 = 0x200a;
+pub const XSS_EXITING_BITMAP: u64 = 0x202c;
 
 pub const PIN_BASED_VM_EXEC_CONTROL: u64 = 0x4000;
 pub const CPU_BASED_VM_EXEC_CONTROL: u64 = 0x4002;

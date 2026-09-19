@@ -2,6 +2,7 @@ use core::arch::asm;
 
 pub const IA32_FEATURE_CONTROL: u32 = 0x3a;
 pub const IA32_DEBUGCTL: u32 = 0x1d9;
+pub const IA32_PAT: u32 = 0x277;
 pub const IA32_SYSENTER_CS: u32 = 0x174;
 pub const IA32_SYSENTER_ESP: u32 = 0x175;
 pub const IA32_SYSENTER_EIP: u32 = 0x176;

@@ -104,6 +104,7 @@ pub fn configure_with_rflags(
     vmwrite(GUEST_IA32_DEBUGCTL, unsafe {
         msr::read(msr::IA32_DEBUGCTL)
     })?;
+    vmwrite(GUEST_IA32_PAT, unsafe { msr::read(msr::IA32_PAT) })?;
     vmwrite(GUEST_IA32_EFER, unsafe { msr::read(msr::IA32_EFER) })?;
     vmwrite(
         GUEST_SYSENTER_CS,

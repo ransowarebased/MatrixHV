@@ -61,7 +61,7 @@ pub fn load_and_unload_image_on_volume(
     boot::unload_image(child_handle).map_err(|error| error.status())
 }
 
-fn load_image_on_volume(
+pub(crate) fn load_image_on_volume(
     device_handle: uefi::Handle,
     path: &CStr16,
 ) -> Result<uefi::Handle, Status> {
