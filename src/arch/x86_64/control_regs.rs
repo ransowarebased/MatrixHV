@@ -1,6 +1,7 @@
 use core::arch::asm;
 
 pub const CR4_VMXE: u64 = 1 << 13;
+pub const CR4_LA57: u64 = 1 << 12;
 
 #[inline]
 pub fn read_cr0() -> u64 {
@@ -18,6 +19,13 @@ pub fn read_cr3() -> u64 {
         asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags));
     }
     value
+}
+
+#[inline]
+pub unsafe fn write_cr3(value: u64) {
+    unsafe {
+        asm!("mov cr3, {}", in(reg) value, options(nostack, preserves_flags));
+    }
 }
 
 #[inline]

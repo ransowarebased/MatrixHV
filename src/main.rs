@@ -7,6 +7,7 @@ mod config;
 mod guest;
 #[path = "core/mod.rs"]
 mod hv_core;
+mod memory;
 mod runtime;
 
 use uefi::{Status, entry};

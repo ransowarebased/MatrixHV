@@ -5,6 +5,7 @@ use super::vt_vmcs_fields::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostStateReport {
+    pub cr3: u64,
     pub cs_selector: u16,
     pub ss_selector: u16,
     pub tr_selector: u16,
@@ -14,6 +15,10 @@ pub struct HostStateReport {
 }
 
 pub fn configure() -> Result<HostStateReport, VmcsError> {
+    configure_with_cr3(control_regs::read_cr3())
+}
+
+pub fn configure_with_cr3(host_cr3: u64) -> Result<HostStateReport, VmcsError> {
     let mut segments = segmentation::capture();
     segments.tr = segmentation::vmx_usable_tr(segments.tr);
 
@@ -47,7 +52,7 @@ pub fn configure() -> Result<HostStateReport, VmcsError> {
     )?;
 
     vmwrite(HOST_CR0, control_regs::read_cr0())?;
-    vmwrite(HOST_CR3, control_regs::read_cr3())?;
+    vmwrite(HOST_CR3, host_cr3)?;
     vmwrite(HOST_CR4, control_regs::read_cr4())?;
     vmwrite(HOST_FS_BASE, segments.fs.base)?;
     vmwrite(HOST_GS_BASE, segments.gs.base)?;
@@ -66,6 +71,7 @@ pub fn configure() -> Result<HostStateReport, VmcsError> {
     })?;
 
     Ok(HostStateReport {
+        cr3: host_cr3,
         cs_selector: host_selector(segments.cs.selector),
         ss_selector: host_selector(segments.ss.selector),
         tr_selector: host_selector(segments.tr.selector),

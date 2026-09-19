@@ -1,11 +1,9 @@
 use core::arch::asm;
-use core::ptr::NonNull;
 
 use uefi::Status;
-use uefi::boot::{self, AllocateType};
-use uefi::mem::memory_map::MemoryType;
 
 use crate::arch::x86_64::{control_regs, msr};
+use crate::memory::resident::{AddressConstraint, ResidentPages};
 
 const PAGE_SIZE: usize = 4096;
 const IA32_VMX_BASIC_REVISION_MASK: u32 = 0x7fff_ffff;
@@ -76,40 +74,32 @@ impl Drop for VmxRootSession {
 }
 
 struct VmxRegion {
-    pointer: NonNull<u8>,
+    pages: ResidentPages,
 }
 
 impl VmxRegion {
     fn allocate(vmx_basic: u64) -> Result<Self, VmxonError> {
-        let allocate_type = if vmx_basic & IA32_VMX_BASIC_PHYS_ADDR_WIDTH_BIT != 0 {
-            AllocateType::MaxAddress(u32::MAX as u64)
+        let constraint = if vmx_basic & IA32_VMX_BASIC_PHYS_ADDR_WIDTH_BIT != 0 {
+            AddressConstraint::Max(u32::MAX as u64)
         } else {
-            AllocateType::AnyPages
+            AddressConstraint::Any
         };
 
-        let pointer = boot::allocate_pages(allocate_type, MemoryType::LOADER_DATA, 1)
-            .map_err(|error| VmxonError::Allocation(error.status()))?;
-        unsafe {
-            pointer.as_ptr().write_bytes(0, PAGE_SIZE);
-        }
-        Ok(Self { pointer })
+        let pages = ResidentPages::allocate(1, constraint).map_err(VmxonError::Allocation)?;
+        Ok(Self { pages })
     }
 
     fn physical_address(&self) -> u64 {
-        self.pointer.as_ptr() as u64
+        self.pages.physical_address()
     }
 
     fn write_revision_id(&mut self, revision_id: u32) {
         unsafe {
-            self.pointer.as_ptr().cast::<u32>().write(revision_id);
-        }
-    }
-}
-
-impl Drop for VmxRegion {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = boot::free_pages(self.pointer, 1);
+            self.pages
+                .pointer()
+                .as_ptr()
+                .cast::<u32>()
+                .write(revision_id);
         }
     }
 }

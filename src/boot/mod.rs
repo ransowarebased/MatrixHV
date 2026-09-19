@@ -9,10 +9,17 @@ pub mod uefi;
 use crate::arch::x86_64::cpu::{self, Vendor};
 use crate::guest::{firmware, vcpu};
 use crate::hv_core;
+use crate::memory::resident;
 use ::uefi::Status;
 
 pub fn run() -> Result<(), Status> {
     uefi::initialize_boot_environment()?;
+    let image_residency = resident::image_residency()?;
+    logger::info(format_args!(
+        "residency image code_type={} data_type={}",
+        image_residency.code_type.0, image_residency.data_type.0
+    ));
+    logger::phase("vmx.residency.image_type.observed");
 
     let capabilities = cpu::capabilities();
     if capabilities.vendor != Vendor::Intel {
@@ -225,6 +232,19 @@ pub fn run() -> Result<(), Status> {
         vcpu_report.controls.primary_processor_based,
         vcpu_report.controls.secondary_processor_based
     ));
+    logger::info(format_args!(
+        "real_boot_vcpu address_space source_cr3={:#x} guest_initial_cr3={:#x} host_cr3={:#x} observed_host_cr3={:#x}/{:#x} last_guest_cr3={:#x} host_pt_arena={:#x}/{} host_pt_used={}",
+        vcpu_report.host_address_space.source_cr3,
+        vcpu_report.guest.cr3,
+        vcpu_report.host.cr3,
+        vcpu_diagnostics.first_host_cr3,
+        vcpu_diagnostics.last_host_cr3,
+        vcpu_diagnostics.last_guest_cr3,
+        vcpu_report.host_address_space.arena_physical_address,
+        vcpu_report.host_address_space.arena_pages,
+        vcpu_report.host_address_space.table_pages
+    ));
+    logger::phase("vmx.host_address_space.ok");
 
     let root_handle_count = services::simple_file_system_count()?;
     let root_windows_present = loaders::veracrypt::windows_boot_present()?;

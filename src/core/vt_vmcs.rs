@@ -1,15 +1,10 @@
 use core::arch::asm;
-use core::ptr::NonNull;
-
 use uefi::Status;
-use uefi::boot::{self, AllocateType};
-use uefi::mem::memory_map::MemoryType;
 
 use super::vt_vmcs_fields::VM_INSTRUCTION_ERROR;
 use super::vt_vmxon::{self, VmxInstructionResult, VmxonError, VmxonReport};
+use crate::memory::resident::{AddressConstraint, ResidentPages};
 use crate::runtime::logger;
-
-const PAGE_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VmcsError {
@@ -33,39 +28,31 @@ pub struct VmcsReport {
 }
 
 pub(crate) struct VmcsRegion {
-    pointer: NonNull<u8>,
+    pages: ResidentPages,
 }
 
 impl VmcsRegion {
     pub(crate) fn allocate(vmx_basic: u64) -> Result<Self, VmcsError> {
-        let allocate_type = if vt_vmxon::region_uses_32_bit_physical_addresses(vmx_basic) {
-            AllocateType::MaxAddress(u32::MAX as u64)
+        let constraint = if vt_vmxon::region_uses_32_bit_physical_addresses(vmx_basic) {
+            AddressConstraint::Max(u32::MAX as u64)
         } else {
-            AllocateType::AnyPages
+            AddressConstraint::Any
         };
-        let pointer = boot::allocate_pages(allocate_type, MemoryType::LOADER_DATA, 1)
-            .map_err(|error| VmcsError::Allocation(error.status()))?;
-        unsafe {
-            pointer.as_ptr().write_bytes(0, PAGE_SIZE);
-        }
-        Ok(Self { pointer })
+        let pages = ResidentPages::allocate(1, constraint).map_err(VmcsError::Allocation)?;
+        Ok(Self { pages })
     }
 
     pub(crate) fn physical_address(&self) -> u64 {
-        self.pointer.as_ptr() as u64
+        self.pages.physical_address()
     }
 
     pub(crate) fn write_revision_id(&mut self, revision_id: u32) {
         unsafe {
-            self.pointer.as_ptr().cast::<u32>().write(revision_id);
-        }
-    }
-}
-
-impl Drop for VmcsRegion {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = boot::free_pages(self.pointer, 1);
+            self.pages
+                .pointer()
+                .as_ptr()
+                .cast::<u32>()
+                .write(revision_id);
         }
     }
 }

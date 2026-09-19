@@ -4,8 +4,9 @@ use super::exit_handlers;
 use super::vt_exit_reason;
 use super::vt_vmcs::{self, VmcsError};
 use super::vt_vmcs_fields::{
-    EXIT_QUALIFICATION, GUEST_RIP, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_REASON,
+    EXIT_QUALIFICATION, GUEST_CR3, GUEST_RIP, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_REASON,
 };
+use crate::arch::x86_64::control_regs;
 use crate::boot::logger;
 
 const DISPATCH_FAILURE_NONE: u32 = 0;
@@ -91,6 +92,9 @@ pub struct DispatchDiagnostics {
     pub final_ecx: u64,
     pub final_edx: u64,
     pub final_rsp: u64,
+    pub first_host_cr3: u64,
+    pub last_host_cr3: u64,
+    pub last_guest_cr3: u64,
 }
 
 static EXIT_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -116,6 +120,9 @@ static FINAL_EBX: AtomicU64 = AtomicU64::new(0);
 static FINAL_ECX: AtomicU64 = AtomicU64::new(0);
 static FINAL_EDX: AtomicU64 = AtomicU64::new(0);
 static FINAL_RSP: AtomicU64 = AtomicU64::new(0);
+static FIRST_HOST_CR3: AtomicU64 = AtomicU64::new(0);
+static LAST_HOST_CR3: AtomicU64 = AtomicU64::new(0);
+static LAST_GUEST_CR3: AtomicU64 = AtomicU64::new(0);
 
 pub fn reset_diagnostics() {
     EXIT_COUNT.store(0, Ordering::Relaxed);
@@ -141,6 +148,9 @@ pub fn reset_diagnostics() {
     FINAL_ECX.store(0, Ordering::Relaxed);
     FINAL_EDX.store(0, Ordering::Relaxed);
     FINAL_RSP.store(0, Ordering::Relaxed);
+    FIRST_HOST_CR3.store(0, Ordering::Relaxed);
+    LAST_HOST_CR3.store(0, Ordering::Relaxed);
+    LAST_GUEST_CR3.store(0, Ordering::Relaxed);
 }
 
 pub fn diagnostics() -> DispatchDiagnostics {
@@ -168,6 +178,9 @@ pub fn diagnostics() -> DispatchDiagnostics {
         final_ecx: FINAL_ECX.load(Ordering::Relaxed),
         final_edx: FINAL_EDX.load(Ordering::Relaxed),
         final_rsp: FINAL_RSP.load(Ordering::Relaxed),
+        first_host_cr3: FIRST_HOST_CR3.load(Ordering::Relaxed),
+        last_host_cr3: LAST_HOST_CR3.load(Ordering::Relaxed),
+        last_guest_cr3: LAST_GUEST_CR3.load(Ordering::Relaxed),
     }
 }
 
@@ -199,14 +212,19 @@ pub extern "efiapi" fn matrixhv_vmexit_dispatch(
         return DispatchAction::Stop as u64;
     }
 
-    let (raw_reason, guest_rip, instruction_length, qualification) = match read_exit_state() {
-        Ok(state) => state,
-        Err(error) => {
-            FAILURE_CODE.store(DISPATCH_FAILURE_VMREAD, Ordering::Relaxed);
-            logger::error(format_args!("vmexit vmread error={error:?}"));
-            return DispatchAction::Stop as u64;
-        }
-    };
+    let (raw_reason, guest_rip, instruction_length, qualification, guest_cr3) =
+        match read_exit_state() {
+            Ok(state) => state,
+            Err(error) => {
+                FAILURE_CODE.store(DISPATCH_FAILURE_VMREAD, Ordering::Relaxed);
+                logger::error(format_args!("vmexit vmread error={error:?}"));
+                return DispatchAction::Stop as u64;
+            }
+        };
+    let host_cr3 = control_regs::read_cr3();
+    let _ = FIRST_HOST_CR3.compare_exchange(0, host_cr3, Ordering::Relaxed, Ordering::Relaxed);
+    LAST_HOST_CR3.store(host_cr3, Ordering::Relaxed);
+    LAST_GUEST_CR3.store(guest_cr3, Ordering::Relaxed);
 
     let basic_reason = vt_exit_reason::basic(raw_reason);
     let exit_index = EXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -224,14 +242,16 @@ pub extern "efiapi" fn matrixhv_vmexit_dispatch(
     LAST_QUALIFICATION.store(qualification, Ordering::Relaxed);
 
     logger::info(format_args!(
-        "vmexit dispatch index={} raw_reason={:#x} name={} basic_reason={} rip={:#x} len={} qualification={:#x}",
+        "vmexit dispatch index={} raw_reason={:#x} name={} basic_reason={} rip={:#x} len={} qualification={:#x} host_cr3={:#x} guest_cr3={:#x}",
         exit_index,
         raw_reason,
         vt_exit_reason::name(raw_reason),
         basic_reason,
         guest_rip,
         instruction_length,
-        qualification
+        qualification,
+        host_cr3,
+        guest_cr3
     ));
 
     if vt_exit_reason::is_vm_entry_failure(raw_reason) {
@@ -364,12 +384,13 @@ fn dispatch_vmcall(registers: &GuestRegisters, guest_rip: u64, instruction_lengt
     DispatchAction::Stop as u64
 }
 
-fn read_exit_state() -> Result<(u32, u64, u32, u64), VmcsError> {
+fn read_exit_state() -> Result<(u32, u64, u32, u64, u64), VmcsError> {
     Ok((
         vt_vmcs::vmread(VM_EXIT_REASON)? as u32,
         vt_vmcs::vmread(GUEST_RIP)?,
         vt_vmcs::vmread(VM_EXIT_INSTRUCTION_LEN)? as u32,
         vt_vmcs::vmread(EXIT_QUALIFICATION)?,
+        vt_vmcs::vmread(GUEST_CR3)?,
     ))
 }
 
