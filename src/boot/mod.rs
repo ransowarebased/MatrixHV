@@ -10,6 +10,7 @@ use crate::arch::x86_64::cpu::{self, Vendor};
 use crate::guest::{firmware, vcpu};
 use crate::hv_core;
 use crate::memory::resident;
+use crate::smp::{startup, topology};
 use ::uefi::Status;
 
 pub fn run() -> Result<(), Status> {
@@ -37,6 +38,69 @@ pub fn run() -> Result<(), Status> {
 
     log::info!("Intel VT-x is available and enabled by IA32_FEATURE_CONTROL");
     logger::phase("vmx.capability.ok");
+
+    logger::phase("smp.topology.start");
+    let topology_report = match topology::enumerate() {
+        Ok(report) => {
+            logger::info(format_args!(
+                "smp topology total={} enabled={} current={} bsp={} first_enabled_ap={:?}",
+                report.total_processors,
+                report.enabled_processors,
+                report.current_processor,
+                report.bsp_processor,
+                report.first_enabled_ap
+            ));
+            logger::phase("smp.topology.ok");
+            Some(report)
+        }
+        Err(status) => {
+            logger::error(format_args!("smp topology status={status:?}"));
+            logger::phase("smp.topology.unavailable");
+            None
+        }
+    };
+
+    if let Some(processor_number) = topology_report.and_then(|report| report.first_enabled_ap) {
+        logger::phase("smp.cpu1_vmx.start");
+        match startup::prove_application_processor_vmx(processor_number) {
+            Ok(report) => {
+                logger::info(format_args!(
+                    "smp cpu1 vmx proof processor={} id={:#x} apic_id={:#x} vmxon={:#x} vmcs={:#x} guest_stack={:#x} bsp_vmxon={:#x} bsp_vmcs={:#x} bsp_guest_stack={:#x}",
+                    report.processor_number,
+                    report.processor_id,
+                    report.initial_state.apic_id,
+                    report.ap_resources.vmxon,
+                    report.ap_resources.vmcs,
+                    report.ap_resources.guest_stack,
+                    report.bsp_resources.vmxon,
+                    report.bsp_resources.vmcs,
+                    report.bsp_resources.guest_stack
+                ));
+                logger::info(format_args!(
+                    "smp cpu1 vmx state cr0={:#x}->{:#x} cr3={:#x}->{:#x} cr4={:#x}->{:#x} rflags={:#x}->{:#x} exit_reason={:#x} vmxon_report_pa={:#x} vmcs_report_pa={:#x}",
+                    report.initial_state.cr0,
+                    report.final_state.cr0,
+                    report.initial_state.cr3,
+                    report.final_state.cr3,
+                    report.initial_state.cr4,
+                    report.final_state.cr4,
+                    report.initial_state.rflags,
+                    report.final_state.rflags,
+                    report.vmlaunch.exit_reason,
+                    report.vmlaunch.vmxon.region_physical_address,
+                    report.vmlaunch.vmcs_physical_address
+                ));
+                logger::phase("smp.cpu1_vmx.ok");
+            }
+            Err(error) => {
+                logger::error(format_args!("smp cpu1 vmx error={error:?}"));
+                logger::phase("smp.cpu1_vmx.failed");
+                return Err(Status::DEVICE_ERROR);
+            }
+        }
+    } else {
+        logger::phase("smp.cpu1_vmx.skipped");
+    }
 
     let memory = memory_map::snapshot()?;
     log::info!(

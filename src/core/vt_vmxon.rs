@@ -45,7 +45,14 @@ pub struct VmxRootSession {
     report: VmxonReport,
     active: bool,
     interrupt_guard: InterruptGuard,
-    vmxon_region: VmxRegion,
+    vmxon_region: VmxonRegion,
+}
+
+pub(crate) struct BorrowedVmxRootSession<'a> {
+    report: VmxonReport,
+    active: bool,
+    interrupt_guard: InterruptGuard,
+    vmxon_region: &'a mut VmxonRegion,
 }
 
 impl VmxRootSession {
@@ -73,12 +80,37 @@ impl Drop for VmxRootSession {
     }
 }
 
-struct VmxRegion {
+impl BorrowedVmxRootSession<'_> {
+    pub(crate) fn report(&self) -> VmxonReport {
+        self.report
+    }
+}
+
+impl Drop for BorrowedVmxRootSession<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                vmxoff();
+            }
+            self.active = false;
+        }
+
+        unsafe {
+            control_regs::write_cr4(self.report.original_cr4);
+            control_regs::write_cr0(self.report.original_cr0);
+        }
+
+        let _ = &self.interrupt_guard;
+        let _ = &self.vmxon_region;
+    }
+}
+
+pub(crate) struct VmxonRegion {
     pages: ResidentPages,
 }
 
-impl VmxRegion {
-    fn allocate(vmx_basic: u64) -> Result<Self, VmxonError> {
+impl VmxonRegion {
+    pub(crate) fn allocate(vmx_basic: u64) -> Result<Self, VmxonError> {
         let constraint = if vmx_basic & IA32_VMX_BASIC_PHYS_ADDR_WIDTH_BIT != 0 {
             AddressConstraint::Max(u32::MAX as u64)
         } else {
@@ -89,7 +121,7 @@ impl VmxRegion {
         Ok(Self { pages })
     }
 
-    fn physical_address(&self) -> u64 {
+    pub(crate) fn physical_address(&self) -> u64 {
         self.pages.physical_address()
     }
 
@@ -113,64 +145,131 @@ pub fn probe_vmxon() -> Result<VmxonReport, VmxonError> {
 
 pub fn enter_vmx_root() -> Result<VmxRootSession, VmxonError> {
     let vmx_basic = unsafe { msr::read(msr::IA32_VMX_BASIC) };
-    let revision_id = revision_id(vmx_basic);
-    let region_size = region_size(vmx_basic);
-    let memory_type = memory_type(vmx_basic);
+    let state = VmxRootState::capture(vmx_basic)?;
+    let vmxon_region = VmxonRegion::allocate(vmx_basic)?;
+    enter_vmx_root_with_state(vmxon_region, state)
+}
 
-    if region_size == 0 || usize::from(region_size) > PAGE_SIZE {
-        return Err(VmxonError::InvalidRegionSize(region_size));
-    }
-    if memory_type != VMX_MEMORY_TYPE_WRITE_BACK {
-        return Err(VmxonError::UnsupportedMemoryType(memory_type));
-    }
+pub(crate) fn enter_vmx_root_with_region(
+    vmx_basic: u64,
+    vmxon_region: VmxonRegion,
+) -> Result<VmxRootSession, VmxonError> {
+    let state = VmxRootState::capture(vmx_basic)?;
+    enter_vmx_root_with_state(vmxon_region, state)
+}
 
-    let original_cr0 = control_regs::read_cr0();
-    let original_cr4 = control_regs::read_cr4();
-    let fixed_cr0_0 = unsafe { msr::read(msr::IA32_VMX_CR0_FIXED0) };
-    let fixed_cr0_1 = unsafe { msr::read(msr::IA32_VMX_CR0_FIXED1) };
-    let fixed_cr4_0 = unsafe { msr::read(msr::IA32_VMX_CR4_FIXED0) };
-    let fixed_cr4_1 = unsafe { msr::read(msr::IA32_VMX_CR4_FIXED1) };
-
-    let vmx_cr0 = (original_cr0 | fixed_cr0_0) & fixed_cr0_1;
-    let vmx_cr4 = (original_cr4 | control_regs::CR4_VMXE | fixed_cr4_0) & fixed_cr4_1;
-    if vmx_cr4 & control_regs::CR4_VMXE == 0 {
-        return Err(VmxonError::InvalidControlRegisters);
-    }
-
-    let mut vmxon_region = VmxRegion::allocate(vmx_basic)?;
-    vmxon_region.write_revision_id(revision_id);
+pub(crate) fn enter_vmx_root_with_borrowed_region(
+    vmx_basic: u64,
+    vmxon_region: &mut VmxonRegion,
+) -> Result<BorrowedVmxRootSession<'_>, VmxonError> {
+    let state = VmxRootState::capture(vmx_basic)?;
+    vmxon_region.write_revision_id(state.revision_id);
     let region_physical_address = vmxon_region.physical_address();
+    let (report, interrupt_guard) = activate_vmx_root(region_physical_address, state)?;
+
+    Ok(BorrowedVmxRootSession {
+        report,
+        active: true,
+        interrupt_guard,
+        vmxon_region,
+    })
+}
+
+struct VmxRootState {
+    revision_id: u32,
+    region_size: u16,
+    original_cr0: u64,
+    original_cr4: u64,
+    vmx_cr0: u64,
+    vmx_cr4: u64,
+}
+
+impl VmxRootState {
+    fn capture(vmx_basic: u64) -> Result<Self, VmxonError> {
+        let revision_id = revision_id(vmx_basic);
+        let region_size = region_size(vmx_basic);
+        let memory_type = memory_type(vmx_basic);
+
+        if region_size == 0 || usize::from(region_size) > PAGE_SIZE {
+            return Err(VmxonError::InvalidRegionSize(region_size));
+        }
+        if memory_type != VMX_MEMORY_TYPE_WRITE_BACK {
+            return Err(VmxonError::UnsupportedMemoryType(memory_type));
+        }
+
+        let original_cr0 = control_regs::read_cr0();
+        let original_cr4 = control_regs::read_cr4();
+        let fixed_cr0_0 = unsafe { msr::read(msr::IA32_VMX_CR0_FIXED0) };
+        let fixed_cr0_1 = unsafe { msr::read(msr::IA32_VMX_CR0_FIXED1) };
+        let fixed_cr4_0 = unsafe { msr::read(msr::IA32_VMX_CR4_FIXED0) };
+        let fixed_cr4_1 = unsafe { msr::read(msr::IA32_VMX_CR4_FIXED1) };
+
+        let vmx_cr0 = (original_cr0 | fixed_cr0_0) & fixed_cr0_1;
+        let vmx_cr4 = (original_cr4 | control_regs::CR4_VMXE | fixed_cr4_0) & fixed_cr4_1;
+        if vmx_cr4 & control_regs::CR4_VMXE == 0 {
+            return Err(VmxonError::InvalidControlRegisters);
+        }
+
+        Ok(Self {
+            revision_id,
+            region_size,
+            original_cr0,
+            original_cr4,
+            vmx_cr0,
+            vmx_cr4,
+        })
+    }
+}
+
+fn enter_vmx_root_with_state(
+    mut vmxon_region: VmxonRegion,
+    state: VmxRootState,
+) -> Result<VmxRootSession, VmxonError> {
+    vmxon_region.write_revision_id(state.revision_id);
+    let region_physical_address = vmxon_region.physical_address();
+    let (report, interrupt_guard) = activate_vmx_root(region_physical_address, state)?;
+
+    Ok(VmxRootSession {
+        report,
+        active: true,
+        interrupt_guard,
+        vmxon_region,
+    })
+}
+
+fn activate_vmx_root(
+    region_physical_address: u64,
+    state: VmxRootState,
+) -> Result<(VmxonReport, InterruptGuard), VmxonError> {
     let interrupt_guard = InterruptGuard::disable();
 
     unsafe {
-        control_regs::write_cr0(vmx_cr0);
-        control_regs::write_cr4(vmx_cr4);
+        control_regs::write_cr0(state.vmx_cr0);
+        control_regs::write_cr4(state.vmx_cr4);
     }
 
     let instruction_result = unsafe { vmxon(region_physical_address) };
     if instruction_result != VmxInstructionResult::Succeeded {
         unsafe {
-            control_regs::write_cr4(original_cr4);
-            control_regs::write_cr0(original_cr0);
+            control_regs::write_cr4(state.original_cr4);
+            control_regs::write_cr0(state.original_cr0);
         }
         drop(interrupt_guard);
         return Err(VmxonError::Instruction(instruction_result));
     }
 
-    Ok(VmxRootSession {
-        report: VmxonReport {
-            revision_id,
-            region_size,
+    Ok((
+        VmxonReport {
+            revision_id: state.revision_id,
+            region_size: state.region_size,
             region_physical_address,
-            original_cr0,
-            original_cr4,
-            vmx_cr0,
-            vmx_cr4,
+            original_cr0: state.original_cr0,
+            original_cr4: state.original_cr4,
+            vmx_cr0: state.vmx_cr0,
+            vmx_cr4: state.vmx_cr4,
         },
-        active: true,
         interrupt_guard,
-        vmxon_region,
-    })
+    ))
 }
 
 pub fn vmx_basic() -> u64 {

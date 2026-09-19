@@ -18,10 +18,11 @@ use crate::memory::paging::{HostAddressSpace, HostPagingError};
 use crate::memory::resident::{
     AddressConstraint, PAGE_SIZE, RESIDENT_CODE_MEMORY_TYPE, RESIDENT_MEMORY_TYPE, ResidentPages,
 };
+use crate::smp::per_cpu::ResidentCpuResources;
 
 const GUEST_STACK_PAGES: usize = 4;
-const BOOT_GUEST_STACK_PAGES: usize = 64;
-const HOST_STACK_PAGES: usize = 4;
+pub(crate) const BOOT_GUEST_STACK_PAGES: usize = 64;
+pub(crate) const HOST_STACK_PAGES: usize = 4;
 const HOST_TABLE_PAGES: usize = 2;
 const RESIDENT_CODE_PAGES: usize = 2;
 const MSR_BITMAP_PAGES: usize = 1;
@@ -511,8 +512,8 @@ impl ResidentCode {
     }
 }
 
-struct ResidentHostTables {
-    pages: ResidentPages,
+pub(crate) struct ResidentHostTables {
+    pub(crate) pages: ResidentPages,
     gdt: u64,
     tss: u64,
     idt: u64,
@@ -520,7 +521,7 @@ struct ResidentHostTables {
 }
 
 #[derive(Clone, Copy)]
-struct ResidentHostSelectors {
+pub(crate) struct ResidentHostSelectors {
     es: u16,
     cs: u16,
     ss: u16,
@@ -545,7 +546,7 @@ impl ResidentHostSelectors {
         Ok(selectors)
     }
 
-    fn fixed() -> Self {
+    pub(crate) fn fixed() -> Self {
         Self {
             es: HOST_DATA_SELECTOR,
             cs: HOST_CODE_SELECTOR,
@@ -564,7 +565,7 @@ impl ResidentHostSelectors {
 }
 
 impl ResidentHostTables {
-    fn allocate(
+    pub(crate) fn allocate(
         fatal_handler: u64,
         selectors: ResidentHostSelectors,
     ) -> Result<Self, ResidentProbeError> {
@@ -901,19 +902,13 @@ pub fn run_windows_boot(
     let initial_rflags = registers::read_rflags();
     let code = ResidentCode::allocate()?;
     let root_segments = segmentation::capture();
-    let mut tables = ResidentHostTables::allocate(code.fatal, ResidentHostSelectors::fixed())?;
-    let context_pages = ResidentPages::allocate(1, AddressConstraint::Any)
-        .map_err(ResidentProbeError::Allocation)?;
-    let guest_stack = ResidentPages::allocate(BOOT_GUEST_STACK_PAGES, AddressConstraint::Any)
-        .map_err(ResidentProbeError::Allocation)?;
-    let host_stack = ResidentPages::allocate(HOST_STACK_PAGES, AddressConstraint::Any)
-        .map_err(ResidentProbeError::Allocation)?;
     let msr_bitmap = ResidentPages::allocate(MSR_BITMAP_PAGES, AddressConstraint::Any)
-        .map_err(ResidentProbeError::Allocation)?;
-    let resident_msr_state = ResidentPages::allocate(1, AddressConstraint::Any)
         .map_err(ResidentProbeError::Allocation)?;
     let ept_test_page = ResidentPages::allocate(1, AddressConstraint::Any)
         .map_err(ResidentProbeError::Allocation)?;
+    let mut host_address_space = HostAddressSpace::reserve().map_err(ResidentProbeError::Paging)?;
+    let vmx_basic = vt_vmxon::vmx_basic();
+    let cpu_resources = ResidentCpuResources::allocate(vmx_basic, code.fatal)?;
     unsafe {
         ept_test_page
             .pointer()
@@ -949,33 +944,30 @@ pub fn run_windows_boot(
     allow_high_msr_passthrough(&msr_bitmap, IA32_FMASK_MSR);
     allow_high_msr_passthrough(&msr_bitmap, IA32_KERNEL_GS_BASE_MSR);
     allow_high_msr_passthrough(&msr_bitmap, IA32_TSC_AUX_MSR);
-    let mut host_address_space = HostAddressSpace::reserve().map_err(ResidentProbeError::Paging)?;
-
-    let vmx_basic = vt_vmxon::vmx_basic();
-    let revision_id = vt_vmxon::revision_id(vmx_basic);
-    let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
-    vmcs_region.write_revision_id(revision_id);
-    let vmcs_physical_address = vmcs_region.physical_address();
-    let mut ept = vt_ept::IdentityEpt::build()?;
-    let session = vt_vmxon::enter_vmx_root().map_err(ResidentProbeError::Vmxon)?;
 
     let host_space = host_address_space
         .clone_current()
         .map_err(ResidentProbeError::Paging)?;
+    let mut ept = vt_ept::IdentityEpt::build()?;
     ept.deny_guest_access(code.pages.physical_address(), code.pages.pages())?;
-    ept.deny_guest_access(tables.pages.physical_address(), tables.pages.pages())?;
-    ept.deny_guest_access(context_pages.physical_address(), context_pages.pages())?;
-    ept.deny_guest_access(host_stack.physical_address(), host_stack.pages())?;
     ept.deny_guest_access(msr_bitmap.physical_address(), msr_bitmap.pages())?;
-    ept.deny_guest_access(
-        resident_msr_state.physical_address(),
-        resident_msr_state.pages(),
-    )?;
     ept.deny_guest_access(host_space.arena_physical_address, host_space.arena_pages)?;
-    ept.deny_guest_access(vmcs_physical_address, 1)?;
-    ept.deny_guest_access(session.report().region_physical_address, 1)?;
     ept.deny_guest_access(ept_test_page.physical_address(), ept_test_page.pages())?;
+    cpu_resources.deny_guest_access(&mut ept)?;
     ept.deny_guest_access_to_tables()?;
+
+    let ResidentCpuResources {
+        vmxon_region,
+        vmcs_region,
+        mut host_tables,
+        context_pages,
+        guest_stack,
+        host_stack,
+        resident_msr_state,
+    } = cpu_resources;
+    let vmcs_physical_address = vmcs_region.physical_address();
+    let session = vt_vmxon::enter_vmx_root_with_region(vmx_basic, vmxon_region)
+        .map_err(ResidentProbeError::Vmxon)?;
     EPT_TEST_PAGE_GPA.store(ept_test_page.physical_address(), Ordering::Release);
     let clear_result = unsafe { vt_vmcs::vmclear(vmcs_physical_address) };
     if clear_result != VmxInstructionResult::Succeeded {
@@ -991,7 +983,7 @@ pub fn run_windows_boot(
     let _controls =
         vt_controls::configure_resident_boot(msr_bitmap.physical_address(), ept.ept_pointer())?;
     configure_resident_msr_switch(&resident_msr_state)?;
-    configure_resident_host(host_space.host_cr3, &tables, root_segments)?;
+    configure_resident_host(host_space.host_cr3, &host_tables, root_segments)?;
     let guest_rsp = guest_stack.physical_address() + guest_stack.byte_len() as u64;
     let guest = vt_guest::configure_with_rflags(entry_rip, guest_rsp & !0xf, initial_rflags)?;
 
@@ -1018,7 +1010,7 @@ pub fn run_windows_boot(
         unsafe { matrixhv_resident_boot_run_asm(context, host_rsp, code.dispatch_entry) };
     EPT_TEST_PAGE_GPA.store(0, Ordering::Release);
     if raw_path == 0 {
-        tables.pages.preserve();
+        host_tables.pages.preserve();
     }
     let vm_instruction_error = vt_vmcs::vmread(VM_INSTRUCTION_ERROR).unwrap_or(u64::MAX);
     let final_clear = unsafe { vt_vmcs::vmclear(vmcs_physical_address) };
@@ -1071,7 +1063,7 @@ pub fn run_windows_boot(
         last_host_cr3: result.last_host_cr3,
         stop_result: result.stop_result,
     };
-    let _ = &tables.pages;
+    let _ = &host_tables.pages;
     Ok(report)
 }
 

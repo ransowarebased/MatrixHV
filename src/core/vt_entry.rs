@@ -131,6 +131,10 @@ impl ProbeStack {
     fn top(&self) -> u64 {
         (self.pointer.as_ptr() as u64 + PAGE_SIZE as u64) & !0xf
     }
+
+    fn physical_address(&self) -> u64 {
+        self.pointer.as_ptr() as u64
+    }
 }
 
 impl Drop for ProbeStack {
@@ -179,15 +183,63 @@ impl Drop for HostExitStack {
     }
 }
 
+pub(crate) struct VmlaunchProbeResources {
+    vmxon_region: vt_vmxon::VmxonRegion,
+    vmcs_region: VmcsRegion,
+    guest_stack: ProbeStack,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VmlaunchProbeResourceAddresses {
+    pub(crate) vmxon: u64,
+    pub(crate) vmcs: u64,
+    pub(crate) guest_stack: u64,
+}
+
+impl VmlaunchProbeResources {
+    pub(crate) fn allocate() -> Result<Self, VmlaunchError> {
+        let vmx_basic = vt_vmxon::vmx_basic();
+        let vmxon_region =
+            vt_vmxon::VmxonRegion::allocate(vmx_basic).map_err(VmlaunchError::Vmxon)?;
+        let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
+        vmcs_region.write_revision_id(vt_vmxon::revision_id(vmx_basic));
+        let guest_stack = ProbeStack::allocate()?;
+        Ok(Self {
+            vmxon_region,
+            vmcs_region,
+            guest_stack,
+        })
+    }
+
+    pub(crate) fn addresses(&self) -> VmlaunchProbeResourceAddresses {
+        VmlaunchProbeResourceAddresses {
+            vmxon: self.vmxon_region.physical_address(),
+            vmcs: self.vmcs_region.physical_address(),
+            guest_stack: self.guest_stack.physical_address(),
+        }
+    }
+
+    pub(crate) fn run(&mut self) -> Result<VmlaunchReport, VmlaunchError> {
+        run_vmlaunch_probe(self)
+    }
+}
+
 pub fn probe_vmlaunch() -> Result<VmlaunchReport, VmlaunchError> {
+    let mut resources = VmlaunchProbeResources::allocate()?;
+    run_vmlaunch_probe(&mut resources)
+}
+
+fn run_vmlaunch_probe(
+    resources: &mut VmlaunchProbeResources,
+) -> Result<VmlaunchReport, VmlaunchError> {
     let vmx_basic = vt_vmxon::vmx_basic();
     let revision_id = vt_vmxon::revision_id(vmx_basic);
-    let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
-    vmcs_region.write_revision_id(revision_id);
-    let vmcs_physical_address = vmcs_region.physical_address();
-    let guest_stack = ProbeStack::allocate()?;
+    resources.vmcs_region.write_revision_id(revision_id);
+    let vmcs_physical_address = resources.vmcs_region.physical_address();
 
-    let session = vt_vmxon::enter_vmx_root().map_err(VmlaunchError::Vmxon)?;
+    let session =
+        vt_vmxon::enter_vmx_root_with_borrowed_region(vmx_basic, &mut resources.vmxon_region)
+            .map_err(VmlaunchError::Vmxon)?;
     let vmxon_report = session.report();
 
     logger::phase("vmx.vmlaunch.vmclear.start");
@@ -230,7 +282,7 @@ pub fn probe_vmlaunch() -> Result<VmlaunchReport, VmlaunchError> {
     logger::phase("vmx.vmlaunch.host_state.ok");
 
     let guest_rip = guest_probe_address();
-    let guest = vt_guest::configure(guest_rip, guest_stack.top())?;
+    let guest = vt_guest::configure(guest_rip, resources.guest_stack.top())?;
     logger::info(format_args!(
         "vmlaunch guest rip={:#x} rsp={:#x} rflags={:#x} cs={:#x} ss={:#x} tr={:#x}",
         guest.rip, guest.rsp, guest.rflags, guest.cs_selector, guest.ss_selector, guest.tr_selector

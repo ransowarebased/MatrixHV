@@ -9,6 +9,7 @@ mod guest;
 mod hv_core;
 mod memory;
 mod runtime;
+mod smp;
 
 use uefi::{Status, entry};
 
