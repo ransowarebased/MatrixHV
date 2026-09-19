@@ -4,6 +4,7 @@
 mod arch;
 mod boot;
 mod config;
+mod guest;
 #[path = "core/mod.rs"]
 mod hv_core;
 mod runtime;

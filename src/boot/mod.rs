@@ -7,6 +7,7 @@ pub mod services;
 pub mod uefi;
 
 use crate::arch::x86_64::cpu::{self, Vendor};
+use crate::guest::{firmware, vcpu};
 use crate::hv_core;
 use ::uefi::Status;
 
@@ -177,6 +178,69 @@ pub fn run() -> Result<(), Status> {
             return Err(Status::DEVICE_ERROR);
         }
     }
+
+    firmware::reset_report();
+    logger::phase("vmx.real_boot_vcpu.start");
+    let vcpu_report = match vcpu::run(firmware::entry_address()) {
+        Ok(report) => report,
+        Err(error) => {
+            log::error!("Persistent boot vCPU failed: {error:?}");
+            logger::error(format_args!("real_boot_vcpu error={error:?}"));
+            logger::phase("vmx.real_boot_vcpu.failed");
+            return Err(vcpu::status_from_error(&error));
+        }
+    };
+    let vcpu_diagnostics = vcpu_report.diagnostics;
+    let boot_stage = firmware::report();
+    logger::info(format_args!(
+        "real_boot_vcpu result={:#x} result_name={} exits={} cpuid={} rdmsr={} wrmsr={} vmcall={} resumes={} failure={} guest_rsp={:#x}/{:#x} guest_rflags={:#x} initial_rflags={:#x}",
+        vcpu_report.result,
+        firmware::result_name(vcpu_report.result),
+        vcpu_diagnostics.exit_count,
+        vcpu_diagnostics.cpuid_count,
+        vcpu_diagnostics.rdmsr_count,
+        vcpu_diagnostics.wrmsr_count,
+        vcpu_diagnostics.vmcall_count,
+        vcpu_diagnostics.resume_count,
+        vcpu_diagnostics.failure_code,
+        vcpu_diagnostics.final_rsp,
+        vcpu_report.guest.rsp,
+        vcpu_report.guest.rflags,
+        vcpu_report.initial_rflags
+    ));
+    logger::info(format_args!(
+        "real_boot_vcpu firmware_report magic={:#x} version={} flags={:#x} status={:#x} handles={} required={}",
+        boot_stage.magic,
+        boot_stage.version,
+        boot_stage.flags,
+        boot_stage.status,
+        boot_stage.handle_count,
+        boot_stage.required_count
+    ));
+    logger::info(format_args!(
+        "real_boot_vcpu vmcs_pa={:#x} vmxon_pa={:#x} host_tr={:#x} primary={:#x} secondary={:#x}",
+        vcpu_report.vmcs_physical_address,
+        vcpu_report.vmxon.region_physical_address,
+        vcpu_report.host.tr_selector,
+        vcpu_report.controls.primary_processor_based,
+        vcpu_report.controls.secondary_processor_based
+    ));
+
+    let root_handle_count = services::simple_file_system_count()?;
+    let root_windows_present = loaders::veracrypt::windows_boot_present()?;
+    logger::info(format_args!(
+        "real_boot_vcpu crosscheck guest_handles={} root_handles={} root_windows_present={}",
+        boot_stage.handle_count, root_handle_count, root_windows_present
+    ));
+    if vcpu_report.result != firmware::BOOT_STAGE_WINDOWS_IMAGE_LOAD_OK
+        || !firmware::proof_complete(boot_stage)
+        || usize::try_from(boot_stage.handle_count).ok() != Some(root_handle_count)
+        || !root_windows_present
+    {
+        logger::phase("vmx.real_boot_vcpu.crosscheck_failed");
+        return Err(Status::DEVICE_ERROR);
+    }
+    logger::phase("vmx.real_boot_vcpu.ok");
 
     loaders::veracrypt::start()
 }

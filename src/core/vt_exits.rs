@@ -15,6 +15,8 @@ const DISPATCH_FAILURE_UNEXPECTED_EXIT: u32 = 3;
 const DISPATCH_FAILURE_CPUID_LENGTH: u32 = 4;
 const DISPATCH_FAILURE_VMCALL_LENGTH: u32 = 5;
 const DISPATCH_FAILURE_RIP_ADVANCE: u32 = 6;
+const DISPATCH_FAILURE_EXIT_LIMIT: u32 = 7;
+const MAX_DISPATCH_EXITS: u32 = 4096;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -37,10 +39,24 @@ pub struct GuestRegisters {
     pub rsp: u64,
 }
 
-#[repr(C)]
-#[derive(Debug, Default)]
+#[repr(C, align(16))]
+#[derive(Debug)]
 pub struct VmRunContext {
     pub root_rsp: u64,
+    _alignment_padding: u64,
+    root_fx_state: [u8; 512],
+    guest_fx_state: [u8; 512],
+}
+
+impl Default for VmRunContext {
+    fn default() -> Self {
+        Self {
+            root_rsp: 0,
+            _alignment_padding: 0,
+            root_fx_state: [0; 512],
+            guest_fx_state: [0; 512],
+        }
+    }
 }
 
 #[repr(u64)]
@@ -54,6 +70,8 @@ pub enum DispatchAction {
 pub struct DispatchDiagnostics {
     pub exit_count: u32,
     pub cpuid_count: u32,
+    pub rdmsr_count: u32,
+    pub wrmsr_count: u32,
     pub vmcall_count: u32,
     pub resume_count: u32,
     pub failure_code: u32,
@@ -77,6 +95,8 @@ pub struct DispatchDiagnostics {
 
 static EXIT_COUNT: AtomicU32 = AtomicU32::new(0);
 static CPUID_COUNT: AtomicU32 = AtomicU32::new(0);
+static RDMSR_COUNT: AtomicU32 = AtomicU32::new(0);
+static WRMSR_COUNT: AtomicU32 = AtomicU32::new(0);
 static VMCALL_COUNT: AtomicU32 = AtomicU32::new(0);
 static RESUME_COUNT: AtomicU32 = AtomicU32::new(0);
 static FAILURE_CODE: AtomicU32 = AtomicU32::new(DISPATCH_FAILURE_NONE);
@@ -100,6 +120,8 @@ static FINAL_RSP: AtomicU64 = AtomicU64::new(0);
 pub fn reset_diagnostics() {
     EXIT_COUNT.store(0, Ordering::Relaxed);
     CPUID_COUNT.store(0, Ordering::Relaxed);
+    RDMSR_COUNT.store(0, Ordering::Relaxed);
+    WRMSR_COUNT.store(0, Ordering::Relaxed);
     VMCALL_COUNT.store(0, Ordering::Relaxed);
     RESUME_COUNT.store(0, Ordering::Relaxed);
     FAILURE_CODE.store(DISPATCH_FAILURE_NONE, Ordering::Relaxed);
@@ -125,6 +147,8 @@ pub fn diagnostics() -> DispatchDiagnostics {
     DispatchDiagnostics {
         exit_count: EXIT_COUNT.load(Ordering::Relaxed),
         cpuid_count: CPUID_COUNT.load(Ordering::Relaxed),
+        rdmsr_count: RDMSR_COUNT.load(Ordering::Relaxed),
+        wrmsr_count: WRMSR_COUNT.load(Ordering::Relaxed),
         vmcall_count: VMCALL_COUNT.load(Ordering::Relaxed),
         resume_count: RESUME_COUNT.load(Ordering::Relaxed),
         failure_code: FAILURE_CODE.load(Ordering::Relaxed),
@@ -156,6 +180,7 @@ pub fn failure_name(code: u32) -> &'static str {
         DISPATCH_FAILURE_CPUID_LENGTH => "invalid_cpuid_length",
         DISPATCH_FAILURE_VMCALL_LENGTH => "invalid_vmcall_length",
         DISPATCH_FAILURE_RIP_ADVANCE => "guest_rip_advance_failed",
+        DISPATCH_FAILURE_EXIT_LIMIT => "exit_limit_exceeded",
         _ => "unknown",
     }
 }
@@ -184,14 +209,23 @@ pub extern "efiapi" fn matrixhv_vmexit_dispatch(
     };
 
     let basic_reason = vt_exit_reason::basic(raw_reason);
-    EXIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    let exit_index = EXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if exit_index > MAX_DISPATCH_EXITS {
+        FAILURE_CODE.store(DISPATCH_FAILURE_EXIT_LIMIT, Ordering::Relaxed);
+        logger::error(format_args!(
+            "vmexit exit_limit_exceeded count={} limit={}",
+            exit_index, MAX_DISPATCH_EXITS
+        ));
+        logger::phase("vmx.dispatch.exit_limit_exceeded");
+        return DispatchAction::Stop as u64;
+    }
     LAST_REASON.store(raw_reason, Ordering::Relaxed);
     LAST_INSTRUCTION_LENGTH.store(instruction_length, Ordering::Relaxed);
     LAST_QUALIFICATION.store(qualification, Ordering::Relaxed);
 
     logger::info(format_args!(
         "vmexit dispatch index={} raw_reason={:#x} name={} basic_reason={} rip={:#x} len={} qualification={:#x}",
-        EXIT_COUNT.load(Ordering::Relaxed),
+        exit_index,
         raw_reason,
         vt_exit_reason::name(raw_reason),
         basic_reason,
@@ -208,6 +242,8 @@ pub extern "efiapi" fn matrixhv_vmexit_dispatch(
 
     match basic_reason {
         vt_exit_reason::CPUID => dispatch_cpuid(registers, guest_rip, instruction_length),
+        vt_exit_reason::RDMSR => dispatch_rdmsr(registers, guest_rip, instruction_length),
+        vt_exit_reason::WRMSR => dispatch_wrmsr(registers, guest_rip, instruction_length),
         vt_exit_reason::VMCALL => dispatch_vmcall(registers, guest_rip, instruction_length),
         _ => {
             FAILURE_CODE.store(DISPATCH_FAILURE_UNEXPECTED_EXIT, Ordering::Relaxed);
@@ -221,6 +257,52 @@ pub extern "efiapi" fn matrixhv_vmexit_dispatch(
             DispatchAction::Stop as u64
         }
     }
+}
+
+fn dispatch_rdmsr(registers: &mut GuestRegisters, guest_rip: u64, instruction_length: u32) -> u64 {
+    logger::phase("vmx.dispatch.rdmsr.start");
+    if instruction_length != 2 {
+        FAILURE_CODE.store(DISPATCH_FAILURE_UNEXPECTED_EXIT, Ordering::Relaxed);
+        return DispatchAction::Stop as u64;
+    }
+    let result = exit_handlers::msr::handle_read(registers);
+    if advance_guest_rip(guest_rip, instruction_length).is_err() {
+        FAILURE_CODE.store(DISPATCH_FAILURE_RIP_ADVANCE, Ordering::Relaxed);
+        return DispatchAction::Stop as u64;
+    }
+    RDMSR_COUNT.fetch_add(1, Ordering::Relaxed);
+    RESUME_COUNT.fetch_add(1, Ordering::Relaxed);
+    logger::info(format_args!(
+        "vmexit rdmsr index={:#x} value={:#x} next_rip={:#x}",
+        result.index,
+        result.value,
+        guest_rip + u64::from(instruction_length)
+    ));
+    logger::phase("vmx.dispatch.rdmsr.resume");
+    DispatchAction::Resume as u64
+}
+
+fn dispatch_wrmsr(registers: &GuestRegisters, guest_rip: u64, instruction_length: u32) -> u64 {
+    logger::phase("vmx.dispatch.wrmsr.start");
+    if instruction_length != 2 {
+        FAILURE_CODE.store(DISPATCH_FAILURE_UNEXPECTED_EXIT, Ordering::Relaxed);
+        return DispatchAction::Stop as u64;
+    }
+    let result = exit_handlers::msr::handle_write(registers);
+    if advance_guest_rip(guest_rip, instruction_length).is_err() {
+        FAILURE_CODE.store(DISPATCH_FAILURE_RIP_ADVANCE, Ordering::Relaxed);
+        return DispatchAction::Stop as u64;
+    }
+    WRMSR_COUNT.fetch_add(1, Ordering::Relaxed);
+    RESUME_COUNT.fetch_add(1, Ordering::Relaxed);
+    logger::info(format_args!(
+        "vmexit wrmsr index={:#x} value={:#x} next_rip={:#x}",
+        result.index,
+        result.value,
+        guest_rip + u64::from(instruction_length)
+    ));
+    logger::phase("vmx.dispatch.wrmsr.resume");
+    DispatchAction::Resume as u64
 }
 
 fn dispatch_cpuid(registers: &mut GuestRegisters, guest_rip: u64, instruction_length: u32) -> u64 {

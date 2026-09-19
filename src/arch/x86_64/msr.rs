@@ -38,3 +38,18 @@ pub unsafe fn read(index: u32) -> u64 {
     }
     (u64::from(high) << 32) | u64::from(low)
 }
+
+#[inline]
+pub unsafe fn write(index: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") index,
+            in("eax") low,
+            in("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}

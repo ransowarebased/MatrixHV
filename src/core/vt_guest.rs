@@ -14,9 +14,17 @@ pub struct GuestStateReport {
 }
 
 pub fn configure(guest_rip: u64, guest_rsp: u64) -> Result<GuestStateReport, VmcsError> {
+    configure_with_rflags(guest_rip, guest_rsp, 0x2)
+}
+
+pub fn configure_with_rflags(
+    guest_rip: u64,
+    guest_rsp: u64,
+    guest_rflags: u64,
+) -> Result<GuestStateReport, VmcsError> {
     let mut segments = segmentation::capture();
     segments.tr = segmentation::vmx_usable_tr(segments.tr);
-    let guest_rflags = 0x2;
+    let guest_rflags = guest_rflags | 0x2;
 
     write_segment(
         GUEST_ES_SELECTOR,
