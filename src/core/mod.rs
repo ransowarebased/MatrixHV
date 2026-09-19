@@ -6,6 +6,7 @@ pub mod vt_exits;
 pub mod vt_guest;
 pub mod vt_host;
 pub mod vt_init;
+pub mod vt_resident;
 pub mod vt_vmcs;
 pub mod vt_vmcs_fields;
 pub mod vt_vmxon;

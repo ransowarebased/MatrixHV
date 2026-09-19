@@ -7,6 +7,7 @@ use uefi::proto::loaded_image::LoadedImage;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const RESIDENT_MEMORY_TYPE: MemoryType = MemoryType::RUNTIME_SERVICES_DATA;
+pub const RESIDENT_CODE_MEMORY_TYPE: MemoryType = MemoryType::RUNTIME_SERVICES_CODE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressConstraint {
@@ -28,11 +29,19 @@ pub struct ResidentPages {
 
 impl ResidentPages {
     pub fn allocate(pages: usize, constraint: AddressConstraint) -> Result<Self, Status> {
+        Self::allocate_typed(pages, constraint, RESIDENT_MEMORY_TYPE)
+    }
+
+    pub fn allocate_typed(
+        pages: usize,
+        constraint: AddressConstraint,
+        memory_type: MemoryType,
+    ) -> Result<Self, Status> {
         let allocate_type = match constraint {
             AddressConstraint::Any => AllocateType::AnyPages,
             AddressConstraint::Max(address) => AllocateType::MaxAddress(address),
         };
-        let pointer = boot::allocate_pages(allocate_type, RESIDENT_MEMORY_TYPE, pages)
+        let pointer = boot::allocate_pages(allocate_type, memory_type, pages)
             .map_err(|error| error.status())?;
         unsafe {
             pointer.as_ptr().write_bytes(0, PAGE_SIZE * pages);

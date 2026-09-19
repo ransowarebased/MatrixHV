@@ -186,6 +186,38 @@ pub fn run() -> Result<(), Status> {
         }
     }
 
+    logger::phase("vmx.resident_host_probe.start");
+    match hv_core::vt_resident::probe() {
+        Ok(report) => {
+            logger::info(format_args!(
+                "resident_host code_pa={:#x}/{} code_type={} data_type={} host_cr3={:#x} guest_cr3={:#x} observed_host_cr3={:#x} observed_guest_cr3={:#x}",
+                report.code_physical_address,
+                report.code_pages,
+                report.code_memory_type,
+                report.data_memory_type,
+                report.host_cr3,
+                report.guest_cr3,
+                report.observed_host_cr3,
+                report.observed_guest_cr3
+            ));
+            logger::info(format_args!(
+                "resident_host exit_reason={:#x} guest_rip={:#x} gdt={:#x} idt={:#x} tss={:#x} host_stack={:#x}",
+                report.exit_reason,
+                report.guest_rip,
+                report.host_gdt,
+                report.host_idt,
+                report.host_tss,
+                report.host_stack
+            ));
+            logger::phase("vmx.resident_host_probe.ok");
+        }
+        Err(error) => {
+            logger::error(format_args!("resident_host error={error:?}"));
+            logger::phase("vmx.resident_host_probe.failed");
+            return Err(hv_core::vt_resident::status_from_error(&error));
+        }
+    }
+
     firmware::reset_report();
     logger::phase("vmx.real_boot_vcpu.start");
     let vcpu_report = match vcpu::run(firmware::entry_address()) {
