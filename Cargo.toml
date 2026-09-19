@@ -1,0 +1,23 @@
+[package]
+name = "matrixhv"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[[bin]]
+name = "MatrixHV"
+path = "src/main.rs"
+
+[dependencies]
+log = { version = "0.4.28", default-features = false }
+uefi = { version = "0.40.0", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

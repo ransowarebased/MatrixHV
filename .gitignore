@@ -1,0 +1,10 @@
+/builds/
+/target/
+.idea/
+.vscode/
+*.pdb
+*.obj
+*.lib
+*.exp
+*.ilk
+*.log
