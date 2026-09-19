@@ -9,6 +9,7 @@ const CPU_BASED_USE_MSR_BITMAPS: u32 = 1 << 28;
 const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
 const SECONDARY_ENABLE_RDTSCP: u32 = 1 << 3;
+const SECONDARY_UNRESTRICTED_GUEST: u32 = 1 << 7;
 const SECONDARY_ENABLE_XSAVES: u32 = 1 << 20;
 const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
 const VM_EXIT_SAVE_IA32_PAT: u32 = 1 << 18;
@@ -34,6 +35,7 @@ pub enum VmxControlsError {
     HostAddressSpaceSizeUnavailable,
     Ia32eGuestModeUnavailable,
     EptUnavailable,
+    UnrestrictedGuestUnavailable,
     EptUnexpectedlyRequired,
     MsrBitmapsUnavailable,
     RdtscpUnavailable,
@@ -69,6 +71,25 @@ pub fn configure_resident_boot(
         Some(msr_bitmap),
         Some(ept_pointer),
     )
+}
+
+pub(crate) fn configure_resident_ap(
+    msr_bitmap: u64,
+    ept_pointer: u64,
+) -> Result<VmxControls, VmxControlsError> {
+    let mut controls = configure_resident_boot(msr_bitmap, ept_pointer)?;
+    controls.secondary_processor_based = adjust_control(
+        controls.secondary_processor_based | SECONDARY_UNRESTRICTED_GUEST,
+        msr::IA32_VMX_PROCBASED_CTLS2,
+    );
+    if controls.secondary_processor_based & SECONDARY_UNRESTRICTED_GUEST == 0 {
+        return Err(VmxControlsError::UnrestrictedGuestUnavailable);
+    }
+    vmwrite(
+        SECONDARY_VM_EXEC_CONTROL,
+        u64::from(controls.secondary_processor_based),
+    )?;
+    Ok(controls)
 }
 
 fn configure_internal(

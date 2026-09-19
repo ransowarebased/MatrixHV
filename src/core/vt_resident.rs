@@ -282,6 +282,10 @@ struct ResidentBootContext {
     stop_result: u64,
     canary_start: u64,
     canary_end: u64,
+    processor_number: u64,
+    ap_started: u64,
+    init_count: u64,
+    sipi_count: u64,
     original_gdtr: [u8; 10],
     original_idtr: [u8; 10],
     alignment_padding: [u8; 28],
@@ -330,6 +334,10 @@ impl ResidentBootContext {
             stop_result: 0,
             canary_start: BOOT_CONTEXT_CANARY_START,
             canary_end: BOOT_CONTEXT_CANARY_END,
+            processor_number: 0,
+            ap_started: 0,
+            init_count: 0,
+            sipi_count: 0,
             original_gdtr: [0; 10],
             original_idtr: [0; 10],
             alignment_padding: [0; 28],
@@ -909,6 +917,25 @@ pub fn run_windows_boot(
     let mut host_address_space = HostAddressSpace::reserve().map_err(ResidentProbeError::Paging)?;
     let vmx_basic = vt_vmxon::vmx_basic();
     let cpu_resources = ResidentCpuResources::allocate(vmx_basic, code.fatal)?;
+    let topology = crate::smp::topology::enumerate().map_err(ResidentProbeError::Allocation)?;
+    let mut ap_resources = alloc::vec::Vec::new();
+    {
+        let handle = boot::get_handle_for_protocol::<uefi::proto::pi::mp::MpServices>()
+            .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
+        let mp = boot::open_protocol_exclusive::<uefi::proto::pi::mp::MpServices>(handle)
+            .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
+        for processor_number in 0..topology.total_processors {
+            let info = mp
+                .get_processor_info(processor_number)
+                .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
+            if info.is_enabled() && !info.is_bsp() {
+                ap_resources.push((
+                    processor_number,
+                    ResidentCpuResources::allocate(vmx_basic, code.fatal)?,
+                ));
+            }
+        }
+    }
     unsafe {
         ept_test_page
             .pointer()
@@ -954,6 +981,9 @@ pub fn run_windows_boot(
     ept.deny_guest_access(host_space.arena_physical_address, host_space.arena_pages)?;
     ept.deny_guest_access(ept_test_page.physical_address(), ept_test_page.pages())?;
     cpu_resources.deny_guest_access(&mut ept)?;
+    for (_, resources) in &ap_resources {
+        resources.deny_guest_access(&mut ept)?;
+    }
     ept.deny_guest_access_to_tables()?;
 
     let ResidentCpuResources {
@@ -1006,8 +1036,50 @@ pub fn run_windows_boot(
         (host_rsp as *mut u64).write(context as u64);
     }
 
+    for (processor_number, resources) in &mut ap_resources {
+        let mut launch = ResidentApLaunch {
+            resources,
+            host_cr3: host_space.host_cr3,
+            event_context,
+            ept_pointer: ept.ept_pointer(),
+            msr_bitmap: msr_bitmap.physical_address(),
+            dispatch_entry: code.dispatch_entry,
+            processor_number: *processor_number,
+        };
+        let result = crate::smp::ap_startup::launch(*processor_number, &mut launch);
+        let ap_context = resources
+            .context_pages
+            .pointer()
+            .as_ptr()
+            .cast::<ResidentBootContext>();
+        let started = unsafe { core::ptr::addr_of!((*ap_context).ap_started).read_volatile() };
+        crate::runtime::logger::info(format_args!(
+            "smp resident processor={} started={} status={:?} vmxon={:#x} vmcs={:#x} host_stack={:#x} context={:#x} host_cr3={:#x} ept={:#x}",
+            processor_number,
+            started,
+            result,
+            resources.vmxon_region.physical_address(),
+            resources.vmcs_region.physical_address(),
+            resources.host_stack.physical_address(),
+            ap_context as u64,
+            host_space.host_cr3,
+            ept.ept_pointer()
+        ));
+        if result.is_err() || started != 1 {
+            resident_startup_halt();
+        }
+    }
+    crate::runtime::logger::info(format_args!(
+        "smp resident BSP context={:#x} vmcs={:#x} vmxon={:#x}",
+        context as u64,
+        vmcs_physical_address,
+        session.report().region_physical_address
+    ));
     let raw_path =
         unsafe { matrixhv_resident_boot_run_asm(context, host_rsp, code.dispatch_entry) };
+    if !ap_resources.is_empty() {
+        resident_startup_halt();
+    }
     EPT_TEST_PAGE_GPA.store(0, Ordering::Release);
     if raw_path == 0 {
         host_tables.pages.preserve();
@@ -1065,6 +1137,77 @@ pub fn run_windows_boot(
     };
     let _ = &host_tables.pages;
     Ok(report)
+}
+
+fn resident_startup_halt() -> ! {
+    crate::runtime::logger::error(format_args!(
+        "smp resident startup failed; retaining active CPU resources"
+    ));
+    loop {
+        unsafe {
+            core::arch::asm!("cli", "hlt", options(nomem, nostack));
+        }
+    }
+}
+
+pub(crate) struct ResidentApLaunch<'a> {
+    resources: &'a mut ResidentCpuResources,
+    host_cr3: u64,
+    event_context: u64,
+    ept_pointer: u64,
+    msr_bitmap: u64,
+    dispatch_entry: u64,
+    processor_number: usize,
+}
+
+impl ResidentApLaunch<'_> {
+    pub(crate) fn prepare(
+        &mut self,
+        guest_rsp: u64,
+        guest_rip: u64,
+    ) -> Result<(), ResidentProbeError> {
+        let segments = segmentation::capture();
+        let session = vt_vmxon::enter_vmx_root_with_borrowed_region(
+            vt_vmxon::vmx_basic(),
+            &mut self.resources.vmxon_region,
+        )
+        .map_err(ResidentProbeError::Vmxon)?;
+        let vmcs = self.resources.vmcs_region.physical_address();
+        let clear = unsafe { vt_vmcs::vmclear(vmcs) };
+        if clear != VmxInstructionResult::Succeeded {
+            return Err(ResidentProbeError::Vmclear(clear));
+        }
+        let load = unsafe { vt_vmcs::vmptrld(vmcs) };
+        if load != VmxInstructionResult::Succeeded {
+            return Err(ResidentProbeError::Vmcs(VmcsError::Vmptrld(load)));
+        }
+        vt_controls::configure_resident_ap(self.msr_bitmap, self.ept_pointer)?;
+        configure_resident_msr_switch(&self.resources.resident_msr_state)?;
+        configure_resident_host(self.host_cr3, &self.resources.host_tables, segments)?;
+        let guest = vt_guest::configure(guest_rip, guest_rsp)?;
+        let context = self
+            .resources
+            .context_pages
+            .pointer()
+            .as_ptr()
+            .cast::<ResidentBootContext>();
+        let mut state =
+            ResidentBootContext::new(self.host_cr3, guest.cr3, self.event_context, 0, 0, 0);
+        state.processor_number = self.processor_number as u64;
+        let host_rsp = (self.resources.host_stack.physical_address()
+            + self.resources.host_stack.byte_len() as u64
+            - 8)
+            & !0xf;
+        unsafe {
+            context.write(state);
+            (host_rsp as *mut u64).write(context as u64);
+        }
+        vmwrite(HOST_RSP, host_rsp)?;
+        vmwrite(HOST_RIP, self.dispatch_entry)?;
+        // The successful guest continuation returns to firmware without dropping this root session.
+        core::mem::forget(session);
+        Ok(())
+    }
 }
 
 fn configure_resident_host(
@@ -1393,6 +1536,8 @@ global_asm!(
     "cmp qword ptr [rdi + {event_ebs_seen}], 0",
     "je .Lresident_dispatch_check_va",
     "inc qword ptr [r12 + {b_post_ebs_count}]",
+    "cmp qword ptr [r12 + {b_processor_number}], 0",
+    "jne .Lresident_dispatch_check_va",
     "cmp qword ptr [r12 + {b_post_ebs_count}], 1",
     "jne .Lresident_dispatch_check_va",
     "lea rsi, [rip + .Lpost_ebs_exit_message]",
@@ -1403,6 +1548,8 @@ global_asm!(
     "cmp qword ptr [rdi + {event_va_seen}], 0",
     "je .Lresident_dispatch_after_events",
     "inc qword ptr [r12 + {b_post_va_count}]",
+    "cmp qword ptr [r12 + {b_processor_number}], 0",
+    "jne .Lresident_dispatch_after_events",
     "cmp qword ptr [r12 + {b_post_va_count}], 1",
     "jne .Lresident_dispatch_after_events",
     "lea rsi, [rip + .Lpost_va_exit_message]",
@@ -1424,6 +1571,12 @@ global_asm!(
     "test eax, 0x80000000",
     "jnz .Lresident_dispatch_unsupported",
     "and eax, 0xffff",
+    "cmp eax, 3",
+    "je .Lresident_ap_init",
+    "cmp eax, 4",
+    "je .Lresident_ap_sipi",
+    "cmp eax, 28",
+    "je .Lresident_ap_cr_access",
     "cmp eax, {ept_violation_reason}",
     "je .Lresident_dispatch_ept_violation",
     "cmp eax, {cpuid_reason}",
@@ -1437,6 +1590,7 @@ global_asm!(
     "cmp eax, {xsetbv_reason}",
     "je .Lresident_dispatch_xsetbv",
     "jmp .Lresident_dispatch_unsupported",
+    include_str!("../../asm/ap_startup.S"),
     ".Lresident_dispatch_ept_violation:",
     "mov rax, {guest_physical_address}",
     "vmread r11, rax",
@@ -1582,6 +1736,10 @@ global_asm!(
     "je .Lresident_dispatch_rdmsr_efer",
     "cmp ecx, {gs_base_msr}",
     "je .Lresident_dispatch_rdmsr_gs_base",
+    "cmp ecx, {fs_base_msr}",
+    "je .Lresident_dispatch_rdmsr_fs_base",
+    "cmp ecx, 0xc0010131",
+    "je .Lresident_dispatch_inject_gp",
     "cmp ecx, {kernel_gs_base_msr}",
     "je .Lresident_dispatch_rdmsr_kernel_gs_base",
     "jmp .Lresident_dispatch_unsupported",
@@ -1601,6 +1759,9 @@ global_asm!(
     "jmp .Lresident_dispatch_resume",
     ".Lresident_dispatch_rdmsr_sysenter_cs:",
     "mov rax, {guest_sysenter_cs}",
+    "jmp .Lresident_dispatch_rdmsr_vmcs_value",
+    ".Lresident_dispatch_rdmsr_fs_base:",
+    "mov rax, {guest_fs_base}",
     "jmp .Lresident_dispatch_rdmsr_vmcs_value",
     ".Lresident_dispatch_rdmsr_sysenter_esp:",
     "mov rax, {guest_sysenter_esp}",
@@ -1806,6 +1967,9 @@ global_asm!(
     ".Lresident_dispatch_vmcall:",
     "inc qword ptr [r12 + {b_vmcall_count}]",
     "mov rax, qword ptr [rsp + 0]",
+    "mov r11, 0x4856415052454144",
+    "cmp rax, r11",
+    "je .Lresident_ap_ready",
     "mov r11, {start_checkpoint_magic}",
     "cmp rax, r11",
     "je .Lresident_dispatch_start_checkpoint",
@@ -1866,6 +2030,18 @@ global_asm!(
     "mov r9d, {vmread_failed_message_len}",
     "call .Lresident_serial_write",
     "jmp .Lresident_dispatch_halt",
+    ".Lresident_dispatch_inject_gp:",
+    "mov rax, {vm_entry_exception_error_code}",
+    "xor r10d, r10d",
+    "vmwrite rax, r10",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "mov rax, {vm_entry_intr_info_field}",
+    "mov r10d, 0x80000b0d",
+    "vmwrite rax, r10",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "jmp .Lresident_dispatch_resume",
     ".Lresident_advance_guest_rip:",
     "mov r10, qword ptr [r12 + {b_last_guest_rip}]",
     "add r10, qword ptr [r12 + {b_last_instruction_len}]",
@@ -2126,6 +2302,59 @@ global_asm!(
     ".globl matrixhv_resident_island_end",
     "matrixhv_resident_island_end:",
     ".text",
+    b_ap_started = const core::mem::offset_of!(ResidentBootContext, ap_started),
+    b_processor_number = const core::mem::offset_of!(ResidentBootContext, processor_number),
+    b_init_count = const core::mem::offset_of!(ResidentBootContext, init_count),
+    b_sipi_count = const core::mem::offset_of!(ResidentBootContext, sipi_count),
+    cr0_guest_host_mask = const CR0_GUEST_HOST_MASK,
+    cr0_read_shadow = const CR0_READ_SHADOW,
+    cr4_guest_host_mask = const CR4_GUEST_HOST_MASK,
+    cr4_read_shadow = const CR4_READ_SHADOW,
+    guest_activity_state = const GUEST_ACTIVITY_STATE,
+    guest_cr0 = const GUEST_CR0,
+    guest_cs_ar_bytes = const GUEST_CS_AR_BYTES,
+    guest_cs_base = const GUEST_CS_BASE,
+    guest_cs_limit = const GUEST_CS_LIMIT,
+    guest_cs_selector = const GUEST_CS_SELECTOR,
+    guest_dr7 = const GUEST_DR7,
+    guest_ds_ar_bytes = const GUEST_DS_AR_BYTES,
+    guest_ds_base = const GUEST_DS_BASE,
+    guest_ds_limit = const GUEST_DS_LIMIT,
+    guest_ds_selector = const GUEST_DS_SELECTOR,
+    guest_es_ar_bytes = const GUEST_ES_AR_BYTES,
+    guest_es_base = const GUEST_ES_BASE,
+    guest_es_limit = const GUEST_ES_LIMIT,
+    guest_es_selector = const GUEST_ES_SELECTOR,
+    guest_fs_ar_bytes = const GUEST_FS_AR_BYTES,
+    guest_fs_limit = const GUEST_FS_LIMIT,
+    guest_fs_selector = const GUEST_FS_SELECTOR,
+    guest_gdtr_base = const GUEST_GDTR_BASE,
+    guest_gdtr_limit = const GUEST_GDTR_LIMIT,
+    guest_gs_ar_bytes = const GUEST_GS_AR_BYTES,
+    guest_gs_limit = const GUEST_GS_LIMIT,
+    guest_gs_selector = const GUEST_GS_SELECTOR,
+    guest_ia32_debugctl = const GUEST_IA32_DEBUGCTL,
+    guest_idtr_base = const GUEST_IDTR_BASE,
+    guest_idtr_limit = const GUEST_IDTR_LIMIT,
+    guest_interruptibility_info = const GUEST_INTERRUPTIBILITY_INFO,
+    guest_ldtr_ar_bytes = const GUEST_LDTR_AR_BYTES,
+    guest_ldtr_base = const GUEST_LDTR_BASE,
+    guest_ldtr_limit = const GUEST_LDTR_LIMIT,
+    guest_ldtr_selector = const GUEST_LDTR_SELECTOR,
+    guest_pending_dbg_exceptions = const GUEST_PENDING_DBG_EXCEPTIONS,
+    guest_rflags = const GUEST_RFLAGS,
+    guest_rsp = const GUEST_RSP,
+    guest_ss_ar_bytes = const GUEST_SS_AR_BYTES,
+    guest_ss_base = const GUEST_SS_BASE,
+    guest_ss_limit = const GUEST_SS_LIMIT,
+    guest_ss_selector = const GUEST_SS_SELECTOR,
+    guest_tr_ar_bytes = const GUEST_TR_AR_BYTES,
+    guest_tr_base = const GUEST_TR_BASE,
+    guest_tr_limit = const GUEST_TR_LIMIT,
+    guest_tr_selector = const GUEST_TR_SELECTOR,
+    vm_entry_controls = const VM_ENTRY_CONTROLS,
+    vm_entry_intr_info_field = const VM_ENTRY_INTR_INFO_FIELD,
+    vm_entry_exception_error_code = const VM_ENTRY_EXCEPTION_ERROR_CODE,
     guest_cr3 = const GUEST_CR3,
     guest_efer = const GUEST_IA32_EFER,
     guest_gs_base = const GUEST_GS_BASE,

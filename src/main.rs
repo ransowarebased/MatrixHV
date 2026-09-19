@@ -1,6 +1,8 @@
 #![no_main]
 #![no_std]
 
+extern crate alloc;
+
 mod arch;
 mod boot;
 mod config;
