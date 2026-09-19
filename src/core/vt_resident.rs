@@ -1,7 +1,10 @@
 use core::arch::global_asm;
+use core::ffi::c_void;
 use core::mem::size_of;
+use core::ptr::NonNull;
 
 use uefi::Status;
+use uefi::boot::{self, EventNotifyFn, EventType, Tpl};
 
 use super::vt_controls::{self, VmxControlsError};
 use super::vt_guest;
@@ -20,6 +23,8 @@ const HOST_TABLE_PAGES: usize = 2;
 const CONTEXT_CANARY_START: u64 = 0x4856_5245_5349_4431;
 const CONTEXT_CANARY_END: u64 = 0x4856_5245_5349_4432;
 const CONTEXT_COMPLETE: u64 = 0x4856_5245_534f_4b21;
+const EVENT_CONTEXT_MAGIC: u64 = 0x4856_4556_454e_5431;
+const EVENT_CONTEXT_CANARY: u64 = 0x4856_4556_4341_4e59;
 const VMCALL_EXIT_REASON: u64 = 18;
 const HOST_TSS_SELECTOR: u16 = 0x40;
 const TSS_OFFSET: usize = 0x100;
@@ -46,6 +51,7 @@ pub enum ResidentProbeError {
     UnexpectedExitReason(u64),
     HostCr3Mismatch { expected: u64, observed: u64 },
     GuestCr3Mismatch { expected: u64, observed: u64 },
+    EventRegistration(Status),
 }
 
 impl From<VmcsError> for ResidentProbeError {
@@ -76,6 +82,24 @@ pub struct ResidentProbeReport {
     pub host_idt: u64,
     pub host_tss: u64,
     pub host_stack: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentEventReport {
+    pub code_physical_address: u64,
+    pub context_physical_address: u64,
+    pub code_memory_type: u32,
+    pub data_memory_type: u32,
+    pub exit_boot_services_event: u64,
+    pub virtual_address_change_event: u64,
+}
+
+#[repr(C, align(16))]
+struct ResidentEventContext {
+    magic: u64,
+    exit_boot_services_seen: u64,
+    virtual_address_change_seen: u64,
+    canary: u64,
 }
 
 #[repr(C, align(16))]
@@ -145,6 +169,8 @@ struct ResidentCode {
     pages: ResidentPages,
     entry: u64,
     fatal: u64,
+    exit_boot_services_callback: u64,
+    virtual_address_change_callback: u64,
 }
 
 impl ResidentCode {
@@ -152,8 +178,21 @@ impl ResidentCode {
         let start = core::ptr::addr_of!(matrixhv_resident_island_start) as u64;
         let entry = core::ptr::addr_of!(matrixhv_resident_island_entry) as u64;
         let fatal = core::ptr::addr_of!(matrixhv_resident_island_fatal) as u64;
+        let exit_boot_services_callback =
+            core::ptr::addr_of!(matrixhv_resident_ebs_callback) as u64;
+        let virtual_address_change_callback =
+            core::ptr::addr_of!(matrixhv_resident_va_callback) as u64;
         let end = core::ptr::addr_of!(matrixhv_resident_island_end) as u64;
-        if entry < start || fatal < start || end <= start || entry >= end || fatal >= end {
+        if entry < start
+            || fatal < start
+            || exit_boot_services_callback < start
+            || virtual_address_change_callback < start
+            || end <= start
+            || entry >= end
+            || fatal >= end
+            || exit_boot_services_callback >= end
+            || virtual_address_change_callback >= end
+        {
             return Err(ResidentProbeError::InvalidCodeLayout);
         }
         let length =
@@ -172,6 +211,8 @@ impl ResidentCode {
         Ok(Self {
             entry: base + (entry - start),
             fatal: base + (fatal - start),
+            exit_boot_services_callback: base + (exit_boot_services_callback - start),
+            virtual_address_change_callback: base + (virtual_address_change_callback - start),
             pages,
         })
     }
@@ -355,9 +396,73 @@ pub fn status_from_error(error: &ResidentProbeError) -> Status {
         ResidentProbeError::Allocation(status)
         | ResidentProbeError::Vmxon(VmxonError::Allocation(status))
         | ResidentProbeError::Vmcs(VmcsError::Allocation(status))
-        | ResidentProbeError::Paging(HostPagingError::Allocation(status)) => *status,
+        | ResidentProbeError::Paging(HostPagingError::Allocation(status))
+        | ResidentProbeError::EventRegistration(status) => *status,
         _ => Status::DEVICE_ERROR,
     }
+}
+
+pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError> {
+    let mut code = ResidentCode::allocate()?;
+    let mut context_pages = ResidentPages::allocate(1, AddressConstraint::Any)
+        .map_err(ResidentProbeError::Allocation)?;
+    let context = context_pages
+        .pointer()
+        .as_ptr()
+        .cast::<ResidentEventContext>();
+    unsafe {
+        context.write(ResidentEventContext {
+            magic: EVENT_CONTEXT_MAGIC,
+            exit_boot_services_seen: 0,
+            virtual_address_change_seen: 0,
+            canary: EVENT_CONTEXT_CANARY,
+        });
+    }
+    let notify_context = NonNull::new(context.cast::<c_void>())
+        .ok_or(ResidentProbeError::Allocation(Status::OUT_OF_RESOURCES))?;
+    let ebs_callback = unsafe {
+        core::mem::transmute::<usize, EventNotifyFn>(code.exit_boot_services_callback as usize)
+    };
+    let va_callback = unsafe {
+        core::mem::transmute::<usize, EventNotifyFn>(code.virtual_address_change_callback as usize)
+    };
+
+    let ebs_event = unsafe {
+        boot::create_event(
+            EventType::SIGNAL_EXIT_BOOT_SERVICES,
+            Tpl::NOTIFY,
+            Some(ebs_callback),
+            Some(notify_context),
+        )
+    }
+    .map_err(|error| ResidentProbeError::EventRegistration(error.status()))?;
+
+    let va_event = match unsafe {
+        boot::create_event(
+            EventType::SIGNAL_VIRTUAL_ADDRESS_CHANGE,
+            Tpl::NOTIFY,
+            Some(va_callback),
+            Some(notify_context),
+        )
+    } {
+        Ok(event) => event,
+        Err(error) => {
+            let _ = boot::close_event(ebs_event);
+            return Err(ResidentProbeError::EventRegistration(error.status()));
+        }
+    };
+
+    let report = ResidentEventReport {
+        code_physical_address: code.pages.physical_address(),
+        context_physical_address: context_pages.physical_address(),
+        code_memory_type: RESIDENT_CODE_MEMORY_TYPE.0,
+        data_memory_type: RESIDENT_MEMORY_TYPE.0,
+        exit_boot_services_event: ebs_event.as_ptr() as usize as u64,
+        virtual_address_change_event: va_event.as_ptr() as usize as u64,
+    };
+    code.pages.preserve();
+    context_pages.preserve();
+    Ok(report)
 }
 
 fn configure_resident_host(
@@ -456,6 +561,8 @@ unsafe extern "C" {
     static matrixhv_resident_island_start: u8;
     static matrixhv_resident_island_entry: u8;
     static matrixhv_resident_island_fatal: u8;
+    static matrixhv_resident_ebs_callback: u8;
+    static matrixhv_resident_va_callback: u8;
     static matrixhv_resident_island_end: u8;
 }
 
@@ -564,6 +671,57 @@ global_asm!(
     "1:",
     "hlt",
     "jmp 1b",
+    ".globl matrixhv_resident_ebs_callback",
+    "matrixhv_resident_ebs_callback:",
+    "push rsi",
+    "mov r8, rdx",
+    "mov qword ptr [r8 + 8], 1",
+    "lea rsi, [rip + .Lebs_message]",
+    "mov r9d, {ebs_message_len}",
+    "call .Lresident_serial_write",
+    "pop rsi",
+    "ret",
+    ".globl matrixhv_resident_va_callback",
+    "matrixhv_resident_va_callback:",
+    "push rsi",
+    "mov r8, rdx",
+    "mov qword ptr [r8 + 16], 1",
+    "lea rsi, [rip + .Lva_message]",
+    "mov r9d, {va_message_len}",
+    "call .Lresident_serial_write",
+    "pop rsi",
+    "ret",
+    ".Lresident_serial_write:",
+    "test r9d, r9d",
+    "jz .Lresident_serial_write_done",
+    "lodsb",
+    "call .Lresident_serial_char",
+    "dec r9d",
+    "jmp .Lresident_serial_write",
+    ".Lresident_serial_write_done:",
+    "ret",
+    ".Lresident_serial_char:",
+    "mov r10b, al",
+    "mov dx, 0x3fd",
+    "mov ecx, 100000",
+    ".Lresident_serial_wait:",
+    "in al, dx",
+    "test al, 0x20",
+    "jnz .Lresident_serial_ready",
+    "dec ecx",
+    "jnz .Lresident_serial_wait",
+    "ret",
+    ".Lresident_serial_ready:",
+    "mov dx, 0x3f8",
+    "mov al, r10b",
+    "out dx, al",
+    "ret",
+    ".Lebs_message:",
+    ".ascii \"[MATRIXHV][RESIDENT] HV:EBS_SIGNAL\\r\\n\"",
+    ".Lebs_message_end:",
+    ".Lva_message:",
+    ".ascii \"[MATRIXHV][RESIDENT] HV:VA_CHANGE_POST_EBS\\r\\n\"",
+    ".Lva_message_end:",
     ".globl matrixhv_resident_island_end",
     "matrixhv_resident_island_end:",
     ".text",
@@ -571,4 +729,6 @@ global_asm!(
     guest_rip = const GUEST_RIP,
     exit_reason = const VM_EXIT_REASON,
     complete = const CONTEXT_COMPLETE,
+    ebs_message_len = const 36,
+    va_message_len = const 44,
 );

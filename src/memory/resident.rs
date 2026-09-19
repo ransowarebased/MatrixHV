@@ -68,6 +68,10 @@ impl ResidentPages {
     pub fn byte_len(&self) -> usize {
         PAGE_SIZE * self.pages
     }
+
+    pub fn preserve(&mut self) {
+        self.release_on_drop = false;
+    }
 }
 
 impl Drop for ResidentPages {

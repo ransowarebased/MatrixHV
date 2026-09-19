@@ -294,5 +294,26 @@ pub fn run() -> Result<(), Status> {
     }
     logger::phase("vmx.real_boot_vcpu.ok");
 
+    logger::phase("vmx.residency_events.arm.start");
+    match hv_core::vt_resident::arm_residency_events() {
+        Ok(report) => {
+            logger::info(format_args!(
+                "residency_events code_pa={:#x} context_pa={:#x} code_type={} data_type={} ebs_event={:#x} va_event={:#x}",
+                report.code_physical_address,
+                report.context_physical_address,
+                report.code_memory_type,
+                report.data_memory_type,
+                report.exit_boot_services_event,
+                report.virtual_address_change_event
+            ));
+            logger::phase("vmx.residency_events.armed");
+        }
+        Err(error) => {
+            logger::error(format_args!("residency_events error={error:?}"));
+            logger::phase("vmx.residency_events.failed");
+            return Err(hv_core::vt_resident::status_from_error(&error));
+        }
+    }
+
     loaders::veracrypt::start()
 }
