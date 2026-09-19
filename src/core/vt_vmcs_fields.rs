@@ -1,0 +1,1 @@
+pub const VM_INSTRUCTION_ERROR: u64 = 0x4400;

@@ -265,7 +265,7 @@ if ([string]::IsNullOrWhiteSpace($BootBinary)) {
     $BootBinary = Join-Path $BuildRoot "$ConfigurationName\EFI\BOOT\BOOTX64.EFI"
 }
 if ([string]::IsNullOrWhiteSpace($ImagePath)) {
-    $ImagePath = Join-Path $BuildRoot "images\MatrixHV-$ConfigurationName.img"
+    $ImagePath = Join-Path $BuildRoot "$ConfigurationName\MatrixHV.img"
 }
 
 $BootBinary = [System.IO.Path]::GetFullPath($BootBinary)

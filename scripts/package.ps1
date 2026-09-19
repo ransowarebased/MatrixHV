@@ -13,8 +13,9 @@ $BuildRoot = [System.IO.Path]::GetFullPath('D:\Projetos\MatrixHV\builds')
 $ConfigurationName = $Configuration.ToLowerInvariant()
 $OutputRoot = Join-Path $BuildRoot $ConfigurationName
 $BinaryPath = Join-Path $OutputRoot 'MatrixHV.efi'
+$ConfigPath = Join-Path $OutputRoot 'MatrixConfig.bin'
 $BootPath = Join-Path $OutputRoot 'EFI\BOOT\BOOTX64.EFI'
-$ImagePath = Join-Path $BuildRoot "images\MatrixHV-$ConfigurationName.img"
+$ImagePath = Join-Path $OutputRoot 'MatrixHV.img'
 $PackageRoot = Join-Path $BuildRoot 'packages'
 $StagingRoot = Join-Path $BuildRoot ".package\$ConfigurationName"
 $ArchivePath = Join-Path $PackageRoot "MatrixHV-$ConfigurationName.zip"
@@ -27,6 +28,9 @@ if (-not (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $BootPath -PathType Leaf)) {
     throw "Staged removable-media boot file not found: $BootPath"
 }
+if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+    throw "Staged MatrixHV configuration not found: $ConfigPath"
+}
 
 if (Test-Path -LiteralPath $StagingRoot) {
     Remove-Item -LiteralPath $StagingRoot -Recurse -Force
@@ -37,6 +41,7 @@ New-Item -ItemType Directory -Path $PackageRoot -Force | Out-Null
 
 try {
     Copy-Item -LiteralPath $BinaryPath -Destination (Join-Path $StagingRoot 'MatrixHV.efi') -Force
+    Copy-Item -LiteralPath $ConfigPath -Destination (Join-Path $StagingRoot 'MatrixConfig.bin') -Force
     Copy-Item -LiteralPath $BootPath -Destination (Join-Path $StagingRoot 'EFI\BOOT\BOOTX64.EFI') -Force
 
     if (Test-Path -LiteralPath $ImagePath -PathType Leaf) {

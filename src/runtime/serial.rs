@@ -36,11 +36,6 @@ pub fn write_line(message: &str) {
     let _ = writeln!(writer, "{message}");
 }
 
-pub fn write_status(prefix: &str, status: uefi::Status) {
-    let mut writer = SerialWriter;
-    let _ = writeln!(writer, "{prefix}:{status:?}");
-}
-
 fn write_byte(byte: u8) {
     for _ in 0..TX_WAIT_LIMIT {
         let ready = unsafe { in8(COM1 + 5) } & TRANSMIT_EMPTY != 0;

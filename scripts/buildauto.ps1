@@ -20,6 +20,7 @@ $BuildRoot = 'D:\Projetos\MatrixHV\builds'
 $TargetTriple = 'x86_64-unknown-uefi'
 $BinaryName = 'MatrixHV'
 $ManifestPath = Join-Path $ProjectRoot 'Cargo.toml'
+$ConfigPath = Join-Path $ProjectRoot 'config\MatrixConfig.bin'
 $CargoTargetRoot = Join-Path $BuildRoot '.cargo-target'
 $ConfigurationName = $Configuration.ToLowerInvariant()
 $CargoProfile = if ($Configuration -eq 'Release') { 'release' } else { 'debug' }
@@ -66,11 +67,17 @@ if (-not (Test-Path -LiteralPath $BuiltBinary -PathType Leaf)) {
 }
 
 $StagedBinary = Join-Path $OutputRoot "$BinaryName.efi"
+$StagedConfig = Join-Path $OutputRoot 'MatrixConfig.bin'
 $BootBinary = Join-Path $BootRoot 'BOOTX64.EFI'
 Copy-Item -LiteralPath $BuiltBinary -Destination $StagedBinary -Force
 Copy-Item -LiteralPath $BuiltBinary -Destination $BootBinary -Force
+if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+    throw "MatrixHV configuration was not generated: $ConfigPath"
+}
+Copy-Item -LiteralPath $ConfigPath -Destination $StagedConfig -Force
 
 Write-Host "Staged UEFI binary: $StagedBinary"
+Write-Host "Staged MatrixHV configuration: $StagedConfig"
 Write-Host "Staged removable-media boot file: $BootBinary"
 
 if (-not $SkipImage) {
