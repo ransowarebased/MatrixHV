@@ -19,6 +19,7 @@ pub enum VmcsError {
     Vmptrld(VmxInstructionResult),
     CurrentPointerMismatch { expected: u64, actual: u64 },
     Vmread(VmxInstructionResult),
+    Vmwrite(VmxInstructionResult),
     FinalVmclear(VmxInstructionResult),
 }
 
@@ -31,12 +32,12 @@ pub struct VmcsReport {
     pub instruction_error: u64,
 }
 
-struct VmcsRegion {
+pub(crate) struct VmcsRegion {
     pointer: NonNull<u8>,
 }
 
 impl VmcsRegion {
-    fn allocate(vmx_basic: u64) -> Result<Self, VmcsError> {
+    pub(crate) fn allocate(vmx_basic: u64) -> Result<Self, VmcsError> {
         let allocate_type = if vt_vmxon::region_uses_32_bit_physical_addresses(vmx_basic) {
             AllocateType::MaxAddress(u32::MAX as u64)
         } else {
@@ -50,11 +51,11 @@ impl VmcsRegion {
         Ok(Self { pointer })
     }
 
-    fn physical_address(&self) -> u64 {
+    pub(crate) fn physical_address(&self) -> u64 {
         self.pointer.as_ptr() as u64
     }
 
-    fn write_revision_id(&mut self, revision_id: u32) {
+    pub(crate) fn write_revision_id(&mut self, revision_id: u32) {
         unsafe {
             self.pointer.as_ptr().cast::<u32>().write(revision_id);
         }
@@ -98,7 +99,7 @@ pub fn probe_vmcs() -> Result<VmcsReport, VmcsError> {
     let current_vmcs_physical_address = unsafe { vmptrst() };
     logger::phase("vmx.vmcs.vmptrst.ok");
     logger::phase("vmx.vmcs.vmread_error.start");
-    let (instruction_error, read_result) = unsafe { vmread(VM_INSTRUCTION_ERROR) };
+    let (instruction_error, read_result) = unsafe { vmread_raw(VM_INSTRUCTION_ERROR) };
     if read_result == VmxInstructionResult::Succeeded {
         logger::phase("vmx.vmcs.vmread_error.ok");
     }
@@ -132,7 +133,7 @@ pub fn probe_vmcs() -> Result<VmcsReport, VmcsError> {
     })
 }
 
-unsafe fn vmclear(physical_address: u64) -> VmxInstructionResult {
+pub(crate) unsafe fn vmclear(physical_address: u64) -> VmxInstructionResult {
     let carry: u8;
     let zero: u8;
     unsafe {
@@ -149,7 +150,7 @@ unsafe fn vmclear(physical_address: u64) -> VmxInstructionResult {
     vt_vmxon::decode_flags(carry, zero)
 }
 
-unsafe fn vmptrld(physical_address: u64) -> VmxInstructionResult {
+pub(crate) unsafe fn vmptrld(physical_address: u64) -> VmxInstructionResult {
     let carry: u8;
     let zero: u8;
     unsafe {
@@ -178,7 +179,7 @@ unsafe fn vmptrst() -> u64 {
     physical_address
 }
 
-unsafe fn vmread(field: u64) -> (u64, VmxInstructionResult) {
+pub(crate) unsafe fn vmread_raw(field: u64) -> (u64, VmxInstructionResult) {
     let value: u64;
     let carry: u8;
     let zero: u8;
@@ -195,4 +196,47 @@ unsafe fn vmread(field: u64) -> (u64, VmxInstructionResult) {
         );
     }
     (value, vt_vmxon::decode_flags(carry, zero))
+}
+
+pub(crate) fn vmread(field: u64) -> Result<u64, VmcsError> {
+    let (value, result) = unsafe { vmread_raw(field) };
+    if result == VmxInstructionResult::Succeeded {
+        Ok(value)
+    } else {
+        Err(VmcsError::Vmread(result))
+    }
+}
+
+pub(crate) fn vmwrite(field: u64, value: u64) -> Result<(), VmcsError> {
+    let carry: u8;
+    let zero: u8;
+    unsafe {
+        asm!(
+            "vmwrite {field}, {value}",
+            "setc {carry}",
+            "setz {zero}",
+            field = in(reg) field,
+            value = in(reg) value,
+            carry = lateout(reg_byte) carry,
+            zero = lateout(reg_byte) zero,
+            options(nostack)
+        );
+    }
+    let result = vt_vmxon::decode_flags(carry, zero);
+    if result == VmxInstructionResult::Succeeded {
+        Ok(())
+    } else {
+        Err(VmcsError::Vmwrite(result))
+    }
+}
+
+pub(crate) fn instruction_error_name(error: u64) -> &'static str {
+    match error {
+        0 => "none",
+        4 => "vmlaunch_non_clear_vmcs",
+        7 => "vm_entry_invalid_control_fields",
+        8 => "vm_entry_invalid_host_state",
+        26 => "vm_entry_blocked_by_mov_ss",
+        _ => "other",
+    }
 }

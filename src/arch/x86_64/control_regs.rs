@@ -12,6 +12,15 @@ pub fn read_cr0() -> u64 {
 }
 
 #[inline]
+pub fn read_cr3() -> u64 {
+    let value: u64;
+    unsafe {
+        asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+#[inline]
 pub unsafe fn write_cr0(value: u64) {
     unsafe {
         asm!("mov cr0, {}", in(reg) value, options(nomem, nostack, preserves_flags));

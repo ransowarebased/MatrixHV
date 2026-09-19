@@ -1,1 +1,103 @@
+pub const GUEST_ES_SELECTOR: u64 = 0x0800;
+pub const GUEST_CS_SELECTOR: u64 = 0x0802;
+pub const GUEST_SS_SELECTOR: u64 = 0x0804;
+pub const GUEST_DS_SELECTOR: u64 = 0x0806;
+pub const GUEST_FS_SELECTOR: u64 = 0x0808;
+pub const GUEST_GS_SELECTOR: u64 = 0x080a;
+pub const GUEST_LDTR_SELECTOR: u64 = 0x080c;
+pub const GUEST_TR_SELECTOR: u64 = 0x080e;
+
+pub const HOST_ES_SELECTOR: u64 = 0x0c00;
+pub const HOST_CS_SELECTOR: u64 = 0x0c02;
+pub const HOST_SS_SELECTOR: u64 = 0x0c04;
+pub const HOST_DS_SELECTOR: u64 = 0x0c06;
+pub const HOST_FS_SELECTOR: u64 = 0x0c08;
+pub const HOST_GS_SELECTOR: u64 = 0x0c0a;
+pub const HOST_TR_SELECTOR: u64 = 0x0c0c;
+
+pub const VMCS_LINK_POINTER: u64 = 0x2800;
+pub const GUEST_IA32_DEBUGCTL: u64 = 0x2802;
+pub const GUEST_IA32_EFER: u64 = 0x2806;
+
+pub const PIN_BASED_VM_EXEC_CONTROL: u64 = 0x4000;
+pub const CPU_BASED_VM_EXEC_CONTROL: u64 = 0x4002;
+pub const EXCEPTION_BITMAP: u64 = 0x4004;
+pub const PAGE_FAULT_ERROR_CODE_MASK: u64 = 0x4006;
+pub const PAGE_FAULT_ERROR_CODE_MATCH: u64 = 0x4008;
+pub const CR3_TARGET_COUNT: u64 = 0x400a;
+pub const VM_EXIT_CONTROLS: u64 = 0x400c;
+pub const VM_EXIT_MSR_STORE_COUNT: u64 = 0x400e;
+pub const VM_EXIT_MSR_LOAD_COUNT: u64 = 0x4010;
+pub const VM_ENTRY_CONTROLS: u64 = 0x4012;
+pub const VM_ENTRY_MSR_LOAD_COUNT: u64 = 0x4014;
+pub const VM_ENTRY_INTR_INFO_FIELD: u64 = 0x4016;
+pub const SECONDARY_VM_EXEC_CONTROL: u64 = 0x401e;
+
 pub const VM_INSTRUCTION_ERROR: u64 = 0x4400;
+pub const VM_EXIT_REASON: u64 = 0x4402;
+pub const VM_EXIT_INSTRUCTION_LEN: u64 = 0x440c;
+
+pub const GUEST_ES_LIMIT: u64 = 0x4800;
+pub const GUEST_CS_LIMIT: u64 = 0x4802;
+pub const GUEST_SS_LIMIT: u64 = 0x4804;
+pub const GUEST_DS_LIMIT: u64 = 0x4806;
+pub const GUEST_FS_LIMIT: u64 = 0x4808;
+pub const GUEST_GS_LIMIT: u64 = 0x480a;
+pub const GUEST_LDTR_LIMIT: u64 = 0x480c;
+pub const GUEST_TR_LIMIT: u64 = 0x480e;
+pub const GUEST_GDTR_LIMIT: u64 = 0x4810;
+pub const GUEST_IDTR_LIMIT: u64 = 0x4812;
+pub const GUEST_ES_AR_BYTES: u64 = 0x4814;
+pub const GUEST_CS_AR_BYTES: u64 = 0x4816;
+pub const GUEST_SS_AR_BYTES: u64 = 0x4818;
+pub const GUEST_DS_AR_BYTES: u64 = 0x481a;
+pub const GUEST_FS_AR_BYTES: u64 = 0x481c;
+pub const GUEST_GS_AR_BYTES: u64 = 0x481e;
+pub const GUEST_LDTR_AR_BYTES: u64 = 0x4820;
+pub const GUEST_TR_AR_BYTES: u64 = 0x4822;
+pub const GUEST_INTERRUPTIBILITY_INFO: u64 = 0x4824;
+pub const GUEST_ACTIVITY_STATE: u64 = 0x4826;
+pub const GUEST_SYSENTER_CS: u64 = 0x482a;
+
+pub const HOST_SYSENTER_CS: u64 = 0x4c00;
+
+pub const CR0_GUEST_HOST_MASK: u64 = 0x6000;
+pub const CR4_GUEST_HOST_MASK: u64 = 0x6002;
+pub const CR0_READ_SHADOW: u64 = 0x6004;
+pub const CR4_READ_SHADOW: u64 = 0x6006;
+
+pub const EXIT_QUALIFICATION: u64 = 0x6400;
+
+pub const GUEST_CR0: u64 = 0x6800;
+pub const GUEST_CR3: u64 = 0x6802;
+pub const GUEST_CR4: u64 = 0x6804;
+pub const GUEST_ES_BASE: u64 = 0x6806;
+pub const GUEST_CS_BASE: u64 = 0x6808;
+pub const GUEST_SS_BASE: u64 = 0x680a;
+pub const GUEST_DS_BASE: u64 = 0x680c;
+pub const GUEST_FS_BASE: u64 = 0x680e;
+pub const GUEST_GS_BASE: u64 = 0x6810;
+pub const GUEST_LDTR_BASE: u64 = 0x6812;
+pub const GUEST_TR_BASE: u64 = 0x6814;
+pub const GUEST_GDTR_BASE: u64 = 0x6816;
+pub const GUEST_IDTR_BASE: u64 = 0x6818;
+pub const GUEST_DR7: u64 = 0x681a;
+pub const GUEST_RSP: u64 = 0x681c;
+pub const GUEST_RIP: u64 = 0x681e;
+pub const GUEST_RFLAGS: u64 = 0x6820;
+pub const GUEST_PENDING_DBG_EXCEPTIONS: u64 = 0x6822;
+pub const GUEST_SYSENTER_ESP: u64 = 0x6824;
+pub const GUEST_SYSENTER_EIP: u64 = 0x6826;
+
+pub const HOST_CR0: u64 = 0x6c00;
+pub const HOST_CR3: u64 = 0x6c02;
+pub const HOST_CR4: u64 = 0x6c04;
+pub const HOST_FS_BASE: u64 = 0x6c06;
+pub const HOST_GS_BASE: u64 = 0x6c08;
+pub const HOST_TR_BASE: u64 = 0x6c0a;
+pub const HOST_GDTR_BASE: u64 = 0x6c0c;
+pub const HOST_IDTR_BASE: u64 = 0x6c0e;
+pub const HOST_SYSENTER_ESP: u64 = 0x6c10;
+pub const HOST_SYSENTER_EIP: u64 = 0x6c12;
+pub const HOST_RSP: u64 = 0x6c14;
+pub const HOST_RIP: u64 = 0x6c16;
