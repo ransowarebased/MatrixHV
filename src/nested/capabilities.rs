@@ -167,20 +167,12 @@ impl NestedVmxCapabilities {
             0
         };
         let true_exit_ctls = if has_true_controls {
-            restrict_emulated_control(
-                host.true_exit_ctls,
-                exit_supported,
-                VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
-            )
+            restrict_emulated_control(host.true_exit_ctls, exit_supported, 0)
         } else {
             0
         };
         let true_entry_ctls = if has_true_controls {
-            restrict_emulated_control(
-                host.true_entry_ctls,
-                entry_supported,
-                VM_ENTRY_IA32E_MODE_GUEST,
-            )
+            restrict_emulated_control(host.true_entry_ctls, entry_supported, 0)
         } else {
             0
         };

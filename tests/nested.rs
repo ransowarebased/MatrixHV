@@ -155,16 +155,14 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     let true_pinbased_control = control_capabilities(0, capabilities::VMX_LEGACY_PINBASED_DEFAULT1);
     let legacy_entry_bits =
         capabilities::VMX_LEGACY_ENTRY_DEFAULT1 | capabilities::VM_ENTRY_IA32E_MODE_GUEST;
-    let ia32e_control =
-        control_capabilities(capabilities::VM_ENTRY_IA32E_MODE_GUEST, legacy_entry_bits);
-    let legacy_entry_control = control_capabilities(legacy_entry_bits, legacy_entry_bits);
+    let ia32e_control = control_capabilities(0, legacy_entry_bits);
+    let legacy_entry_control =
+        control_capabilities(capabilities::VMX_LEGACY_ENTRY_DEFAULT1, legacy_entry_bits);
     let legacy_exit_bits =
         capabilities::VMX_LEGACY_EXIT_DEFAULT1 | capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE;
-    let host_address_size_control = control_capabilities(
-        capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
-        legacy_exit_bits,
-    );
-    let legacy_exit_control = control_capabilities(legacy_exit_bits, legacy_exit_bits);
+    let host_address_size_control = control_capabilities(0, legacy_exit_bits);
+    let legacy_exit_control =
+        control_capabilities(capabilities::VMX_LEGACY_EXIT_DEFAULT1, legacy_exit_bits);
     let primary_may_be_one = capabilities::VMX_LEGACY_PROCBASED_DEFAULT1
         | capabilities::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS;
     let primary_control = control_capabilities(
@@ -253,14 +251,8 @@ fn emulated_true_controls_do_not_inherit_host_fixed_one_settings() {
 
     assert_eq!(capabilities.vmx_true_pinbased_ctls as u32, 0);
     assert_eq!(capabilities.vmx_true_procbased_ctls as u32, 0);
-    assert_eq!(
-        capabilities.vmx_true_exit_ctls as u32,
-        capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
-    );
-    assert_eq!(
-        capabilities.vmx_true_entry_ctls as u32,
-        capabilities::VM_ENTRY_IA32E_MODE_GUEST
-    );
+    assert_eq!(capabilities.vmx_true_exit_ctls as u32, 0);
+    assert_eq!(capabilities.vmx_true_entry_ctls as u32, 0);
 }
 
 #[test]

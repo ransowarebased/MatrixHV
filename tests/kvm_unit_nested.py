@@ -26,6 +26,8 @@ DEFAULT_CASES = (
     "test_vmx_caps",
     "vmenter",
     "vmx_controls_test",
+    "vmx_host_state_area_test",
+    "vmx_guest_state_area_test",
 )
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SUMMARY_PATTERN = re.compile(
