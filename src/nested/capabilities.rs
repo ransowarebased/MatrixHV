@@ -24,6 +24,13 @@ pub const IA32_VMX_TRUE_ENTRY_CTLS_MSR: u32 = 0x490;
 
 pub const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
 pub const VM_ENTRY_IA32E_MODE_GUEST: u32 = 1 << 9;
+pub const VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
+pub const VMX_SECONDARY_ENABLE_EPT: u32 = 1 << 1;
+pub const VMX_EPT_PAGE_WALK_LENGTH_4: u64 = 1 << 6;
+pub const VMX_EPT_MEMORY_TYPE_WB: u64 = 1 << 14;
+pub const VMX_EPT_2MB_PAGE: u64 = 1 << 16;
+pub const VMX_EPT_CAPABILITIES: u64 =
+    VMX_EPT_PAGE_WALK_LENGTH_4 | VMX_EPT_MEMORY_TYPE_WB | VMX_EPT_2MB_PAGE;
 pub const VMCS12_MAX_ENUM_INDEX: u64 = 22;
 
 pub const CPUID_VMX_BIT: u32 = 1 << 5;
@@ -110,6 +117,26 @@ impl NestedVmxCapabilities {
     pub fn from_host(host: HostVmxCapabilities) -> Self {
         let revision_id = host.vmx_basic as u32 & 0x7fff_ffff;
         let has_true_controls = host.vmx_basic & VMX_BASIC_TRUE_CONTROLS != 0;
+        let selected_primary = if has_true_controls {
+            host.true_procbased_ctls
+        } else {
+            host.procbased_ctls
+        };
+        let ept_supported =
+            control_may_be_one(selected_primary, VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS)
+                && control_may_be_one(host.procbased_ctls2, VMX_SECONDARY_ENABLE_EPT)
+                && host.ept_vpid_cap & (VMX_EPT_PAGE_WALK_LENGTH_4 | VMX_EPT_MEMORY_TYPE_WB)
+                    == (VMX_EPT_PAGE_WALK_LENGTH_4 | VMX_EPT_MEMORY_TYPE_WB);
+        let primary_supported = if ept_supported {
+            VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS
+        } else {
+            0
+        };
+        let secondary_supported = if ept_supported {
+            VMX_SECONDARY_ENABLE_EPT
+        } else {
+            0
+        };
         let exit_ctls = restrict_control(
             host.exit_ctls,
             VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
@@ -147,7 +174,7 @@ impl NestedVmxCapabilities {
                 | (VMX_MEMORY_TYPE_WRITE_BACK << 50)
                 | (host.vmx_basic & VMX_BASIC_TRUE_CONTROLS),
             vmx_pinbased_ctls: restrict_control(host.pinbased_ctls, 0, 0),
-            vmx_procbased_ctls: restrict_control(host.procbased_ctls, 0, 0),
+            vmx_procbased_ctls: restrict_control(host.procbased_ctls, primary_supported, 0),
             vmx_exit_ctls: exit_ctls,
             vmx_entry_ctls: entry_ctls,
             vmx_misc: 0,
@@ -156,15 +183,19 @@ impl NestedVmxCapabilities {
             vmx_cr4_fixed0: host.cr4_fixed0,
             vmx_cr4_fixed1: host.cr4_fixed1,
             vmx_vmcs_enum: restrict_vmcs_enum(host.vmcs_enum),
-            vmx_procbased_ctls2: restrict_control(host.procbased_ctls2, 0, 0),
-            vmx_ept_vpid_cap: 0,
+            vmx_procbased_ctls2: restrict_control(host.procbased_ctls2, secondary_supported, 0),
+            vmx_ept_vpid_cap: if ept_supported {
+                host.ept_vpid_cap & VMX_EPT_CAPABILITIES
+            } else {
+                0
+            },
             vmx_true_pinbased_ctls: if has_true_controls {
                 restrict_control(host.true_pinbased_ctls, 0, 0)
             } else {
                 0
             },
             vmx_true_procbased_ctls: if has_true_controls {
-                restrict_control(host.true_procbased_ctls, 0, 0)
+                restrict_control(host.true_procbased_ctls, primary_supported, 0)
             } else {
                 0
             },
@@ -216,6 +247,10 @@ fn restrict_control(host: u64, supported: u32, required: u32) -> u64 {
     let may_be_one = host_may_be_one & supported;
     let must_be_one = (host_must_be_one | required) & may_be_one;
     u64::from(must_be_one) | (u64::from(may_be_one) << 32)
+}
+
+fn control_may_be_one(capabilities: u64, control: u32) -> bool {
+    (capabilities >> 32) as u32 & control != 0
 }
 
 fn restrict_vmcs_enum(host: u64) -> u64 {

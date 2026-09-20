@@ -1,4 +1,8 @@
-use crate::hv_core::vt_ept::{EptError, IdentityEpt};
+extern crate alloc;
+
+use alloc::vec::Vec;
+
+use crate::hv_core::vt_ept::{EptComposition, EptError, IdentityEpt};
 use crate::hv_core::vt_resident::{
     BOOT_GUEST_STACK_PAGES, HOST_STACK_PAGES, ResidentHostSelectors, ResidentHostTables,
     ResidentProbeError,
@@ -13,6 +17,11 @@ const NESTED_VMCS12_OPERAND_POINTER_OFFSET: usize = 16;
 const NESTED_VMPTRST_DESTINATION_POINTER_OFFSET: usize = 24;
 const NESTED_VMCS12_OPERAND_PAGE_OFFSET: u64 = PAGE_SIZE as u64;
 const NESTED_VMPTRST_DESTINATION_OFFSET: u64 = NESTED_VMCS12_OPERAND_PAGE_OFFSET + 8;
+const NESTED_EPT12_POINTER_OFFSET: usize = 32;
+const NESTED_EPT_SOURCE_POINTER_OFFSET: usize = 40;
+const NESTED_EPT_TARGET_POINTER_OFFSET: usize = 48;
+pub(crate) const NESTED_EPT_SOURCE_MARKER: u64 = 0x4e45_5054_5352_4331;
+pub(crate) const NESTED_EPT_TARGET_MARKER: u64 = 0x4e45_5054_5447_5431;
 
 pub(crate) struct ResidentCpuResources {
     pub(crate) vmxon_region: VmxonRegion,
@@ -25,6 +34,11 @@ pub(crate) struct ResidentCpuResources {
     pub(crate) resident_msr_state: ResidentPages,
     pub(crate) nested_vmxon_page: ResidentPages,
     pub(crate) nested_vmcs12_pages: ResidentPages,
+    nested_ept_source_page: ResidentPages,
+    nested_ept_target_page: ResidentPages,
+    nested_ept12: Option<IdentityEpt>,
+    nested_ept02: Option<IdentityEpt>,
+    nested_ept_composition: Option<EptComposition>,
 }
 
 impl ResidentCpuResources {
@@ -47,6 +61,10 @@ impl ResidentCpuResources {
         let nested_vmxon_page = ResidentPages::allocate(1, AddressConstraint::Any)
             .map_err(ResidentProbeError::Allocation)?;
         let nested_vmcs12_pages = ResidentPages::allocate(2, AddressConstraint::Any)
+            .map_err(ResidentProbeError::Allocation)?;
+        let nested_ept_source_page = ResidentPages::allocate(1, AddressConstraint::Any)
+            .map_err(ResidentProbeError::Allocation)?;
+        let nested_ept_target_page = ResidentPages::allocate(1, AddressConstraint::Any)
             .map_err(ResidentProbeError::Allocation)?;
         let capabilities = NestedVmxCapabilities::vmxon_vmxoff(vmx_basic);
         let nested_vmcs12_region = nested_vmcs12_pages.physical_address();
@@ -77,6 +95,16 @@ impl ResidentCpuResources {
                 .add(NESTED_VMPTRST_DESTINATION_OFFSET as usize)
                 .cast::<u64>()
                 .write(u64::MAX);
+            nested_ept_source_page
+                .pointer()
+                .as_ptr()
+                .cast::<u64>()
+                .write(NESTED_EPT_SOURCE_MARKER);
+            nested_ept_target_page
+                .pointer()
+                .as_ptr()
+                .cast::<u64>()
+                .write(NESTED_EPT_TARGET_MARKER);
         }
 
         Ok(Self {
@@ -90,7 +118,43 @@ impl ResidentCpuResources {
             resident_msr_state,
             nested_vmxon_page,
             nested_vmcs12_pages,
+            nested_ept_source_page,
+            nested_ept_target_page,
+            nested_ept12: None,
+            nested_ept02: None,
+            nested_ept_composition: None,
         })
+    }
+
+    pub(crate) fn prepare_nested_ept(
+        &mut self,
+        ept01: &IdentityEpt,
+    ) -> Result<EptComposition, EptError> {
+        let source_gpa = self.nested_ept_source_page.physical_address();
+        let target_gpa = self.nested_ept_target_page.physical_address();
+        let mut ept12 = IdentityEpt::build()?;
+        ept12.remap_page(source_gpa, target_gpa)?;
+        let mut ept02 = ept01.clone_shadow()?;
+        let composition = ept02.compose_page(&ept12, ept01, source_gpa)?;
+        unsafe {
+            let metadata = self.nested_vmxon_page.pointer().as_ptr();
+            metadata
+                .add(NESTED_EPT12_POINTER_OFFSET)
+                .cast::<u64>()
+                .write(ept12.ept_pointer());
+            metadata
+                .add(NESTED_EPT_SOURCE_POINTER_OFFSET)
+                .cast::<u64>()
+                .write(source_gpa);
+            metadata
+                .add(NESTED_EPT_TARGET_POINTER_OFFSET)
+                .cast::<u64>()
+                .write(target_gpa);
+        }
+        self.nested_ept12 = Some(ept12);
+        self.nested_ept02 = Some(ept02);
+        self.nested_ept_composition = Some(composition);
+        Ok(composition)
     }
 
     pub(crate) fn nested_vmxon_operand(&self) -> u64 {
@@ -115,6 +179,43 @@ impl ResidentCpuResources {
 
     pub(crate) fn nested_vmcs02_region(&self) -> u64 {
         self.nested_vmcs02_region.physical_address()
+    }
+
+    pub(crate) fn nested_ept12_pointer(&self) -> Option<u64> {
+        self.nested_ept12.as_ref().map(IdentityEpt::ept_pointer)
+    }
+
+    pub(crate) fn nested_ept02_pointer(&self) -> Option<u64> {
+        self.nested_ept02.as_ref().map(IdentityEpt::ept_pointer)
+    }
+
+    pub(crate) fn nested_ept_source_gpa(&self) -> u64 {
+        self.nested_ept_source_page.physical_address()
+    }
+
+    pub(crate) fn nested_ept_target_gpa(&self) -> u64 {
+        self.nested_ept_target_page.physical_address()
+    }
+
+    pub(crate) fn nested_ept_composition(&self) -> Option<EptComposition> {
+        self.nested_ept_composition
+    }
+
+    pub(crate) fn nested_ept02_table_regions(&self) -> Vec<(u64, usize)> {
+        self.nested_ept02
+            .as_ref()
+            .map(IdentityEpt::table_regions)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn deny_nested_ept02_regions(
+        &mut self,
+        regions: &[(u64, usize)],
+    ) -> Result<(), EptError> {
+        self.nested_ept02
+            .as_mut()
+            .ok_or(EptError::InvalidPageTable)?
+            .deny_guest_access_to_regions(regions)
     }
 
     pub(crate) fn deny_guest_access(&self, ept: &mut IdentityEpt) -> Result<(), EptError> {

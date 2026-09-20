@@ -56,7 +56,7 @@ const GUEST_STACK_PAGES: usize = 4;
 pub(crate) const BOOT_GUEST_STACK_PAGES: usize = 64;
 pub(crate) const HOST_STACK_PAGES: usize = 4;
 const HOST_TABLE_PAGES: usize = 2;
-const RESIDENT_CODE_PAGES: usize = 3;
+const RESIDENT_CODE_PAGES: usize = 4;
 const MSR_BITMAP_PAGES: usize = 1;
 const MSR_BITMAP_READ_HIGH_OFFSET: usize = 1024;
 const MSR_BITMAP_WRITE_LOW_OFFSET: usize = 2048;
@@ -351,7 +351,7 @@ struct ResidentBootContext {
     nested: NestedVmxState,
     original_gdtr: [u8; 10],
     original_idtr: [u8; 10],
-    alignment_padding: [u8; 28],
+    alignment_padding: [u8; 36],
     root_fx_state: [u8; 512],
 }
 
@@ -411,7 +411,7 @@ impl ResidentBootContext {
             nested,
             original_gdtr: [0; 10],
             original_idtr: [0; 10],
-            alignment_padding: [0; 28],
+            alignment_padding: [0; 36],
             root_fx_state: [0; 512],
         }
     }
@@ -577,6 +577,7 @@ const BCTX_NESTED_VMCS12_PRIMARY_CONTROL: usize = BCTX_NESTED_VMCS12_EXTENDED_FI
 const BCTX_NESTED_VMCS12_SECONDARY_CONTROL: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 24;
 const BCTX_NESTED_VMCS12_VM_EXIT_CONTROLS: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 64;
 const BCTX_NESTED_VMCS12_VM_ENTRY_CONTROLS: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 88;
+const BCTX_NESTED_VMCS12_EPT_POINTER: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 128;
 const BCTX_NESTED_VMCS12_CONTROL_VALIDATION_COUNT: usize =
     core::mem::offset_of!(ResidentBootContext, nested)
         + core::mem::offset_of!(NestedVmxState, vmcs12)
@@ -630,6 +631,12 @@ const BCTX_NESTED_L2_RESUME_COUNT: usize = core::mem::offset_of!(ResidentBootCon
     + core::mem::offset_of!(NestedVmxState, l2_resume_count);
 const BCTX_NESTED_L2_RESUME_EXIT_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, l2_resume_exit_count);
+const BCTX_NESTED_EPT12_POINTER: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, ept12_pointer);
+const BCTX_NESTED_EPT_PROBE_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, ept_probe_count);
+const BCTX_NESTED_EPT_OBSERVED_VALUE: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, ept_observed_value);
 const BCTX_ORIGINAL_GDTR: usize = core::mem::offset_of!(ResidentBootContext, original_gdtr);
 const BCTX_ORIGINAL_IDTR: usize = core::mem::offset_of!(ResidentBootContext, original_idtr);
 const BCTX_ROOT_FX_STATE: usize = core::mem::offset_of!(ResidentBootContext, root_fx_state);
@@ -1271,7 +1278,7 @@ pub fn run_windows_boot(
         .map_err(ResidentProbeError::Allocation)?;
     let mut host_address_space = HostAddressSpace::reserve().map_err(ResidentProbeError::Paging)?;
     let vmx_basic = vt_vmxon::vmx_basic();
-    let cpu_resources = ResidentCpuResources::allocate(vmx_basic, code.fatal)?;
+    let mut cpu_resources = ResidentCpuResources::allocate(vmx_basic, code.fatal)?;
     let topology = crate::smp::topology::enumerate().map_err(ResidentProbeError::Allocation)?;
     let mut ap_resources = alloc::vec::Vec::new();
     {
@@ -1341,6 +1348,28 @@ pub fn run_windows_boot(
         resources.deny_guest_access(&mut ept)?;
     }
     ept.deny_guest_access_to_tables()?;
+    let bsp_ept_composition = cpu_resources.prepare_nested_ept(&ept)?;
+    for (_, resources) in &mut ap_resources {
+        resources.prepare_nested_ept(&ept)?;
+    }
+    let mut nested_ept02_regions = cpu_resources.nested_ept02_table_regions();
+    for (_, resources) in &ap_resources {
+        nested_ept02_regions.extend(resources.nested_ept02_table_regions());
+    }
+    ept.deny_guest_access_to_regions(&nested_ept02_regions)?;
+    cpu_resources.deny_nested_ept02_regions(&nested_ept02_regions)?;
+    for (_, resources) in &mut ap_resources {
+        resources.deny_nested_ept02_regions(&nested_ept02_regions)?;
+    }
+
+    let nested_ept12_pointer = cpu_resources
+        .nested_ept12_pointer()
+        .ok_or(EptError::InvalidPageTable)?;
+    let nested_ept02_pointer = cpu_resources
+        .nested_ept02_pointer()
+        .ok_or(EptError::InvalidPageTable)?;
+    let nested_ept_source_gpa = cpu_resources.nested_ept_source_gpa();
+    let nested_ept_target_gpa = cpu_resources.nested_ept_target_gpa();
 
     let ResidentCpuResources {
         vmxon_region,
@@ -1353,6 +1382,7 @@ pub fn run_windows_boot(
         resident_msr_state,
         nested_vmxon_page,
         nested_vmcs12_pages,
+        ..
     } = cpu_resources;
     let nested_vmxon_operand = nested_vmxon_page.physical_address() + 8;
     let nested_vmxon_region = nested_vmxon_page.physical_address();
@@ -1382,6 +1412,27 @@ pub fn run_windows_boot(
     let guest_rsp = guest_stack.physical_address() + guest_stack.byte_len() as u64;
     let guest = vt_state::configure_guest_with_rflags(entry_rip, guest_rsp & !0xf, initial_rflags)?;
     let nested_capabilities = nested_vmx_capabilities(vmx_basic);
+    let mut nested_state = NestedVmxState::new(
+        nested_capabilities,
+        nested_vmxon_operand,
+        nested_vmxon_region,
+        NestedVmcs12State::new(
+            nested_capabilities.revision_id,
+            nested_vmcs12_operand,
+            nested_vmcs12_region,
+            nested_vmptrst_destination,
+        ),
+        vmcs_physical_address,
+        nested_vmcs02_physical_address,
+    );
+    nested_state.configure_ept(
+        nested_ept12_pointer,
+        nested_ept02_pointer,
+        nested_ept_source_gpa,
+        nested_ept_target_gpa,
+        bsp_ept_composition.host_physical_address,
+        bsp_ept_composition.permissions,
+    );
 
     let context = context_pages
         .pointer()
@@ -1395,19 +1446,7 @@ pub fn run_windows_boot(
             ept_test_page.physical_address(),
             ept_probe_fault_rip,
             ept_probe_resume_rip,
-            NestedVmxState::new(
-                nested_capabilities,
-                nested_vmxon_operand,
-                nested_vmxon_region,
-                NestedVmcs12State::new(
-                    nested_capabilities.revision_id,
-                    nested_vmcs12_operand,
-                    nested_vmcs12_region,
-                    nested_vmptrst_destination,
-                ),
-                vmcs_physical_address,
-                nested_vmcs02_physical_address,
-            ),
+            nested_state,
         ));
     }
     let host_rsp = (host_stack.physical_address() + host_stack.byte_len() as u64 - 8) & !0xf;
@@ -1418,7 +1457,7 @@ pub fn run_windows_boot(
         vmcs01_region: vmcs_physical_address,
         vmcs02_region: nested_vmcs02_physical_address,
         msr_bitmap: msr_bitmap.physical_address(),
-        ept_pointer: ept.ept_pointer(),
+        ept_pointer: nested_ept02_pointer,
         msr_state: &resident_msr_state,
         host_cr3: host_space.host_cr3,
         host_tables: &host_tables,
@@ -1522,8 +1561,8 @@ pub fn run_windows_boot(
             || nested.vmcs12.vmclear_count != 2
             || nested.vmcs12.vmptrld_count != 2
             || nested.vmcs12.vmptrst_count != 1
-            || nested.vmcs12.vmwrite_count != 15
-            || nested.vmcs12.vmread_count != 18
+            || nested.vmcs12.vmwrite_count != 16
+            || nested.vmcs12.vmread_count != 19
             || nested.vmcs12.probe_complete != 1
             || nested.vmcs12.vmlaunch_count != 3
             || nested.vmcs12.vmresume_count != 3
@@ -1540,6 +1579,16 @@ pub fn run_windows_boot(
             || nested.l1_reflection_count != 2
             || nested.l2_resume_count != 1
             || nested.l2_resume_exit_count != 1
+            || nested.ept12_pointer == 0
+            || nested.ept02_pointer == 0
+            || nested.ept12_pointer == nested.ept02_pointer
+            || nested.ept_source_gpa == nested.ept_target_gpa
+            || nested.ept_composed_hpa != nested.ept_target_gpa
+            || nested.ept_permissions != 7
+            || nested.ept_composition_count != 1
+            || nested.ept_probe_count != 1
+            || nested.ept_observed_value != crate::smp::per_cpu::NESTED_EPT_TARGET_MARKER
+            || nested.vmcs12.extended_fields[16] != nested.ept12_pointer
         {
             resident_startup_halt();
         }
@@ -1654,6 +1703,20 @@ impl ResidentApLaunch<'_> {
         let nested_vmcs12_region = self.resources.nested_vmcs12_region();
         let nested_vmptrst_destination = self.resources.nested_vmptrst_destination();
         let nested_vmcs02_region = self.resources.nested_vmcs02_region();
+        let nested_ept12_pointer = self
+            .resources
+            .nested_ept12_pointer()
+            .ok_or(EptError::InvalidPageTable)?;
+        let nested_ept02_pointer = self
+            .resources
+            .nested_ept02_pointer()
+            .ok_or(EptError::InvalidPageTable)?;
+        let nested_ept_source_gpa = self.resources.nested_ept_source_gpa();
+        let nested_ept_target_gpa = self.resources.nested_ept_target_gpa();
+        let nested_ept_composition = self
+            .resources
+            .nested_ept_composition()
+            .ok_or(EptError::InvalidPageTable)?;
         let vmx_basic = vt_vmxon::vmx_basic();
         let session = vt_vmxon::enter_vmx_root_with_borrowed_region(
             vmx_basic,
@@ -1674,6 +1737,27 @@ impl ResidentApLaunch<'_> {
         configure_resident_host(self.host_cr3, &self.resources.host_tables, segments)?;
         let guest = vt_state::configure_guest(guest_rip, guest_rsp)?;
         let nested_capabilities = nested_vmx_capabilities(vmx_basic);
+        let mut nested_state = NestedVmxState::new(
+            nested_capabilities,
+            nested_vmxon_operand,
+            nested_vmxon_region,
+            NestedVmcs12State::new(
+                nested_capabilities.revision_id,
+                nested_vmcs12_operand,
+                nested_vmcs12_region,
+                nested_vmptrst_destination,
+            ),
+            vmcs,
+            nested_vmcs02_region,
+        );
+        nested_state.configure_ept(
+            nested_ept12_pointer,
+            nested_ept02_pointer,
+            nested_ept_source_gpa,
+            nested_ept_target_gpa,
+            nested_ept_composition.host_physical_address,
+            nested_ept_composition.permissions,
+        );
         let context = self
             .resources
             .context_pages
@@ -1687,19 +1771,7 @@ impl ResidentApLaunch<'_> {
             0,
             0,
             0,
-            NestedVmxState::new(
-                nested_capabilities,
-                nested_vmxon_operand,
-                nested_vmxon_region,
-                NestedVmcs12State::new(
-                    nested_capabilities.revision_id,
-                    nested_vmcs12_operand,
-                    nested_vmcs12_region,
-                    nested_vmptrst_destination,
-                ),
-                vmcs,
-                nested_vmcs02_region,
-            ),
+            nested_state,
         );
         state.processor_number = self.processor_number as u64;
         let host_rsp = (self.resources.host_stack.physical_address()
@@ -1714,7 +1786,7 @@ impl ResidentApLaunch<'_> {
             vmcs01_region: vmcs,
             vmcs02_region: nested_vmcs02_region,
             msr_bitmap: self.msr_bitmap,
-            ept_pointer: self.ept_pointer,
+            ept_pointer: nested_ept02_pointer,
             msr_state: &self.resources.resident_msr_state,
             host_cr3: self.host_cr3,
             host_tables: &self.resources.host_tables,
@@ -2142,6 +2214,15 @@ global_asm!(
     "and eax, 0xffff",
     "cmp eax, {vmcall_reason}",
     "jne .Lresident_dispatch_halt",
+    "cmp qword ptr [r12 + {b_nested_l2_exit_count}], 0",
+    "jne .Lresident_nested_l2_ept_probe_done",
+    "mov r11, qword ptr [rsp + 96]",
+    "mov qword ptr [r12 + {b_nested_ept_observed_value}], r11",
+    "mov rax, {nested_ept_target_marker}",
+    "cmp r11, rax",
+    "jne .Lresident_dispatch_halt",
+    "inc qword ptr [r12 + {b_nested_ept_probe_count}]",
+    ".Lresident_nested_l2_ept_probe_done:",
     "inc qword ptr [r12 + {b_nested_l2_exit_count}]",
     "inc qword ptr [r12 + {b_nested_l1_reflection_count}]",
     "cmp qword ptr [r12 + {b_nested_l2_resume_count}], 0",
@@ -2595,7 +2676,7 @@ global_asm!(
     "call .Lresident_nested_control_is_valid",
     "test eax, eax",
     "jz .Lresident_nested_validate_invalid_controls",
-    "jmp .Lresident_nested_validate_host_state",
+    "jmp .Lresident_nested_validate_ept",
     ".Lresident_nested_validate_legacy_controls:",
     "mov edx, dword ptr [r12 + {b_nested_vmcs12_pin_based_control}]",
     "mov r11, qword ptr [r12 + {b_nested_vmx_pinbased_ctls}]",
@@ -2625,6 +2706,14 @@ global_asm!(
     "call .Lresident_nested_control_is_valid",
     "test eax, eax",
     "jz .Lresident_nested_validate_invalid_controls",
+    ".Lresident_nested_validate_ept:",
+    "bt dword ptr [r12 + {b_nested_vmcs12_primary_control}], 31",
+    "jnc .Lresident_nested_validate_host_state",
+    "bt dword ptr [r12 + {b_nested_vmcs12_secondary_control}], 1",
+    "jnc .Lresident_nested_validate_host_state",
+    "mov rax, qword ptr [r12 + {b_nested_vmcs12_ept_pointer}]",
+    "cmp rax, qword ptr [r12 + {b_nested_ept12_pointer}]",
+    "jne .Lresident_nested_validate_invalid_controls",
     ".Lresident_nested_validate_host_state:",
     "mov rax, qword ptr [r12 + {b_nested_vmcs12_host_rip}]",
     "mov r11, rax",
@@ -4164,6 +4253,7 @@ global_asm!(
     b_nested_vmcs12_secondary_control = const BCTX_NESTED_VMCS12_SECONDARY_CONTROL,
     b_nested_vmcs12_vm_exit_controls = const BCTX_NESTED_VMCS12_VM_EXIT_CONTROLS,
     b_nested_vmcs12_vm_entry_controls = const BCTX_NESTED_VMCS12_VM_ENTRY_CONTROLS,
+    b_nested_vmcs12_ept_pointer = const BCTX_NESTED_VMCS12_EPT_POINTER,
     b_nested_vmcs12_control_validation_count = const BCTX_NESTED_VMCS12_CONTROL_VALIDATION_COUNT,
     b_nested_vmclear_count = const BCTX_NESTED_VMCLEAR_COUNT,
     b_nested_vmptrld_count = const BCTX_NESTED_VMPTRLD_COUNT,
@@ -4185,6 +4275,10 @@ global_asm!(
     b_nested_l1_reflection_count = const BCTX_NESTED_L1_REFLECTION_COUNT,
     b_nested_l2_resume_count = const BCTX_NESTED_L2_RESUME_COUNT,
     b_nested_l2_resume_exit_count = const BCTX_NESTED_L2_RESUME_EXIT_COUNT,
+    b_nested_ept12_pointer = const BCTX_NESTED_EPT12_POINTER,
+    b_nested_ept_probe_count = const BCTX_NESTED_EPT_PROBE_COUNT,
+    b_nested_ept_observed_value = const BCTX_NESTED_EPT_OBSERVED_VALUE,
+    nested_ept_target_marker = const crate::smp::per_cpu::NESTED_EPT_TARGET_MARKER,
     vmcs12_launch_state_clear = const VMCS12_LAUNCH_STATE_CLEAR,
     vmcs12_launch_state_launched = const VMCS12_LAUNCH_STATE_LAUNCHED,
     vmcs12_extended_field_count = const VMCS12_EXTENDED_FIELD_COUNT,

@@ -47,6 +47,15 @@ pub struct NestedVmxState {
     pub l1_reflection_count: u64,
     pub l2_resume_count: u64,
     pub l2_resume_exit_count: u64,
+    pub ept12_pointer: u64,
+    pub ept02_pointer: u64,
+    pub ept_source_gpa: u64,
+    pub ept_target_gpa: u64,
+    pub ept_composed_hpa: u64,
+    pub ept_permissions: u64,
+    pub ept_composition_count: u64,
+    pub ept_probe_count: u64,
+    pub ept_observed_value: u64,
 }
 
 impl NestedVmxState {
@@ -100,6 +109,33 @@ impl NestedVmxState {
             l1_reflection_count: 0,
             l2_resume_count: 0,
             l2_resume_exit_count: 0,
+            ept12_pointer: 0,
+            ept02_pointer: 0,
+            ept_source_gpa: 0,
+            ept_target_gpa: 0,
+            ept_composed_hpa: 0,
+            ept_permissions: 0,
+            ept_composition_count: 0,
+            ept_probe_count: 0,
+            ept_observed_value: 0,
         }
+    }
+
+    pub fn configure_ept(
+        &mut self,
+        ept12_pointer: u64,
+        ept02_pointer: u64,
+        source_gpa: u64,
+        target_gpa: u64,
+        composed_hpa: u64,
+        permissions: u64,
+    ) {
+        self.ept12_pointer = ept12_pointer;
+        self.ept02_pointer = ept02_pointer;
+        self.ept_source_gpa = source_gpa;
+        self.ept_target_gpa = target_gpa;
+        self.ept_composed_hpa = composed_hpa;
+        self.ept_permissions = permissions;
+        self.ept_composition_count = 1;
     }
 }

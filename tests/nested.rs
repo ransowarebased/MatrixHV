@@ -129,9 +129,12 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
         capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
         capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
     );
+    let primary_control =
+        control_capabilities(0, capabilities::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS);
+    let secondary_control = control_capabilities(0, capabilities::VMX_SECONDARY_ENABLE_EPT);
 
     assert_eq!(capabilities.vmx_pinbased_ctls, 0);
-    assert_eq!(capabilities.vmx_procbased_ctls, 0);
+    assert_eq!(capabilities.vmx_procbased_ctls, primary_control);
     assert_eq!(capabilities.vmx_exit_ctls, host_address_size_control);
     assert_eq!(capabilities.vmx_entry_ctls, ia32e_control);
     assert_eq!(capabilities.vmx_misc, 0);
@@ -143,10 +146,15 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
         capabilities.vmx_vmcs_enum,
         capabilities::VMCS12_MAX_ENUM_INDEX << 1
     );
-    assert_eq!(capabilities.vmx_procbased_ctls2, 0);
-    assert_eq!(capabilities.vmx_ept_vpid_cap, 0);
+    assert_eq!(capabilities.vmx_procbased_ctls2, secondary_control);
+    assert_eq!(
+        capabilities.vmx_ept_vpid_cap,
+        capabilities::VMX_EPT_CAPABILITIES
+    );
+    assert_eq!(capabilities::VMX_EPT_CAPABILITIES, 0x1_4040);
+    assert_eq!(capabilities.vmx_ept_vpid_cap & !0x1_4040, 0);
     assert_eq!(capabilities.vmx_true_pinbased_ctls, 0);
-    assert_eq!(capabilities.vmx_true_procbased_ctls, 0);
+    assert_eq!(capabilities.vmx_true_procbased_ctls, primary_control);
     assert_eq!(capabilities.vmx_true_exit_ctls, host_address_size_control);
     assert_eq!(capabilities.vmx_true_entry_ctls, ia32e_control);
     assert!(!capabilities.expose_vmx);
@@ -168,6 +176,19 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
     assert_eq!(capabilities.vmx_entry_ctls, 0);
     assert_eq!(capabilities.vmx_true_exit_ctls, 0);
     assert_eq!(capabilities.vmx_true_entry_ctls, 0);
+}
+
+#[test]
+fn nested_ept_is_hidden_when_the_host_contract_is_incomplete() {
+    let mut host = host_vmx_capabilities();
+    host.ept_vpid_cap &= !capabilities::VMX_EPT_MEMORY_TYPE_WB;
+
+    let capabilities = NestedVmxCapabilities::from_host(host);
+
+    assert_eq!(capabilities.vmx_procbased_ctls, 0);
+    assert_eq!(capabilities.vmx_procbased_ctls2, 0);
+    assert_eq!(capabilities.vmx_ept_vpid_cap, 0);
+    assert_eq!(capabilities.vmx_true_procbased_ctls, 0);
 }
 
 #[test]
@@ -318,6 +339,30 @@ fn per_cpu_nested_state_starts_independent_and_inactive() {
     assert_eq!(bsp.l1_reflection_count, 0);
     assert_eq!(bsp.l2_resume_count, 0);
     assert_eq!(bsp.l2_resume_exit_count, 0);
+    assert_eq!(bsp.ept12_pointer, 0);
+    assert_eq!(bsp.ept02_pointer, 0);
+    assert_eq!(bsp.ept_source_gpa, 0);
+    assert_eq!(bsp.ept_target_gpa, 0);
+    assert_eq!(bsp.ept_composed_hpa, 0);
+    assert_eq!(bsp.ept_permissions, 0);
+    assert_eq!(bsp.ept_composition_count, 0);
+    assert_eq!(bsp.ept_probe_count, 0);
+    assert_eq!(bsp.ept_observed_value, 0);
+}
+
+#[test]
+fn nested_state_records_ept_composition() {
+    let mut state = nested_state(0);
+
+    state.configure_ept(0x60_001e, 0x70_001e, 0x80_0000, 0x90_0000, 0x90_0000, 0x5);
+
+    assert_eq!(state.ept12_pointer, 0x60_001e);
+    assert_eq!(state.ept02_pointer, 0x70_001e);
+    assert_eq!(state.ept_source_gpa, 0x80_0000);
+    assert_eq!(state.ept_target_gpa, 0x90_0000);
+    assert_eq!(state.ept_composed_hpa, 0x90_0000);
+    assert_eq!(state.ept_permissions, 0x5);
+    assert_eq!(state.ept_composition_count, 1);
 }
 
 #[test]

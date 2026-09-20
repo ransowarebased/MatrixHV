@@ -52,8 +52,24 @@ pub enum EptError {
     UncacheableUnavailable,
     WriteBackUnavailable,
     InvalidProtectionAddress(u64),
+    InvalidRemapAddress(u64),
     InvalidPageTable,
     ProtectionTableCapacityExceeded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EptComposition {
+    pub l2_guest_physical_address: u64,
+    pub l1_guest_physical_address: u64,
+    pub host_physical_address: u64,
+    pub permissions: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EptTranslation {
+    physical_address: u64,
+    permissions: u64,
+    memory_type: u64,
 }
 
 pub struct IdentityEpt {
@@ -233,6 +249,98 @@ impl IdentityEpt {
         self.ept_pointer
     }
 
+    pub fn clone_shadow(&self) -> Result<Self, EptError> {
+        let protection_pool = ProtectionTablePool::allocate()?;
+        let mut pages = Vec::new();
+        let root = clone_table(self.root, 4, &mut pages)?;
+        let ept_pointer = root.physical_address | (self.ept_pointer & !EPT_ADDRESS_MASK);
+        Ok(Self {
+            pages,
+            protection_pool,
+            root,
+            ept_pointer,
+            mapped_end: self.mapped_end,
+        })
+    }
+
+    pub fn remap_page(
+        &mut self,
+        guest_physical_address: u64,
+        target_physical_address: u64,
+    ) -> Result<(), EptError> {
+        if guest_physical_address & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(EptError::InvalidRemapAddress(guest_physical_address));
+        }
+        if target_physical_address & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(EptError::InvalidRemapAddress(target_physical_address));
+        }
+        if guest_physical_address >= self.mapped_end || target_physical_address >= self.mapped_end {
+            return Err(EptError::InvalidRemapAddress(
+                guest_physical_address.max(target_physical_address),
+            ));
+        }
+        let (table, index) = self.ensure_4k_leaf(guest_physical_address)?;
+        let leaf = read_entry(table, index);
+        write_entry(
+            table,
+            index,
+            (target_physical_address & EPT_ADDRESS_MASK) | (leaf & !EPT_ADDRESS_MASK),
+        );
+        Ok(())
+    }
+
+    pub fn compose_page(
+        &mut self,
+        ept12: &Self,
+        ept01: &Self,
+        l2_guest_physical_address: u64,
+    ) -> Result<EptComposition, EptError> {
+        if l2_guest_physical_address & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(EptError::InvalidRemapAddress(l2_guest_physical_address));
+        }
+        let l1_translation = ept12.translate(l2_guest_physical_address)?;
+        let l1_guest_physical_address = l1_translation.physical_address & EPT_ADDRESS_MASK;
+        let host_translation = ept01.translate(l1_guest_physical_address)?;
+        let host_physical_address = host_translation.physical_address & EPT_ADDRESS_MASK;
+        let permissions = l1_translation.permissions & host_translation.permissions;
+        let (table, index) = self.ensure_4k_leaf(l2_guest_physical_address)?;
+        write_entry(
+            table,
+            index,
+            host_physical_address
+                | permissions
+                | (host_translation.memory_type << EPT_MEMORY_TYPE_SHIFT),
+        );
+        Ok(EptComposition {
+            l2_guest_physical_address,
+            l1_guest_physical_address,
+            host_physical_address,
+            permissions,
+        })
+    }
+
+    pub fn table_regions(&self) -> Vec<(u64, usize)> {
+        let mut regions = Vec::with_capacity(self.pages.len() + 1);
+        for page in &self.pages {
+            regions.push((page.physical_address(), page.pages()));
+        }
+        regions.push((
+            self.protection_pool.pages.physical_address(),
+            self.protection_pool.pages.pages(),
+        ));
+        regions
+    }
+
+    pub fn deny_guest_access_to_regions(
+        &mut self,
+        regions: &[(u64, usize)],
+    ) -> Result<(), EptError> {
+        for &(physical_address, page_count) in regions {
+            self.deny_guest_access(physical_address, page_count)?;
+        }
+        Ok(())
+    }
+
     pub fn deny_guest_access(
         &mut self,
         physical_address: u64,
@@ -267,6 +375,15 @@ impl IdentityEpt {
             return Err(EptError::InvalidProtectionAddress(physical_address));
         }
 
+        let pt_index = ((physical_address / PAGE_SIZE as u64) & 0x1ff) as usize;
+        let (pt, _) = self.ensure_4k_leaf(physical_address)?;
+
+        let leaf = read_entry(pt, pt_index);
+        write_entry(pt, pt_index, leaf & !EPT_PERMISSIONS);
+        Ok(())
+    }
+
+    fn ensure_4k_leaf(&mut self, physical_address: u64) -> Result<(TablePage, usize), EptError> {
         let pml4_index = ((physical_address / EPT_512GB_PAGE_SIZE) & 0x1ff) as usize;
         let pdpt_index = ((physical_address / EPT_1GB_PAGE_SIZE) & 0x1ff) as usize;
         let pd_index = ((physical_address / EPT_2MB_PAGE_SIZE) & 0x1ff) as usize;
@@ -297,11 +414,77 @@ impl IdentityEpt {
         } else {
             table_from_entry(pd_entry)?
         };
-
-        let leaf = read_entry(pt, pt_index);
-        write_entry(pt, pt_index, leaf & !EPT_PERMISSIONS);
-        Ok(())
+        Ok((pt, pt_index))
     }
+
+    fn translate(&self, guest_physical_address: u64) -> Result<EptTranslation, EptError> {
+        if guest_physical_address >= self.mapped_end {
+            return Err(EptError::InvalidRemapAddress(guest_physical_address));
+        }
+        let pml4_index = ((guest_physical_address / EPT_512GB_PAGE_SIZE) & 0x1ff) as usize;
+        let pdpt_index = ((guest_physical_address / EPT_1GB_PAGE_SIZE) & 0x1ff) as usize;
+        let pd_index = ((guest_physical_address / EPT_2MB_PAGE_SIZE) & 0x1ff) as usize;
+        let pt_index = ((guest_physical_address / PAGE_SIZE as u64) & 0x1ff) as usize;
+
+        let pml4_entry = read_entry(self.root, pml4_index);
+        let pdpt = table_from_entry(pml4_entry)?;
+        let pdpt_entry = read_entry(pdpt, pdpt_index);
+        if pdpt_entry & EPT_LARGE_PAGE != 0 {
+            return translation_from_leaf(pdpt_entry, guest_physical_address, EPT_1GB_PAGE_SIZE);
+        }
+        let pd = table_from_entry(pdpt_entry)?;
+        let pd_entry = read_entry(pd, pd_index);
+        if pd_entry & EPT_LARGE_PAGE != 0 {
+            return translation_from_leaf(pd_entry, guest_physical_address, EPT_2MB_PAGE_SIZE);
+        }
+        let pt = table_from_entry(pd_entry)?;
+        translation_from_leaf(
+            read_entry(pt, pt_index),
+            guest_physical_address,
+            PAGE_SIZE as u64,
+        )
+    }
+}
+
+fn clone_table(
+    source: TablePage,
+    level: u8,
+    pages: &mut Vec<ResidentPages>,
+) -> Result<TablePage, EptError> {
+    let destination = allocate_table(pages)?;
+    for index in 0..EPT_ENTRY_COUNT {
+        let entry = read_entry(source, index);
+        if entry == 0 || level == 1 || entry & EPT_LARGE_PAGE != 0 {
+            write_entry(destination, index, entry);
+            continue;
+        }
+        let child = table_from_entry(entry)?;
+        let cloned_child = clone_table(child, level - 1, pages)?;
+        write_entry(
+            destination,
+            index,
+            (entry & !EPT_ADDRESS_MASK) | cloned_child.physical_address,
+        );
+    }
+    Ok(destination)
+}
+
+fn translation_from_leaf(
+    entry: u64,
+    guest_physical_address: u64,
+    page_size: u64,
+) -> Result<EptTranslation, EptError> {
+    let permissions = entry & EPT_PERMISSIONS;
+    if permissions == 0 {
+        return Err(EptError::InvalidPageTable);
+    }
+    let base = (entry & EPT_ADDRESS_MASK) & !(page_size - 1);
+    let offset = guest_physical_address & (page_size - 1);
+    Ok(EptTranslation {
+        physical_address: base + offset,
+        permissions,
+        memory_type: (entry >> EPT_MEMORY_TYPE_SHIFT) & 0x7,
+    })
 }
 
 fn allocate_table(pages: &mut Vec<ResidentPages>) -> Result<TablePage, EptError> {
