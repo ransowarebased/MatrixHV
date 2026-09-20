@@ -29,6 +29,8 @@ pub struct NestedVmxState {
     pub l2_last_exit_rip: u64,
     pub l2_last_exit_rsp: u64,
     pub l1_reflection_count: u64,
+    pub l2_resume_count: u64,
+    pub l2_resume_exit_count: u64,
 }
 
 impl NestedVmxState {
@@ -64,6 +66,8 @@ impl NestedVmxState {
             l2_last_exit_rip: 0,
             l2_last_exit_rsp: 0,
             l1_reflection_count: 0,
+            l2_resume_count: 0,
+            l2_resume_exit_count: 0,
         }
     }
 }

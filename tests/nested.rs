@@ -115,6 +115,8 @@ fn per_cpu_nested_state_starts_independent_and_inactive() {
     assert_eq!(bsp.l2_exit_count, 0);
     assert_eq!(bsp.l2_last_exit_rsp, 0);
     assert_eq!(bsp.l1_reflection_count, 0);
+    assert_eq!(bsp.l2_resume_count, 0);
+    assert_eq!(bsp.l2_resume_exit_count, 0);
 }
 
 #[test]
