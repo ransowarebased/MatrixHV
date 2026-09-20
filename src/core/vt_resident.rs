@@ -367,7 +367,7 @@ struct ResidentBootContext {
     nested: NestedVmxState,
     original_gdtr: [u8; 10],
     original_idtr: [u8; 10],
-    alignment_padding: [u8; 44],
+    alignment_padding: [u8; 36],
     root_fx_state: [u8; 512],
 }
 
@@ -428,7 +428,7 @@ impl ResidentBootContext {
             nested,
             original_gdtr: [0; 10],
             original_idtr: [0; 10],
-            alignment_padding: [0; 44],
+            alignment_padding: [0; 36],
             root_fx_state: [0; 512],
         }
     }
@@ -613,6 +613,8 @@ const BCTX_NESTED_VMCS12_CR0_MASK: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 
 const BCTX_NESTED_VMCS12_CR4_MASK: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 160;
 const BCTX_NESTED_VMCS12_CR0_SHADOW: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 168;
 const BCTX_NESTED_VMCS12_CR4_SHADOW: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 176;
+const BCTX_NESTED_VMCS12_IO_BITMAP_A: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 744;
+const BCTX_NESTED_VMCS12_IO_BITMAP_B: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 752;
 const BCTX_NESTED_VMCS12_VM_EXIT_MSR_STORE_ADDR: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 824;
 const BCTX_NESTED_VMCS12_VM_EXIT_MSR_LOAD_ADDR: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 832;
 const BCTX_NESTED_VMCS12_VM_ENTRY_MSR_LOAD_ADDR: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 840;
@@ -752,6 +754,19 @@ const BCTX_NESTED_INHERITED_L1_EFER: usize = core::mem::offset_of!(ResidentBootC
 const BCTX_NESTED_INHERITED_L1_TSC_OFFSET: usize =
     core::mem::offset_of!(ResidentBootContext, nested)
         + core::mem::offset_of!(NestedVmxState, inherited_l1_tsc_offset);
+const BCTX_NESTED_VMCS01_PIN_BASED_CONTROLS: usize =
+    core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, vmcs01_pin_based_controls);
+const BCTX_NESTED_VMCS01_PRIMARY_CONTROLS: usize =
+    core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, vmcs01_primary_controls);
+const BCTX_NESTED_VMCS01_SECONDARY_CONTROLS: usize =
+    core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, vmcs01_secondary_controls);
+const BCTX_NESTED_VMCS01_EXIT_CONTROLS: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmcs01_exit_controls);
+const BCTX_NESTED_VMCS01_ENTRY_CONTROLS: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmcs01_entry_controls);
 const BCTX_NESTED_L2_SAVED_PAT: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, l2_saved_pat);
 const BCTX_NESTED_L2_SAVED_EFER: usize = core::mem::offset_of!(ResidentBootContext, nested)
@@ -3419,6 +3434,17 @@ global_asm!(
     "jne .Lresident_nested_validate_invalid_controls",
     "cmp qword ptr [r12 + {b_nested_vmcs12_cr3_target_count}], 4",
     "ja .Lresident_nested_validate_invalid_controls",
+    "bt dword ptr [r12 + {b_nested_vmcs12_primary_control}], 25",
+    "jnc .Lresident_nested_validate_io_bitmaps_done",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_io_bitmap_a}]",
+    "call .Lresident_nested_physical_address_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_validate_invalid_controls",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_io_bitmap_b}]",
+    "call .Lresident_nested_physical_address_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_validate_invalid_controls",
+    ".Lresident_nested_validate_io_bitmaps_done:",
     "mov r11, qword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_store_addr}]",
     "mov r10d, dword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_store_count}]",
     "call .Lresident_nested_msr_list_is_valid",
@@ -3678,22 +3704,30 @@ global_asm!(
     "ret",
     ".Lresident_nested_merge_vmcs02_controls:",
     "mov rax, {pin_based_vm_exec_control}",
-    "vmread r11, rax",
-    "jna .Lresident_dispatch_vmread_failed",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs01_pin_based_controls}]",
     "mov edx, dword ptr [r12 + {b_nested_vmcs12_pin_based_control}]",
     "or r11d, edx",
     "vmwrite rax, r11",
     "jna .Lresident_dispatch_vmwrite_failed",
     "mov rax, {cpu_based_vm_exec_control}",
-    "vmread r11, rax",
-    "jna .Lresident_dispatch_vmread_failed",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs01_primary_controls}]",
     "mov edx, dword ptr [r12 + {b_nested_vmcs12_primary_control}]",
     "or r11d, edx",
     "vmwrite rax, r11",
     "jna .Lresident_dispatch_vmwrite_failed",
+    "bt dword ptr [r12 + {b_nested_vmcs12_primary_control}], 25",
+    "jnc .Lresident_nested_merge_io_bitmaps_done",
+    "mov rax, {io_bitmap_a}",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_io_bitmap_a}]",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    "mov rax, {io_bitmap_b}",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_io_bitmap_b}]",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    ".Lresident_nested_merge_io_bitmaps_done:",
     "mov rax, {secondary_vm_exec_control}",
-    "vmread r11, rax",
-    "jna .Lresident_dispatch_vmread_failed",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs01_secondary_controls}]",
     "mov edx, dword ptr [r12 + {b_nested_vmcs12_secondary_control}]",
     "and edx, 2",
     "or r11d, edx",
@@ -3701,15 +3735,13 @@ global_asm!(
     "jna .Lresident_dispatch_vmwrite_failed",
     "mov qword ptr [r12 + {b_nested_last_merged_secondary_controls}], r11",
     "mov rax, {vm_exit_controls}",
-    "vmread r11, rax",
-    "jna .Lresident_dispatch_vmread_failed",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs01_exit_controls}]",
     "mov edx, dword ptr [r12 + {b_nested_vmcs12_vm_exit_controls}]",
     "or r11d, edx",
     "vmwrite rax, r11",
     "jna .Lresident_dispatch_vmwrite_failed",
     "mov rax, {vm_entry_controls}",
-    "vmread r11, rax",
-    "jna .Lresident_dispatch_vmread_failed",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs01_entry_controls}]",
     "mov edx, dword ptr [r12 + {b_nested_vmcs12_vm_entry_controls}]",
     "or r11d, edx",
     "vmwrite rax, r11",
@@ -3752,6 +3784,26 @@ global_asm!(
     "vmread r11, rax",
     "jna .Lresident_dispatch_vmread_failed",
     "mov qword ptr [r12 + {b_nested_inherited_l1_tsc_offset}], r11",
+    "mov rax, {pin_based_vm_exec_control}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "mov qword ptr [r12 + {b_nested_vmcs01_pin_based_controls}], r11",
+    "mov rax, {cpu_based_vm_exec_control}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "mov qword ptr [r12 + {b_nested_vmcs01_primary_controls}], r11",
+    "mov rax, {secondary_vm_exec_control}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "mov qword ptr [r12 + {b_nested_vmcs01_secondary_controls}], r11",
+    "mov rax, {vm_exit_controls}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "mov qword ptr [r12 + {b_nested_vmcs01_exit_controls}], r11",
+    "mov rax, {vm_entry_controls}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "mov qword ptr [r12 + {b_nested_vmcs01_entry_controls}], r11",
     "ret",
     ".Lresident_nested_sync_vmcs02_guest_state:",
     "mov rax, {vmcs_link_pointer}",
@@ -5528,6 +5580,8 @@ global_asm!(
     cpu_based_vm_exec_control = const CPU_BASED_VM_EXEC_CONTROL,
     secondary_vm_exec_control = const SECONDARY_VM_EXEC_CONTROL,
     vm_exit_controls = const VM_EXIT_CONTROLS,
+    io_bitmap_a = const IO_BITMAP_A,
+    io_bitmap_b = const IO_BITMAP_B,
     cr0_guest_host_mask = const CR0_GUEST_HOST_MASK,
     cr0_read_shadow = const CR0_READ_SHADOW,
     cr4_guest_host_mask = const CR4_GUEST_HOST_MASK,
@@ -5816,6 +5870,8 @@ global_asm!(
     b_nested_vmcs12_cr4_mask = const BCTX_NESTED_VMCS12_CR4_MASK,
     b_nested_vmcs12_cr0_shadow = const BCTX_NESTED_VMCS12_CR0_SHADOW,
     b_nested_vmcs12_cr4_shadow = const BCTX_NESTED_VMCS12_CR4_SHADOW,
+    b_nested_vmcs12_io_bitmap_a = const BCTX_NESTED_VMCS12_IO_BITMAP_A,
+    b_nested_vmcs12_io_bitmap_b = const BCTX_NESTED_VMCS12_IO_BITMAP_B,
     b_nested_vmcs12_vm_exit_msr_store_addr = const BCTX_NESTED_VMCS12_VM_EXIT_MSR_STORE_ADDR,
     b_nested_vmcs12_vm_exit_msr_load_addr = const BCTX_NESTED_VMCS12_VM_EXIT_MSR_LOAD_ADDR,
     b_nested_vmcs12_vm_entry_msr_load_addr = const BCTX_NESTED_VMCS12_VM_ENTRY_MSR_LOAD_ADDR,
@@ -5879,6 +5935,11 @@ global_asm!(
     b_nested_inherited_l1_pat = const BCTX_NESTED_INHERITED_L1_PAT,
     b_nested_inherited_l1_efer = const BCTX_NESTED_INHERITED_L1_EFER,
     b_nested_inherited_l1_tsc_offset = const BCTX_NESTED_INHERITED_L1_TSC_OFFSET,
+    b_nested_vmcs01_pin_based_controls = const BCTX_NESTED_VMCS01_PIN_BASED_CONTROLS,
+    b_nested_vmcs01_primary_controls = const BCTX_NESTED_VMCS01_PRIMARY_CONTROLS,
+    b_nested_vmcs01_secondary_controls = const BCTX_NESTED_VMCS01_SECONDARY_CONTROLS,
+    b_nested_vmcs01_exit_controls = const BCTX_NESTED_VMCS01_EXIT_CONTROLS,
+    b_nested_vmcs01_entry_controls = const BCTX_NESTED_VMCS01_ENTRY_CONTROLS,
     b_nested_l2_saved_pat = const BCTX_NESTED_L2_SAVED_PAT,
     b_nested_l2_saved_efer = const BCTX_NESTED_L2_SAVED_EFER,
     b_nested_last_merged_secondary_controls = const BCTX_NESTED_LAST_MERGED_SECONDARY_CONTROLS,

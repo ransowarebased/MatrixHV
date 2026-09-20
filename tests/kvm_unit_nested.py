@@ -29,6 +29,7 @@ DEFAULT_CASES = (
     "vmx_host_state_area_test",
     "vmx_guest_state_area_test",
     "CR_shadowing",
+    "I/O_bitmap",
 )
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SUMMARY_PATTERN = re.compile(

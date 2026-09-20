@@ -164,6 +164,8 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     let legacy_exit_control =
         control_capabilities(capabilities::VMX_LEGACY_EXIT_DEFAULT1, legacy_exit_bits);
     let primary_may_be_one = capabilities::VMX_LEGACY_PROCBASED_DEFAULT1
+        | capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
+        | capabilities::VMX_PRIMARY_USE_IO_BITMAPS
         | capabilities::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS;
     let primary_control = control_capabilities(
         capabilities::VMX_LEGACY_PROCBASED_DEFAULT1,
@@ -217,6 +219,13 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
     host.entry_ctls = control_capabilities(0, entry_supported);
     host.true_exit_ctls = control_capabilities(0, exit_supported);
     host.true_entry_ctls = control_capabilities(0, entry_supported);
+    host.procbased_ctls = control_capabilities(
+        0,
+        u32::MAX
+            & !capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
+            & !capabilities::VMX_PRIMARY_USE_IO_BITMAPS,
+    );
+    host.true_procbased_ctls = host.procbased_ctls;
 
     let capabilities = NestedVmxCapabilities::from_host(host);
 
@@ -235,6 +244,22 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
     );
     assert_eq!(
         capabilities.vmx_true_entry_ctls >> 32 & u64::from(capabilities::VM_ENTRY_IA32E_MODE_GUEST),
+        0
+    );
+    assert_eq!(
+        capabilities.vmx_procbased_ctls >> 32
+            & u64::from(
+                capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
+                    | capabilities::VMX_PRIMARY_USE_IO_BITMAPS
+            ),
+        0
+    );
+    assert_eq!(
+        capabilities.vmx_true_procbased_ctls >> 32
+            & u64::from(
+                capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
+                    | capabilities::VMX_PRIMARY_USE_IO_BITMAPS
+            ),
         0
     );
 }
