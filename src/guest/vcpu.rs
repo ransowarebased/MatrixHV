@@ -5,8 +5,7 @@ use crate::boot::logger;
 use crate::hv_core::vt_controls::{self, VmxControls, VmxControlsError};
 use crate::hv_core::vt_entry;
 use crate::hv_core::vt_exits::{self, DispatchDiagnostics, VmRunContext};
-use crate::hv_core::vt_guest::{self, GuestStateReport};
-use crate::hv_core::vt_host::{self, HostStateReport};
+use crate::hv_core::vt_state::{self, GuestStateReport, HostStateReport};
 use crate::hv_core::vt_vmcs::{self, VmcsError, VmcsRegion};
 use crate::hv_core::vt_vmcs_fields::VM_INSTRUCTION_ERROR;
 use crate::hv_core::vt_vmxon::{
@@ -186,8 +185,9 @@ impl Vcpu {
         logger::phase("vmx.vcpu.vmptrld.ok");
 
         let controls = vt_controls::configure()?;
-        let host = vt_host::configure_with_cr3(host_address_space_report.host_cr3)?;
-        let guest = vt_guest::configure_with_rflags(entry_rip, guest_stack.top(), initial_rflags)?;
+        let host = vt_state::configure_host_with_cr3(host_address_space_report.host_cr3)?;
+        let guest =
+            vt_state::configure_guest_with_rflags(entry_rip, guest_stack.top(), initial_rflags)?;
         if host.cr3 == guest.cr3 {
             drop(session);
             return Err(PersistentVcpuError::HostCr3NotIndependent {

@@ -1,10 +1,7 @@
 pub mod config;
-pub mod loaders;
-pub mod logger;
-pub mod matrix_config;
+pub use crate::runtime::logger;
 pub mod memory_map;
 pub mod services;
-pub mod uefi;
 
 use crate::arch::x86_64::cpu::{self, Vendor};
 use crate::guest::{firmware, vcpu};
@@ -14,7 +11,7 @@ use crate::smp::{startup, topology};
 use ::uefi::Status;
 
 pub fn run() -> Result<(), Status> {
-    uefi::initialize_boot_environment()?;
+    services::initialize_boot_environment()?;
     let image_residency = resident::image_residency()?;
     logger::info(format_args!(
         "residency image code_type={} data_type={}",
@@ -115,7 +112,7 @@ pub fn run() -> Result<(), Status> {
     logger::phase("uefi.memory_map.ok");
 
     logger::phase("vmx.vmxon.start");
-    match hv_core::vt_init::probe_vmxon() {
+    match hv_core::vt_vmxon::probe_vmxon() {
         Ok(report) => {
             log::info!(
                 "VMXON probe succeeded: revision={:#x}, region_size={}, region_pa={:#x}, cr0={:#x}->{:#x}, cr4={:#x}->{:#x}",
@@ -148,7 +145,7 @@ pub fn run() -> Result<(), Status> {
     }
 
     logger::phase("vmx.vmcs.start");
-    match hv_core::vt_init::probe_vmcs() {
+    match hv_core::vt_vmcs::probe_vmcs() {
         Ok(report) => {
             logger::info(format_args!(
                 "vmcs revision={:#x} region_pa={:#x} current_pa={:#x} instruction_error={} vmxon_pa={:#x}",
@@ -169,7 +166,7 @@ pub fn run() -> Result<(), Status> {
     }
 
     logger::phase("vmx.vmlaunch_probe.start");
-    match hv_core::vt_init::probe_vmlaunch() {
+    match hv_core::vt_entry::probe_vmlaunch() {
         Ok(report) => {
             logger::info(format_args!(
                 "vmlaunch proof vmcs_pa={:#x} exit_reason={:#x} qualification={:#x} instruction_len={} guest_rip_after_exit={:#x}",
@@ -201,7 +198,7 @@ pub fn run() -> Result<(), Status> {
     }
 
     logger::phase("vmx.dispatch_probe.start");
-    match hv_core::vt_init::probe_vmexit_dispatcher() {
+    match hv_core::vt_entry::probe_vmexit_dispatcher() {
         Ok(report) => {
             let diagnostics = report.diagnostics;
             logger::info(format_args!(
@@ -343,7 +340,7 @@ pub fn run() -> Result<(), Status> {
     logger::phase("vmx.host_address_space.ok");
 
     let root_handle_count = services::simple_file_system_count()?;
-    let root_windows_present = loaders::veracrypt::windows_boot_present()?;
+    let root_windows_present = services::windows_boot_present()?;
     logger::info(format_args!(
         "real_boot_vcpu crosscheck guest_handles={} root_handles={} root_windows_present={}",
         boot_stage.handle_count, root_handle_count, root_windows_present
@@ -427,7 +424,7 @@ pub fn run() -> Result<(), Status> {
             logger::error(format_args!("windows_start_vcpu error={error:?}"));
             logger::phase("vmx.windows_start_vcpu.failed");
             logger::phase("boot.native_fallback.after_vmlaunch_failure");
-            loaders::veracrypt::start()
+            services::start_loader()
         }
     }
 }

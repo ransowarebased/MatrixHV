@@ -5,10 +5,8 @@ use uefi::boot::{self, AllocateType};
 use uefi::mem::memory_map::MemoryType;
 
 use super::vt_controls::{self, VmxControls, VmxControlsError};
-use super::vt_exit_reason;
 use super::vt_exits::{self, DispatchDiagnostics, VmRunContext};
-use super::vt_guest::{self, GuestStateReport};
-use super::vt_host::{self, HostStateReport};
+use super::vt_state::{self, GuestStateReport, HostStateReport};
 use super::vt_vmcs::{self, VmcsError, VmcsRegion};
 use super::vt_vmcs_fields::{
     EXIT_QUALIFICATION, GUEST_RIP, GUEST_RSP, HOST_RIP, HOST_RSP, VM_EXIT_INSTRUCTION_LEN,
@@ -269,7 +267,7 @@ fn run_vmlaunch_probe(
     ));
     logger::phase("vmx.vmlaunch.controls.ok");
 
-    let host = vt_host::configure()?;
+    let host = vt_state::configure_host()?;
     logger::info(format_args!(
         "vmlaunch host cs={:#x} ss={:#x} tr={:#x} tr_base={:#x} gdtr={:#x} idtr={:#x}",
         host.cs_selector,
@@ -282,7 +280,7 @@ fn run_vmlaunch_probe(
     logger::phase("vmx.vmlaunch.host_state.ok");
 
     let guest_rip = guest_probe_address();
-    let guest = vt_guest::configure(guest_rip, resources.guest_stack.top())?;
+    let guest = vt_state::configure_guest(guest_rip, resources.guest_stack.top())?;
     logger::info(format_args!(
         "vmlaunch guest rip={:#x} rsp={:#x} rflags={:#x} cs={:#x} ss={:#x} tr={:#x}",
         guest.rip, guest.rsp, guest.rflags, guest.cs_selector, guest.ss_selector, guest.tr_selector
@@ -294,7 +292,7 @@ fn run_vmlaunch_probe(
     logger::phase("vmx.vmlaunch.returned_to_host");
 
     let exit_reason = vt_vmcs::vmread(VM_EXIT_REASON).unwrap_or(0) as u32;
-    let basic_exit_reason = vt_exit_reason::basic(exit_reason);
+    let basic_exit_reason = vt_exits::basic_reason(exit_reason);
     let exit_qualification = vt_vmcs::vmread(EXIT_QUALIFICATION).unwrap_or(0);
     let instruction_length = vt_vmcs::vmread(VM_EXIT_INSTRUCTION_LEN).unwrap_or(0);
     let vm_instruction_error = vt_vmcs::vmread(VM_INSTRUCTION_ERROR).unwrap_or(u64::MAX);
@@ -304,7 +302,7 @@ fn run_vmlaunch_probe(
         "vmlaunch raw_path={} exit_reason={:#x} exit_name={} basic_reason={} qualification={:#x} instruction_len={} vm_instruction_error={} vm_instruction_error_name={} guest_rip={:#x}",
         raw_path,
         exit_reason,
-        vt_exit_reason::name(exit_reason),
+        vt_exits::reason_name(exit_reason),
         basic_exit_reason,
         exit_qualification,
         instruction_length,
@@ -314,13 +312,11 @@ fn run_vmlaunch_probe(
     ));
 
     let launch_result = match raw_path {
-        0 if vt_exit_reason::is_vm_entry_failure(exit_reason) => {
-            Err(VmlaunchError::VmEntryFailure {
-                exit_reason,
-                qualification: exit_qualification,
-            })
-        }
-        0 if basic_exit_reason != vt_exit_reason::VMCALL => {
+        0 if vt_exits::is_vm_entry_failure(exit_reason) => Err(VmlaunchError::VmEntryFailure {
+            exit_reason,
+            qualification: exit_qualification,
+        }),
+        0 if basic_exit_reason != vt_exits::VMCALL => {
             Err(VmlaunchError::UnexpectedExit(basic_exit_reason))
         }
         0 if instruction_length != 3 => Err(VmlaunchError::UnexpectedInstructionLength(
@@ -404,11 +400,11 @@ pub fn probe_vmexit_dispatcher() -> Result<VmexitLoopReport, VmexitLoopError> {
     ));
     logger::phase("vmx.dispatch_probe.controls.ok");
 
-    let host = vt_host::configure()?;
+    let host = vt_state::configure_host()?;
     logger::phase("vmx.dispatch_probe.host_state.ok");
 
     let guest_rip = dispatch_guest_address();
-    let guest = vt_guest::configure(guest_rip, guest_stack.top())?;
+    let guest = vt_state::configure_guest(guest_rip, guest_stack.top())?;
     logger::info(format_args!(
         "dispatch guest rip={:#x} rsp={:#x} cpuid_rip={:#x} vmcall_rip={:#x}",
         guest.rip,

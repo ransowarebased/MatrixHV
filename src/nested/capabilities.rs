@@ -3,6 +3,13 @@ pub const IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX: u64 = 1 << 2;
 pub const VMX_MEMORY_TYPE_WRITE_BACK: u64 = 6;
 pub const VMX_REGION_SIZE: u64 = 4096;
 
+pub const CPUID_VMX_BIT: u32 = 1 << 5;
+pub const CPUID_OSXSAVE_BIT: u32 = 1 << 27;
+pub const CPUID_HYPERVISOR_PRESENT_BIT: u32 = 1 << 31;
+pub const HYPERVISOR_LEAF_START: u32 = 0x4000_0000;
+pub const HYPERVISOR_LEAF_END: u32 = 0x4fff_ffff;
+pub const HYPERV_FEATURES_LEAF: u32 = 0x4000_0003;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NestedVmxCapabilities {
     pub revision_id: u32,

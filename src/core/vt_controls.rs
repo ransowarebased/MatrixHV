@@ -46,6 +46,17 @@ pub enum VmxControlsError {
     EferControlsUnavailable,
 }
 
+struct RequestedControls {
+    pin_based: u32,
+    primary_processor_based: u32,
+    secondary_processor_based: u32,
+    vm_exit: u32,
+    vm_entry: u32,
+    exception_bitmap: u64,
+    msr_bitmap: Option<u64>,
+    ept_pointer: Option<u64>,
+}
+
 impl From<VmcsError> for VmxControlsError {
     fn from(value: VmcsError) -> Self {
         Self::Vmcs(value)
@@ -53,28 +64,39 @@ impl From<VmcsError> for VmxControlsError {
 }
 
 pub fn configure() -> Result<VmxControls, VmxControlsError> {
-    configure_internal(PIN_BASED_NMI_EXITING, 0, 0, 0, 0, 1 << 6, None, None)
+    configure_internal(RequestedControls {
+        pin_based: PIN_BASED_NMI_EXITING,
+        primary_processor_based: 0,
+        secondary_processor_based: 0,
+        vm_exit: 0,
+        vm_entry: 0,
+        exception_bitmap: 1 << 6,
+        msr_bitmap: None,
+        ept_pointer: None,
+    })
 }
 
 pub fn configure_resident_boot(
     msr_bitmap: u64,
     ept_pointer: u64,
 ) -> Result<VmxControls, VmxControlsError> {
-    configure_internal(
-        0,
-        CPU_BASED_USE_TSC_OFFSETTING
+    configure_internal(RequestedControls {
+        pin_based: 0,
+        primary_processor_based: CPU_BASED_USE_TSC_OFFSETTING
             | CPU_BASED_USE_MSR_BITMAPS
             | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
-        SECONDARY_ENABLE_EPT | SECONDARY_ENABLE_RDTSCP | SECONDARY_ENABLE_XSAVES,
-        VM_EXIT_SAVE_IA32_PAT
+        secondary_processor_based: SECONDARY_ENABLE_EPT
+            | SECONDARY_ENABLE_RDTSCP
+            | SECONDARY_ENABLE_XSAVES,
+        vm_exit: VM_EXIT_SAVE_IA32_PAT
             | VM_EXIT_LOAD_IA32_PAT
             | VM_EXIT_SAVE_IA32_EFER
             | VM_EXIT_LOAD_IA32_EFER,
-        VM_ENTRY_LOAD_IA32_PAT | VM_ENTRY_LOAD_IA32_EFER,
-        0,
-        Some(msr_bitmap),
-        Some(ept_pointer),
-    )
+        vm_entry: VM_ENTRY_LOAD_IA32_PAT | VM_ENTRY_LOAD_IA32_EFER,
+        exception_bitmap: 0,
+        msr_bitmap: Some(msr_bitmap),
+        ept_pointer: Some(ept_pointer),
+    })
 }
 
 pub(crate) fn configure_resident_ap(
@@ -96,16 +118,7 @@ pub(crate) fn configure_resident_ap(
     Ok(controls)
 }
 
-fn configure_internal(
-    desired_pin: u32,
-    desired_primary: u32,
-    desired_secondary: u32,
-    desired_exit: u32,
-    desired_entry: u32,
-    exception_bitmap: u64,
-    msr_bitmap: Option<u64>,
-    ept_pointer: Option<u64>,
-) -> Result<VmxControls, VmxControlsError> {
+fn configure_internal(requested: RequestedControls) -> Result<VmxControls, VmxControlsError> {
     let basic = unsafe { msr::read(msr::IA32_VMX_BASIC) };
     let use_true_controls = basic & IA32_VMX_BASIC_TRUE_CTLS != 0;
 
@@ -130,16 +143,22 @@ fn configure_internal(
         msr::IA32_VMX_ENTRY_CTLS
     };
 
-    let pin_based = adjust_control(desired_pin, pin_msr);
-    let primary_processor_based = adjust_control(desired_primary, proc_msr);
+    let pin_based = adjust_control(requested.pin_based, pin_msr);
+    let primary_processor_based = adjust_control(requested.primary_processor_based, proc_msr);
     let secondary_processor_based =
         if primary_processor_based & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS != 0 {
-            adjust_control(desired_secondary, msr::IA32_VMX_PROCBASED_CTLS2)
+            adjust_control(
+                requested.secondary_processor_based,
+                msr::IA32_VMX_PROCBASED_CTLS2,
+            )
         } else {
             0
         };
-    let vm_exit = adjust_control(VM_EXIT_HOST_ADDRESS_SPACE_SIZE | desired_exit, exit_msr);
-    let vm_entry = adjust_control(VM_ENTRY_IA32E_MODE_GUEST | desired_entry, entry_msr);
+    let vm_exit = adjust_control(
+        VM_EXIT_HOST_ADDRESS_SPACE_SIZE | requested.vm_exit,
+        exit_msr,
+    );
+    let vm_entry = adjust_control(VM_ENTRY_IA32E_MODE_GUEST | requested.vm_entry, entry_msr);
 
     if vm_exit & VM_EXIT_HOST_ADDRESS_SPACE_SIZE == 0 {
         return Err(VmxControlsError::HostAddressSpaceSizeUnavailable);
@@ -147,43 +166,43 @@ fn configure_internal(
     if vm_entry & VM_ENTRY_IA32E_MODE_GUEST == 0 {
         return Err(VmxControlsError::Ia32eGuestModeUnavailable);
     }
-    if desired_secondary & SECONDARY_ENABLE_EPT != 0
+    if requested.secondary_processor_based & SECONDARY_ENABLE_EPT != 0
         && secondary_processor_based & SECONDARY_ENABLE_EPT == 0
     {
         return Err(VmxControlsError::EptUnavailable);
     }
-    if secondary_processor_based & SECONDARY_ENABLE_EPT != 0 && ept_pointer.is_none() {
+    if secondary_processor_based & SECONDARY_ENABLE_EPT != 0 && requested.ept_pointer.is_none() {
         return Err(VmxControlsError::EptUnexpectedlyRequired);
     }
-    if desired_secondary & SECONDARY_ENABLE_RDTSCP != 0
+    if requested.secondary_processor_based & SECONDARY_ENABLE_RDTSCP != 0
         && secondary_processor_based & SECONDARY_ENABLE_RDTSCP == 0
     {
         return Err(VmxControlsError::RdtscpUnavailable);
     }
-    if desired_primary & CPU_BASED_USE_MSR_BITMAPS != 0
+    if requested.primary_processor_based & CPU_BASED_USE_MSR_BITMAPS != 0
         && primary_processor_based & CPU_BASED_USE_MSR_BITMAPS == 0
     {
         return Err(VmxControlsError::MsrBitmapsUnavailable);
     }
-    if desired_primary & CPU_BASED_USE_TSC_OFFSETTING != 0
+    if requested.primary_processor_based & CPU_BASED_USE_TSC_OFFSETTING != 0
         && primary_processor_based & CPU_BASED_USE_TSC_OFFSETTING == 0
     {
         return Err(VmxControlsError::TscOffsettingUnavailable);
     }
-    if desired_secondary & SECONDARY_ENABLE_XSAVES != 0
+    if requested.secondary_processor_based & SECONDARY_ENABLE_XSAVES != 0
         && secondary_processor_based & SECONDARY_ENABLE_XSAVES == 0
     {
         return Err(VmxControlsError::XsavesUnavailable);
     }
-    let desired_pat_exit = desired_exit & (VM_EXIT_SAVE_IA32_PAT | VM_EXIT_LOAD_IA32_PAT);
-    let desired_pat_entry = desired_entry & VM_ENTRY_LOAD_IA32_PAT;
+    let desired_pat_exit = requested.vm_exit & (VM_EXIT_SAVE_IA32_PAT | VM_EXIT_LOAD_IA32_PAT);
+    let desired_pat_entry = requested.vm_entry & VM_ENTRY_LOAD_IA32_PAT;
     if vm_exit & desired_pat_exit != desired_pat_exit
         || vm_entry & desired_pat_entry != desired_pat_entry
     {
         return Err(VmxControlsError::PatControlsUnavailable);
     }
-    let desired_efer_exit = desired_exit & (VM_EXIT_SAVE_IA32_EFER | VM_EXIT_LOAD_IA32_EFER);
-    let desired_efer_entry = desired_entry & VM_ENTRY_LOAD_IA32_EFER;
+    let desired_efer_exit = requested.vm_exit & (VM_EXIT_SAVE_IA32_EFER | VM_EXIT_LOAD_IA32_EFER);
+    let desired_efer_entry = requested.vm_entry & VM_ENTRY_LOAD_IA32_EFER;
     if vm_exit & desired_efer_exit != desired_efer_exit
         || vm_entry & desired_efer_entry != desired_efer_entry
     {
@@ -204,13 +223,18 @@ fn configure_internal(
     vmwrite(VM_EXIT_CONTROLS, u64::from(vm_exit))?;
     vmwrite(VM_ENTRY_CONTROLS, u64::from(vm_entry))?;
 
-    if let Some(bitmap) = msr_bitmap {
+    if let Some(bitmap) = requested.msr_bitmap {
         vmwrite(MSR_BITMAP, bitmap)?;
     }
     if secondary_processor_based & SECONDARY_ENABLE_EPT != 0 {
-        vmwrite(EPT_POINTER, ept_pointer.unwrap())?;
+        vmwrite(
+            EPT_POINTER,
+            requested
+                .ept_pointer
+                .ok_or(VmxControlsError::EptUnexpectedlyRequired)?,
+        )?;
     }
-    vmwrite(EXCEPTION_BITMAP, exception_bitmap)?;
+    vmwrite(EXCEPTION_BITMAP, requested.exception_bitmap)?;
     vmwrite(PAGE_FAULT_ERROR_CODE_MASK, 0)?;
     vmwrite(PAGE_FAULT_ERROR_CODE_MATCH, 0)?;
     vmwrite(CR3_TARGET_COUNT, 0)?;

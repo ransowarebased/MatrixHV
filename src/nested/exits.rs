@@ -1,0 +1,7 @@
+pub const VMCLEAR_EXIT_REASON: u64 = 19;
+pub const VMPTRLD_EXIT_REASON: u64 = 21;
+pub const VMPTRST_EXIT_REASON: u64 = 22;
+pub const VMREAD_EXIT_REASON: u64 = 23;
+pub const VMWRITE_EXIT_REASON: u64 = 25;
+pub const VMXOFF_EXIT_REASON: u64 = 26;
+pub const VMXON_EXIT_REASON: u64 = 27;

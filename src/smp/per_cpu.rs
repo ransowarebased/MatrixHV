@@ -5,10 +5,14 @@ use crate::hv_core::vt_resident::{
 };
 use crate::hv_core::vt_vmcs::VmcsRegion;
 use crate::hv_core::vt_vmxon::{self, VmxonRegion};
-use crate::memory::resident::{AddressConstraint, ResidentPages};
-use crate::nested::nested_capabilities::NestedVmxCapabilities;
+use crate::memory::resident::{AddressConstraint, PAGE_SIZE, ResidentPages};
+use crate::nested::capabilities::NestedVmxCapabilities;
 
 const NESTED_VMXON_OPERAND_OFFSET: u64 = 8;
+const NESTED_VMCS12_OPERAND_POINTER_OFFSET: usize = 16;
+const NESTED_VMPTRST_DESTINATION_POINTER_OFFSET: usize = 24;
+const NESTED_VMCS12_OPERAND_PAGE_OFFSET: u64 = PAGE_SIZE as u64;
+const NESTED_VMPTRST_DESTINATION_OFFSET: u64 = NESTED_VMCS12_OPERAND_PAGE_OFFSET + 8;
 
 pub(crate) struct ResidentCpuResources {
     pub(crate) vmxon_region: VmxonRegion,
@@ -19,6 +23,7 @@ pub(crate) struct ResidentCpuResources {
     pub(crate) host_stack: ResidentPages,
     pub(crate) resident_msr_state: ResidentPages,
     pub(crate) nested_vmxon_page: ResidentPages,
+    pub(crate) nested_vmcs12_pages: ResidentPages,
 }
 
 impl ResidentCpuResources {
@@ -38,7 +43,12 @@ impl ResidentCpuResources {
             .map_err(ResidentProbeError::Allocation)?;
         let nested_vmxon_page = ResidentPages::allocate(1, AddressConstraint::Any)
             .map_err(ResidentProbeError::Allocation)?;
+        let nested_vmcs12_pages = ResidentPages::allocate(2, AddressConstraint::Any)
+            .map_err(ResidentProbeError::Allocation)?;
         let capabilities = NestedVmxCapabilities::vmxon_vmxoff(vmx_basic);
+        let nested_vmcs12_region = nested_vmcs12_pages.physical_address();
+        let nested_vmcs12_operand = nested_vmcs12_region + NESTED_VMCS12_OPERAND_PAGE_OFFSET;
+        let nested_vmptrst_destination = nested_vmcs12_region + NESTED_VMPTRST_DESTINATION_OFFSET;
         unsafe {
             let page = nested_vmxon_page.pointer().as_ptr();
             page.write_bytes(0, nested_vmxon_page.byte_len());
@@ -46,6 +56,24 @@ impl ResidentCpuResources {
             page.add(NESTED_VMXON_OPERAND_OFFSET as usize)
                 .cast::<u64>()
                 .write(nested_vmxon_page.physical_address());
+            page.add(NESTED_VMCS12_OPERAND_POINTER_OFFSET)
+                .cast::<u64>()
+                .write(nested_vmcs12_operand);
+            page.add(NESTED_VMPTRST_DESTINATION_POINTER_OFFSET)
+                .cast::<u64>()
+                .write(nested_vmptrst_destination);
+
+            let vmcs12 = nested_vmcs12_pages.pointer().as_ptr();
+            vmcs12.write_bytes(0, nested_vmcs12_pages.byte_len());
+            vmcs12.cast::<u32>().write(capabilities.revision_id);
+            vmcs12
+                .add(NESTED_VMCS12_OPERAND_PAGE_OFFSET as usize)
+                .cast::<u64>()
+                .write(nested_vmcs12_region);
+            vmcs12
+                .add(NESTED_VMPTRST_DESTINATION_OFFSET as usize)
+                .cast::<u64>()
+                .write(u64::MAX);
         }
 
         Ok(Self {
@@ -57,6 +85,7 @@ impl ResidentCpuResources {
             host_stack,
             resident_msr_state,
             nested_vmxon_page,
+            nested_vmcs12_pages,
         })
     }
 
@@ -66,6 +95,18 @@ impl ResidentCpuResources {
 
     pub(crate) fn nested_vmxon_region(&self) -> u64 {
         self.nested_vmxon_page.physical_address()
+    }
+
+    pub(crate) fn nested_vmcs12_operand(&self) -> u64 {
+        self.nested_vmcs12_pages.physical_address() + NESTED_VMCS12_OPERAND_PAGE_OFFSET
+    }
+
+    pub(crate) fn nested_vmcs12_region(&self) -> u64 {
+        self.nested_vmcs12_pages.physical_address()
+    }
+
+    pub(crate) fn nested_vmptrst_destination(&self) -> u64 {
+        self.nested_vmcs12_pages.physical_address() + NESTED_VMPTRST_DESTINATION_OFFSET
     }
 
     pub(crate) fn deny_guest_access(&self, ept: &mut IdentityEpt) -> Result<(), EptError> {

@@ -6,11 +6,47 @@ use uefi::proto::BootPolicy;
 use uefi::proto::device_path::{DevicePath, build};
 use uefi::proto::media::file::{File, FileAttribute, FileMode};
 use uefi::proto::media::fs::SimpleFileSystem;
-use uefi::{CStr16, Status};
+use uefi::{CStr16, Status, cstr16};
 
 extern crate alloc;
 
+const VERACRYPT_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\VeraCrypt\DcsBoot.efi");
+const WINDOWS_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\Microsoft\Boot\bootmgfw.efi");
 const HANDLE_COUNT_CAPACITY: usize = 128;
+
+pub fn initialize_boot_environment() -> Result<(), Status> {
+    boot::set_watchdog_timer(0, 0x10000, None).map_err(|error| error.status())?;
+    log::info!("MatrixHV UEFI bootstrap started");
+    Ok(())
+}
+
+pub fn windows_boot_present() -> Result<bool, Status> {
+    Ok(find_image_volume(WINDOWS_BOOT_PATH)?.is_some())
+}
+
+pub fn start_loader() -> Result<(), Status> {
+    if let Some(device_handle) = find_image_volume(VERACRYPT_BOOT_PATH)? {
+        log::info!("VeraCrypt EFI loader detected: {}", VERACRYPT_BOOT_PATH);
+        crate::runtime::logger::phase("boot.veracrypt.detected");
+        crate::runtime::logger::phase("boot.veracrypt.start");
+        let result = start_image_on_volume(device_handle, VERACRYPT_BOOT_PATH);
+        if result.is_err() {
+            crate::runtime::logger::phase("boot.veracrypt.returned_error");
+        }
+        return result;
+    }
+
+    log::info!("VeraCrypt was not detected; starting the normal Windows boot manager");
+    crate::runtime::logger::phase("boot.veracrypt.absent");
+
+    let device_handle = find_image_volume(WINDOWS_BOOT_PATH)?.ok_or_else(|| {
+        crate::runtime::logger::phase("boot.windows_fallback.not_found");
+        Status::NOT_FOUND
+    })?;
+
+    crate::runtime::logger::phase("boot.windows_fallback.start");
+    start_image_on_volume(device_handle, WINDOWS_BOOT_PATH)
+}
 
 pub fn simple_file_system_count() -> Result<usize, Status> {
     let mut handles: [MaybeUninit<uefi::Handle>; HANDLE_COUNT_CAPACITY] =

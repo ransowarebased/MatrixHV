@@ -1,4 +1,5 @@
-use super::nested_capabilities::NestedVmxCapabilities;
+use super::capabilities::NestedVmxCapabilities;
+use super::vmcs::NestedVmcs12State;
 
 pub const INVALID_VMCS_POINTER: u64 = u64::MAX;
 
@@ -18,10 +19,16 @@ pub struct NestedVmxState {
     pub failure_count: u64,
     pub active: u64,
     pub probe_complete: u64,
+    pub vmcs12: NestedVmcs12State,
 }
 
 impl NestedVmxState {
-    pub fn new(capabilities: NestedVmxCapabilities, vmxon_operand: u64, vmxon_region: u64) -> Self {
+    pub fn new(
+        capabilities: NestedVmxCapabilities,
+        vmxon_operand: u64,
+        vmxon_region: u64,
+        vmcs12: NestedVmcs12State,
+    ) -> Self {
         Self {
             feature_control: capabilities.feature_control,
             vmx_basic: capabilities.vmx_basic,
@@ -36,6 +43,7 @@ impl NestedVmxState {
             failure_count: 0,
             active: 0,
             probe_complete: 0,
+            vmcs12,
         }
     }
 }
