@@ -2,7 +2,14 @@ pub const VMCS12_LAUNCH_STATE_CLEAR: u64 = 0;
 pub const VMCS12_LAUNCH_STATE_LAUNCHED: u64 = 1;
 pub const VMCS12_LAUNCH_STATE_UNINITIALIZED: u64 = u64::MAX;
 pub const VMCS_FIELD_VM_INSTRUCTION_ERROR: u64 = 0x4400;
+pub const VMCS_FIELD_VM_EXIT_REASON: u64 = 0x4402;
+pub const VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN: u64 = 0x440c;
+pub const VMCS_FIELD_EXIT_QUALIFICATION: u64 = 0x6400;
+pub const VMCS_FIELD_GUEST_RSP: u64 = 0x681c;
 pub const VMCS_FIELD_GUEST_RIP: u64 = 0x681e;
+pub const VMCS_FIELD_GUEST_RFLAGS: u64 = 0x6820;
+pub const VMCS_FIELD_HOST_RSP: u64 = 0x6c14;
+pub const VMCS_FIELD_HOST_RIP: u64 = 0x6c16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,6 +30,13 @@ pub struct NestedVmcs12State {
     pub vmlaunch_count: u64,
     pub vmresume_count: u64,
     pub entry_rejection_count: u64,
+    pub guest_rsp: u64,
+    pub guest_rflags: u64,
+    pub host_rsp: u64,
+    pub host_rip: u64,
+    pub exit_reason: u64,
+    pub exit_instruction_len: u64,
+    pub exit_qualification: u64,
 }
 
 impl NestedVmcs12State {
@@ -44,6 +58,13 @@ impl NestedVmcs12State {
             vmlaunch_count: 0,
             vmresume_count: 0,
             entry_rejection_count: 0,
+            guest_rsp: 0,
+            guest_rflags: 0,
+            host_rsp: 0,
+            host_rip: 0,
+            exit_reason: 0,
+            exit_instruction_len: 0,
+            exit_qualification: 0,
         }
     }
 }

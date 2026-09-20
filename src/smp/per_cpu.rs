@@ -17,6 +17,7 @@ const NESTED_VMPTRST_DESTINATION_OFFSET: u64 = NESTED_VMCS12_OPERAND_PAGE_OFFSET
 pub(crate) struct ResidentCpuResources {
     pub(crate) vmxon_region: VmxonRegion,
     pub(crate) vmcs_region: VmcsRegion,
+    pub(crate) nested_vmcs02_region: VmcsRegion,
     pub(crate) host_tables: ResidentHostTables,
     pub(crate) context_pages: ResidentPages,
     pub(crate) guest_stack: ResidentPages,
@@ -31,6 +32,8 @@ impl ResidentCpuResources {
         let vmxon_region = VmxonRegion::allocate(vmx_basic).map_err(ResidentProbeError::Vmxon)?;
         let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
         vmcs_region.write_revision_id(vt_vmxon::revision_id(vmx_basic));
+        let mut nested_vmcs02_region = VmcsRegion::allocate(vmx_basic)?;
+        nested_vmcs02_region.write_revision_id(vt_vmxon::revision_id(vmx_basic));
         let host_tables =
             ResidentHostTables::allocate(fatal_handler, ResidentHostSelectors::fixed())?;
         let context_pages = ResidentPages::allocate(1, AddressConstraint::Any)
@@ -79,6 +82,7 @@ impl ResidentCpuResources {
         Ok(Self {
             vmxon_region,
             vmcs_region,
+            nested_vmcs02_region,
             host_tables,
             context_pages,
             guest_stack,
@@ -109,9 +113,14 @@ impl ResidentCpuResources {
         self.nested_vmcs12_pages.physical_address() + NESTED_VMPTRST_DESTINATION_OFFSET
     }
 
+    pub(crate) fn nested_vmcs02_region(&self) -> u64 {
+        self.nested_vmcs02_region.physical_address()
+    }
+
     pub(crate) fn deny_guest_access(&self, ept: &mut IdentityEpt) -> Result<(), EptError> {
         ept.deny_guest_access(self.vmxon_region.physical_address(), 1)?;
         ept.deny_guest_access(self.vmcs_region.physical_address(), 1)?;
+        ept.deny_guest_access(self.nested_vmcs02_region.physical_address(), 1)?;
         ept.deny_guest_access(
             self.host_tables.pages.physical_address(),
             self.host_tables.pages.pages(),

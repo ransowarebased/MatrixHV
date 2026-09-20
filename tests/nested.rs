@@ -26,7 +26,9 @@ use instructions::{
 };
 use state::{INVALID_VMCS_POINTER, NestedVmxState};
 use vmcs::{
-    NestedVmcs12State, VMCS_FIELD_GUEST_RIP, VMCS_FIELD_VM_INSTRUCTION_ERROR,
+    NestedVmcs12State, VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS,
+    VMCS_FIELD_GUEST_RIP, VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
+    VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR,
     VMCS12_LAUNCH_STATE_CLEAR, VMCS12_LAUNCH_STATE_LAUNCHED, VMCS12_LAUNCH_STATE_UNINITIALIZED,
 };
 
@@ -36,6 +38,8 @@ const VMXON_OPERAND: u64 = 0x21_0000;
 const VMCS12_REGION: u64 = 0x30_0000;
 const VMCS12_OPERAND: u64 = 0x31_0000;
 const VMPTRST_DESTINATION: u64 = VMCS12_OPERAND + 8;
+const VMCS01_REGION: u64 = 0x40_0000;
+const VMCS02_REGION: u64 = 0x50_0000;
 
 fn vmcs12(region_offset: u64) -> NestedVmcs12State {
     NestedVmcs12State::new(
@@ -52,6 +56,8 @@ fn nested_state(region_offset: u64) -> NestedVmxState {
         VMXON_OPERAND + region_offset,
         VMXON_REGION + region_offset,
         vmcs12(region_offset),
+        VMCS01_REGION + region_offset,
+        VMCS02_REGION + region_offset,
     )
 }
 
@@ -102,6 +108,13 @@ fn per_cpu_nested_state_starts_independent_and_inactive() {
     assert_eq!(bsp.vmxoff_count, 0);
     assert_eq!(bsp.failure_count, 0);
     assert_eq!(bsp.probe_complete, 0);
+    assert_eq!(bsp.vmcs01_region, VMCS01_REGION);
+    assert_eq!(bsp.vmcs02_region, VMCS02_REGION);
+    assert_eq!(bsp.l2_active, 0);
+    assert_eq!(bsp.l2_entry_count, 0);
+    assert_eq!(bsp.l2_exit_count, 0);
+    assert_eq!(bsp.l2_last_exit_rsp, 0);
+    assert_eq!(bsp.l1_reflection_count, 0);
 }
 
 #[test]
@@ -125,6 +138,13 @@ fn vmcs12_state_starts_uninitialized_with_zero_observability() {
     assert_eq!(vmcs12.vmlaunch_count, 0);
     assert_eq!(vmcs12.vmresume_count, 0);
     assert_eq!(vmcs12.entry_rejection_count, 0);
+    assert_eq!(vmcs12.guest_rsp, 0);
+    assert_eq!(vmcs12.guest_rflags, 0);
+    assert_eq!(vmcs12.host_rsp, 0);
+    assert_eq!(vmcs12.host_rip, 0);
+    assert_eq!(vmcs12.exit_reason, 0);
+    assert_eq!(vmcs12.exit_instruction_len, 0);
+    assert_eq!(vmcs12.exit_qualification, 0);
 }
 
 #[test]
@@ -163,7 +183,14 @@ fn vm_instruction_errors_and_status_flags_match_architecture() {
 #[test]
 fn supported_vmcs12_fields_match_intel_encodings() {
     assert_eq!(VMCS_FIELD_VM_INSTRUCTION_ERROR, 0x4400);
+    assert_eq!(VMCS_FIELD_VM_EXIT_REASON, 0x4402);
+    assert_eq!(VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, 0x440c);
+    assert_eq!(VMCS_FIELD_EXIT_QUALIFICATION, 0x6400);
+    assert_eq!(VMCS_FIELD_GUEST_RSP, 0x681c);
     assert_eq!(VMCS_FIELD_GUEST_RIP, 0x681e);
+    assert_eq!(VMCS_FIELD_GUEST_RFLAGS, 0x6820);
+    assert_eq!(VMCS_FIELD_HOST_RSP, 0x6c14);
+    assert_eq!(VMCS_FIELD_HOST_RIP, 0x6c16);
     assert_eq!(VMCS12_LAUNCH_STATE_CLEAR, 0);
     assert_eq!(VMCS12_LAUNCH_STATE_LAUNCHED, 1);
 }

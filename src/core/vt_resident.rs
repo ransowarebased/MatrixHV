@@ -38,7 +38,9 @@ use crate::nested::instructions::{
 };
 use crate::nested::state::NestedVmxState;
 use crate::nested::vmcs::{
-    NestedVmcs12State, VMCS_FIELD_GUEST_RIP, VMCS_FIELD_VM_INSTRUCTION_ERROR,
+    NestedVmcs12State, VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS,
+    VMCS_FIELD_GUEST_RIP, VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
+    VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR,
     VMCS12_LAUNCH_STATE_CLEAR, VMCS12_LAUNCH_STATE_LAUNCHED,
 };
 use crate::smp::per_cpu::ResidentCpuResources;
@@ -171,11 +173,13 @@ const NESTED_FAILURE_MESSAGE_LEN: usize = b"[MATRIXHV][NESTED] PROBE_FAILED".len
 const NESTED_VMCS12_MESSAGE_LEN: usize = b"[MATRIXHV][NESTED] VMCS12 cpu=0x".len();
 const NESTED_REGION_MESSAGE_LEN: usize = b" region=0x".len();
 const NESTED_VALUE_MESSAGE_LEN: usize = b" value=0x".len();
+const NESTED_L2_EXIT_MESSAGE_LEN: usize = b"[MATRIXHV][NESTED] L2_EXIT cpu=0x".len();
 
 pub const RESIDENT_VMCALL_START_CHECKPOINT: u64 = 0x4856_5354_4152_5421;
 pub const RESIDENT_VMCALL_STOP: u64 = 0x4856_5354_4f50_2121;
 pub const RESIDENT_VMCALL_NESTED_PROBE_FAILED: u64 = 0x4856_4e56_4d46_4149;
 pub const NESTED_VMCS12_TEST_VALUE: u64 = 0x1122_3344_5566_7788;
+pub const NESTED_L2_VMCALL_MAGIC: u64 = 0x4c32_564d_4341_4c4c;
 const RESIDENT_STOP_UNSUPPORTED_EXIT: u64 = 0x4856_554e_5355_5050;
 static EPT_TEST_PAGE_GPA: AtomicU64 = AtomicU64::new(0);
 
@@ -500,6 +504,29 @@ const BCTX_NESTED_VMCS12_LAUNCH_STATE: usize = core::mem::offset_of!(ResidentBoo
 const BCTX_NESTED_VMCS12_GUEST_RIP: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, vmcs12)
     + core::mem::offset_of!(NestedVmcs12State, guest_rip);
+const BCTX_NESTED_VMCS12_GUEST_RSP: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmcs12)
+    + core::mem::offset_of!(NestedVmcs12State, guest_rsp);
+const BCTX_NESTED_VMCS12_GUEST_RFLAGS: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmcs12)
+    + core::mem::offset_of!(NestedVmcs12State, guest_rflags);
+const BCTX_NESTED_VMCS12_HOST_RSP: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmcs12)
+    + core::mem::offset_of!(NestedVmcs12State, host_rsp);
+const BCTX_NESTED_VMCS12_HOST_RIP: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmcs12)
+    + core::mem::offset_of!(NestedVmcs12State, host_rip);
+const BCTX_NESTED_VMCS12_EXIT_REASON: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmcs12)
+    + core::mem::offset_of!(NestedVmcs12State, exit_reason);
+const BCTX_NESTED_VMCS12_EXIT_INSTRUCTION_LEN: usize =
+    core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, vmcs12)
+        + core::mem::offset_of!(NestedVmcs12State, exit_instruction_len);
+const BCTX_NESTED_VMCS12_EXIT_QUALIFICATION: usize =
+    core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, vmcs12)
+        + core::mem::offset_of!(NestedVmcs12State, exit_qualification);
 const BCTX_NESTED_VMCLEAR_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, vmcs12)
     + core::mem::offset_of!(NestedVmcs12State, vmclear_count);
@@ -527,6 +554,24 @@ const BCTX_NESTED_VMRESUME_COUNT: usize = core::mem::offset_of!(ResidentBootCont
 const BCTX_NESTED_ENTRY_REJECTION_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, vmcs12)
     + core::mem::offset_of!(NestedVmcs12State, entry_rejection_count);
+const BCTX_NESTED_VMCS01_REGION: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmcs01_region);
+const BCTX_NESTED_VMCS02_REGION: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmcs02_region);
+const BCTX_NESTED_L2_ACTIVE: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, l2_active);
+const BCTX_NESTED_L2_ENTRY_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, l2_entry_count);
+const BCTX_NESTED_L2_EXIT_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, l2_exit_count);
+const BCTX_NESTED_L2_LAST_EXIT_REASON: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, l2_last_exit_reason);
+const BCTX_NESTED_L2_LAST_EXIT_RIP: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, l2_last_exit_rip);
+const BCTX_NESTED_L2_LAST_EXIT_RSP: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, l2_last_exit_rsp);
+const BCTX_NESTED_L1_REFLECTION_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, l1_reflection_count);
 const BCTX_ORIGINAL_GDTR: usize = core::mem::offset_of!(ResidentBootContext, original_gdtr);
 const BCTX_ORIGINAL_IDTR: usize = core::mem::offset_of!(ResidentBootContext, original_idtr);
 const BCTX_ROOT_FX_STATE: usize = core::mem::offset_of!(ResidentBootContext, root_fx_state);
@@ -1039,6 +1084,59 @@ fn configure_resident_msr_switch(msr_state: &ResidentPages) -> Result<(), VmcsEr
     Ok(())
 }
 
+struct NestedVmcs02Configuration<'a> {
+    vmcs01_region: u64,
+    vmcs02_region: u64,
+    msr_bitmap: u64,
+    ept_pointer: u64,
+    msr_state: &'a ResidentPages,
+    host_cr3: u64,
+    host_tables: &'a ResidentHostTables,
+    segments: segmentation::SegmentationState,
+    host_rsp: u64,
+    host_rip: u64,
+    guest_rip: u64,
+    guest_rsp: u64,
+    guest_rflags: u64,
+}
+
+fn configure_nested_vmcs02(
+    configuration: NestedVmcs02Configuration<'_>,
+) -> Result<(), ResidentProbeError> {
+    let clear = unsafe { vt_vmcs::vmclear(configuration.vmcs02_region) };
+    if clear != VmxInstructionResult::Succeeded {
+        return Err(ResidentProbeError::Vmclear(clear));
+    }
+    let load = unsafe { vt_vmcs::vmptrld(configuration.vmcs02_region) };
+    if load != VmxInstructionResult::Succeeded {
+        return Err(ResidentProbeError::Vmcs(VmcsError::Vmptrld(load)));
+    }
+
+    let configure_result = (|| -> Result<(), ResidentProbeError> {
+        vt_controls::configure_resident_boot(configuration.msr_bitmap, configuration.ept_pointer)?;
+        configure_resident_msr_switch(configuration.msr_state)?;
+        configure_resident_host(
+            configuration.host_cr3,
+            configuration.host_tables,
+            configuration.segments,
+        )?;
+        vt_state::configure_guest_with_rflags(
+            configuration.guest_rip,
+            configuration.guest_rsp,
+            configuration.guest_rflags,
+        )?;
+        vmwrite(HOST_RSP, configuration.host_rsp)?;
+        vmwrite(HOST_RIP, configuration.host_rip)?;
+        Ok(())
+    })();
+
+    let restore = unsafe { vt_vmcs::vmptrld(configuration.vmcs01_region) };
+    if restore != VmxInstructionResult::Succeeded {
+        return Err(ResidentProbeError::Vmcs(VmcsError::Vmptrld(restore)));
+    }
+    configure_result
+}
+
 pub fn run_windows_boot(
     entry_rip: u64,
     event_context: u64,
@@ -1134,6 +1232,7 @@ pub fn run_windows_boot(
     let ResidentCpuResources {
         vmxon_region,
         vmcs_region,
+        nested_vmcs02_region,
         mut host_tables,
         context_pages,
         guest_stack,
@@ -1148,6 +1247,7 @@ pub fn run_windows_boot(
     let nested_vmcs12_operand = nested_vmcs12_region + PAGE_SIZE as u64;
     let nested_vmptrst_destination = nested_vmcs12_operand + 8;
     let vmcs_physical_address = vmcs_region.physical_address();
+    let nested_vmcs02_physical_address = nested_vmcs02_region.physical_address();
     let session = vt_vmxon::enter_vmx_root_with_region(vmx_basic, vmxon_region)
         .map_err(ResidentProbeError::Vmxon)?;
     EPT_TEST_PAGE_GPA.store(ept_test_page.physical_address(), Ordering::Release);
@@ -1191,6 +1291,8 @@ pub fn run_windows_boot(
                     nested_vmcs12_region,
                     nested_vmptrst_destination,
                 ),
+                vmcs_physical_address,
+                nested_vmcs02_physical_address,
             ),
         ));
     }
@@ -1198,6 +1300,21 @@ pub fn run_windows_boot(
     unsafe {
         (host_rsp as *mut u64).write(context as u64);
     }
+    configure_nested_vmcs02(NestedVmcs02Configuration {
+        vmcs01_region: vmcs_physical_address,
+        vmcs02_region: nested_vmcs02_physical_address,
+        msr_bitmap: msr_bitmap.physical_address(),
+        ept_pointer: ept.ept_pointer(),
+        msr_state: &resident_msr_state,
+        host_cr3: host_space.host_cr3,
+        host_tables: &host_tables,
+        segments: root_segments,
+        host_rsp,
+        host_rip: code.dispatch_entry,
+        guest_rip: entry_rip,
+        guest_rsp: guest_rsp & !0xf,
+        guest_rflags: initial_rflags,
+    })?;
 
     for (processor_number, resources) in &mut ap_resources {
         let mut launch = ResidentApLaunch {
@@ -1258,6 +1375,18 @@ pub fn run_windows_boot(
             nested.vmcs12.probe_complete,
             nested.vmcs12.entry_rejection_count
         ));
+        crate::runtime::logger::info(format_args!(
+            "nested AP L2 processor={} vmcs01={:#x} vmcs02={:#x} entries={} exits={} reflections={} reason={:#x} rip={:#x} rsp={:#x}",
+            processor_number,
+            nested.vmcs01_region,
+            nested.vmcs02_region,
+            nested.l2_entry_count,
+            nested.l2_exit_count,
+            nested.l1_reflection_count,
+            nested.l2_last_exit_reason,
+            nested.l2_last_exit_rip,
+            nested.l2_last_exit_rsp
+        ));
         if result.is_err()
             || started != 1
             || nested.vmxon_count != 2
@@ -1266,17 +1395,32 @@ pub fn run_windows_boot(
             || nested.failure_count != 5
             || nested.probe_complete != 1
             || nested.vmcs12.last_stored_pointer != nested.vmcs12.region
-            || nested.vmcs12.guest_rip != NESTED_VMCS12_TEST_VALUE
+            || nested.vmcs12.guest_rip == 0
+            || nested.vmcs12.guest_rip != nested.l2_last_exit_rip
+            || nested.vmcs12.guest_rsp == 0
+            || nested.vmcs12.guest_rsp != nested.l2_last_exit_rsp
+            || nested.vmcs12.host_rip == 0
+            || nested.vmcs12.host_rsp == 0
+            || nested.vmcs12.exit_reason & 0xffff != VMCALL_EXIT_REASON
+            || nested.vmcs12.exit_instruction_len != 3
             || nested.vmcs12.vmclear_count != 2
-            || nested.vmcs12.vmptrld_count != 1
+            || nested.vmcs12.vmptrld_count != 2
             || nested.vmcs12.vmptrst_count != 1
-            || nested.vmcs12.vmwrite_count != 1
-            || nested.vmcs12.vmread_count != 4
+            || nested.vmcs12.vmwrite_count != 6
+            || nested.vmcs12.vmread_count != 7
             || nested.vmcs12.probe_complete != 1
-            || nested.vmcs12.vmlaunch_count != 2
+            || nested.vmcs12.vmlaunch_count != 3
             || nested.vmcs12.vmresume_count != 2
             || nested.vmcs12.entry_rejection_count != 4
-            || nested.vmcs12.launch_state != VMCS12_LAUNCH_STATE_CLEAR
+            || nested.vmcs12.launch_state != VMCS12_LAUNCH_STATE_LAUNCHED
+            || nested.vmcs01_region == nested.vmcs02_region
+            || nested.l2_active != 0
+            || nested.l2_entry_count != 1
+            || nested.l2_exit_count != 1
+            || nested.l2_last_exit_reason & 0xffff != VMCALL_EXIT_REASON
+            || nested.l2_last_exit_rip == 0
+            || nested.l2_last_exit_rsp == 0
+            || nested.l1_reflection_count != 1
         {
             resident_startup_halt();
         }
@@ -1390,6 +1534,7 @@ impl ResidentApLaunch<'_> {
         let nested_vmcs12_operand = self.resources.nested_vmcs12_operand();
         let nested_vmcs12_region = self.resources.nested_vmcs12_region();
         let nested_vmptrst_destination = self.resources.nested_vmptrst_destination();
+        let nested_vmcs02_region = self.resources.nested_vmcs02_region();
         let vmx_basic = vt_vmxon::vmx_basic();
         let session = vt_vmxon::enter_vmx_root_with_borrowed_region(
             vmx_basic,
@@ -1432,6 +1577,8 @@ impl ResidentApLaunch<'_> {
                     nested_vmcs12_region,
                     nested_vmptrst_destination,
                 ),
+                vmcs,
+                nested_vmcs02_region,
             ),
         );
         state.processor_number = self.processor_number as u64;
@@ -1443,6 +1590,21 @@ impl ResidentApLaunch<'_> {
             context.write(state);
             (host_rsp as *mut u64).write(context as u64);
         }
+        configure_nested_vmcs02(NestedVmcs02Configuration {
+            vmcs01_region: vmcs,
+            vmcs02_region: nested_vmcs02_region,
+            msr_bitmap: self.msr_bitmap,
+            ept_pointer: self.ept_pointer,
+            msr_state: &self.resources.resident_msr_state,
+            host_cr3: self.host_cr3,
+            host_tables: &self.resources.host_tables,
+            segments,
+            host_rsp,
+            host_rip: self.dispatch_entry,
+            guest_rip,
+            guest_rsp,
+            guest_rflags: 0x2,
+        })?;
         vmwrite(HOST_RSP, host_rsp)?;
         vmwrite(HOST_RIP, self.dispatch_entry)?;
         // The successful guest continuation returns to firmware without dropping this root session.
@@ -1767,6 +1929,8 @@ global_asm!(
     "mov rax, qword ptr [r12 + {b_last_host_cr3}]",
     "cmp rax, qword ptr [r12 + {b_expected_host_cr3}]",
     "jne .Lresident_dispatch_host_cr3_mismatch",
+    "cmp qword ptr [r12 + {b_nested_l2_active}], 1",
+    "je .Lresident_nested_l2_reflect",
     "mov rdi, qword ptr [r12 + {b_event_context}]",
     "test rdi, rdi",
     "jz .Lresident_dispatch_after_events",
@@ -1852,6 +2016,81 @@ global_asm!(
     "je .Lresident_dispatch_xsetbv",
     "jmp .Lresident_dispatch_unsupported",
     include_str!("../../asm/ap_startup.S"),
+    ".Lresident_nested_l2_reflect:",
+    "mov r10, qword ptr [r12 + {b_last_reason}]",
+    "mov eax, r10d",
+    "and eax, 0xffff",
+    "cmp eax, {vmcall_reason}",
+    "jne .Lresident_dispatch_halt",
+    "inc qword ptr [r12 + {b_nested_l2_exit_count}]",
+    "inc qword ptr [r12 + {b_nested_l1_reflection_count}]",
+    "mov qword ptr [r12 + {b_nested_l2_last_exit_reason}], r10",
+    "mov qword ptr [r12 + {b_nested_vmcs12_exit_reason}], r10",
+    "mov r11, qword ptr [r12 + {b_last_instruction_len}]",
+    "mov qword ptr [r12 + {b_nested_vmcs12_exit_instruction_len}], r11",
+    "mov r11, qword ptr [r12 + {b_last_qualification}]",
+    "mov qword ptr [r12 + {b_nested_vmcs12_exit_qualification}], r11",
+    "mov r11, qword ptr [r12 + {b_last_guest_rip}]",
+    "mov qword ptr [r12 + {b_nested_l2_last_exit_rip}], r11",
+    "mov qword ptr [r12 + {b_nested_vmcs12_guest_rip}], r11",
+    "mov rax, {guest_rsp}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "mov qword ptr [r12 + {b_nested_vmcs12_guest_rsp}], r11",
+    "mov qword ptr [r12 + {b_nested_l2_last_exit_rsp}], r11",
+    "mov rax, {guest_rflags}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "mov qword ptr [r12 + {b_nested_vmcs12_guest_rflags}], r11",
+    "mov qword ptr [r12 + {b_nested_vmcs12_launch_state}], {vmcs12_launch_state_launched}",
+    "mov qword ptr [r12 + {b_nested_l2_active}], 0",
+    "vmptrld [r12 + {b_nested_vmcs01_region}]",
+    "jna .Lresident_dispatch_halt",
+    "mov rax, {guest_rip}",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_host_rip}]",
+    "vmwrite rax, r11",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "mov rax, {guest_rsp}",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_host_rsp}]",
+    "vmwrite rax, r11",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "mov rax, {guest_rflags}",
+    "mov r11, 2",
+    "vmwrite rax, r11",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "mov rax, {guest_interruptibility_info}",
+    "xor r11d, r11d",
+    "vmwrite rax, r11",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "mov rax, {vm_entry_intr_info_field}",
+    "vmwrite rax, r11",
+    "jc .Lresident_dispatch_vmwrite_failed",
+    "jz .Lresident_dispatch_vmwrite_failed",
+    "lea rsi, [rip + .Lnested_l2_exit_message]",
+    "mov r9d, {nested_l2_exit_message_len}",
+    "call .Lresident_serial_write",
+    "mov rax, qword ptr [r12 + {b_processor_number}]",
+    "call .Lresident_serial_hex64",
+    "lea rsi, [rip + .Lstate_reason]",
+    "mov r9d, {state_reason_len}",
+    "call .Lresident_serial_write",
+    "mov rax, qword ptr [r12 + {b_nested_l2_last_exit_reason}]",
+    "call .Lresident_serial_hex64",
+    "lea rsi, [rip + .Lstate_rip]",
+    "mov r9d, {state_rip_len}",
+    "call .Lresident_serial_write",
+    "mov rax, qword ptr [r12 + {b_nested_l2_last_exit_rip}]",
+    "call .Lresident_serial_hex64",
+    "lea rsi, [rip + .Lstate_newline]",
+    "mov r9d, {state_newline_len}",
+    "call .Lresident_serial_write",
+    "jmp .Lresident_dispatch_resume",
     ".Lresident_dispatch_ept_violation:",
     "mov rax, {guest_physical_address}",
     "vmread r11, rax",
@@ -1923,6 +2162,8 @@ global_asm!(
     "je .Lresident_nested_vmclear_vmxon_pointer",
     "cmp r11, qword ptr [r12 + {b_nested_vmcs12_region}]",
     "jne .Lresident_nested_vmclear_invalid_address",
+    "vmclear [r12 + {b_nested_vmcs02_region}]",
+    "jna .Lresident_dispatch_halt",
     "mov qword ptr [r12 + {b_nested_vmcs12_launch_state}], {vmcs12_launch_state_clear}",
     "cmp r11, qword ptr [r12 + {b_nested_current_vmcs}]",
     "jne .Lresident_nested_succeed",
@@ -1955,7 +2196,39 @@ global_asm!(
     "jnz .Lresident_nested_entry_mov_ss",
     "cmp qword ptr [r12 + {b_nested_vmcs12_launch_state}], {vmcs12_launch_state_clear}",
     "jne .Lresident_nested_vmlaunch_non_clear",
-    // The current VMCS12 has no control fields and cannot describe a valid entry.
+    "cmp qword ptr [r12 + {b_nested_vmcs12_guest_rip}], 0",
+    "je .Lresident_nested_entry_invalid_controls",
+    "cmp qword ptr [r12 + {b_nested_vmcs12_guest_rsp}], 0",
+    "je .Lresident_nested_entry_invalid_controls",
+    "cmp qword ptr [r12 + {b_nested_vmcs12_host_rip}], 0",
+    "je .Lresident_nested_entry_invalid_controls",
+    "cmp qword ptr [r12 + {b_nested_vmcs12_host_rsp}], 0",
+    "je .Lresident_nested_entry_invalid_controls",
+    "test qword ptr [r12 + {b_nested_vmcs12_guest_rflags}], 2",
+    "jz .Lresident_nested_entry_invalid_controls",
+    "dec qword ptr [r12 + {b_nested_entry_rejection_count}]",
+    "mov qword ptr [r12 + {b_nested_l2_active}], 1",
+    "inc qword ptr [r12 + {b_nested_l2_entry_count}]",
+    "vmptrld [r12 + {b_nested_vmcs02_region}]",
+    "jna .Lresident_dispatch_halt",
+    "mov rax, {guest_rip}",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_guest_rip}]",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    "mov rax, {guest_rsp}",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_guest_rsp}]",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    "mov rax, {guest_rflags}",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_guest_rflags}]",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    "mov rax, {vm_entry_intr_info_field}",
+    "xor r11d, r11d",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    "jmp .Lresident_nested_l2_enter",
+    ".Lresident_nested_entry_invalid_controls:",
     "mov r10d, {vm_entry_invalid_control_fields_error}",
     "jmp .Lresident_nested_vmfail_with_error",
     ".Lresident_nested_vmlaunch_non_clear:",
@@ -2031,7 +2304,21 @@ global_asm!(
     "mov r10, qword ptr [rsp + 8]",
     "cmp r10, {vmcs_field_guest_rip}",
     "je .Lresident_nested_vmwrite_guest_rip",
+    "cmp r10, {vmcs_field_guest_rsp}",
+    "je .Lresident_nested_vmwrite_guest_rsp",
+    "cmp r10, {vmcs_field_guest_rflags}",
+    "je .Lresident_nested_vmwrite_guest_rflags",
+    "cmp r10, {vmcs_field_host_rsp}",
+    "je .Lresident_nested_vmwrite_host_rsp",
+    "cmp r10, {vmcs_field_host_rip}",
+    "je .Lresident_nested_vmwrite_host_rip",
     "cmp r10, {vmcs_field_instruction_error}",
+    "je .Lresident_nested_vmwrite_read_only",
+    "cmp r10, {vmcs_field_exit_reason}",
+    "je .Lresident_nested_vmwrite_read_only",
+    "cmp r10, {vmcs_field_exit_instruction_len}",
+    "je .Lresident_nested_vmwrite_read_only",
+    "cmp r10, {vmcs_field_exit_qualification}",
     "je .Lresident_nested_vmwrite_read_only",
     "mov r10d, {vmcs_unsupported_component_error}",
     "jmp .Lresident_nested_vmfail_with_error",
@@ -2041,6 +2328,22 @@ global_asm!(
     ".Lresident_nested_vmwrite_guest_rip:",
     "mov r11, qword ptr [rsp + 16]",
     "mov qword ptr [r12 + {b_nested_vmcs12_guest_rip}], r11",
+    "jmp .Lresident_nested_succeed",
+    ".Lresident_nested_vmwrite_guest_rsp:",
+    "mov r11, qword ptr [rsp + 16]",
+    "mov qword ptr [r12 + {b_nested_vmcs12_guest_rsp}], r11",
+    "jmp .Lresident_nested_succeed",
+    ".Lresident_nested_vmwrite_guest_rflags:",
+    "mov r11, qword ptr [rsp + 16]",
+    "mov qword ptr [r12 + {b_nested_vmcs12_guest_rflags}], r11",
+    "jmp .Lresident_nested_succeed",
+    ".Lresident_nested_vmwrite_host_rsp:",
+    "mov r11, qword ptr [rsp + 16]",
+    "mov qword ptr [r12 + {b_nested_vmcs12_host_rsp}], r11",
+    "jmp .Lresident_nested_succeed",
+    ".Lresident_nested_vmwrite_host_rip:",
+    "mov r11, qword ptr [rsp + 16]",
+    "mov qword ptr [r12 + {b_nested_vmcs12_host_rip}], r11",
     "jmp .Lresident_nested_succeed",
     ".Lresident_dispatch_vmread:",
     "inc qword ptr [r12 + {b_nested_vmread_count}]",
@@ -2057,12 +2360,47 @@ global_asm!(
     "mov r10, qword ptr [rsp + 8]",
     "cmp r10, {vmcs_field_guest_rip}",
     "je .Lresident_nested_vmread_guest_rip",
+    "cmp r10, {vmcs_field_guest_rsp}",
+    "je .Lresident_nested_vmread_guest_rsp",
+    "cmp r10, {vmcs_field_guest_rflags}",
+    "je .Lresident_nested_vmread_guest_rflags",
+    "cmp r10, {vmcs_field_host_rsp}",
+    "je .Lresident_nested_vmread_host_rsp",
+    "cmp r10, {vmcs_field_host_rip}",
+    "je .Lresident_nested_vmread_host_rip",
     "cmp r10, {vmcs_field_instruction_error}",
     "je .Lresident_nested_vmread_instruction_error",
+    "cmp r10, {vmcs_field_exit_reason}",
+    "je .Lresident_nested_vmread_exit_reason",
+    "cmp r10, {vmcs_field_exit_instruction_len}",
+    "je .Lresident_nested_vmread_exit_instruction_len",
+    "cmp r10, {vmcs_field_exit_qualification}",
+    "je .Lresident_nested_vmread_exit_qualification",
     "mov r10d, {vmcs_unsupported_component_error}",
     "jmp .Lresident_nested_vmfail_with_error",
     ".Lresident_nested_vmread_instruction_error:",
     "mov r11, qword ptr [r12 + {b_nested_instruction_error}]",
+    "jmp .Lresident_nested_vmread_value",
+    ".Lresident_nested_vmread_exit_reason:",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_exit_reason}]",
+    "jmp .Lresident_nested_vmread_value",
+    ".Lresident_nested_vmread_exit_instruction_len:",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_exit_instruction_len}]",
+    "jmp .Lresident_nested_vmread_value",
+    ".Lresident_nested_vmread_exit_qualification:",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_exit_qualification}]",
+    "jmp .Lresident_nested_vmread_value",
+    ".Lresident_nested_vmread_guest_rsp:",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_guest_rsp}]",
+    "jmp .Lresident_nested_vmread_value",
+    ".Lresident_nested_vmread_guest_rflags:",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_guest_rflags}]",
+    "jmp .Lresident_nested_vmread_value",
+    ".Lresident_nested_vmread_host_rsp:",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_host_rsp}]",
+    "jmp .Lresident_nested_vmread_value",
+    ".Lresident_nested_vmread_host_rip:",
+    "mov r11, qword ptr [r12 + {b_nested_vmcs12_host_rip}]",
     "jmp .Lresident_nested_vmread_value",
     ".Lresident_nested_vmread_guest_rip:",
     "mov r11, qword ptr [r12 + {b_nested_vmcs12_guest_rip}]",
@@ -2089,6 +2427,59 @@ global_asm!(
     ".Lresident_nested_vmread_value:",
     "mov qword ptr [rsp + 16], r11",
     "jmp .Lresident_nested_succeed",
+    ".Lresident_nested_l2_enter:",
+    "pop rax",
+    "pop rcx",
+    "pop rdx",
+    "pop rbx",
+    "pop rbp",
+    "pop rsi",
+    "pop rdi",
+    "pop r8",
+    "pop r9",
+    "pop r10",
+    "pop r11",
+    "pop r12",
+    "pop r13",
+    "pop r14",
+    "pop r15",
+    "vmlaunch",
+    "push r15",
+    "push r14",
+    "push r13",
+    "push r12",
+    "push r11",
+    "push r10",
+    "push r9",
+    "push r8",
+    "push rdi",
+    "push rsi",
+    "push rbp",
+    "push rbx",
+    "push rdx",
+    "push rcx",
+    "push rax",
+    "pushfq",
+    "mov r12, qword ptr [rsp + 128]",
+    "mov r10, qword ptr [rsp]",
+    "add rsp, 8",
+    "mov qword ptr [r12 + {b_nested_l2_active}], 0",
+    "dec qword ptr [r12 + {b_nested_l2_entry_count}]",
+    "inc qword ptr [r12 + {b_nested_entry_rejection_count}]",
+    "test r10b, 1",
+    "jnz .Lresident_nested_l2_launch_fail_invalid",
+    "test r10b, 0x40",
+    "jz .Lresident_dispatch_halt",
+    "mov rax, {vm_instruction_error}",
+    "vmread r10, rax",
+    "jna .Lresident_dispatch_halt",
+    "vmptrld [r12 + {b_nested_vmcs01_region}]",
+    "jna .Lresident_dispatch_halt",
+    "jmp .Lresident_nested_vmfail_with_error",
+    ".Lresident_nested_l2_launch_fail_invalid:",
+    "vmptrld [r12 + {b_nested_vmcs01_region}]",
+    "jna .Lresident_dispatch_halt",
+    "jmp .Lresident_nested_vmfail_invalid",
     ".Lresident_dispatch_vmresume:",
     "inc qword ptr [r12 + {b_nested_vmresume_count}]",
     "inc qword ptr [r12 + {b_nested_entry_rejection_count}]",
@@ -3023,6 +3414,9 @@ global_asm!(
     ".Lnested_value_message:",
     ".ascii \" value=0x\"",
     ".Lnested_value_message_end:",
+    ".Lnested_l2_exit_message:",
+    ".ascii \"[MATRIXHV][NESTED] L2_EXIT cpu=0x\"",
+    ".Lnested_l2_exit_message_end:",
     ".Lstate_reason:",
     ".ascii \" reason=0x\"",
     ".Lstate_reason_end:",
@@ -3275,6 +3669,13 @@ global_asm!(
     b_nested_vmcs12_revision_id = const BCTX_NESTED_VMCS12_REVISION_ID,
     b_nested_vmcs12_launch_state = const BCTX_NESTED_VMCS12_LAUNCH_STATE,
     b_nested_vmcs12_guest_rip = const BCTX_NESTED_VMCS12_GUEST_RIP,
+    b_nested_vmcs12_guest_rsp = const BCTX_NESTED_VMCS12_GUEST_RSP,
+    b_nested_vmcs12_guest_rflags = const BCTX_NESTED_VMCS12_GUEST_RFLAGS,
+    b_nested_vmcs12_host_rsp = const BCTX_NESTED_VMCS12_HOST_RSP,
+    b_nested_vmcs12_host_rip = const BCTX_NESTED_VMCS12_HOST_RIP,
+    b_nested_vmcs12_exit_reason = const BCTX_NESTED_VMCS12_EXIT_REASON,
+    b_nested_vmcs12_exit_instruction_len = const BCTX_NESTED_VMCS12_EXIT_INSTRUCTION_LEN,
+    b_nested_vmcs12_exit_qualification = const BCTX_NESTED_VMCS12_EXIT_QUALIFICATION,
     b_nested_vmclear_count = const BCTX_NESTED_VMCLEAR_COUNT,
     b_nested_vmptrld_count = const BCTX_NESTED_VMPTRLD_COUNT,
     b_nested_vmptrst_count = const BCTX_NESTED_VMPTRST_COUNT,
@@ -3284,9 +3685,25 @@ global_asm!(
     b_nested_vmlaunch_count = const BCTX_NESTED_VMLAUNCH_COUNT,
     b_nested_vmresume_count = const BCTX_NESTED_VMRESUME_COUNT,
     b_nested_entry_rejection_count = const BCTX_NESTED_ENTRY_REJECTION_COUNT,
+    b_nested_vmcs01_region = const BCTX_NESTED_VMCS01_REGION,
+    b_nested_vmcs02_region = const BCTX_NESTED_VMCS02_REGION,
+    b_nested_l2_active = const BCTX_NESTED_L2_ACTIVE,
+    b_nested_l2_entry_count = const BCTX_NESTED_L2_ENTRY_COUNT,
+    b_nested_l2_exit_count = const BCTX_NESTED_L2_EXIT_COUNT,
+    b_nested_l2_last_exit_reason = const BCTX_NESTED_L2_LAST_EXIT_REASON,
+    b_nested_l2_last_exit_rip = const BCTX_NESTED_L2_LAST_EXIT_RIP,
+    b_nested_l2_last_exit_rsp = const BCTX_NESTED_L2_LAST_EXIT_RSP,
+    b_nested_l1_reflection_count = const BCTX_NESTED_L1_REFLECTION_COUNT,
     vmcs12_launch_state_clear = const VMCS12_LAUNCH_STATE_CLEAR,
     vmcs12_launch_state_launched = const VMCS12_LAUNCH_STATE_LAUNCHED,
+    vmcs_field_exit_qualification = const VMCS_FIELD_EXIT_QUALIFICATION,
+    vmcs_field_guest_rflags = const VMCS_FIELD_GUEST_RFLAGS,
     vmcs_field_guest_rip = const VMCS_FIELD_GUEST_RIP,
+    vmcs_field_guest_rsp = const VMCS_FIELD_GUEST_RSP,
+    vmcs_field_host_rip = const VMCS_FIELD_HOST_RIP,
+    vmcs_field_host_rsp = const VMCS_FIELD_HOST_RSP,
+    vmcs_field_exit_instruction_len = const VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN,
+    vmcs_field_exit_reason = const VMCS_FIELD_VM_EXIT_REASON,
     vmcs_field_instruction_error = const VMCS_FIELD_VM_INSTRUCTION_ERROR,
     event_magic_offset = const EVENT_CTX_MAGIC,
     event_ebs_seen = const EVENT_CTX_EBS_SEEN,
@@ -3315,6 +3732,7 @@ global_asm!(
     nested_vmcs12_message_len = const NESTED_VMCS12_MESSAGE_LEN,
     nested_region_message_len = const NESTED_REGION_MESSAGE_LEN,
     nested_value_message_len = const NESTED_VALUE_MESSAGE_LEN,
+    nested_l2_exit_message_len = const NESTED_L2_EXIT_MESSAGE_LEN,
     state_reason_len = const STATE_REASON_LEN,
     state_rip_len = const STATE_RIP_LEN,
     state_instruction_len_len = const STATE_INSTRUCTION_LEN_LEN,

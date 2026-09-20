@@ -20,6 +20,15 @@ pub struct NestedVmxState {
     pub active: u64,
     pub probe_complete: u64,
     pub vmcs12: NestedVmcs12State,
+    pub vmcs01_region: u64,
+    pub vmcs02_region: u64,
+    pub l2_active: u64,
+    pub l2_entry_count: u64,
+    pub l2_exit_count: u64,
+    pub l2_last_exit_reason: u64,
+    pub l2_last_exit_rip: u64,
+    pub l2_last_exit_rsp: u64,
+    pub l1_reflection_count: u64,
 }
 
 impl NestedVmxState {
@@ -28,6 +37,8 @@ impl NestedVmxState {
         vmxon_operand: u64,
         vmxon_region: u64,
         vmcs12: NestedVmcs12State,
+        vmcs01_region: u64,
+        vmcs02_region: u64,
     ) -> Self {
         Self {
             feature_control: capabilities.feature_control,
@@ -44,6 +55,15 @@ impl NestedVmxState {
             active: 0,
             probe_complete: 0,
             vmcs12,
+            vmcs01_region,
+            vmcs02_region,
+            l2_active: 0,
+            l2_entry_count: 0,
+            l2_exit_count: 0,
+            l2_last_exit_reason: 0,
+            l2_last_exit_rip: 0,
+            l2_last_exit_rsp: 0,
+            l1_reflection_count: 0,
         }
     }
 }
