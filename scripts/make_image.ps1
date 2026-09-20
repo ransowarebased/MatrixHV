@@ -12,7 +12,9 @@ param(
     [ValidateRange(64, 2048)]
     [int]$ImageSizeMiB = 64,
 
-    [string]$VeraCryptEfiSource
+    [string]$VeraCryptEfiSource,
+
+    [string]$VmxFlatEfiSource
 )
 
 Set-StrictMode -Version Latest
@@ -280,6 +282,13 @@ if (-not (Test-Path -LiteralPath $BootBinary -PathType Leaf)) {
 
 $ImageFiles = New-Object 'System.Collections.Generic.List[object]'
 $ImageFiles.Add((New-ImageFileDescriptor -Directory 'BOOT' -Name 'BOOTX64.EFI' -ShortName 'BOOTX64 EFI' -LongName $null -SourcePath $BootBinary))
+if (-not [string]::IsNullOrWhiteSpace($VmxFlatEfiSource)) {
+    $VmxFlatEfiSource = [System.IO.Path]::GetFullPath($VmxFlatEfiSource)
+    if (-not (Test-Path -LiteralPath $VmxFlatEfiSource -PathType Leaf)) {
+        throw "VMX flat EFI payload not found: $VmxFlatEfiSource"
+    }
+    $ImageFiles.Add((New-ImageFileDescriptor -Directory 'BOOT' -Name 'VMXFLAT.EFI' -ShortName 'VMXFLAT EFI' -LongName $null -SourcePath $VmxFlatEfiSource))
+}
 
 $VeraCryptPayload = $null
 if (-not [string]::IsNullOrWhiteSpace($VeraCryptEfiSource)) {
@@ -449,8 +458,9 @@ try {
     $Index = 0
     $Index = Write-FatNamedDirectoryEntry -Stream $Stream -DirectoryOffset $BootDirectoryOffset -EntryIndex $Index -ShortName '.          ' -LongName $null -Attributes 0x10 -FirstCluster $BootDirectoryCluster
     $Index = Write-FatNamedDirectoryEntry -Stream $Stream -DirectoryOffset $BootDirectoryOffset -EntryIndex $Index -ShortName '..         ' -LongName $null -Attributes 0x10 -FirstCluster $EfiCluster
-    $BootFile = @($ImageFiles | Where-Object { $_.Directory -eq 'BOOT' })[0]
-    $Index = Write-FatNamedDirectoryEntry -Stream $Stream -DirectoryOffset $BootDirectoryOffset -EntryIndex $Index -ShortName $BootFile.ShortName -LongName $BootFile.LongName -Attributes 0x20 -FirstCluster $BootFile.FirstCluster -FileSize ([UInt32]$BootFile.Bytes.Length)
+    foreach ($ImageFile in @($ImageFiles | Where-Object { $_.Directory -eq 'BOOT' })) {
+        $Index = Write-FatNamedDirectoryEntry -Stream $Stream -DirectoryOffset $BootDirectoryOffset -EntryIndex $Index -ShortName $ImageFile.ShortName -LongName $ImageFile.LongName -Attributes 0x20 -FirstCluster $ImageFile.FirstCluster -FileSize ([UInt32]$ImageFile.Bytes.Length)
+    }
 
     if ($null -ne $VeraCryptPayload) {
         $VeraCryptDirectoryOffset = Get-ClusterOffset -Cluster $VeraCryptDirectoryCluster -FirstDataSector $FirstDataSector -SectorsPerCluster $SectorsPerCluster -BytesPerSector $BytesPerSector
@@ -474,6 +484,10 @@ finally {
 }
 
 Write-Host "Created UEFI FAT32 image: $ImagePath"
+if (-not [string]::IsNullOrWhiteSpace($VmxFlatEfiSource)) {
+    $VmxFlatHash = (Get-FileHash -LiteralPath $VmxFlatEfiSource -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-Host "  EFI\BOOT\VMXFLAT.EFI <= $VmxFlatEfiSource [$VmxFlatHash]"
+}
 if ($null -ne $VeraCryptPayload) {
     Write-Host "Embedded VeraCrypt EFI payload from: $($VeraCryptPayload.Directory)"
     foreach ($ImageFile in @($ImageFiles | Where-Object { $_.Directory -eq 'VeraCrypt' })) {

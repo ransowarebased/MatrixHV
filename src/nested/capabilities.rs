@@ -27,6 +27,10 @@ pub const VM_ENTRY_IA32E_MODE_GUEST: u32 = 1 << 9;
 pub const VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 pub const VMX_SECONDARY_ENABLE_EPT: u32 = 1 << 1;
 pub const VMX_SECONDARY_ENABLE_VPID: u32 = 1 << 5;
+pub const VMX_LEGACY_PINBASED_DEFAULT1: u32 = 0x0000_0016;
+pub const VMX_LEGACY_PROCBASED_DEFAULT1: u32 = 0x0401_e172;
+pub const VMX_LEGACY_EXIT_DEFAULT1: u32 = 0x0003_6dff;
+pub const VMX_LEGACY_ENTRY_DEFAULT1: u32 = 0x0000_11ff;
 pub const VMX_EPT_PAGE_WALK_LENGTH_4: u64 = 1 << 6;
 pub const VMX_EPT_MEMORY_TYPE_WB: u64 = 1 << 14;
 pub const VMX_EPT_2MB_PAGE: u64 = 1 << 16;
@@ -136,44 +140,84 @@ impl NestedVmxCapabilities {
                 && control_may_be_one(host.procbased_ctls2, VMX_SECONDARY_ENABLE_EPT)
                 && host.ept_vpid_cap & (VMX_EPT_PAGE_WALK_LENGTH_4 | VMX_EPT_MEMORY_TYPE_WB)
                     == (VMX_EPT_PAGE_WALK_LENGTH_4 | VMX_EPT_MEMORY_TYPE_WB);
-        let primary_supported = if ept_supported {
+        let optional_primary = if ept_supported {
             VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS
         } else {
             0
         };
+        let pinbased_supported = VMX_LEGACY_PINBASED_DEFAULT1;
+        let procbased_supported = VMX_LEGACY_PROCBASED_DEFAULT1 | optional_primary;
+        let exit_supported = VMX_LEGACY_EXIT_DEFAULT1 | VM_EXIT_HOST_ADDRESS_SPACE_SIZE;
+        let entry_supported = VMX_LEGACY_ENTRY_DEFAULT1 | VM_ENTRY_IA32E_MODE_GUEST;
         let secondary_ept = restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_EPT, 0);
         let secondary_supported = if ept_supported {
             secondary_ept | (u64::from(VMX_SECONDARY_ENABLE_VPID) << 32)
         } else {
             0
         };
-        let exit_ctls = restrict_control(
-            host.exit_ctls,
-            VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
-            VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
-        );
-        let entry_ctls = restrict_control(
-            host.entry_ctls,
-            VM_ENTRY_IA32E_MODE_GUEST,
-            VM_ENTRY_IA32E_MODE_GUEST,
-        );
+        let true_pinbased_ctls = if has_true_controls {
+            restrict_emulated_control(host.true_pinbased_ctls, pinbased_supported, 0)
+        } else {
+            0
+        };
+        let true_procbased_ctls = if has_true_controls {
+            restrict_emulated_control(host.true_procbased_ctls, procbased_supported, 0)
+        } else {
+            0
+        };
         let true_exit_ctls = if has_true_controls {
-            restrict_control(
+            restrict_emulated_control(
                 host.true_exit_ctls,
-                VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
+                exit_supported,
                 VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
             )
         } else {
             0
         };
         let true_entry_ctls = if has_true_controls {
-            restrict_control(
+            restrict_emulated_control(
                 host.true_entry_ctls,
-                VM_ENTRY_IA32E_MODE_GUEST,
+                entry_supported,
                 VM_ENTRY_IA32E_MODE_GUEST,
             )
         } else {
             0
+        };
+        let pinbased_ctls = if has_true_controls {
+            legacy_control_from_true(true_pinbased_ctls, VMX_LEGACY_PINBASED_DEFAULT1)
+        } else {
+            restrict_control(
+                host.pinbased_ctls,
+                pinbased_supported,
+                VMX_LEGACY_PINBASED_DEFAULT1,
+            )
+        };
+        let procbased_ctls = if has_true_controls {
+            legacy_control_from_true(true_procbased_ctls, VMX_LEGACY_PROCBASED_DEFAULT1)
+        } else {
+            restrict_control(
+                host.procbased_ctls,
+                procbased_supported,
+                VMX_LEGACY_PROCBASED_DEFAULT1,
+            )
+        };
+        let exit_ctls = if has_true_controls {
+            legacy_control_from_true(true_exit_ctls, VMX_LEGACY_EXIT_DEFAULT1)
+        } else {
+            restrict_control(
+                host.exit_ctls,
+                exit_supported,
+                VMX_LEGACY_EXIT_DEFAULT1 | VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
+            )
+        };
+        let entry_ctls = if has_true_controls {
+            legacy_control_from_true(true_entry_ctls, VMX_LEGACY_ENTRY_DEFAULT1)
+        } else {
+            restrict_control(
+                host.entry_ctls,
+                entry_supported,
+                VMX_LEGACY_ENTRY_DEFAULT1 | VM_ENTRY_IA32E_MODE_GUEST,
+            )
         };
 
         Self {
@@ -183,8 +227,8 @@ impl NestedVmxCapabilities {
                 | (VMX_REGION_SIZE << 32)
                 | (VMX_MEMORY_TYPE_WRITE_BACK << 50)
                 | (host.vmx_basic & VMX_BASIC_TRUE_CONTROLS),
-            vmx_pinbased_ctls: restrict_control(host.pinbased_ctls, 0, 0),
-            vmx_procbased_ctls: restrict_control(host.procbased_ctls, primary_supported, 0),
+            vmx_pinbased_ctls: pinbased_ctls,
+            vmx_procbased_ctls: procbased_ctls,
             vmx_exit_ctls: exit_ctls,
             vmx_entry_ctls: entry_ctls,
             vmx_misc: 0,
@@ -199,16 +243,8 @@ impl NestedVmxCapabilities {
             } else {
                 0
             },
-            vmx_true_pinbased_ctls: if has_true_controls {
-                restrict_control(host.true_pinbased_ctls, 0, 0)
-            } else {
-                0
-            },
-            vmx_true_procbased_ctls: if has_true_controls {
-                restrict_control(host.true_procbased_ctls, primary_supported, 0)
-            } else {
-                0
-            },
+            vmx_true_pinbased_ctls: true_pinbased_ctls,
+            vmx_true_procbased_ctls: true_procbased_ctls,
             vmx_true_exit_ctls: true_exit_ctls,
             vmx_true_entry_ctls: true_entry_ctls,
             expose_vmx: false,
@@ -259,8 +295,21 @@ fn restrict_control(host: u64, supported: u32, required: u32) -> u64 {
     u64::from(must_be_one) | (u64::from(may_be_one) << 32)
 }
 
+fn restrict_emulated_control(host: u64, supported: u32, required: u32) -> u64 {
+    let host_may_be_one = (host >> 32) as u32;
+    let may_be_one = host_may_be_one & supported;
+    let must_be_one = required & may_be_one;
+    u64::from(must_be_one) | (u64::from(may_be_one) << 32)
+}
+
 fn control_may_be_one(capabilities: u64, control: u32) -> bool {
     (capabilities >> 32) as u32 & control != 0
+}
+
+fn legacy_control_from_true(true_control: u64, default_one: u32) -> u64 {
+    let may_be_one = (true_control >> 32) as u32;
+    let must_be_one = (true_control as u32 | default_one) & may_be_one;
+    u64::from(must_be_one) | (u64::from(may_be_one) << 32)
 }
 
 fn restrict_vmcs_enum(host: u64) -> u64 {

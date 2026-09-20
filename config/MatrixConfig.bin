@@ -1,3 +1,4 @@
 MATRIXHV_CONFIG_V1
 cpuidpresence=false
 logger=true
+vmxflat=false

@@ -47,6 +47,7 @@ pub const VM_INSTRUCTION_ERROR: u64 = 0x4400;
 pub const VM_EXIT_REASON: u64 = 0x4402;
 pub const VM_EXIT_INTR_INFO: u64 = 0x4404;
 pub const VM_EXIT_INSTRUCTION_LEN: u64 = 0x440c;
+pub const VM_EXIT_INSTRUCTION_INFO: u64 = 0x440e;
 
 pub const GUEST_ES_LIMIT: u64 = 0x4800;
 pub const GUEST_CS_LIMIT: u64 = 0x4802;

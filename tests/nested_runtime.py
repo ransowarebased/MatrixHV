@@ -42,8 +42,8 @@ def validate(start, end, cpu_count):
             "nested_vmclear_count": 2,
             "nested_vmptrld_count": 2,
             "nested_vmptrst_count": 1,
-            "nested_vmwrite_count": 18,
-            "nested_vmread_count": 25,
+            "nested_vmwrite_count": 29,
+            "nested_vmread_count": 35,
             "nested_vmcs12_probe_complete": 1,
             "nested_vmlaunch_count": 3,
             "nested_vmresume_count": 4,
@@ -61,6 +61,9 @@ def validate(start, end, cpu_count):
             "nested_invept_software_count": 2,
             "nested_invvpid_count": 2,
             "nested_invvpid_software_count": 2,
+            "nested_control_merge_count": 3,
+            "nested_guest_state_sync_count": 3,
+            "nested_l1_host_restore_count": 3,
         }
         if cpu == 0:
             expected.update(ept_test_seen=1, checkpoint=1)
@@ -78,14 +81,25 @@ def validate(start, end, cpu_count):
         checks[prefix + "control_vpid"] = current["nested_vmcs12_vpid"] == 1
         checks[prefix + "control_exit"] = current["nested_vmcs12_vm_exit_controls"] == 1 << 9
         checks[prefix + "control_entry"] = current["nested_vmcs12_vm_entry_controls"] == 1 << 9
-        control_capability = (1 << 9) | ((1 << 9) << 32)
-        checks[prefix + "vmx_pinbased_cap"] = current["nested_vmx_pinbased_ctls"] == 0
-        primary_capability = (1 << 31) << 32
+        pinbased_default = 0x16
+        procbased_default = 0x0401E172
+        exit_default = 0x00036DFF
+        entry_default = 0x000011FF
+        pinbased_capability = pinbased_default | (pinbased_default << 32)
+        primary_may_be_one = procbased_default | (1 << 31)
+        primary_capability = procbased_default | (primary_may_be_one << 32)
+        exit_bits = exit_default | (1 << 9)
+        exit_capability = exit_bits | (exit_bits << 32)
+        entry_bits = entry_default | (1 << 9)
+        entry_capability = entry_bits | (entry_bits << 32)
+        checks[prefix + "vmx_pinbased_cap"] = (
+            current["nested_vmx_pinbased_ctls"] == pinbased_capability
+        )
         secondary_capability = ((1 << 1) | (1 << 5)) << 32
         checks[prefix + "vmx_procbased_cap"] = current["nested_vmx_procbased_ctls"] == primary_capability
         checks[prefix + "vmx_secondary_cap"] = current["nested_vmx_procbased_ctls2"] == secondary_capability
-        checks[prefix + "vmx_exit_cap"] = current["nested_vmx_exit_ctls"] == control_capability
-        checks[prefix + "vmx_entry_cap"] = current["nested_vmx_entry_ctls"] == control_capability
+        checks[prefix + "vmx_exit_cap"] = current["nested_vmx_exit_ctls"] == exit_capability
+        checks[prefix + "vmx_entry_cap"] = current["nested_vmx_entry_ctls"] == entry_capability
         checks[prefix + "vmx_misc_cap"] = current["nested_vmx_misc"] == 0
         software_invalidation_capability = (1 << 20) | (1 << 25) | (1 << 32) | (1 << 41)
         required_ept_capability = 0x4040 | software_invalidation_capability
@@ -96,13 +110,55 @@ def validate(start, end, cpu_count):
         )
         checks[prefix + "vmx_vmcs_enum"] = 0 < (current["nested_vmx_vmcs_enum"] >> 1) <= 22
         has_true_controls = bool(current["nested_vmx_basic"] & (1 << 55))
-        checks[prefix + "vmx_true_pinbased_cap"] = current["nested_vmx_true_pinbased_ctls"] == 0
-        checks[prefix + "vmx_true_procbased_cap"] = current["nested_vmx_true_procbased_ctls"] == (primary_capability if has_true_controls else 0)
-        checks[prefix + "vmx_true_exit_cap"] = current["nested_vmx_true_exit_ctls"] == (control_capability if has_true_controls else 0)
-        checks[prefix + "vmx_true_entry_cap"] = current["nested_vmx_true_entry_ctls"] == (control_capability if has_true_controls else 0)
-        checks[prefix + "extended_exception_bitmap"] = current["nested_vmcs12_exception_bitmap"] == 0x40
+        true_pinbased_capability = pinbased_default << 32
+        true_primary_capability = primary_may_be_one << 32
+        true_exit_capability = (1 << 9) | (exit_bits << 32)
+        true_entry_capability = (1 << 9) | (entry_bits << 32)
+        checks[prefix + "vmx_true_pinbased_cap"] = current["nested_vmx_true_pinbased_ctls"] == (
+            true_pinbased_capability if has_true_controls else 0
+        )
+        checks[prefix + "vmx_true_procbased_cap"] = current["nested_vmx_true_procbased_ctls"] == (
+            true_primary_capability if has_true_controls else 0
+        )
+        checks[prefix + "vmx_true_exit_cap"] = current["nested_vmx_true_exit_ctls"] == (
+            true_exit_capability if has_true_controls else 0
+        )
+        checks[prefix + "vmx_true_entry_cap"] = current["nested_vmx_true_entry_ctls"] == (
+            true_entry_capability if has_true_controls else 0
+        )
+        checks[prefix + "extended_exception_bitmap"] = current["nested_vmcs12_exception_bitmap"] == 0
+        checks[prefix + "vmcs_link_pointer"] = current["nested_vmcs12_link_pointer"] == (1 << 64) - 1
+        checks[prefix + "guest_cr0_sync"] = (
+            current["nested_vmcs12_guest_cr0_field"] == current["nested_last_synced_guest_cr0"] != 0
+        )
         checks[prefix + "extended_guest_cr3"] = current["nested_vmcs12_guest_cr3_field"] == current["initial_cr3"]
+        checks[prefix + "guest_cr3_sync"] = current["nested_last_synced_guest_cr3"] == current["nested_vmcs12_guest_cr3_field"]
+        checks[prefix + "guest_cr4_sync"] = (
+            current["nested_vmcs12_guest_cr4_field"] == current["nested_last_synced_guest_cr4"] != 0
+        )
+        checks[prefix + "host_cr0_restore"] = (
+            current["nested_vmcs12_host_cr0_field"] == current["nested_last_restored_host_cr0"] != 0
+        )
         checks[prefix + "extended_host_cr3"] = current["nested_vmcs12_host_cr3_field"] == current["initial_cr3"]
+        checks[prefix + "host_cr3_restore"] = current["nested_last_restored_host_cr3"] == current["nested_vmcs12_host_cr3_field"]
+        checks[prefix + "host_cr4_restore"] = (
+            current["nested_vmcs12_host_cr4_field"] == current["nested_last_restored_host_cr4"] != 0
+        )
+        checks[prefix + "guest_sysenter_sync"] = (
+            current["nested_vmcs12_guest_sysenter_eip_field"]
+            == current["nested_last_synced_guest_sysenter_eip"]
+        )
+        checks[prefix + "host_sysenter_restore"] = (
+            current["nested_vmcs12_host_sysenter_eip_field"]
+            == current["nested_last_restored_host_sysenter_eip"]
+        )
+        checks[prefix + "effective_pat_roundtrip"] = (
+            current["nested_inherited_l1_pat"] == current["nested_l2_saved_pat"]
+        )
+        checks[prefix + "effective_efer_roundtrip"] = (
+            current["nested_inherited_l1_efer"] == current["nested_l2_saved_efer"]
+            and current["nested_inherited_l1_efer"] != 0
+        )
         checks[prefix + "ept_pointer"] = current["nested_vmcs12_ept_pointer"] == current["nested_ept12_pointer"] != 0
         checks[prefix + "ept02_private"] = (
             current["nested_ept02_initial_pointer"] != 0
@@ -166,7 +222,7 @@ def main():
     checks["sampling_interval"] = args.end.stat().st_mtime - args.start.stat().st_mtime >= 30
     failed = [name for name, passed in checks.items() if not passed]
     report = {
-        "scope": "Controlled pre-EBS nested VMX proof with expanded VMCS12 state, host-derived controls, two immutable EPT02 generations, real L2 VMLAUNCH plus two VMRESUMEs, three reflected VMCALL exits, and software-backed single-context INVEPT/INVVPID on a VMware host that does not expose physical invalidation instructions; post-EBS residency. Public CPUID.VMX exposure remains disabled.",
+        "scope": "Controlled pre-EBS nested VMX proof with expanded VMCS12 state, L0 control composition, bidirectional 64-bit VMCS12/VMCS02 core guest-state synchronization, L2-to-L1 CR/SYSENTER host restoration, inherited PAT/EFER/TSC state, two immutable EPT02 generations, real L2 VMLAUNCH plus two VMRESUMEs, three reflected VMCALL exits, and software-backed single-context INVEPT/INVVPID; post-EBS residency. Public CPUID.VMX exposure remains disabled.",
         "inputs": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (args.start, args.end)},
         "checks": checks,
         "failed_checks": failed,

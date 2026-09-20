@@ -1,9 +1,10 @@
 use alloc::vec::Vec;
-use core::mem::MaybeUninit;
+use core::mem::{MaybeUninit, size_of_val};
 
 use uefi::boot::{self, LoadImageSource, OpenProtocolAttributes, OpenProtocolParams, SearchType};
 use uefi::proto::BootPolicy;
 use uefi::proto::device_path::{DevicePath, build};
+use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::{File, FileAttribute, FileMode};
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::{CStr16, Status, cstr16};
@@ -12,6 +13,10 @@ extern crate alloc;
 
 const VERACRYPT_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\VeraCrypt\DcsBoot.efi");
 const WINDOWS_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\Microsoft\Boot\bootmgfw.efi");
+const VMX_FLAT_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\BOOT\VMXFLAT.EFI");
+const VMX_FLAT_LOAD_OPTIONS: &uefi::CStr16 = cstr16!(
+    "vmx.efi test_vmx_feature_control test_vmxon test_vmptrld test_vmclear test_vmptrst test_vmwrite_vmread test_vmx_caps"
+);
 const HANDLE_COUNT_CAPACITY: usize = 128;
 
 pub fn initialize_boot_environment() -> Result<(), Status> {
@@ -21,10 +26,19 @@ pub fn initialize_boot_environment() -> Result<(), Status> {
 }
 
 pub fn windows_boot_present() -> Result<bool, Status> {
-    Ok(find_image_volume(WINDOWS_BOOT_PATH)?.is_some())
+    Ok(find_image_volume(boot_target_path())?.is_some())
 }
 
 pub fn start_loader() -> Result<(), Status> {
+    if crate::boot::config::current().vmx_flat {
+        let device_handle = find_image_volume(VMX_FLAT_BOOT_PATH)?.ok_or_else(|| {
+            crate::runtime::logger::phase("boot.vmx_flat.not_found");
+            Status::NOT_FOUND
+        })?;
+        crate::runtime::logger::phase("boot.vmx_flat.start");
+        return start_image_on_volume(device_handle, VMX_FLAT_BOOT_PATH);
+    }
+
     if let Some(device_handle) = find_image_volume(VERACRYPT_BOOT_PATH)? {
         log::info!("VeraCrypt EFI loader detected: {}", VERACRYPT_BOOT_PATH);
         crate::runtime::logger::phase("boot.veracrypt.detected");
@@ -83,10 +97,44 @@ fn volume_contains(device_handle: uefi::Handle, path: &CStr16) -> bool {
 
 pub fn start_image_on_volume(device_handle: uefi::Handle, path: &CStr16) -> Result<(), Status> {
     let child_handle = load_image_on_volume(device_handle, path)?;
+    configure_image_load_options(child_handle)?;
 
     let result = boot::start_image(child_handle).map_err(|error| error.status());
     let _ = boot::unload_image(child_handle);
     result
+}
+
+pub(crate) fn boot_target_path() -> &'static CStr16 {
+    if crate::boot::config::current().vmx_flat {
+        VMX_FLAT_BOOT_PATH
+    } else {
+        WINDOWS_BOOT_PATH
+    }
+}
+
+pub(crate) fn configure_image_load_options(child_handle: uefi::Handle) -> Result<(), Status> {
+    if !crate::boot::config::current().vmx_flat {
+        return Ok(());
+    }
+
+    let params = OpenProtocolParams {
+        handle: child_handle,
+        agent: boot::image_handle(),
+        controller: None,
+    };
+    let mut loaded_image =
+        unsafe { boot::open_protocol::<LoadedImage>(params, OpenProtocolAttributes::GetProtocol) }
+            .map_err(|error| error.status())?;
+    let options = VMX_FLAT_LOAD_OPTIONS.as_slice_with_nul();
+    unsafe {
+        loaded_image.set_load_options(
+            options.as_ptr().cast(),
+            size_of_val(options)
+                .try_into()
+                .map_err(|_| Status::BAD_BUFFER_SIZE)?,
+        );
+    }
+    Ok(())
 }
 
 pub fn load_and_unload_image_on_volume(

@@ -4,7 +4,8 @@ use std::io;
 use std::path::Path;
 
 const CONFIG_HEADER: &str = "MATRIXHV_CONFIG_V1";
-const DEFAULT_FILE_TEXT: &str = "MATRIXHV_CONFIG_V1\ncpuidpresence=true\nlogger=true\n";
+const DEFAULT_FILE_TEXT: &str =
+    "MATRIXHV_CONFIG_V1\ncpuidpresence=true\nlogger=true\nvmxflat=false\n";
 
 fn main() {
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is missing");
@@ -63,7 +64,7 @@ fn validate_user_config(path: &Path) -> io::Result<()> {
         }
 
         match key.trim() {
-            "cpuidpresence" | "logger" => {}
+            "cpuidpresence" | "logger" | "vmxflat" => {}
             unknown => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,

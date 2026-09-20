@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, SearchType};
 use uefi::proto::media::file::{File, FileAttribute, FileMode};
 use uefi::proto::media::fs::SimpleFileSystem;
-use uefi::{Handle, Status, cstr16};
+use uefi::{Handle, Status};
 
 use crate::boot::services;
 use crate::hv_core::vt_resident;
@@ -27,7 +27,6 @@ const FLAG_WINDOWS_PATH_OK: u32 = 1 << 2;
 const FLAG_WINDOWS_IMAGE_LOAD_OK: u32 = 1 << 3;
 const FLAG_TERMINAL_READY: u32 = 1 << 4;
 const HANDLE_CAPACITY: usize = 128;
-const WINDOWS_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\Microsoft\Boot\bootmgfw.efi");
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BootStageReport {
@@ -108,8 +107,14 @@ pub fn result_name(result: u64) -> &'static str {
 }
 
 #[unsafe(no_mangle)]
+pub extern "efiapi" fn matrixhv_vmx_flat_enabled() -> u64 {
+    u64::from(crate::boot::config::current().vmx_flat)
+}
+
+#[unsafe(no_mangle)]
 pub extern "efiapi" fn matrixhv_windows_start_guest_stage() -> u64 {
     REPORT_FLAGS.fetch_or(FLAG_ENTERED, Ordering::Release);
+    let boot_target_path = services::boot_target_path();
 
     let mut handles: [MaybeUninit<Handle>; HANDLE_CAPACITY] =
         [const { MaybeUninit::uninit() }; HANDLE_CAPACITY];
@@ -140,14 +145,14 @@ pub extern "efiapi" fn matrixhv_windows_start_guest_stage() -> u64 {
             continue;
         };
         if root
-            .open(WINDOWS_BOOT_PATH, FileMode::Read, FileAttribute::empty())
+            .open(boot_target_path, FileMode::Read, FileAttribute::empty())
             .is_err()
         {
             continue;
         }
         REPORT_FLAGS.fetch_or(FLAG_WINDOWS_PATH_OK, Ordering::Release);
 
-        let child_handle = match services::load_image_on_volume(*handle, WINDOWS_BOOT_PATH) {
+        let child_handle = match services::load_image_on_volume(*handle, boot_target_path) {
             Ok(handle) => handle,
             Err(status) => {
                 REPORT_STATUS.store(status.0 as u64, Ordering::Relaxed);
@@ -157,6 +162,12 @@ pub extern "efiapi" fn matrixhv_windows_start_guest_stage() -> u64 {
         };
         REPORT_STATUS.store(Status::SUCCESS.0 as u64, Ordering::Relaxed);
         REPORT_FLAGS.fetch_or(FLAG_WINDOWS_IMAGE_LOAD_OK, Ordering::Release);
+        if let Err(status) = services::configure_image_load_options(child_handle) {
+            REPORT_STATUS.store(status.0 as u64, Ordering::Relaxed);
+            REPORT_FLAGS.fetch_or(FLAG_TERMINAL_READY, Ordering::Release);
+            let _ = boot::unload_image(child_handle);
+            return BOOT_STAGE_START_IMAGE_ERROR;
+        }
 
         unsafe {
             matrixhv_windows_start_checkpoint_asm();
@@ -181,6 +192,7 @@ pub extern "efiapi" fn matrixhv_windows_start_guest_stage() -> u64 {
 #[unsafe(no_mangle)]
 pub extern "efiapi" fn matrixhv_real_boot_guest_stage() -> u64 {
     REPORT_FLAGS.fetch_or(FLAG_ENTERED, Ordering::Release);
+    let boot_target_path = services::boot_target_path();
 
     let mut handles: [MaybeUninit<Handle>; HANDLE_CAPACITY] =
         [const { MaybeUninit::uninit() }; HANDLE_CAPACITY];
@@ -208,11 +220,11 @@ pub extern "efiapi" fn matrixhv_real_boot_guest_stage() -> u64 {
                     continue;
                 };
                 if root
-                    .open(WINDOWS_BOOT_PATH, FileMode::Read, FileAttribute::empty())
+                    .open(boot_target_path, FileMode::Read, FileAttribute::empty())
                     .is_ok()
                 {
                     REPORT_FLAGS.fetch_or(FLAG_WINDOWS_PATH_OK, Ordering::Release);
-                    match services::load_and_unload_image_on_volume(*handle, WINDOWS_BOOT_PATH) {
+                    match services::load_and_unload_image_on_volume(*handle, boot_target_path) {
                         Ok(()) => {
                             REPORT_STATUS.store(Status::SUCCESS.0 as u64, Ordering::Relaxed);
                             REPORT_FLAGS.fetch_or(
@@ -358,6 +370,107 @@ global_asm!(
     "jna .Lwindows_nested_probe_failed",
     "cmp rdx, r10",
     "jne .Lwindows_nested_probe_failed",
+    "mov rcx, {guest_cr0_field}",
+    "mov rdx, cr0",
+    "mov r10, rdx",
+    "vmwrite rcx, rdx",
+    "jna .Lwindows_nested_probe_failed",
+    "xor edx, edx",
+    "vmread rdx, rcx",
+    "jna .Lwindows_nested_probe_failed",
+    "cmp rdx, r10",
+    "jne .Lwindows_nested_probe_failed",
+    "mov rcx, {host_cr0_field}",
+    "mov rdx, r10",
+    "vmwrite rcx, rdx",
+    "jna .Lwindows_nested_probe_failed",
+    "xor edx, edx",
+    "vmread rdx, rcx",
+    "jna .Lwindows_nested_probe_failed",
+    "cmp rdx, r10",
+    "jne .Lwindows_nested_probe_failed",
+    "mov rcx, {guest_cr4_field}",
+    "mov rdx, cr4",
+    "mov r10, rdx",
+    "vmwrite rcx, rdx",
+    "jna .Lwindows_nested_probe_failed",
+    "xor edx, edx",
+    "vmread rdx, rcx",
+    "jna .Lwindows_nested_probe_failed",
+    "cmp rdx, r10",
+    "jne .Lwindows_nested_probe_failed",
+    "mov rcx, {host_cr4_field}",
+    "mov rdx, r10",
+    "vmwrite rcx, rdx",
+    "jna .Lwindows_nested_probe_failed",
+    "xor edx, edx",
+    "vmread rdx, rcx",
+    "jna .Lwindows_nested_probe_failed",
+    "cmp rdx, r10",
+    "jne .Lwindows_nested_probe_failed",
+    "mov ecx, {sysenter_cs_msr}",
+    "rdmsr",
+    "shl rdx, 32",
+    "or rdx, rax",
+    "mov r10, rdx",
+    "mov rcx, {guest_sysenter_cs_field}",
+    "vmwrite rcx, r10",
+    "jna .Lwindows_nested_probe_failed",
+    "xor edx, edx",
+    "vmread rdx, rcx",
+    "jna .Lwindows_nested_probe_failed",
+    "cmp rdx, r10",
+    "jne .Lwindows_nested_probe_failed",
+    "mov rcx, {host_sysenter_cs_field}",
+    "vmwrite rcx, r10",
+    "jna .Lwindows_nested_probe_failed",
+    "xor edx, edx",
+    "vmread rdx, rcx",
+    "jna .Lwindows_nested_probe_failed",
+    "cmp rdx, r10",
+    "jne .Lwindows_nested_probe_failed",
+    "mov ecx, {sysenter_esp_msr}",
+    "rdmsr",
+    "shl rdx, 32",
+    "or rdx, rax",
+    "mov r10, rdx",
+    "mov rcx, {guest_sysenter_esp_field}",
+    "vmwrite rcx, r10",
+    "jna .Lwindows_nested_probe_failed",
+    "xor edx, edx",
+    "vmread rdx, rcx",
+    "jna .Lwindows_nested_probe_failed",
+    "cmp rdx, r10",
+    "jne .Lwindows_nested_probe_failed",
+    "mov rcx, {host_sysenter_esp_field}",
+    "vmwrite rcx, r10",
+    "jna .Lwindows_nested_probe_failed",
+    "xor edx, edx",
+    "vmread rdx, rcx",
+    "jna .Lwindows_nested_probe_failed",
+    "cmp rdx, r10",
+    "jne .Lwindows_nested_probe_failed",
+    "mov ecx, {sysenter_eip_msr}",
+    "rdmsr",
+    "shl rdx, 32",
+    "or rdx, rax",
+    "mov r10, rdx",
+    "mov rcx, {guest_sysenter_eip_field}",
+    "vmwrite rcx, r10",
+    "jna .Lwindows_nested_probe_failed",
+    "xor edx, edx",
+    "vmread rdx, rcx",
+    "jna .Lwindows_nested_probe_failed",
+    "cmp rdx, r10",
+    "jne .Lwindows_nested_probe_failed",
+    "mov rcx, {host_sysenter_eip_field}",
+    "vmwrite rcx, r10",
+    "jna .Lwindows_nested_probe_failed",
+    "xor edx, edx",
+    "vmread rdx, rcx",
+    "jna .Lwindows_nested_probe_failed",
+    "cmp rdx, r10",
+    "jne .Lwindows_nested_probe_failed",
     "vmlaunch",
     "pushfq",
     "pop r10",
@@ -394,6 +507,10 @@ global_asm!(
     "cmp r10d, 1",
     "jne .Lwindows_nested_probe_failed",
     "vmptrld [r8]",
+    "jna .Lwindows_nested_probe_failed",
+    "mov rcx, {exception_bitmap_field}",
+    "xor edx, edx",
+    "vmwrite rcx, rdx",
     "jna .Lwindows_nested_probe_failed",
     "mov rcx, {pin_based_control_field}",
     "xor edx, edx",
@@ -434,13 +551,13 @@ global_asm!(
     "cmp edx, 1",
     "jne .Lwindows_nested_probe_failed",
     "mov rcx, {ept_pointer_field}",
-    "mov rdx, qword ptr [rax + 24]",
+    "mov rdx, qword ptr [rbx + 24]",
     "vmwrite rcx, rdx",
     "jna .Lwindows_nested_probe_failed",
     "xor edx, edx",
     "vmread rdx, rcx",
     "jna .Lwindows_nested_probe_failed",
-    "cmp rdx, qword ptr [rax + 24]",
+    "cmp rdx, qword ptr [rbx + 24]",
     "jne .Lwindows_nested_probe_failed",
     "mov rcx, {vm_exit_controls_field}",
     "mov edx, {vm_exit_host_address_space_size}",
@@ -480,8 +597,8 @@ global_asm!(
     "mov rdx, rsp",
     "vmwrite rcx, rdx",
     "jna .Lwindows_nested_probe_failed",
-    "mov r14, qword ptr [rax + 32]",
-    "mov r15, qword ptr [rax + 40]",
+    "mov r14, qword ptr [rbx + 32]",
+    "mov r15, qword ptr [rbx + 40]",
     "mov r10, qword ptr [r14]",
     "mov r11, {ept_source_marker}",
     "cmp r10, r11",
@@ -686,6 +803,11 @@ global_asm!(
     "jne .Lwindows_nested_probe_failed",
     "vmxoff",
     "jna .Lwindows_nested_probe_failed",
+    "sub rsp, 32",
+    "call matrixhv_vmx_flat_enabled",
+    "add rsp, 32",
+    "test rax, rax",
+    "jnz .Lwindows_cpuid_done",
     "mov eax, 1",
     "xor ecx, ecx",
     "cpuid",
@@ -742,8 +864,18 @@ global_asm!(
     host_rip_field = const crate::nested::vmcs::VMCS_FIELD_HOST_RIP,
     host_rsp_field = const crate::nested::vmcs::VMCS_FIELD_HOST_RSP,
     exception_bitmap_field = const crate::nested::vmcs::VMCS_FIELD_EXCEPTION_BITMAP,
+    guest_cr0_field = const crate::nested::vmcs::VMCS_FIELD_GUEST_CR0,
     guest_cr3_field = const crate::nested::vmcs::VMCS_FIELD_GUEST_CR3,
+    guest_cr4_field = const crate::nested::vmcs::VMCS_FIELD_GUEST_CR4,
+    host_cr0_field = const crate::nested::vmcs::VMCS_FIELD_HOST_CR0,
     host_cr3_field = const crate::nested::vmcs::VMCS_FIELD_HOST_CR3,
+    host_cr4_field = const crate::nested::vmcs::VMCS_FIELD_HOST_CR4,
+    guest_sysenter_cs_field = const crate::nested::vmcs::VMCS_FIELD_GUEST_SYSENTER_CS,
+    guest_sysenter_esp_field = const crate::nested::vmcs::VMCS_FIELD_GUEST_SYSENTER_ESP,
+    guest_sysenter_eip_field = const crate::nested::vmcs::VMCS_FIELD_GUEST_SYSENTER_EIP,
+    host_sysenter_cs_field = const crate::nested::vmcs::VMCS_FIELD_HOST_SYSENTER_CS,
+    host_sysenter_esp_field = const crate::nested::vmcs::VMCS_FIELD_HOST_SYSENTER_ESP,
+    host_sysenter_eip_field = const crate::nested::vmcs::VMCS_FIELD_HOST_SYSENTER_EIP,
     pin_based_control_field = const crate::nested::vmcs::VMCS_FIELD_PIN_BASED_VM_EXEC_CONTROL,
     primary_control_field = const crate::nested::vmcs::VMCS_FIELD_CPU_BASED_VM_EXEC_CONTROL,
     secondary_control_field = const crate::nested::vmcs::VMCS_FIELD_SECONDARY_VM_EXEC_CONTROL,
@@ -770,4 +902,7 @@ global_asm!(
     l2_vmcall_magic = const vt_resident::NESTED_L2_VMCALL_MAGIC,
     l2_vmresume_magic = const vt_resident::NESTED_L2_VMRESUME_MAGIC,
     l2_post_invept_magic = const vt_resident::NESTED_L2_POST_INVEPT_MAGIC,
+    sysenter_cs_msr = const crate::arch::x86_64::msr::IA32_SYSENTER_CS,
+    sysenter_esp_msr = const crate::arch::x86_64::msr::IA32_SYSENTER_ESP,
+    sysenter_eip_msr = const crate::arch::x86_64::msr::IA32_SYSENTER_EIP,
 );

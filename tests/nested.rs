@@ -25,7 +25,7 @@ use instructions::{
     VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR, VMX_STATUS_FLAGS,
     VMX_STATUS_FLAGS_CLEAR_MASK, VMXON_IN_VMX_ROOT_ERROR,
 };
-use state::{INVALID_VMCS_POINTER, NestedVmxState};
+use state::{INVALID_VMCS_POINTER, NestedEptConfiguration, NestedVmxState};
 use vmcs::{
     NestedVmcs12State, VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS,
     VMCS_FIELD_GUEST_RIP, VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
@@ -122,25 +122,39 @@ fn capabilities_normalize_vmx_basic_and_keep_vmx_internal() {
 fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     let host = host_vmx_capabilities();
     let capabilities = NestedVmxCapabilities::from_host(host);
-    let ia32e_control = control_capabilities(
-        capabilities::VM_ENTRY_IA32E_MODE_GUEST,
-        capabilities::VM_ENTRY_IA32E_MODE_GUEST,
+    let pinbased_control = control_capabilities(
+        capabilities::VMX_LEGACY_PINBASED_DEFAULT1,
+        capabilities::VMX_LEGACY_PINBASED_DEFAULT1,
     );
+    let true_pinbased_control = control_capabilities(0, capabilities::VMX_LEGACY_PINBASED_DEFAULT1);
+    let legacy_entry_bits =
+        capabilities::VMX_LEGACY_ENTRY_DEFAULT1 | capabilities::VM_ENTRY_IA32E_MODE_GUEST;
+    let ia32e_control =
+        control_capabilities(capabilities::VM_ENTRY_IA32E_MODE_GUEST, legacy_entry_bits);
+    let legacy_entry_control = control_capabilities(legacy_entry_bits, legacy_entry_bits);
+    let legacy_exit_bits =
+        capabilities::VMX_LEGACY_EXIT_DEFAULT1 | capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE;
     let host_address_size_control = control_capabilities(
         capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
-        capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
+        legacy_exit_bits,
     );
-    let primary_control =
-        control_capabilities(0, capabilities::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS);
+    let legacy_exit_control = control_capabilities(legacy_exit_bits, legacy_exit_bits);
+    let primary_may_be_one = capabilities::VMX_LEGACY_PROCBASED_DEFAULT1
+        | capabilities::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS;
+    let primary_control = control_capabilities(
+        capabilities::VMX_LEGACY_PROCBASED_DEFAULT1,
+        primary_may_be_one,
+    );
+    let true_primary_control = control_capabilities(0, primary_may_be_one);
     let secondary_control = control_capabilities(
         0,
         capabilities::VMX_SECONDARY_ENABLE_EPT | capabilities::VMX_SECONDARY_ENABLE_VPID,
     );
 
-    assert_eq!(capabilities.vmx_pinbased_ctls, 0);
+    assert_eq!(capabilities.vmx_pinbased_ctls, pinbased_control);
     assert_eq!(capabilities.vmx_procbased_ctls, primary_control);
-    assert_eq!(capabilities.vmx_exit_ctls, host_address_size_control);
-    assert_eq!(capabilities.vmx_entry_ctls, ia32e_control);
+    assert_eq!(capabilities.vmx_exit_ctls, legacy_exit_control);
+    assert_eq!(capabilities.vmx_entry_ctls, legacy_entry_control);
     assert_eq!(capabilities.vmx_misc, 0);
     assert_eq!(capabilities.vmx_cr0_fixed0, host.cr0_fixed0);
     assert_eq!(capabilities.vmx_cr0_fixed1, host.cr0_fixed1);
@@ -160,8 +174,8 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
         capabilities.vmx_ept_vpid_cap & capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES,
         capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES
     );
-    assert_eq!(capabilities.vmx_true_pinbased_ctls, 0);
-    assert_eq!(capabilities.vmx_true_procbased_ctls, primary_control);
+    assert_eq!(capabilities.vmx_true_pinbased_ctls, true_pinbased_control);
+    assert_eq!(capabilities.vmx_true_procbased_ctls, true_primary_control);
     assert_eq!(capabilities.vmx_true_exit_ctls, host_address_size_control);
     assert_eq!(capabilities.vmx_true_entry_ctls, ia32e_control);
     assert!(!capabilities.expose_vmx);
@@ -179,10 +193,45 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
 
     let capabilities = NestedVmxCapabilities::from_host(host);
 
-    assert_eq!(capabilities.vmx_exit_ctls, 0);
-    assert_eq!(capabilities.vmx_entry_ctls, 0);
-    assert_eq!(capabilities.vmx_true_exit_ctls, 0);
-    assert_eq!(capabilities.vmx_true_entry_ctls, 0);
+    assert_eq!(
+        capabilities.vmx_exit_ctls >> 32 & u64::from(capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE),
+        0
+    );
+    assert_eq!(
+        capabilities.vmx_entry_ctls >> 32 & u64::from(capabilities::VM_ENTRY_IA32E_MODE_GUEST),
+        0
+    );
+    assert_eq!(
+        capabilities.vmx_true_exit_ctls >> 32
+            & u64::from(capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE),
+        0
+    );
+    assert_eq!(
+        capabilities.vmx_true_entry_ctls >> 32 & u64::from(capabilities::VM_ENTRY_IA32E_MODE_GUEST),
+        0
+    );
+}
+
+#[test]
+fn emulated_true_controls_do_not_inherit_host_fixed_one_settings() {
+    let mut host = host_vmx_capabilities();
+    host.true_pinbased_ctls = control_capabilities(u32::MAX, u32::MAX);
+    host.true_procbased_ctls = control_capabilities(u32::MAX, u32::MAX);
+    host.true_exit_ctls = control_capabilities(u32::MAX, u32::MAX);
+    host.true_entry_ctls = control_capabilities(u32::MAX, u32::MAX);
+
+    let capabilities = NestedVmxCapabilities::from_host(host);
+
+    assert_eq!(capabilities.vmx_true_pinbased_ctls as u32, 0);
+    assert_eq!(capabilities.vmx_true_procbased_ctls as u32, 0);
+    assert_eq!(
+        capabilities.vmx_true_exit_ctls as u32,
+        capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+    );
+    assert_eq!(
+        capabilities.vmx_true_entry_ctls as u32,
+        capabilities::VM_ENTRY_IA32E_MODE_GUEST
+    );
 }
 
 #[test]
@@ -192,10 +241,18 @@ fn nested_ept_is_hidden_when_the_host_contract_is_incomplete() {
 
     let capabilities = NestedVmxCapabilities::from_host(host);
 
-    assert_eq!(capabilities.vmx_procbased_ctls, 0);
+    assert_eq!(
+        capabilities.vmx_procbased_ctls >> 32
+            & u64::from(capabilities::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS),
+        0
+    );
     assert_eq!(capabilities.vmx_procbased_ctls2, 0);
     assert_eq!(capabilities.vmx_ept_vpid_cap, 0);
-    assert_eq!(capabilities.vmx_true_procbased_ctls, 0);
+    assert_eq!(
+        capabilities.vmx_true_procbased_ctls >> 32
+            & u64::from(capabilities::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS),
+        0
+    );
 }
 
 #[test]
@@ -389,16 +446,47 @@ fn per_cpu_nested_state_starts_independent_and_inactive() {
     assert_eq!(bsp.ept02_initial_pointer, 0);
     assert_eq!(bsp.ept12_source_leaf_attributes, 0);
     assert_eq!(bsp.ept_observed_value_before_invept, 0);
+    assert_eq!(bsp.control_merge_count, 0);
+    assert_eq!(bsp.guest_state_sync_count, 0);
+    assert_eq!(bsp.l1_host_restore_count, 0);
+    assert_eq!(bsp.last_synced_guest_cr0, 0);
+    assert_eq!(bsp.last_synced_guest_cr3, 0);
+    assert_eq!(bsp.last_synced_guest_cr4, 0);
+    assert_eq!(bsp.last_restored_host_cr0, 0);
+    assert_eq!(bsp.last_restored_host_cr3, 0);
+    assert_eq!(bsp.last_restored_host_cr4, 0);
+    assert_eq!(bsp.last_synced_guest_sysenter_eip, 0);
+    assert_eq!(bsp.last_restored_host_sysenter_eip, 0);
+    assert_eq!(bsp.inherited_l1_pat, 0);
+    assert_eq!(bsp.inherited_l1_efer, 0);
+    assert_eq!(bsp.inherited_l1_tsc_offset, 0);
+    assert_eq!(bsp.l2_saved_pat, 0);
+    assert_eq!(bsp.l2_saved_efer, 0);
+    assert_eq!(bsp.last_merged_secondary_controls, 0);
+    assert_eq!(bsp.last_synced_guest_gs_base, 0);
+    assert_eq!(bsp.last_captured_guest_gs_base, 0);
+    assert_eq!(bsp.last_restored_host_gs_base, 0);
+    assert_eq!(bsp.last_restored_host_cs_ar, 0);
 }
 
 #[test]
 fn nested_state_records_ept_composition() {
     let mut state = nested_state(0);
 
-    state.configure_ept(
-        0x60_001e, 0x70_001e, 0x80_0000, 0x90_0000, 0x90_0000, 0x5, 0x71_001e, 0xa0_0000,
-        0xb0_0128, 0x7, 0xa0_0000, 0x3,
-    );
+    state.configure_ept(NestedEptConfiguration {
+        ept12_pointer: 0x60_001e,
+        ept02_pointer: 0x70_001e,
+        source_gpa: 0x80_0000,
+        target_gpa: 0x90_0000,
+        composed_hpa: 0x90_0000,
+        permissions: 0x5,
+        alternate_ept02_pointer: 0x71_001e,
+        second_target_gpa: 0xa0_0000,
+        source_leaf: 0xb0_0128,
+        source_leaf_attributes: 0x7,
+        alternate_composed_hpa: 0xa0_0000,
+        alternate_permissions: 0x3,
+    });
 
     assert_eq!(state.ept12_pointer, 0x60_001e);
     assert_eq!(state.ept02_pointer, 0x70_001e);

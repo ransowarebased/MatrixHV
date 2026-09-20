@@ -69,6 +69,43 @@ pub struct NestedVmxState {
     pub ept02_initial_pointer: u64,
     pub ept12_source_leaf_attributes: u64,
     pub ept_observed_value_before_invept: u64,
+    pub control_merge_count: u64,
+    pub guest_state_sync_count: u64,
+    pub l1_host_restore_count: u64,
+    pub last_synced_guest_cr0: u64,
+    pub last_synced_guest_cr3: u64,
+    pub last_synced_guest_cr4: u64,
+    pub last_restored_host_cr0: u64,
+    pub last_restored_host_cr3: u64,
+    pub last_restored_host_cr4: u64,
+    pub last_synced_guest_sysenter_eip: u64,
+    pub last_restored_host_sysenter_eip: u64,
+    pub inherited_l1_pat: u64,
+    pub inherited_l1_efer: u64,
+    pub inherited_l1_tsc_offset: u64,
+    pub l2_saved_pat: u64,
+    pub l2_saved_efer: u64,
+    pub last_merged_secondary_controls: u64,
+    pub last_synced_guest_gs_base: u64,
+    pub last_captured_guest_gs_base: u64,
+    pub last_restored_host_gs_base: u64,
+    pub last_restored_host_cs_ar: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NestedEptConfiguration {
+    pub ept12_pointer: u64,
+    pub ept02_pointer: u64,
+    pub source_gpa: u64,
+    pub target_gpa: u64,
+    pub composed_hpa: u64,
+    pub permissions: u64,
+    pub alternate_ept02_pointer: u64,
+    pub second_target_gpa: u64,
+    pub source_leaf: u64,
+    pub source_leaf_attributes: u64,
+    pub alternate_composed_hpa: u64,
+    pub alternate_permissions: u64,
 }
 
 impl NestedVmxState {
@@ -144,37 +181,44 @@ impl NestedVmxState {
             ept02_initial_pointer: 0,
             ept12_source_leaf_attributes: 0,
             ept_observed_value_before_invept: 0,
+            control_merge_count: 0,
+            guest_state_sync_count: 0,
+            l1_host_restore_count: 0,
+            last_synced_guest_cr0: 0,
+            last_synced_guest_cr3: 0,
+            last_synced_guest_cr4: 0,
+            last_restored_host_cr0: 0,
+            last_restored_host_cr3: 0,
+            last_restored_host_cr4: 0,
+            last_synced_guest_sysenter_eip: 0,
+            last_restored_host_sysenter_eip: 0,
+            inherited_l1_pat: 0,
+            inherited_l1_efer: 0,
+            inherited_l1_tsc_offset: 0,
+            l2_saved_pat: 0,
+            l2_saved_efer: 0,
+            last_merged_secondary_controls: 0,
+            last_synced_guest_gs_base: 0,
+            last_captured_guest_gs_base: 0,
+            last_restored_host_gs_base: 0,
+            last_restored_host_cs_ar: 0,
         }
     }
 
-    pub fn configure_ept(
-        &mut self,
-        ept12_pointer: u64,
-        ept02_pointer: u64,
-        source_gpa: u64,
-        target_gpa: u64,
-        composed_hpa: u64,
-        permissions: u64,
-        alternate_ept02_pointer: u64,
-        second_target_gpa: u64,
-        source_leaf: u64,
-        source_leaf_attributes: u64,
-        alternate_composed_hpa: u64,
-        alternate_permissions: u64,
-    ) {
-        self.ept12_pointer = ept12_pointer;
-        self.ept02_pointer = ept02_pointer;
-        self.ept_source_gpa = source_gpa;
-        self.ept_target_gpa = target_gpa;
-        self.ept_composed_hpa = composed_hpa;
-        self.ept_permissions = permissions;
+    pub fn configure_ept(&mut self, configuration: NestedEptConfiguration) {
+        self.ept12_pointer = configuration.ept12_pointer;
+        self.ept02_pointer = configuration.ept02_pointer;
+        self.ept_source_gpa = configuration.source_gpa;
+        self.ept_target_gpa = configuration.target_gpa;
+        self.ept_composed_hpa = configuration.composed_hpa;
+        self.ept_permissions = configuration.permissions;
         self.ept_composition_count = 2;
-        self.ept02_alternate_pointer = alternate_ept02_pointer;
-        self.ept_second_target_gpa = second_target_gpa;
-        self.ept12_source_leaf = source_leaf;
-        self.ept12_source_leaf_attributes = source_leaf_attributes;
-        self.ept_alternate_composed_hpa = alternate_composed_hpa;
-        self.ept_alternate_permissions = alternate_permissions;
-        self.ept02_initial_pointer = ept02_pointer;
+        self.ept02_alternate_pointer = configuration.alternate_ept02_pointer;
+        self.ept_second_target_gpa = configuration.second_target_gpa;
+        self.ept12_source_leaf = configuration.source_leaf;
+        self.ept12_source_leaf_attributes = configuration.source_leaf_attributes;
+        self.ept_alternate_composed_hpa = configuration.alternate_composed_hpa;
+        self.ept_alternate_permissions = configuration.alternate_permissions;
+        self.ept02_initial_pointer = configuration.ept02_pointer;
     }
 }

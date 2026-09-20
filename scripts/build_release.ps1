@@ -6,11 +6,13 @@ param(
 
     [switch]$SkipPackage,
 
-    [string]$VeraCryptEfiSource
+    [string]$VeraCryptEfiSource,
+
+    [string]$VmxFlatEfiSource
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $BuildScript = Join-Path $PSScriptRoot 'buildauto.ps1'
-& $BuildScript -Configuration Release -SkipImage:$SkipImage -SkipPackage:$SkipPackage -VeraCryptEfiSource $VeraCryptEfiSource
+& $BuildScript -Configuration Release -SkipImage:$SkipImage -SkipPackage:$SkipPackage -VeraCryptEfiSource $VeraCryptEfiSource -VmxFlatEfiSource $VmxFlatEfiSource

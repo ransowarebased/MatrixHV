@@ -9,7 +9,9 @@ param(
 
     [switch]$SkipPackage,
 
-    [string]$VeraCryptEfiSource
+    [string]$VeraCryptEfiSource,
+
+    [string]$VmxFlatEfiSource
 )
 
 Set-StrictMode -Version Latest
@@ -89,6 +91,9 @@ if (-not $SkipImage) {
 
     if (-not [string]::IsNullOrWhiteSpace($VeraCryptEfiSource)) {
         $ImageArguments.VeraCryptEfiSource = $VeraCryptEfiSource
+    }
+    if (-not [string]::IsNullOrWhiteSpace($VmxFlatEfiSource)) {
+        $ImageArguments.VmxFlatEfiSource = $VmxFlatEfiSource
     }
 
     & $MakeImageScript @ImageArguments
