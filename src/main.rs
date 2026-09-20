@@ -24,8 +24,11 @@ fn main() -> Status {
     crate::runtime::logger::initialize();
     crate::runtime::logger::phase("boot.entry");
     crate::runtime::logger::info(format_args!(
-        "config cpuidpresence={} logger={} vmxflat={}",
-        active_config.cpuid_presence, active_config.logger, active_config.vmx_flat
+        "config cpuidpresence={} logger={} vt_nested={} vmx_test={}",
+        active_config.cpuid_presence,
+        active_config.logger,
+        active_config.vt_nested,
+        active_config.vmx_test
     ));
 
     if uefi::helpers::init().is_err() {

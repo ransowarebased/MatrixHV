@@ -1,24 +1,30 @@
 use core::str;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-pub const CONFIG_HEADER: &str = "MATRIXHV_CONFIG_V1";
+pub const CONFIG_HEADER: &str = "MATRIXHV_CONFIG_V2";
 pub const DEFAULT_FILE_TEXT: &str =
-    "MATRIXHV_CONFIG_V1\ncpuidpresence=true\nlogger=true\nvmxflat=false\n";
+    "MATRIXHV_CONFIG_V2\ncpuidpresence=true\nlogger=true\nVtNested=false\nVmxTest=false\n";
 pub const CPUIDPRESENCE_KEY: &str = "cpuidpresence";
 pub const LOGGER_KEY: &str = "logger";
-pub const VMXFLAT_KEY: &str = "vmxflat";
+pub const VT_NESTED_KEY: &str = "VtNested";
+pub const VMX_TEST_KEY: &str = "VmxTest";
 
-const EMBEDDED_CONFIG: &[u8] = include_bytes!("../../config/MatrixConfig.bin");
+#[cfg(not(test))]
+const EMBEDDED_CONFIG: &[u8] = include_bytes!("../../builds/MatrixConfig.bin");
+#[cfg(test)]
+const EMBEDDED_CONFIG: &[u8] = DEFAULT_FILE_TEXT.as_bytes();
 
 static CPUID_PRESENCE: AtomicBool = AtomicBool::new(true);
 static LOGGER: AtomicBool = AtomicBool::new(true);
-static VMX_FLAT: AtomicBool = AtomicBool::new(false);
+static VT_NESTED: AtomicBool = AtomicBool::new(false);
+static VMX_TEST: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MatrixConfig {
     pub cpuid_presence: bool,
     pub logger: bool,
-    pub vmx_flat: bool,
+    pub vt_nested: bool,
+    pub vmx_test: bool,
 }
 
 impl Default for MatrixConfig {
@@ -26,7 +32,8 @@ impl Default for MatrixConfig {
         Self {
             cpuid_presence: true,
             logger: true,
-            vmx_flat: false,
+            vt_nested: false,
+            vmx_test: false,
         }
     }
 }
@@ -37,6 +44,7 @@ pub enum ParseError {
     InvalidLine,
     InvalidBoolean,
     UnknownKey,
+    VmxTestRequiresVtNested,
 }
 
 pub fn parse(bytes: &[u8]) -> Result<MatrixConfig, ParseError> {
@@ -54,9 +62,14 @@ pub fn parse(bytes: &[u8]) -> Result<MatrixConfig, ParseError> {
         match key.trim() {
             CPUIDPRESENCE_KEY => config.cpuid_presence = parsed,
             LOGGER_KEY => config.logger = parsed,
-            VMXFLAT_KEY => config.vmx_flat = parsed,
+            VT_NESTED_KEY => config.vt_nested = parsed,
+            VMX_TEST_KEY => config.vmx_test = parsed,
             _ => return Err(ParseError::UnknownKey),
         }
+    }
+
+    if config.vmx_test && !config.vt_nested {
+        return Err(ParseError::VmxTestRequiresVtNested);
     }
 
     Ok(config)
@@ -82,13 +95,15 @@ pub fn load_embedded() -> Result<MatrixConfig, ParseError> {
 pub fn apply(config: MatrixConfig) {
     CPUID_PRESENCE.store(config.cpuid_presence, Ordering::Relaxed);
     LOGGER.store(config.logger, Ordering::Relaxed);
-    VMX_FLAT.store(config.vmx_flat, Ordering::Relaxed);
+    VT_NESTED.store(config.vt_nested, Ordering::Relaxed);
+    VMX_TEST.store(config.vmx_test, Ordering::Relaxed);
 }
 
 pub fn current() -> MatrixConfig {
     MatrixConfig {
         cpuid_presence: CPUID_PRESENCE.load(Ordering::Relaxed),
         logger: LOGGER.load(Ordering::Relaxed),
-        vmx_flat: VMX_FLAT.load(Ordering::Relaxed),
+        vt_nested: VT_NESTED.load(Ordering::Relaxed),
+        vmx_test: VMX_TEST.load(Ordering::Relaxed),
     }
 }

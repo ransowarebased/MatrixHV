@@ -590,7 +590,7 @@ global_asm!(
     "jne .Lap_nested_probe_failed",
     "vmxoff",
     "jna .Lap_nested_probe_failed",
-    "call matrixhv_vmx_flat_enabled",
+    "call matrixhv_vt_nested_enabled",
     "test rax, rax",
     "jnz .Lap_cpuid_done",
     "mov eax, 1",

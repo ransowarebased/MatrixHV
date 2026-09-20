@@ -9,7 +9,10 @@ param(
     [string]$Logger,
 
     [ValidateSet('true', 'false')]
-    [string]$VmxFlat,
+    [string]$VtNested,
+
+    [ValidateSet('true', 'false')]
+    [string]$VmxTest,
 
     [string]$OutputPath
 )
@@ -19,13 +22,14 @@ $ErrorActionPreference = 'Stop'
 
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-    $OutputPath = Join-Path $ProjectRoot 'config\MatrixConfig.bin'
+    $OutputPath = Join-Path $ProjectRoot 'builds\MatrixConfig.bin'
 }
 $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 
 $CurrentCpuidPresence = $true
 $CurrentLogger = $true
-$CurrentVmxFlat = $false
+$CurrentVtNested = $false
+$CurrentVmxTest = $false
 if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
     foreach ($Line in Get-Content -LiteralPath $OutputPath) {
         if ($Line -match '^\s*cpuidpresence\s*=\s*(true|false)\s*$') {
@@ -34,8 +38,11 @@ if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
         elseif ($Line -match '^\s*logger\s*=\s*(true|false)\s*$') {
             $CurrentLogger = [bool]::Parse($Matches[1])
         }
-        elseif ($Line -match '^\s*vmxflat\s*=\s*(true|false)\s*$') {
-            $CurrentVmxFlat = [bool]::Parse($Matches[1])
+        elseif ($Line -match '^\s*VtNested\s*=\s*(true|false)\s*$') {
+            $CurrentVtNested = [bool]::Parse($Matches[1])
+        }
+        elseif ($Line -match '^\s*VmxTest\s*=\s*(true|false)\s*$') {
+            $CurrentVmxTest = [bool]::Parse($Matches[1])
         }
     }
 }
@@ -46,18 +53,25 @@ if (-not [string]::IsNullOrWhiteSpace($CpuidPresence)) {
 if (-not [string]::IsNullOrWhiteSpace($Logger)) {
     $CurrentLogger = [bool]::Parse($Logger)
 }
-if (-not [string]::IsNullOrWhiteSpace($VmxFlat)) {
-    $CurrentVmxFlat = [bool]::Parse($VmxFlat)
+if (-not [string]::IsNullOrWhiteSpace($VtNested)) {
+    $CurrentVtNested = [bool]::Parse($VtNested)
+}
+if (-not [string]::IsNullOrWhiteSpace($VmxTest)) {
+    $CurrentVmxTest = [bool]::Parse($VmxTest)
+}
+if ($CurrentVmxTest -and -not $CurrentVtNested) {
+    throw 'VmxTest requires VtNested=true.'
 }
 
 $Parent = Split-Path -Parent $OutputPath
 New-Item -ItemType Directory -Path $Parent -Force | Out-Null
 
 $Contents = @(
-    'MATRIXHV_CONFIG_V1'
+    'MATRIXHV_CONFIG_V2'
     "cpuidpresence=$($CurrentCpuidPresence.ToString().ToLowerInvariant())"
     "logger=$($CurrentLogger.ToString().ToLowerInvariant())"
-    "vmxflat=$($CurrentVmxFlat.ToString().ToLowerInvariant())"
+    "VtNested=$($CurrentVtNested.ToString().ToLowerInvariant())"
+    "VmxTest=$($CurrentVmxTest.ToString().ToLowerInvariant())"
 ) -join "`n"
 
 [System.IO.File]::WriteAllText($OutputPath, $Contents + "`n", (New-Object System.Text.UTF8Encoding($false)))

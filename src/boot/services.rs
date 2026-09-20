@@ -30,7 +30,7 @@ pub fn windows_boot_present() -> Result<bool, Status> {
 }
 
 pub fn start_loader() -> Result<(), Status> {
-    if crate::boot::config::current().vmx_flat {
+    if crate::boot::config::current().vmx_test {
         let device_handle = find_image_volume(VMX_FLAT_BOOT_PATH)?.ok_or_else(|| {
             crate::runtime::logger::phase("boot.vmx_flat.not_found");
             Status::NOT_FOUND
@@ -105,7 +105,7 @@ pub fn start_image_on_volume(device_handle: uefi::Handle, path: &CStr16) -> Resu
 }
 
 pub(crate) fn boot_target_path() -> &'static CStr16 {
-    if crate::boot::config::current().vmx_flat {
+    if crate::boot::config::current().vmx_test {
         VMX_FLAT_BOOT_PATH
     } else {
         WINDOWS_BOOT_PATH
@@ -113,7 +113,7 @@ pub(crate) fn boot_target_path() -> &'static CStr16 {
 }
 
 pub(crate) fn configure_image_load_options(child_handle: uefi::Handle) -> Result<(), Status> {
-    if !crate::boot::config::current().vmx_flat {
+    if !crate::boot::config::current().vmx_test {
         return Ok(());
     }
 

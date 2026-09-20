@@ -107,8 +107,8 @@ pub fn result_name(result: u64) -> &'static str {
 }
 
 #[unsafe(no_mangle)]
-pub extern "efiapi" fn matrixhv_vmx_flat_enabled() -> u64 {
-    u64::from(crate::boot::config::current().vmx_flat)
+pub extern "efiapi" fn matrixhv_vt_nested_enabled() -> u64 {
+    u64::from(crate::boot::config::current().vt_nested)
 }
 
 #[unsafe(no_mangle)]
@@ -804,7 +804,7 @@ global_asm!(
     "vmxoff",
     "jna .Lwindows_nested_probe_failed",
     "sub rsp, 32",
-    "call matrixhv_vmx_flat_enabled",
+    "call matrixhv_vt_nested_enabled",
     "add rsp, 32",
     "test rax, rax",
     "jnz .Lwindows_cpuid_done",

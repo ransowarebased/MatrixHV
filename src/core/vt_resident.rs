@@ -1535,7 +1535,7 @@ fn nested_vmx_capabilities(host_vmx_basic: u64) -> NestedVmxCapabilities {
         }
     };
     let mut capabilities = NestedVmxCapabilities::from_host(host);
-    capabilities.expose_vmx = crate::boot::config::current().vmx_flat;
+    capabilities.expose_vmx = crate::boot::config::current().vt_nested;
     debug_assert_eq!(
         capabilities.vmx_msr(IA32_VMX_BASIC_MSR),
         Some(capabilities.vmx_basic)
