@@ -196,3 +196,36 @@ fn supported_vmcs12_fields_match_intel_encodings() {
     assert_eq!(VMCS12_LAUNCH_STATE_CLEAR, 0);
     assert_eq!(VMCS12_LAUNCH_STATE_LAUNCHED, 1);
 }
+
+#[test]
+fn extended_vmcs12_fields_are_dense_unique_and_cover_entry_state() {
+    assert_eq!(
+        vmcs::VMCS12_EXTENDED_FIELDS.len(),
+        vmcs::VMCS12_EXTENDED_FIELD_COUNT
+    );
+    for (index, field) in vmcs::VMCS12_EXTENDED_FIELDS.iter().enumerate() {
+        assert_eq!(field.index, index);
+        assert_eq!(
+            vmcs::VMCS12_EXTENDED_FIELDS
+                .iter()
+                .filter(|candidate| candidate.encoding == field.encoding)
+                .count(),
+            1
+        );
+    }
+    assert!(
+        vmcs::VMCS12_EXTENDED_FIELDS
+            .iter()
+            .any(|field| field.encoding == vmcs::VMCS_FIELD_EXCEPTION_BITMAP)
+    );
+    assert!(
+        vmcs::VMCS12_EXTENDED_FIELDS
+            .iter()
+            .any(|field| field.encoding == vmcs::VMCS_FIELD_GUEST_CR3)
+    );
+    assert!(
+        vmcs::VMCS12_EXTENDED_FIELDS
+            .iter()
+            .any(|field| field.encoding == vmcs::VMCS_FIELD_HOST_CR3)
+    );
+}

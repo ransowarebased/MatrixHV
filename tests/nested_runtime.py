@@ -42,8 +42,8 @@ def validate(start, end, cpu_count):
             "nested_vmclear_count": 2,
             "nested_vmptrld_count": 2,
             "nested_vmptrst_count": 1,
-            "nested_vmwrite_count": 7,
-            "nested_vmread_count": 10,
+            "nested_vmwrite_count": 10,
+            "nested_vmread_count": 13,
             "nested_vmcs12_probe_complete": 1,
             "nested_vmlaunch_count": 3,
             "nested_vmresume_count": 3,
@@ -65,6 +65,9 @@ def validate(start, end, cpu_count):
         checks[prefix + "cpuid_bits"] = current["cpuid_leaf1_count"] > 0 and current["cpuid_leaf1_ecx"] & ((1 << 31) | (1 << 5)) == 0
         checks[prefix + "hypervisor_queries"] = current["cpuid_hypervisor_count"] >= 4
         checks[prefix + "vmcs_pointer"] = current["nested_last_stored_pointer"] == current["nested_vmcs12_region"]
+        checks[prefix + "extended_exception_bitmap"] = current["nested_vmcs12_exception_bitmap"] == 0x40
+        checks[prefix + "extended_guest_cr3"] = current["nested_vmcs12_guest_cr3_field"] == current["initial_cr3"]
+        checks[prefix + "extended_host_cr3"] = current["nested_vmcs12_host_cr3_field"] == current["initial_cr3"]
         checks[prefix + "l2_exit_reason"] = current["nested_l2_last_exit_reason"] & 0xffff == 18
         checks[prefix + "vmcs12_exit_reason"] = current["nested_vmcs12_exit_reason"] & 0xffff == 18
         checks[prefix + "l2_exit_length"] = current["nested_vmcs12_exit_instruction_len"] == 3
@@ -88,7 +91,7 @@ def main():
     checks["sampling_interval"] = args.end.stat().st_mtime - args.start.stat().st_mtime >= 30
     failed = [name for name, passed in checks.items() if not passed]
     report = {
-        "scope": "Controlled pre-EBS VMXON/VMXOFF, VMCS12 access, rejected entries, real L2 VMLAUNCH plus VMRESUME, and two reflected VMCALL exits per CPU; post-EBS residency. No nested EPT yet.",
+        "scope": "Controlled pre-EBS VMXON/VMXOFF, expanded VMCS12 control/guest/host field access, rejected entries, real L2 VMLAUNCH plus VMRESUME, and two reflected VMCALL exits per CPU; post-EBS residency. No nested EPT yet.",
         "inputs": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (args.start, args.end)},
         "checks": checks,
         "failed_checks": failed,
