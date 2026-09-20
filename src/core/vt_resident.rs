@@ -113,6 +113,7 @@ const MSR_DRAM_ENERGY_STATUS: u32 = 0x619;
 const MSR_PP0_ENERGY_STATUS: u32 = 0x639;
 const MSR_PP1_ENERGY_STATUS: u32 = 0x641;
 const IA32_TSC_DEADLINE_MSR: u32 = 0x6e0;
+const AMD_SEV_STATUS_MSR: u32 = 0xc001_0131;
 const MACHINE_CHECK_BANK_MSR_STRIDE: u32 = 4;
 const HYPERV_GUEST_IDLE_ACCESS_MASK: u32 = !(1 << 10);
 const HYPERV_GUEST_IDLE_FEATURE_MASK: u32 = !(1 << 5);
@@ -314,10 +315,12 @@ struct ResidentEventContext {
     exit_boot_services_seen: u64,
     virtual_address_change_seen: u64,
     canary: u64,
+    serial_lock: AtomicU64,
 }
 
 #[repr(C, align(16))]
 struct ResidentBootContext {
+    serial_lock: u64,
     root_rsp: u64,
     return_rip: u64,
     expected_host_cr3: u64,
@@ -363,7 +366,7 @@ struct ResidentBootContext {
     nested: NestedVmxState,
     original_gdtr: [u8; 10],
     original_idtr: [u8; 10],
-    alignment_padding: [u8; 52],
+    alignment_padding: [u8; 60],
     root_fx_state: [u8; 512],
 }
 
@@ -378,6 +381,7 @@ impl ResidentBootContext {
         nested: NestedVmxState,
     ) -> Self {
         Self {
+            serial_lock: event_context + EVENT_CTX_SERIAL_LOCK as u64,
             root_rsp: 0,
             return_rip: 0,
             expected_host_cr3,
@@ -423,12 +427,13 @@ impl ResidentBootContext {
             nested,
             original_gdtr: [0; 10],
             original_idtr: [0; 10],
-            alignment_padding: [0; 52],
+            alignment_padding: [0; 60],
             root_fx_state: [0; 512],
         }
     }
 }
 
+const BCTX_SERIAL_LOCK: usize = core::mem::offset_of!(ResidentBootContext, serial_lock);
 const BCTX_ROOT_RSP: usize = core::mem::offset_of!(ResidentBootContext, root_rsp);
 const BCTX_RETURN_RIP: usize = core::mem::offset_of!(ResidentBootContext, return_rip);
 const BCTX_EXPECTED_HOST_CR3: usize = core::mem::offset_of!(ResidentBootContext, expected_host_cr3);
@@ -774,6 +779,7 @@ const EVENT_CTX_EBS_SEEN: usize =
 const EVENT_CTX_VA_SEEN: usize =
     core::mem::offset_of!(ResidentEventContext, virtual_address_change_seen);
 const EVENT_CTX_CANARY: usize = core::mem::offset_of!(ResidentEventContext, canary);
+const EVENT_CTX_SERIAL_LOCK: usize = core::mem::offset_of!(ResidentEventContext, serial_lock);
 
 #[repr(C, align(16))]
 struct ResidentContext {
@@ -1148,8 +1154,11 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
             exit_boot_services_seen: 0,
             virtual_address_change_seen: 0,
             canary: EVENT_CONTEXT_CANARY,
+            serial_lock: AtomicU64::new(0),
         });
     }
+    let serial_lock_address = context_pages.physical_address() + EVENT_CTX_SERIAL_LOCK as u64;
+    crate::runtime::serial::install_shared_lock(serial_lock_address);
     let notify_context = NonNull::new(context.cast::<c_void>())
         .ok_or(ResidentProbeError::Allocation(Status::OUT_OF_RESOURCES))?;
     let ebs_callback = unsafe {
@@ -4425,8 +4434,8 @@ global_asm!(
     "je .Lresident_dispatch_rdmsr_gs_base",
     "cmp ecx, {fs_base_msr}",
     "je .Lresident_dispatch_rdmsr_fs_base",
-    "cmp ecx, 0xc0010131",
-    "je .Lresident_dispatch_inject_gp",
+    "cmp ecx, {amd_sev_status_msr}",
+    "je .Lresident_dispatch_rdmsr_zero",
     "cmp ecx, {kernel_gs_base_msr}",
     "je .Lresident_dispatch_rdmsr_kernel_gs_base",
     "cmp ecx, 0x480",
@@ -4544,6 +4553,9 @@ global_asm!(
     "mov qword ptr [rsp + 16], rax",
     "call .Lresident_advance_guest_rip",
     "jmp .Lresident_dispatch_resume",
+    ".Lresident_dispatch_rdmsr_zero:",
+    "xor r11d, r11d",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
     ".Lresident_dispatch_rdmsr_fixed_mtrr:",
     "mov r10d, ecx",
     "mov ecx, {mtrrcap_msr}",
@@ -4991,23 +5003,13 @@ global_asm!(
     "jmp 1b",
     ".globl matrixhv_resident_ebs_callback",
     "matrixhv_resident_ebs_callback:",
-    "push rsi",
     "mov r8, rdx",
-    "mov qword ptr [r8 + 8], 1",
-    "lea rsi, [rip + .Lebs_message]",
-    "mov r9d, {ebs_message_len}",
-    "call .Lresident_serial_write",
-    "pop rsi",
+    "mov qword ptr [r8 + {event_ebs_seen}], 1",
     "ret",
     ".globl matrixhv_resident_va_callback",
     "matrixhv_resident_va_callback:",
-    "push rsi",
     "mov r8, rdx",
-    "mov qword ptr [r8 + 16], 1",
-    "lea rsi, [rip + .Lva_message]",
-    "mov r9d, {va_message_len}",
-    "call .Lresident_serial_write",
-    "pop rsi",
+    "mov qword ptr [r8 + {event_va_seen}], 1",
     "ret",
     ".Lresident_serial_write:",
     "test r9d, r9d",
@@ -5020,6 +5022,7 @@ global_asm!(
     "ret",
     ".Lresident_serial_char:",
     "mov r10b, al",
+    "call .Lresident_serial_acquire",
     "mov dx, 0x3fd",
     "mov ecx, 100000",
     ".Lresident_serial_wait:",
@@ -5028,11 +5031,39 @@ global_asm!(
     "jnz .Lresident_serial_ready",
     "dec ecx",
     "jnz .Lresident_serial_wait",
+    "cmp r10b, 0x0a",
+    "je .Lresident_serial_release",
     "ret",
     ".Lresident_serial_ready:",
     "mov dx, 0x3f8",
     "mov al, r10b",
     "out dx, al",
+    "cmp r10b, 0x0a",
+    "je .Lresident_serial_release",
+    "ret",
+    ".Lresident_serial_acquire:",
+    "mov rcx, qword ptr [r12 + {b_serial_lock}]",
+    "test rcx, rcx",
+    "jz .Lresident_serial_acquire_done",
+    "mov rdx, r12",
+    ".Lresident_serial_acquire_retry:",
+    "cmp qword ptr [rcx], r12",
+    "je .Lresident_serial_acquire_done",
+    "xor eax, eax",
+    "lock cmpxchg qword ptr [rcx], rdx",
+    "je .Lresident_serial_acquire_done",
+    "pause",
+    "jmp .Lresident_serial_acquire_retry",
+    ".Lresident_serial_acquire_done:",
+    "ret",
+    ".Lresident_serial_release:",
+    "mov rcx, qword ptr [r12 + {b_serial_lock}]",
+    "test rcx, rcx",
+    "jz .Lresident_serial_release_done",
+    "cmp qword ptr [rcx], r12",
+    "jne .Lresident_serial_release_done",
+    "mov qword ptr [rcx], 0",
+    ".Lresident_serial_release_done:",
     "ret",
     ".Lresident_serial_hex64:",
     "mov rbx, rax",
@@ -5290,12 +5321,6 @@ global_asm!(
     ".Lstate_newline:",
     ".ascii \"\\r\\n\"",
     ".Lstate_newline_end:",
-    ".Lebs_message:",
-    ".ascii \"[MATRIXHV][RESIDENT] HV:EBS_SIGNAL\\r\\n\"",
-    ".Lebs_message_end:",
-    ".Lva_message:",
-    ".ascii \"[MATRIXHV][RESIDENT] HV:VA_CHANGE_POST_EBS\\r\\n\"",
-    ".Lva_message_end:",
     ".globl matrixhv_resident_island_end",
     "matrixhv_resident_island_end:",
     ".text",
@@ -5458,6 +5483,7 @@ global_asm!(
     hyperv_reference_time_msr_span = const HYPERV_REFERENCE_TIME_MSR_SPAN,
     hyperv_vp_assist_msr = const HYPERV_VP_ASSIST_MSR,
     efer_msr = const IA32_EFER_MSR,
+    amd_sev_status_msr = const AMD_SEV_STATUS_MSR,
     gs_base_msr = const IA32_GS_BASE_MSR,
     fs_base_msr = const IA32_FS_BASE_MSR,
     kernel_gs_base_msr = const IA32_KERNEL_GS_BASE_MSR,
@@ -5491,6 +5517,7 @@ global_asm!(
     vmware_hypervisor_magic = const VMWARE_HYPERVISOR_MAGIC,
     vmware_hypervisor_port = const VMWARE_HYPERVISOR_PORT,
     unsupported_stop = const RESIDENT_STOP_UNSUPPORTED_EXIT,
+    b_serial_lock = const BCTX_SERIAL_LOCK,
     b_expected_host_cr3 = const BCTX_EXPECTED_HOST_CR3,
     b_event_context = const BCTX_EVENT_CONTEXT,
     b_ept_test_gpa = const BCTX_EPT_TEST_GPA,
@@ -5722,6 +5749,4 @@ global_asm!(
     state_rcx_len = const STATE_RCX_LEN,
     state_rdx_len = const STATE_RDX_LEN,
     state_newline_len = const STATE_NEWLINE_LEN,
-    ebs_message_len = const 36,
-    va_message_len = const 44,
 );

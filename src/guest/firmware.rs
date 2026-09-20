@@ -145,11 +145,6 @@ pub extern "efiapi" fn matrixhv_boot_loader_start_guest_stage() -> u64 {
             };
             REPORT_STATUS.store(Status::SUCCESS.0 as u64, Ordering::Relaxed);
             REPORT_FLAGS.fetch_or(FLAG_TARGET_IMAGE_LOAD_OK, Ordering::Release);
-            crate::runtime::logger::info(format_args!(
-                "boot target chainload kind={} path={}",
-                target.kind.name(),
-                target.path
-            ));
             if let Err(status) = services::configure_image_load_options(child_handle) {
                 REPORT_STATUS.store(status.0 as u64, Ordering::Relaxed);
                 REPORT_FLAGS.fetch_or(FLAG_TERMINAL_READY, Ordering::Release);
@@ -194,11 +189,6 @@ pub extern "efiapi" fn matrixhv_real_boot_guest_stage() -> u64 {
                 for handle in found.iter() {
                     if services::volume_contains(*handle, target.path) {
                         REPORT_FLAGS.fetch_or(FLAG_TARGET_PATH_OK, Ordering::Release);
-                        crate::runtime::logger::info(format_args!(
-                            "boot target probe kind={} path={}",
-                            target.kind.name(),
-                            target.path
-                        ));
                         match services::load_and_unload_image_on_volume(*handle, target.path) {
                             Ok(()) => {
                                 REPORT_STATUS.store(Status::SUCCESS.0 as u64, Ordering::Relaxed);

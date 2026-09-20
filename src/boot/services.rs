@@ -83,10 +83,6 @@ pub fn initialize_boot_environment() -> Result<(), Status> {
     Ok(())
 }
 
-pub fn boot_target_present() -> Result<bool, Status> {
-    Ok(find_boot_target()?.is_some())
-}
-
 pub fn start_loader() -> Result<(), Status> {
     let target = find_boot_target()?.ok_or_else(|| {
         crate::runtime::logger::phase("boot.target.not_found");

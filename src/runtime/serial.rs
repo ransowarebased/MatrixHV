@@ -1,9 +1,14 @@
 use core::arch::asm;
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const COM1: u16 = 0x3f8;
 const TRANSMIT_EMPTY: u8 = 1 << 5;
 const TX_WAIT_LIMIT: usize = 100_000;
+const RUST_LOCK_OWNER: u64 = 1;
+
+static FALLBACK_LOCK: AtomicU64 = AtomicU64::new(0);
+static SHARED_LOCK_ADDRESS: AtomicU64 = AtomicU64::new(0);
 
 struct SerialWriter;
 
@@ -31,9 +36,42 @@ pub fn initialize() {
     }
 }
 
+pub fn install_shared_lock(address: u64) {
+    SHARED_LOCK_ADDRESS.store(address, Ordering::Release);
+}
+
 pub fn write_line(message: &str) {
+    let _guard = SerialLockGuard::acquire();
     let mut writer = SerialWriter;
     let _ = writeln!(writer, "{message}");
+}
+
+struct SerialLockGuard {
+    lock: &'static AtomicU64,
+}
+
+impl SerialLockGuard {
+    fn acquire() -> Self {
+        let address = SHARED_LOCK_ADDRESS.load(Ordering::Acquire);
+        let lock = if address == 0 {
+            &FALLBACK_LOCK
+        } else {
+            unsafe { &*(address as *const AtomicU64) }
+        };
+        while lock
+            .compare_exchange_weak(0, RUST_LOCK_OWNER, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Self { lock }
+    }
+}
+
+impl Drop for SerialLockGuard {
+    fn drop(&mut self) {
+        self.lock.store(0, Ordering::Release);
+    }
 }
 
 fn write_byte(byte: u8) {

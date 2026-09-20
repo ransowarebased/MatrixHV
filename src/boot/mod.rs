@@ -340,7 +340,15 @@ pub fn run() -> Result<(), Status> {
     logger::phase("vmx.host_address_space.ok");
 
     let root_handle_count = services::simple_file_system_count()?;
-    let root_boot_target_present = services::boot_target_present()?;
+    let root_boot_target = services::find_boot_target()?;
+    let root_boot_target_present = root_boot_target.is_some();
+    if let Some(target) = root_boot_target {
+        logger::info(format_args!(
+            "boot target verified kind={} path={}",
+            target.spec.kind.name(),
+            target.spec.path
+        ));
+    }
     logger::info(format_args!(
         "real_boot_vcpu crosscheck guest_handles={} root_handles={} root_boot_target_present={}",
         boot_stage.handle_count, root_handle_count, root_boot_target_present
@@ -379,6 +387,13 @@ pub fn run() -> Result<(), Status> {
 
     firmware::reset_report();
     logger::phase("vmx.boot_loader_start_vcpu.start");
+    if let Some(target) = root_boot_target {
+        logger::info(format_args!(
+            "boot target chainload kind={} path={}",
+            target.spec.kind.name(),
+            target.spec.path
+        ));
+    }
     logger::info(format_args!(
         "boot_loader_start_vcpu entry={:#x} residency_context={:#x}",
         firmware::start_entry_address(),
