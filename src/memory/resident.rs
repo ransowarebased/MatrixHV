@@ -6,7 +6,8 @@ use uefi::mem::memory_map::MemoryType;
 use uefi::proto::loaded_image::LoadedImage;
 
 pub const PAGE_SIZE: usize = 4096;
-pub const RESIDENT_MEMORY_TYPE: MemoryType = MemoryType::RUNTIME_SERVICES_DATA;
+pub const RESIDENT_MEMORY_TYPE: MemoryType = MemoryType::RESERVED;
+pub const RESIDENT_EVENT_MEMORY_TYPE: MemoryType = MemoryType::RUNTIME_SERVICES_DATA;
 pub const RESIDENT_CODE_MEMORY_TYPE: MemoryType = MemoryType::RUNTIME_SERVICES_CODE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

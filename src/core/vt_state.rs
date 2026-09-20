@@ -17,6 +17,7 @@ pub struct HostStateReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuestStateReport {
     pub cr3: u64,
+    pub cr4: u64,
     pub rip: u64,
     pub rsp: u64,
     pub rflags: u64,
@@ -170,9 +171,10 @@ pub fn configure_guest_with_rflags(
     vmwrite(GUEST_IDTR_LIMIT, u64::from(segments.idtr.limit))?;
 
     let guest_cr3 = control_regs::read_cr3();
+    let guest_cr4 = control_regs::read_cr4();
     vmwrite(GUEST_CR0, control_regs::read_cr0())?;
     vmwrite(GUEST_CR3, guest_cr3)?;
-    vmwrite(GUEST_CR4, control_regs::read_cr4())?;
+    vmwrite(GUEST_CR4, guest_cr4)?;
     vmwrite(GUEST_DR7, registers::read_dr7())?;
     vmwrite(GUEST_RSP, guest_rsp)?;
     vmwrite(GUEST_RIP, guest_rip)?;
@@ -199,6 +201,7 @@ pub fn configure_guest_with_rflags(
 
     Ok(GuestStateReport {
         cr3: guest_cr3,
+        cr4: guest_cr4,
         rip: guest_rip,
         rsp: guest_rsp,
         rflags: guest_rflags,

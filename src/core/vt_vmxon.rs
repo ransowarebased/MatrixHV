@@ -150,14 +150,6 @@ pub fn enter_vmx_root() -> Result<VmxRootSession, VmxonError> {
     enter_vmx_root_with_state(vmxon_region, state)
 }
 
-pub(crate) fn enter_vmx_root_with_region(
-    vmx_basic: u64,
-    vmxon_region: VmxonRegion,
-) -> Result<VmxRootSession, VmxonError> {
-    let state = VmxRootState::capture(vmx_basic)?;
-    enter_vmx_root_with_state(vmxon_region, state)
-}
-
 pub(crate) fn enter_vmx_root_with_borrowed_region(
     vmx_basic: u64,
     vmxon_region: &mut VmxonRegion,

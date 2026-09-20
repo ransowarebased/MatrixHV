@@ -340,15 +340,15 @@ pub fn run() -> Result<(), Status> {
     logger::phase("vmx.host_address_space.ok");
 
     let root_handle_count = services::simple_file_system_count()?;
-    let root_windows_present = services::windows_boot_present()?;
+    let root_boot_target_present = services::boot_target_present()?;
     logger::info(format_args!(
-        "real_boot_vcpu crosscheck guest_handles={} root_handles={} root_windows_present={}",
-        boot_stage.handle_count, root_handle_count, root_windows_present
+        "real_boot_vcpu crosscheck guest_handles={} root_handles={} root_boot_target_present={}",
+        boot_stage.handle_count, root_handle_count, root_boot_target_present
     ));
-    if vcpu_report.result != firmware::BOOT_STAGE_WINDOWS_IMAGE_LOAD_OK
+    if vcpu_report.result != firmware::BOOT_STAGE_TARGET_IMAGE_LOAD_OK
         || !firmware::proof_complete(boot_stage)
         || usize::try_from(boot_stage.handle_count).ok() != Some(root_handle_count)
-        || !root_windows_present
+        || !root_boot_target_present
     {
         logger::phase("vmx.real_boot_vcpu.crosscheck_failed");
         return Err(Status::DEVICE_ERROR);
@@ -378,13 +378,13 @@ pub fn run() -> Result<(), Status> {
     };
 
     firmware::reset_report();
-    logger::phase("vmx.windows_start_vcpu.start");
+    logger::phase("vmx.boot_loader_start_vcpu.start");
     logger::info(format_args!(
-        "windows_start_vcpu entry={:#x} residency_context={:#x}",
+        "boot_loader_start_vcpu entry={:#x} residency_context={:#x}",
         firmware::start_entry_address(),
         residency_events.context_physical_address
     ));
-    match hv_core::vt_resident::run_windows_boot(
+    match hv_core::vt_resident::run_boot_loader(
         firmware::start_entry_address(),
         residency_events.context_physical_address,
         firmware::ept_probe_fault_address(),
@@ -392,7 +392,7 @@ pub fn run() -> Result<(), Status> {
     ) {
         Ok(report) => {
             logger::error(format_args!(
-                "windows_start_vcpu returned unexpectedly raw_path={} vm_instruction_error={:#x} host_cr3={:#x} guest_cr3={:#x} exits={} cpuid={} rdmsr={} wrmsr={} xsetbv={} vmcall={} checkpoint={} post_start={} post_ebs={} post_va={} ept_test={} last_reason={:#x} len={} qual={:#x} gpa={:#x} rip={:#x} last_guest_cr3={:#x} last_host_cr3={:#x} stop_result={:#x}",
+                "boot_loader_start_vcpu returned unexpectedly raw_path={} vm_instruction_error={:#x} host_cr3={:#x} guest_cr3={:#x} exits={} cpuid={} rdmsr={} wrmsr={} xsetbv={} vmcall={} checkpoint={} post_start={} post_ebs={} post_va={} ept_test={} last_reason={:#x} len={} qual={:#x} gpa={:#x} rip={:#x} last_guest_cr3={:#x} last_host_cr3={:#x} stop_result={:#x}",
                 report.raw_path,
                 report.vm_instruction_error,
                 report.host_cr3,
@@ -417,12 +417,12 @@ pub fn run() -> Result<(), Status> {
                 report.last_host_cr3,
                 report.stop_result
             ));
-            logger::phase("vmx.windows_start_vcpu.unexpected_return");
+            logger::phase("vmx.boot_loader_start_vcpu.unexpected_return");
             Err(Status::DEVICE_ERROR)
         }
         Err(error) => {
-            logger::error(format_args!("windows_start_vcpu error={error:?}"));
-            logger::phase("vmx.windows_start_vcpu.failed");
+            logger::error(format_args!("boot_loader_start_vcpu error={error:?}"));
+            logger::phase("vmx.boot_loader_start_vcpu.failed");
             logger::phase("boot.native_fallback.after_vmlaunch_failure");
             services::start_loader()
         }

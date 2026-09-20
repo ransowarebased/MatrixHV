@@ -1,4 +1,4 @@
-use crate::arch::x86_64::msr;
+use crate::arch::x86_64::{msr, registers::CR4_VMXE};
 
 use super::vt_vmcs::{VmcsError, vmwrite};
 use super::vt_vmcs_fields::*;
@@ -11,6 +11,7 @@ const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
 const SECONDARY_ENABLE_RDTSCP: u32 = 1 << 3;
 const SECONDARY_UNRESTRICTED_GUEST: u32 = 1 << 7;
+const SECONDARY_ENABLE_INVPCID: u32 = 1 << 12;
 const SECONDARY_ENABLE_XSAVES: u32 = 1 << 20;
 const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
 const VM_EXIT_SAVE_IA32_PAT: u32 = 1 << 18;
@@ -41,6 +42,7 @@ pub enum VmxControlsError {
     MsrBitmapsUnavailable,
     TscOffsettingUnavailable,
     RdtscpUnavailable,
+    InvpcidUnavailable,
     XsavesUnavailable,
     PatControlsUnavailable,
     EferControlsUnavailable,
@@ -87,6 +89,7 @@ pub fn configure_resident_boot(
             | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
         secondary_processor_based: SECONDARY_ENABLE_EPT
             | SECONDARY_ENABLE_RDTSCP
+            | SECONDARY_ENABLE_INVPCID
             | SECONDARY_ENABLE_XSAVES,
         vm_exit: VM_EXIT_SAVE_IA32_PAT
             | VM_EXIT_LOAD_IA32_PAT
@@ -116,6 +119,12 @@ pub(crate) fn configure_resident_ap(
         u64::from(controls.secondary_processor_based),
     )?;
     Ok(controls)
+}
+
+pub(crate) fn virtualize_resident_cr4_vmxe(guest_cr4: u64) -> Result<(), VmxControlsError> {
+    vmwrite(CR4_GUEST_HOST_MASK, CR4_VMXE)?;
+    vmwrite(CR4_READ_SHADOW, guest_cr4)?;
+    Ok(())
 }
 
 fn configure_internal(requested: RequestedControls) -> Result<VmxControls, VmxControlsError> {
@@ -188,6 +197,11 @@ fn configure_internal(requested: RequestedControls) -> Result<VmxControls, VmxCo
         && primary_processor_based & CPU_BASED_USE_TSC_OFFSETTING == 0
     {
         return Err(VmxControlsError::TscOffsettingUnavailable);
+    }
+    if requested.secondary_processor_based & SECONDARY_ENABLE_INVPCID != 0
+        && secondary_processor_based & SECONDARY_ENABLE_INVPCID == 0
+    {
+        return Err(VmxControlsError::InvpcidUnavailable);
     }
     if requested.secondary_processor_based & SECONDARY_ENABLE_XSAVES != 0
         && secondary_processor_based & SECONDARY_ENABLE_XSAVES == 0

@@ -12,6 +12,8 @@ use uefi::{CStr16, Status, cstr16};
 extern crate alloc;
 
 const VERACRYPT_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\VeraCrypt\DcsBoot.efi");
+const UBUNTU_SHIM_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\ubuntu\shimx64.efi");
+const UBUNTU_GRUB_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\ubuntu\grubx64.efi");
 const WINDOWS_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\Microsoft\Boot\bootmgfw.efi");
 const VMX_FLAT_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\BOOT\VMXFLAT.EFI");
 const VMX_FLAT_LOAD_OPTIONS: &uefi::CStr16 = cstr16!(
@@ -19,47 +21,95 @@ const VMX_FLAT_LOAD_OPTIONS: &uefi::CStr16 = cstr16!(
 );
 const HANDLE_COUNT_CAPACITY: usize = 128;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BootTargetKind {
+    VmxFlat,
+    VeraCrypt,
+    UbuntuShim,
+    UbuntuGrub,
+    Windows,
+}
+
+impl BootTargetKind {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::VmxFlat => "vmx_flat",
+            Self::VeraCrypt => "veracrypt",
+            Self::UbuntuShim => "ubuntu_shim",
+            Self::UbuntuGrub => "ubuntu_grub",
+            Self::Windows => "windows",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BootTargetSpec {
+    pub kind: BootTargetKind,
+    pub path: &'static CStr16,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BootTarget {
+    pub device_handle: uefi::Handle,
+    pub spec: BootTargetSpec,
+}
+
+const VMX_TEST_BOOT_TARGETS: &[BootTargetSpec] = &[BootTargetSpec {
+    kind: BootTargetKind::VmxFlat,
+    path: VMX_FLAT_BOOT_PATH,
+}];
+const NORMAL_BOOT_TARGETS: &[BootTargetSpec] = &[
+    BootTargetSpec {
+        kind: BootTargetKind::VeraCrypt,
+        path: VERACRYPT_BOOT_PATH,
+    },
+    BootTargetSpec {
+        kind: BootTargetKind::UbuntuShim,
+        path: UBUNTU_SHIM_BOOT_PATH,
+    },
+    BootTargetSpec {
+        kind: BootTargetKind::UbuntuGrub,
+        path: UBUNTU_GRUB_BOOT_PATH,
+    },
+    BootTargetSpec {
+        kind: BootTargetKind::Windows,
+        path: WINDOWS_BOOT_PATH,
+    },
+];
+
 pub fn initialize_boot_environment() -> Result<(), Status> {
     boot::set_watchdog_timer(0, 0x10000, None).map_err(|error| error.status())?;
     log::info!("MatrixHV UEFI bootstrap started");
     Ok(())
 }
 
-pub fn windows_boot_present() -> Result<bool, Status> {
-    Ok(find_image_volume(boot_target_path())?.is_some())
+pub fn boot_target_present() -> Result<bool, Status> {
+    Ok(find_boot_target()?.is_some())
 }
 
 pub fn start_loader() -> Result<(), Status> {
-    if crate::boot::config::current().vmx_test {
-        let device_handle = find_image_volume(VMX_FLAT_BOOT_PATH)?.ok_or_else(|| {
-            crate::runtime::logger::phase("boot.vmx_flat.not_found");
-            Status::NOT_FOUND
-        })?;
-        crate::runtime::logger::phase("boot.vmx_flat.start");
-        return start_image_on_volume(device_handle, VMX_FLAT_BOOT_PATH);
-    }
-
-    if let Some(device_handle) = find_image_volume(VERACRYPT_BOOT_PATH)? {
-        log::info!("VeraCrypt EFI loader detected: {}", VERACRYPT_BOOT_PATH);
-        crate::runtime::logger::phase("boot.veracrypt.detected");
-        crate::runtime::logger::phase("boot.veracrypt.start");
-        let result = start_image_on_volume(device_handle, VERACRYPT_BOOT_PATH);
-        if result.is_err() {
-            crate::runtime::logger::phase("boot.veracrypt.returned_error");
-        }
-        return result;
-    }
-
-    log::info!("VeraCrypt was not detected; starting the normal Windows boot manager");
-    crate::runtime::logger::phase("boot.veracrypt.absent");
-
-    let device_handle = find_image_volume(WINDOWS_BOOT_PATH)?.ok_or_else(|| {
-        crate::runtime::logger::phase("boot.windows_fallback.not_found");
+    let target = find_boot_target()?.ok_or_else(|| {
+        crate::runtime::logger::phase("boot.target.not_found");
         Status::NOT_FOUND
     })?;
+    log::info!(
+        "EFI boot target detected: kind={} path={}",
+        target.spec.kind.name(),
+        target.spec.path
+    );
+    crate::runtime::logger::info(format_args!(
+        "boot target kind={} path={}",
+        target.spec.kind.name(),
+        target.spec.path
+    ));
+    crate::runtime::logger::phase("boot.target.detected");
+    crate::runtime::logger::phase("boot.target.start");
 
-    crate::runtime::logger::phase("boot.windows_fallback.start");
-    start_image_on_volume(device_handle, WINDOWS_BOOT_PATH)
+    let result = start_image_on_volume(target.device_handle, target.spec.path);
+    if result.is_err() {
+        crate::runtime::logger::phase("boot.target.returned_error");
+    }
+    result
 }
 
 pub fn simple_file_system_count() -> Result<usize, Status> {
@@ -82,9 +132,15 @@ pub fn find_image_volume(path: &CStr16) -> Result<Option<uefi::Handle>, Status> 
     Ok(None)
 }
 
-fn volume_contains(device_handle: uefi::Handle, path: &CStr16) -> bool {
-    let Ok(mut file_system) = boot::open_protocol_exclusive::<SimpleFileSystem>(device_handle)
-    else {
+pub(crate) fn volume_contains(device_handle: uefi::Handle, path: &CStr16) -> bool {
+    let params = OpenProtocolParams {
+        handle: device_handle,
+        agent: boot::image_handle(),
+        controller: None,
+    };
+    let Ok(mut file_system) = (unsafe {
+        boot::open_protocol::<SimpleFileSystem>(params, OpenProtocolAttributes::GetProtocol)
+    }) else {
         return false;
     };
     let Ok(mut root) = file_system.open_volume() else {
@@ -104,12 +160,25 @@ pub fn start_image_on_volume(device_handle: uefi::Handle, path: &CStr16) -> Resu
     result
 }
 
-pub(crate) fn boot_target_path() -> &'static CStr16 {
+pub(crate) fn boot_target_candidates() -> &'static [BootTargetSpec] {
     if crate::boot::config::current().vmx_test {
-        VMX_FLAT_BOOT_PATH
+        VMX_TEST_BOOT_TARGETS
     } else {
-        WINDOWS_BOOT_PATH
+        NORMAL_BOOT_TARGETS
     }
+}
+
+pub(crate) fn find_boot_target() -> Result<Option<BootTarget>, Status> {
+    for spec in boot_target_candidates() {
+        if let Some(device_handle) = find_image_volume(spec.path)? {
+            return Ok(Some(BootTarget {
+                device_handle,
+                spec: *spec,
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
 pub(crate) fn configure_image_load_options(child_handle: uefi::Handle) -> Result<(), Status> {

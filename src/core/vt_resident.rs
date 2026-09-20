@@ -16,7 +16,8 @@ use super::vt_vmxon::{self, VmxInstructionResult, VmxonError};
 use crate::arch::x86_64::{control_regs, msr, registers, segmentation};
 use crate::memory::paging::{HostAddressSpace, HostPagingError};
 use crate::memory::resident::{
-    AddressConstraint, PAGE_SIZE, RESIDENT_CODE_MEMORY_TYPE, RESIDENT_MEMORY_TYPE, ResidentPages,
+    AddressConstraint, PAGE_SIZE, RESIDENT_CODE_MEMORY_TYPE, RESIDENT_EVENT_MEMORY_TYPE,
+    RESIDENT_MEMORY_TYPE, ResidentPages,
 };
 use crate::nested::capabilities::{
     CPUID_HYPERVISOR_PRESENT_BIT, CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, HYPERV_FEATURES_LEAF,
@@ -75,15 +76,20 @@ const WRMSR_EXIT_REASON: u64 = 32;
 const XSETBV_EXIT_REASON: u64 = 55;
 const EPT_VIOLATION_EXIT_REASON: u64 = 48;
 const EPT_TEST_READ_ACCESS: u64 = 1;
+const VMWARE_HYPERVISOR_MAGIC: u32 = 0x564d_5868;
+const VMWARE_HYPERVISOR_PORT: u16 = 0x5658;
 const IA32_TSC_MSR: u32 = 0x10;
 const IA32_TSC_ADJUST_MSR: u32 = 0x3b;
 const IA32_PLATFORM_ID_MSR: u32 = 0x17;
 const IA32_APIC_BASE_MSR: u32 = 0x1b;
 const IA32_FEATURE_CONTROL_MSR: u32 = 0x3a;
+const IA32_SPEC_CTRL_MSR: u32 = 0x48;
+const IA32_PRED_CMD_MSR: u32 = 0x49;
 const IA32_BIOS_SIGN_ID_MSR: u32 = 0x8b;
 const IA32_MTRRCAP_MSR: u32 = 0xfe;
 const IA32_ARCH_CAPABILITIES_MSR: u32 = 0x10a;
 const IA32_MCG_CAP_MSR: u32 = 0x179;
+const IA32_MCG_STATUS_MSR: u32 = 0x17a;
 const IA32_MCG_CTL_MSR: u32 = 0x17b;
 const IA32_SYSENTER_CS_MSR: u32 = 0x174;
 const IA32_SYSENTER_ESP_MSR: u32 = 0x175;
@@ -99,11 +105,14 @@ const IA32_MC0_CTL2_MSR: u32 = 0x280;
 const IA32_MTRR_DEF_TYPE_MSR: u32 = 0x2ff;
 const IA32_MC0_CTL_MSR: u32 = 0x400;
 const IA32_MC0_STATUS_MSR: u32 = 0x401;
+const IA32_X2APIC_MSR_BASE: u32 = 0x800;
+const IA32_X2APIC_MSR_END: u32 = 0x8ff;
 const MSR_PKG_ENERGY_STATUS: u32 = 0x611;
 const MSR_RAPL_POWER_UNIT: u32 = 0x606;
 const MSR_DRAM_ENERGY_STATUS: u32 = 0x619;
 const MSR_PP0_ENERGY_STATUS: u32 = 0x639;
 const MSR_PP1_ENERGY_STATUS: u32 = 0x641;
+const IA32_TSC_DEADLINE_MSR: u32 = 0x6e0;
 const MACHINE_CHECK_BANK_MSR_STRIDE: u32 = 4;
 const HYPERV_GUEST_IDLE_ACCESS_MASK: u32 = !(1 << 10);
 const HYPERV_GUEST_IDLE_FEATURE_MASK: u32 = !(1 << 5);
@@ -127,7 +136,7 @@ const IA32_FS_BASE_MSR: u32 = 0xc000_0100;
 const IA32_GS_BASE_MSR: u32 = 0xc000_0101;
 const IA32_KERNEL_GS_BASE_MSR: u32 = 0xc000_0102;
 const IA32_TSC_AUX_MSR: u32 = 0xc000_0103;
-const RESIDENT_MSR_SWITCH_COUNT: usize = 6;
+const RESIDENT_MSR_SWITCH_COUNT: usize = 7;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1126,8 +1135,9 @@ pub fn ept_test_page_gpa() -> u64 {
 
 pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError> {
     let mut code = ResidentCode::allocate()?;
-    let mut context_pages = ResidentPages::allocate(1, AddressConstraint::Any)
-        .map_err(ResidentProbeError::Allocation)?;
+    let mut context_pages =
+        ResidentPages::allocate_typed(1, AddressConstraint::Any, RESIDENT_EVENT_MEMORY_TYPE)
+            .map_err(ResidentProbeError::Allocation)?;
     let context = context_pages
         .pointer()
         .as_ptr()
@@ -1178,7 +1188,7 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
         code_physical_address: code.pages.physical_address(),
         context_physical_address: context_pages.physical_address(),
         code_memory_type: RESIDENT_CODE_MEMORY_TYPE.0,
-        data_memory_type: RESIDENT_MEMORY_TYPE.0,
+        data_memory_type: RESIDENT_EVENT_MEMORY_TYPE.0,
         exit_boot_services_event: ebs_event.as_ptr() as usize as u64,
         virtual_address_change_event: va_event.as_ptr() as usize as u64,
     };
@@ -1212,6 +1222,19 @@ fn allow_low_msr_read_passthrough(bitmap: &ResidentPages, index: u32) {
     }
 }
 
+fn allow_low_msr_write_passthrough(bitmap: &ResidentPages, index: u32) {
+    debug_assert!(index <= 0x1fff);
+    let byte_index = (index >> 3) as usize;
+    let bit_mask = !(1_u8 << (index & 7));
+    unsafe {
+        let write_byte = bitmap
+            .pointer()
+            .as_ptr()
+            .add(MSR_BITMAP_WRITE_LOW_OFFSET + byte_index);
+        write_byte.write(write_byte.read() & bit_mask);
+    }
+}
+
 fn allow_high_msr_passthrough(bitmap: &ResidentPages, index: u32) {
     debug_assert!((0xc000_0000..=0xc000_1fff).contains(&index));
     let relative_index = index - 0xc000_0000;
@@ -1234,6 +1257,7 @@ fn allow_high_msr_passthrough(bitmap: &ResidentPages, index: u32) {
 fn configure_resident_msr_switch(msr_state: &ResidentPages) -> Result<(), VmcsError> {
     let entries = msr_state.pointer().as_ptr().cast::<VmxMsrEntry>();
     let initial_values = [
+        (IA32_SPEC_CTRL_MSR, unsafe { msr::read(IA32_SPEC_CTRL_MSR) }),
         (IA32_KERNEL_GS_BASE_MSR, unsafe {
             msr::read(IA32_KERNEL_GS_BASE_MSR)
         }),
@@ -1302,11 +1326,12 @@ fn configure_nested_vmcs02(
             configuration.host_tables,
             configuration.segments,
         )?;
-        vt_state::configure_guest_with_rflags(
+        let guest = vt_state::configure_guest_with_rflags(
             configuration.guest_rip,
             configuration.guest_rsp,
             configuration.guest_rflags,
         )?;
+        vt_controls::virtualize_resident_cr4_vmxe(guest.cr4)?;
         vmwrite(HOST_RSP, configuration.host_rsp)?;
         vmwrite(HOST_RIP, configuration.host_rip)?;
         Ok(())
@@ -1543,7 +1568,7 @@ fn nested_vmx_capabilities(host_vmx_basic: u64) -> NestedVmxCapabilities {
     capabilities
 }
 
-pub fn run_windows_boot(
+pub fn run_boot_loader(
     entry_rip: u64,
     event_context: u64,
     ept_probe_fault_rip: u64,
@@ -1562,6 +1587,8 @@ pub fn run_windows_boot(
     let msr_bitmap = ResidentPages::allocate(MSR_BITMAP_PAGES, AddressConstraint::Any)
         .map_err(ResidentProbeError::Allocation)?;
     let ept_test_page = ResidentPages::allocate(1, AddressConstraint::Any)
+        .map_err(ResidentProbeError::Allocation)?;
+    let zero_page = ResidentPages::allocate(1, AddressConstraint::Any)
         .map_err(ResidentProbeError::Allocation)?;
     let mut host_address_space = HostAddressSpace::reserve().map_err(ResidentProbeError::Paging)?;
     let vmx_basic = vt_vmxon::vmx_basic();
@@ -1599,8 +1626,12 @@ pub fn run_windows_boot(
             .write_bytes(0xff, msr_bitmap.byte_len());
     }
     allow_low_msr_passthrough(&msr_bitmap, IA32_ARCH_CAPABILITIES_MSR);
+    allow_low_msr_passthrough(&msr_bitmap, IA32_SPEC_CTRL_MSR);
+    allow_low_msr_write_passthrough(&msr_bitmap, IA32_PRED_CMD_MSR);
     allow_low_msr_read_passthrough(&msr_bitmap, IA32_MCG_CAP_MSR);
+    allow_low_msr_passthrough(&msr_bitmap, IA32_MCG_STATUS_MSR);
     allow_low_msr_passthrough(&msr_bitmap, IA32_MCG_CTL_MSR);
+    allow_low_msr_passthrough(&msr_bitmap, IA32_TSC_DEADLINE_MSR);
     let machine_check_bank_count = unsafe { msr::read(IA32_MCG_CAP_MSR) } as u32 & 0xff;
     for bank in 0..machine_check_bank_count {
         allow_low_msr_passthrough(&msr_bitmap, IA32_MC0_CTL2_MSR + bank);
@@ -1626,15 +1657,33 @@ pub fn run_windows_boot(
         .clone_current()
         .map_err(ResidentProbeError::Paging)?;
     let mut ept = vt_ept::IdentityEpt::build()?;
-    ept.deny_guest_access(code.pages.physical_address(), code.pages.pages())?;
-    ept.deny_guest_access(msr_bitmap.physical_address(), msr_bitmap.pages())?;
-    ept.deny_guest_access(host_space.arena_physical_address, host_space.arena_pages)?;
+    let zero_page_physical_address = zero_page.physical_address();
+    ept.conceal_guest_access(
+        zero_page_physical_address,
+        zero_page.pages(),
+        zero_page_physical_address,
+    )?;
+    ept.conceal_guest_access(
+        code.pages.physical_address(),
+        code.pages.pages(),
+        zero_page_physical_address,
+    )?;
+    ept.conceal_guest_access(
+        msr_bitmap.physical_address(),
+        msr_bitmap.pages(),
+        zero_page_physical_address,
+    )?;
+    ept.conceal_guest_access(
+        host_space.arena_physical_address,
+        host_space.arena_pages,
+        zero_page_physical_address,
+    )?;
     ept.deny_guest_access(ept_test_page.physical_address(), ept_test_page.pages())?;
-    cpu_resources.deny_guest_access(&mut ept)?;
+    cpu_resources.conceal_guest_access(&mut ept, zero_page_physical_address)?;
     for (_, resources) in &ap_resources {
-        resources.deny_guest_access(&mut ept)?;
+        resources.conceal_guest_access(&mut ept, zero_page_physical_address)?;
     }
-    ept.deny_guest_access_to_tables()?;
+    ept.conceal_guest_access_to_tables(zero_page_physical_address)?;
     let bsp_ept_composition = cpu_resources.prepare_nested_ept(&ept)?;
     for (_, resources) in &mut ap_resources {
         resources.prepare_nested_ept(&ept)?;
@@ -1643,10 +1692,12 @@ pub fn run_windows_boot(
     for (_, resources) in &ap_resources {
         nested_ept02_regions.extend(resources.nested_ept02_table_regions());
     }
-    ept.deny_guest_access_to_regions(&nested_ept02_regions)?;
-    cpu_resources.deny_nested_ept02_regions(&nested_ept02_regions)?;
+    ept.conceal_guest_access_to_regions(&nested_ept02_regions, zero_page_physical_address)?;
+    cpu_resources
+        .conceal_nested_ept02_regions(&nested_ept02_regions, zero_page_physical_address)?;
     for (_, resources) in &mut ap_resources {
-        resources.deny_nested_ept02_regions(&nested_ept02_regions)?;
+        resources
+            .conceal_nested_ept02_regions(&nested_ept02_regions, zero_page_physical_address)?;
     }
 
     let nested_ept12_pointer = cpu_resources
@@ -1667,28 +1718,16 @@ pub fn run_windows_boot(
         .nested_ept_alternate_composition()
         .ok_or(EptError::InvalidPageTable)?;
 
-    let ResidentCpuResources {
-        vmxon_region,
-        vmcs_region,
-        nested_vmcs02_region,
-        mut host_tables,
-        context_pages,
-        guest_stack,
-        host_stack,
-        resident_msr_state,
-        nested_vmxon_page,
-        nested_vmcs12_pages,
-        ..
-    } = cpu_resources;
-    let nested_vmxon_operand = nested_vmxon_page.physical_address() + 8;
-    let nested_vmxon_region = nested_vmxon_page.physical_address();
-    let nested_vmcs12_region = nested_vmcs12_pages.physical_address();
+    let nested_vmxon_operand = cpu_resources.nested_vmxon_page.physical_address() + 8;
+    let nested_vmxon_region = cpu_resources.nested_vmxon_page.physical_address();
+    let nested_vmcs12_region = cpu_resources.nested_vmcs12_pages.physical_address();
     let nested_vmcs12_operand = nested_vmcs12_region + PAGE_SIZE as u64;
     let nested_vmptrst_destination = nested_vmcs12_operand + 8;
-    let vmcs_physical_address = vmcs_region.physical_address();
-    let nested_vmcs02_physical_address = nested_vmcs02_region.physical_address();
-    let session = vt_vmxon::enter_vmx_root_with_region(vmx_basic, vmxon_region)
-        .map_err(ResidentProbeError::Vmxon)?;
+    let vmcs_physical_address = cpu_resources.vmcs_region.physical_address();
+    let nested_vmcs02_physical_address = cpu_resources.nested_vmcs02_region.physical_address();
+    let session =
+        vt_vmxon::enter_vmx_root_with_borrowed_region(vmx_basic, &mut cpu_resources.vmxon_region)
+            .map_err(ResidentProbeError::Vmxon)?;
     EPT_TEST_PAGE_GPA.store(ept_test_page.physical_address(), Ordering::Release);
     let clear_result = unsafe { vt_vmcs::vmclear(vmcs_physical_address) };
     if clear_result != VmxInstructionResult::Succeeded {
@@ -1703,10 +1742,16 @@ pub fn run_windows_boot(
 
     let _controls =
         vt_controls::configure_resident_boot(msr_bitmap.physical_address(), ept.ept_pointer())?;
-    configure_resident_msr_switch(&resident_msr_state)?;
-    configure_resident_host(host_space.host_cr3, &host_tables, root_segments)?;
-    let guest_rsp = guest_stack.physical_address() + guest_stack.byte_len() as u64;
+    configure_resident_msr_switch(&cpu_resources.resident_msr_state)?;
+    configure_resident_host(
+        host_space.host_cr3,
+        &cpu_resources.host_tables,
+        root_segments,
+    )?;
+    let guest_rsp =
+        cpu_resources.guest_stack.physical_address() + cpu_resources.guest_stack.byte_len() as u64;
     let guest = vt_state::configure_guest_with_rflags(entry_rip, guest_rsp & !0xf, initial_rflags)?;
+    vt_controls::virtualize_resident_cr4_vmxe(guest.cr4)?;
     let nested_capabilities = nested_vmx_capabilities(vmx_basic);
     let mut nested_state = NestedVmxState::new(
         nested_capabilities,
@@ -1737,7 +1782,8 @@ pub fn run_windows_boot(
     });
     seed_nested_vmcs12_core_state(&mut nested_state.vmcs12, root_segments);
 
-    let context = context_pages
+    let context = cpu_resources
+        .context_pages
         .pointer()
         .as_ptr()
         .cast::<ResidentBootContext>();
@@ -1752,7 +1798,10 @@ pub fn run_windows_boot(
             nested_state,
         ));
     }
-    let host_rsp = (host_stack.physical_address() + host_stack.byte_len() as u64 - 8) & !0xf;
+    let host_rsp = (cpu_resources.host_stack.physical_address()
+        + cpu_resources.host_stack.byte_len() as u64
+        - 8)
+        & !0xf;
     unsafe {
         (host_rsp as *mut u64).write(context as u64);
     }
@@ -1761,9 +1810,9 @@ pub fn run_windows_boot(
         vmcs02_region: nested_vmcs02_physical_address,
         msr_bitmap: msr_bitmap.physical_address(),
         ept_pointer: nested_ept02_pointer,
-        msr_state: &resident_msr_state,
+        msr_state: &cpu_resources.resident_msr_state,
         host_cr3: host_space.host_cr3,
-        host_tables: &host_tables,
+        host_tables: &cpu_resources.host_tables,
         segments: root_segments,
         host_rsp,
         host_rip: code.dispatch_entry,
@@ -1942,7 +1991,7 @@ pub fn run_windows_boot(
     }
     EPT_TEST_PAGE_GPA.store(0, Ordering::Release);
     if raw_path == 0 {
-        host_tables.pages.preserve();
+        cpu_resources.host_tables.pages.preserve();
     }
     let vm_instruction_error = vt_vmcs::vmread(VM_INSTRUCTION_ERROR).unwrap_or(u64::MAX);
     let final_clear = unsafe { vt_vmcs::vmclear(vmcs_physical_address) };
@@ -2001,7 +2050,8 @@ pub fn run_windows_boot(
         cpuid_hypervisor_eax: result.cpuid_hypervisor_eax,
         nested: result.nested,
     };
-    let _ = &host_tables.pages;
+    let _ = &cpu_resources;
+    let _ = &zero_page;
     Ok(report)
 }
 
@@ -4321,6 +4371,11 @@ global_asm!(
     "je .Lresident_dispatch_rdmsr_passthrough",
     "cmp ecx, {pp1_energy_status_msr}",
     "je .Lresident_dispatch_rdmsr_passthrough",
+    "cmp ecx, {x2apic_msr_base}",
+    "jb .Lresident_dispatch_rdmsr_before_x2apic",
+    "cmp ecx, {x2apic_msr_end}",
+    "jbe .Lresident_dispatch_rdmsr_passthrough",
+    ".Lresident_dispatch_rdmsr_before_x2apic:",
     "cmp ecx, {mtrr_physbase0_msr}",
     "jb .Lresident_dispatch_rdmsr_after_variable_mtrr",
     "mov r10d, ecx",
@@ -4379,7 +4434,7 @@ global_asm!(
     "cmp ecx, 0x490",
     "jbe .Lresident_dispatch_inject_gp",
     ".Lresident_dispatch_rdmsr_not_vmx:",
-    "jmp .Lresident_dispatch_unsupported",
+    "jmp .Lresident_dispatch_inject_gp",
     ".Lresident_dispatch_rdmsr_tsc_adjust:",
     "mov r11, qword ptr [r12 + {b_tsc_adjust}]",
     "jmp .Lresident_dispatch_rdmsr_nested_value",
@@ -4575,6 +4630,11 @@ global_asm!(
     "je .Lresident_dispatch_wrmsr_passthrough",
     "cmp ecx, {mtrr_def_type_msr}",
     "je .Lresident_dispatch_wrmsr_passthrough",
+    "cmp ecx, {x2apic_msr_base}",
+    "jb .Lresident_dispatch_wrmsr_before_x2apic",
+    "cmp ecx, {x2apic_msr_end}",
+    "jbe .Lresident_dispatch_wrmsr_passthrough",
+    ".Lresident_dispatch_wrmsr_before_x2apic:",
     "cmp ecx, {mtrr_physbase0_msr}",
     "jb .Lresident_dispatch_wrmsr_after_variable_mtrr",
     "mov r10d, ecx",
@@ -4636,7 +4696,7 @@ global_asm!(
     "jbe .Lresident_dispatch_inject_gp",
     ".Lresident_dispatch_wrmsr_not_vmx:",
     "cmp ecx, {efer_msr}",
-    "jne .Lresident_dispatch_unsupported",
+    "jne .Lresident_dispatch_inject_gp",
     "mov eax, dword ptr [rsp + 0]",
     "mov edx, dword ptr [rsp + 16]",
     "shl rdx, 32",
@@ -4777,7 +4837,27 @@ global_asm!(
     "mov r11, {nested_probe_failed_magic}",
     "cmp rax, r11",
     "je .Lresident_dispatch_nested_probe_failed",
+    "cmp eax, {vmware_hypervisor_magic}",
+    "je .Lresident_dispatch_vmware_hypercall",
     "jmp .Lresident_dispatch_unsupported",
+    ".Lresident_dispatch_vmware_hypercall:",
+    "mov rax, qword ptr [rsp + 0]",
+    "mov rcx, qword ptr [rsp + 8]",
+    "mov rdx, qword ptr [rsp + 16]",
+    "mov rbx, qword ptr [rsp + 24]",
+    "mov rsi, qword ptr [rsp + 40]",
+    "mov rdi, qword ptr [rsp + 48]",
+    "mov dx, {vmware_hypervisor_port}",
+    "in eax, dx",
+    "mov qword ptr [rsp + 0], rax",
+    "mov qword ptr [rsp + 8], rcx",
+    "mov qword ptr [rsp + 16], rdx",
+    "mov qword ptr [rsp + 24], rbx",
+    "mov qword ptr [rsp + 40], rsi",
+    "mov qword ptr [rsp + 48], rdi",
+    "mov r12, qword ptr [rsp + 120]",
+    "call .Lresident_advance_guest_rip",
+    "jmp .Lresident_dispatch_resume",
     ".Lresident_dispatch_start_checkpoint:",
     "mov qword ptr [r12 + {b_start_checkpoint_seen}], 1",
     "lea rsi, [rip + .Lstart_checkpoint_message]",
@@ -5350,6 +5430,8 @@ global_asm!(
     dram_energy_status_msr = const MSR_DRAM_ENERGY_STATUS,
     pp0_energy_status_msr = const MSR_PP0_ENERGY_STATUS,
     pp1_energy_status_msr = const MSR_PP1_ENERGY_STATUS,
+    x2apic_msr_base = const IA32_X2APIC_MSR_BASE,
+    x2apic_msr_end = const IA32_X2APIC_MSR_END,
     sysenter_cs_msr = const IA32_SYSENTER_CS_MSR,
     sysenter_esp_msr = const IA32_SYSENTER_ESP_MSR,
     sysenter_eip_msr = const IA32_SYSENTER_EIP_MSR,
@@ -5406,6 +5488,8 @@ global_asm!(
     start_checkpoint_magic = const RESIDENT_VMCALL_START_CHECKPOINT,
     stop_magic = const RESIDENT_VMCALL_STOP,
     nested_probe_failed_magic = const RESIDENT_VMCALL_NESTED_PROBE_FAILED,
+    vmware_hypervisor_magic = const VMWARE_HYPERVISOR_MAGIC,
+    vmware_hypervisor_port = const VMWARE_HYPERVISOR_PORT,
     unsupported_stop = const RESIDENT_STOP_UNSUPPORTED_EXIT,
     b_expected_host_cr3 = const BCTX_EXPECTED_HOST_CR3,
     b_event_context = const BCTX_EVENT_CONTEXT,

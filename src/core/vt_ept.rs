@@ -356,12 +356,13 @@ impl IdentityEpt {
         regions
     }
 
-    pub fn deny_guest_access_to_regions(
+    pub fn conceal_guest_access_to_regions(
         &mut self,
         regions: &[(u64, usize)],
+        zero_page_physical_address: u64,
     ) -> Result<(), EptError> {
         for &(physical_address, page_count) in regions {
-            self.deny_guest_access(physical_address, page_count)?;
+            self.conceal_guest_access(physical_address, page_count, zero_page_physical_address)?;
         }
         Ok(())
     }
@@ -383,15 +384,45 @@ impl IdentityEpt {
         Ok(())
     }
 
-    pub fn deny_guest_access_to_tables(&mut self) -> Result<(), EptError> {
+    pub fn conceal_guest_access(
+        &mut self,
+        physical_address: u64,
+        page_count: usize,
+        zero_page_physical_address: u64,
+    ) -> Result<(), EptError> {
+        if physical_address & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(EptError::InvalidProtectionAddress(physical_address));
+        }
+        if zero_page_physical_address & (PAGE_SIZE as u64 - 1) != 0
+            || zero_page_physical_address >= self.mapped_end
+        {
+            return Err(EptError::InvalidRemapAddress(zero_page_physical_address));
+        }
+        for page_index in 0..page_count {
+            let page_address = physical_address
+                .checked_add((page_index * PAGE_SIZE) as u64)
+                .ok_or(EptError::AddressOverflow)?;
+            self.conceal_guest_access_page(page_address, zero_page_physical_address)?;
+        }
+        Ok(())
+    }
+
+    pub fn conceal_guest_access_to_tables(
+        &mut self,
+        zero_page_physical_address: u64,
+    ) -> Result<(), EptError> {
         for page_index in 0..self.pages.len() {
             let physical_address = self.pages[page_index].physical_address();
             let page_count = self.pages[page_index].pages();
-            self.deny_guest_access(physical_address, page_count)?;
+            self.conceal_guest_access(physical_address, page_count, zero_page_physical_address)?;
         }
         let protection_pool_address = self.protection_pool.pages.physical_address();
         let protection_pool_pages = self.protection_pool.pages.pages();
-        self.deny_guest_access(protection_pool_address, protection_pool_pages)?;
+        self.conceal_guest_access(
+            protection_pool_address,
+            protection_pool_pages,
+            zero_page_physical_address,
+        )?;
         Ok(())
     }
 
@@ -405,6 +436,27 @@ impl IdentityEpt {
 
         let leaf = read_entry(pt, pt_index);
         write_entry(pt, pt_index, leaf & !EPT_PERMISSIONS);
+        Ok(())
+    }
+
+    fn conceal_guest_access_page(
+        &mut self,
+        physical_address: u64,
+        zero_page_physical_address: u64,
+    ) -> Result<(), EptError> {
+        if physical_address >= self.mapped_end {
+            return Err(EptError::InvalidProtectionAddress(physical_address));
+        }
+
+        let pt_index = ((physical_address / PAGE_SIZE as u64) & 0x1ff) as usize;
+        let (pt, _) = self.ensure_4k_leaf(physical_address)?;
+        let leaf = read_entry(pt, pt_index);
+        let memory_type = leaf & (0x7 << EPT_MEMORY_TYPE_SHIFT);
+        write_entry(
+            pt,
+            pt_index,
+            (zero_page_physical_address & EPT_ADDRESS_MASK) | memory_type | EPT_READ,
+        );
         Ok(())
     }
 

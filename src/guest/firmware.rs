@@ -2,8 +2,7 @@ use core::arch::global_asm;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, SearchType};
-use uefi::proto::media::file::{File, FileAttribute, FileMode};
+use uefi::boot::{self, SearchType};
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::{Handle, Status};
 
@@ -13,8 +12,8 @@ use crate::hv_core::vt_resident;
 pub const BOOT_STAGE_MAGIC: u64 = 0x4d_48_56_42_4f_4f_54_31;
 pub const BOOT_STAGE_VERSION: u32 = 1;
 pub const BOOT_STAGE_LOCATE_OK: u64 = 0xb010;
-pub const BOOT_STAGE_WINDOWS_PATH_OK: u64 = 0xb020;
-pub const BOOT_STAGE_WINDOWS_IMAGE_LOAD_OK: u64 = 0xb030;
+pub const BOOT_STAGE_TARGET_PATH_OK: u64 = 0xb020;
+pub const BOOT_STAGE_TARGET_IMAGE_LOAD_OK: u64 = 0xb030;
 pub const BOOT_STAGE_START_IMAGE_RETURNED: u64 = 0xb040;
 pub const BOOT_STAGE_START_IMAGE_ERROR: u64 = 0xb041;
 pub const BOOT_STAGE_BUFFER_TOO_SMALL: u64 = 0xb011;
@@ -23,8 +22,8 @@ pub const BOOT_STAGE_ERROR: u64 = 0xb0ee;
 
 const FLAG_ENTERED: u32 = 1 << 0;
 const FLAG_LOCATE_OK: u32 = 1 << 1;
-const FLAG_WINDOWS_PATH_OK: u32 = 1 << 2;
-const FLAG_WINDOWS_IMAGE_LOAD_OK: u32 = 1 << 3;
+const FLAG_TARGET_PATH_OK: u32 = 1 << 2;
+const FLAG_TARGET_IMAGE_LOAD_OK: u32 = 1 << 3;
 const FLAG_TERMINAL_READY: u32 = 1 << 4;
 const HANDLE_CAPACITY: usize = 128;
 
@@ -70,8 +69,8 @@ pub fn proof_complete(report: BootStageReport) -> bool {
         && report.version == BOOT_STAGE_VERSION
         && report.flags & (FLAG_ENTERED | FLAG_LOCATE_OK | FLAG_TERMINAL_READY)
             == (FLAG_ENTERED | FLAG_LOCATE_OK | FLAG_TERMINAL_READY)
-        && report.flags & FLAG_WINDOWS_PATH_OK != 0
-        && report.flags & FLAG_WINDOWS_IMAGE_LOAD_OK != 0
+        && report.flags & FLAG_TARGET_PATH_OK != 0
+        && report.flags & FLAG_TARGET_IMAGE_LOAD_OK != 0
         && report.status == Status::SUCCESS.0 as u64
         && report.handle_count > 0
 }
@@ -81,22 +80,22 @@ pub fn entry_address() -> u64 {
 }
 
 pub fn start_entry_address() -> u64 {
-    matrixhv_windows_start_guest_asm as *const () as usize as u64
+    matrixhv_boot_loader_start_guest_asm as *const () as usize as u64
 }
 
 pub fn ept_probe_fault_address() -> u64 {
-    core::ptr::addr_of!(matrixhv_windows_ept_probe_fault) as u64
+    core::ptr::addr_of!(matrixhv_boot_loader_ept_probe_fault) as u64
 }
 
 pub fn ept_probe_resume_address() -> u64 {
-    core::ptr::addr_of!(matrixhv_windows_ept_probe_resume) as u64
+    core::ptr::addr_of!(matrixhv_boot_loader_ept_probe_resume) as u64
 }
 
 pub fn result_name(result: u64) -> &'static str {
     match result {
         BOOT_STAGE_LOCATE_OK => "locate_sfs_ok",
-        BOOT_STAGE_WINDOWS_PATH_OK => "windows_path_ok",
-        BOOT_STAGE_WINDOWS_IMAGE_LOAD_OK => "windows_image_load_ok",
+        BOOT_STAGE_TARGET_PATH_OK => "target_path_ok",
+        BOOT_STAGE_TARGET_IMAGE_LOAD_OK => "target_image_load_ok",
         BOOT_STAGE_START_IMAGE_RETURNED => "start_image_returned",
         BOOT_STAGE_START_IMAGE_ERROR => "start_image_error",
         BOOT_STAGE_BUFFER_TOO_SMALL => "buffer_too_small",
@@ -112,9 +111,8 @@ pub extern "efiapi" fn matrixhv_vt_nested_enabled() -> u64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "efiapi" fn matrixhv_windows_start_guest_stage() -> u64 {
+pub extern "efiapi" fn matrixhv_boot_loader_start_guest_stage() -> u64 {
     REPORT_FLAGS.fetch_or(FLAG_ENTERED, Ordering::Release);
-    let boot_target_path = services::boot_target_path();
 
     let mut handles: [MaybeUninit<Handle>; HANDLE_CAPACITY] =
         [const { MaybeUninit::uninit() }; HANDLE_CAPACITY];
@@ -130,58 +128,49 @@ pub extern "efiapi" fn matrixhv_windows_start_guest_stage() -> u64 {
     REPORT_HANDLE_COUNT.store(found.len() as u32, Ordering::Relaxed);
     REPORT_FLAGS.fetch_or(FLAG_LOCATE_OK, Ordering::Release);
 
-    for handle in found {
-        let params = OpenProtocolParams {
-            handle: *handle,
-            agent: boot::image_handle(),
-            controller: None,
-        };
-        let Ok(mut file_system) = (unsafe {
-            boot::open_protocol::<SimpleFileSystem>(params, OpenProtocolAttributes::GetProtocol)
-        }) else {
-            continue;
-        };
-        let Ok(mut root) = file_system.open_volume() else {
-            continue;
-        };
-        if root
-            .open(boot_target_path, FileMode::Read, FileAttribute::empty())
-            .is_err()
-        {
-            continue;
-        }
-        REPORT_FLAGS.fetch_or(FLAG_WINDOWS_PATH_OK, Ordering::Release);
+    for target in services::boot_target_candidates() {
+        for handle in found.iter() {
+            if !services::volume_contains(*handle, target.path) {
+                continue;
+            }
+            REPORT_FLAGS.fetch_or(FLAG_TARGET_PATH_OK, Ordering::Release);
 
-        let child_handle = match services::load_image_on_volume(*handle, boot_target_path) {
-            Ok(handle) => handle,
-            Err(status) => {
+            let child_handle = match services::load_image_on_volume(*handle, target.path) {
+                Ok(handle) => handle,
+                Err(status) => {
+                    REPORT_STATUS.store(status.0 as u64, Ordering::Relaxed);
+                    REPORT_FLAGS.fetch_or(FLAG_TERMINAL_READY, Ordering::Release);
+                    return BOOT_STAGE_START_IMAGE_ERROR;
+                }
+            };
+            REPORT_STATUS.store(Status::SUCCESS.0 as u64, Ordering::Relaxed);
+            REPORT_FLAGS.fetch_or(FLAG_TARGET_IMAGE_LOAD_OK, Ordering::Release);
+            crate::runtime::logger::info(format_args!(
+                "boot target chainload kind={} path={}",
+                target.kind.name(),
+                target.path
+            ));
+            if let Err(status) = services::configure_image_load_options(child_handle) {
                 REPORT_STATUS.store(status.0 as u64, Ordering::Relaxed);
                 REPORT_FLAGS.fetch_or(FLAG_TERMINAL_READY, Ordering::Release);
+                let _ = boot::unload_image(child_handle);
                 return BOOT_STAGE_START_IMAGE_ERROR;
             }
-        };
-        REPORT_STATUS.store(Status::SUCCESS.0 as u64, Ordering::Relaxed);
-        REPORT_FLAGS.fetch_or(FLAG_WINDOWS_IMAGE_LOAD_OK, Ordering::Release);
-        if let Err(status) = services::configure_image_load_options(child_handle) {
-            REPORT_STATUS.store(status.0 as u64, Ordering::Relaxed);
-            REPORT_FLAGS.fetch_or(FLAG_TERMINAL_READY, Ordering::Release);
-            let _ = boot::unload_image(child_handle);
-            return BOOT_STAGE_START_IMAGE_ERROR;
-        }
 
-        unsafe {
-            matrixhv_windows_start_checkpoint_asm();
-        }
-        let ept_test_page_gpa = vt_resident::ept_test_page_gpa();
-        if ept_test_page_gpa != 0 {
             unsafe {
-                matrixhv_windows_ept_probe_asm(ept_test_page_gpa);
+                matrixhv_boot_loader_start_checkpoint_asm();
             }
+            let ept_test_page_gpa = vt_resident::ept_test_page_gpa();
+            if ept_test_page_gpa != 0 {
+                unsafe {
+                    matrixhv_boot_loader_ept_probe_asm(ept_test_page_gpa);
+                }
+            }
+            return match boot::start_image(child_handle) {
+                Ok(()) => BOOT_STAGE_START_IMAGE_RETURNED,
+                Err(_) => BOOT_STAGE_START_IMAGE_ERROR,
+            };
         }
-        return match boot::start_image(child_handle) {
-            Ok(()) => BOOT_STAGE_START_IMAGE_RETURNED,
-            Err(_) => BOOT_STAGE_START_IMAGE_ERROR,
-        };
     }
 
     REPORT_STATUS.store(Status::NOT_FOUND.0 as u64, Ordering::Relaxed);
@@ -192,7 +181,6 @@ pub extern "efiapi" fn matrixhv_windows_start_guest_stage() -> u64 {
 #[unsafe(no_mangle)]
 pub extern "efiapi" fn matrixhv_real_boot_guest_stage() -> u64 {
     REPORT_FLAGS.fetch_or(FLAG_ENTERED, Ordering::Release);
-    let boot_target_path = services::boot_target_path();
 
     let mut handles: [MaybeUninit<Handle>; HANDLE_CAPACITY] =
         [const { MaybeUninit::uninit() }; HANDLE_CAPACITY];
@@ -202,41 +190,29 @@ pub extern "efiapi" fn matrixhv_real_boot_guest_stage() -> u64 {
             REPORT_HANDLE_COUNT.store(found.len() as u32, Ordering::Relaxed);
             REPORT_FLAGS.fetch_or(FLAG_LOCATE_OK, Ordering::Release);
 
-            for handle in found {
-                let params = OpenProtocolParams {
-                    handle: *handle,
-                    agent: boot::image_handle(),
-                    controller: None,
-                };
-                let Ok(mut file_system) = (unsafe {
-                    boot::open_protocol::<SimpleFileSystem>(
-                        params,
-                        OpenProtocolAttributes::GetProtocol,
-                    )
-                }) else {
-                    continue;
-                };
-                let Ok(mut root) = file_system.open_volume() else {
-                    continue;
-                };
-                if root
-                    .open(boot_target_path, FileMode::Read, FileAttribute::empty())
-                    .is_ok()
-                {
-                    REPORT_FLAGS.fetch_or(FLAG_WINDOWS_PATH_OK, Ordering::Release);
-                    match services::load_and_unload_image_on_volume(*handle, boot_target_path) {
-                        Ok(()) => {
-                            REPORT_STATUS.store(Status::SUCCESS.0 as u64, Ordering::Relaxed);
-                            REPORT_FLAGS.fetch_or(
-                                FLAG_WINDOWS_IMAGE_LOAD_OK | FLAG_TERMINAL_READY,
-                                Ordering::Release,
-                            );
-                            return BOOT_STAGE_WINDOWS_IMAGE_LOAD_OK;
-                        }
-                        Err(status) => {
-                            REPORT_STATUS.store(status.0 as u64, Ordering::Relaxed);
-                            REPORT_FLAGS.fetch_or(FLAG_TERMINAL_READY, Ordering::Release);
-                            return BOOT_STAGE_ERROR;
+            for target in services::boot_target_candidates() {
+                for handle in found.iter() {
+                    if services::volume_contains(*handle, target.path) {
+                        REPORT_FLAGS.fetch_or(FLAG_TARGET_PATH_OK, Ordering::Release);
+                        crate::runtime::logger::info(format_args!(
+                            "boot target probe kind={} path={}",
+                            target.kind.name(),
+                            target.path
+                        ));
+                        match services::load_and_unload_image_on_volume(*handle, target.path) {
+                            Ok(()) => {
+                                REPORT_STATUS.store(Status::SUCCESS.0 as u64, Ordering::Relaxed);
+                                REPORT_FLAGS.fetch_or(
+                                    FLAG_TARGET_IMAGE_LOAD_OK | FLAG_TERMINAL_READY,
+                                    Ordering::Release,
+                                );
+                                return BOOT_STAGE_TARGET_IMAGE_LOAD_OK;
+                            }
+                            Err(status) => {
+                                REPORT_STATUS.store(status.0 as u64, Ordering::Relaxed);
+                                REPORT_FLAGS.fetch_or(FLAG_TERMINAL_READY, Ordering::Release);
+                                return BOOT_STAGE_ERROR;
+                            }
                         }
                     }
                 }
@@ -267,11 +243,11 @@ pub extern "efiapi" fn matrixhv_real_boot_guest_stage() -> u64 {
 
 unsafe extern "efiapi" {
     fn matrixhv_real_boot_guest_asm();
-    fn matrixhv_windows_start_guest_asm();
-    fn matrixhv_windows_start_checkpoint_asm();
-    fn matrixhv_windows_ept_probe_asm(physical_address: u64);
-    static matrixhv_windows_ept_probe_fault: u8;
-    static matrixhv_windows_ept_probe_resume: u8;
+    fn matrixhv_boot_loader_start_guest_asm();
+    fn matrixhv_boot_loader_start_checkpoint_asm();
+    fn matrixhv_boot_loader_ept_probe_asm(physical_address: u64);
+    static matrixhv_boot_loader_ept_probe_fault: u8;
+    static matrixhv_boot_loader_ept_probe_resume: u8;
 }
 
 global_asm!(
@@ -287,25 +263,25 @@ global_asm!(
 
 global_asm!(
     ".text",
-    ".globl matrixhv_windows_ept_probe_asm",
-    ".globl matrixhv_windows_ept_probe_fault",
-    ".globl matrixhv_windows_ept_probe_resume",
-    "matrixhv_windows_ept_probe_asm:",
-    "matrixhv_windows_ept_probe_fault:",
+    ".globl matrixhv_boot_loader_ept_probe_asm",
+    ".globl matrixhv_boot_loader_ept_probe_fault",
+    ".globl matrixhv_boot_loader_ept_probe_resume",
+    "matrixhv_boot_loader_ept_probe_asm:",
+    "matrixhv_boot_loader_ept_probe_fault:",
     "mov rax, qword ptr [rcx]",
-    "matrixhv_windows_ept_probe_resume:",
+    "matrixhv_boot_loader_ept_probe_resume:",
     "ret",
 );
 
 global_asm!(
     ".text",
-    ".globl matrixhv_windows_start_checkpoint_asm",
-    "matrixhv_windows_start_checkpoint_asm:",
+    ".globl matrixhv_boot_loader_start_checkpoint_asm",
+    "matrixhv_boot_loader_start_checkpoint_asm:",
     "mov rax, {checkpoint_magic}",
     "vmcall",
     "ret",
-    ".globl matrixhv_windows_start_guest_asm",
-    "matrixhv_windows_start_guest_asm:",
+    ".globl matrixhv_boot_loader_start_guest_asm",
+    "matrixhv_boot_loader_start_guest_asm:",
     "mov r8, qword ptr [rax + 8]",
     "mov r9, qword ptr [rax + 16]",
     "mov rbx, rax",
@@ -845,7 +821,7 @@ global_asm!(
     "jnz .Lwindows_nested_probe_failed",
     ".Lwindows_cpuid_done:",
     "sub rsp, 32",
-    "call matrixhv_windows_start_guest_stage",
+    "call matrixhv_boot_loader_start_guest_stage",
     "add rsp, 32",
     "mov rdx, rax",
     "mov rax, {stop_magic}",

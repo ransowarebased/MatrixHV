@@ -296,36 +296,60 @@ impl ResidentCpuResources {
         regions
     }
 
-    pub(crate) fn deny_nested_ept02_regions(
+    pub(crate) fn conceal_nested_ept02_regions(
         &mut self,
         regions: &[(u64, usize)],
+        zero_page_physical_address: u64,
     ) -> Result<(), EptError> {
         self.nested_ept02
             .as_mut()
             .ok_or(EptError::InvalidPageTable)?
-            .deny_guest_access_to_regions(regions)?;
+            .conceal_guest_access_to_regions(regions, zero_page_physical_address)?;
         self.nested_ept02_alternate
             .as_mut()
             .ok_or(EptError::InvalidPageTable)?
-            .deny_guest_access_to_regions(regions)
+            .conceal_guest_access_to_regions(regions, zero_page_physical_address)
     }
 
-    pub(crate) fn deny_guest_access(&self, ept: &mut IdentityEpt) -> Result<(), EptError> {
-        ept.deny_guest_access(self.vmxon_region.physical_address(), 1)?;
-        ept.deny_guest_access(self.vmcs_region.physical_address(), 1)?;
-        ept.deny_guest_access(self.nested_vmcs02_region.physical_address(), 1)?;
-        ept.deny_guest_access(
+    pub(crate) fn conceal_guest_access(
+        &self,
+        ept: &mut IdentityEpt,
+        zero_page_physical_address: u64,
+    ) -> Result<(), EptError> {
+        ept.conceal_guest_access(
+            self.vmxon_region.physical_address(),
+            1,
+            zero_page_physical_address,
+        )?;
+        ept.conceal_guest_access(
+            self.vmcs_region.physical_address(),
+            1,
+            zero_page_physical_address,
+        )?;
+        ept.conceal_guest_access(
+            self.nested_vmcs02_region.physical_address(),
+            1,
+            zero_page_physical_address,
+        )?;
+        ept.conceal_guest_access(
             self.host_tables.pages.physical_address(),
             self.host_tables.pages.pages(),
+            zero_page_physical_address,
         )?;
-        ept.deny_guest_access(
+        ept.conceal_guest_access(
             self.context_pages.physical_address(),
             self.context_pages.pages(),
+            zero_page_physical_address,
         )?;
-        ept.deny_guest_access(self.host_stack.physical_address(), self.host_stack.pages())?;
-        ept.deny_guest_access(
+        ept.conceal_guest_access(
+            self.host_stack.physical_address(),
+            self.host_stack.pages(),
+            zero_page_physical_address,
+        )?;
+        ept.conceal_guest_access(
             self.resident_msr_state.physical_address(),
             self.resident_msr_state.pages(),
+            zero_page_physical_address,
         )?;
         Ok(())
     }
