@@ -7,3 +7,5 @@ pub const VMRESUME_EXIT_REASON: u64 = 24;
 pub const VMWRITE_EXIT_REASON: u64 = 25;
 pub const VMXOFF_EXIT_REASON: u64 = 26;
 pub const VMXON_EXIT_REASON: u64 = 27;
+pub const INVEPT_EXIT_REASON: u64 = 50;
+pub const INVVPID_EXIT_REASON: u64 = 53;

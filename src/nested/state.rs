@@ -56,6 +56,19 @@ pub struct NestedVmxState {
     pub ept_composition_count: u64,
     pub ept_probe_count: u64,
     pub ept_observed_value: u64,
+    pub ept02_alternate_pointer: u64,
+    pub ept_second_target_gpa: u64,
+    pub ept12_source_leaf: u64,
+    pub ept_alternate_composed_hpa: u64,
+    pub ept_alternate_permissions: u64,
+    pub invept_count: u64,
+    pub invept_software_count: u64,
+    pub invvpid_count: u64,
+    pub invvpid_software_count: u64,
+    pub ept_observed_value_after_invept: u64,
+    pub ept02_initial_pointer: u64,
+    pub ept12_source_leaf_attributes: u64,
+    pub ept_observed_value_before_invept: u64,
 }
 
 impl NestedVmxState {
@@ -118,6 +131,19 @@ impl NestedVmxState {
             ept_composition_count: 0,
             ept_probe_count: 0,
             ept_observed_value: 0,
+            ept02_alternate_pointer: 0,
+            ept_second_target_gpa: 0,
+            ept12_source_leaf: 0,
+            ept_alternate_composed_hpa: 0,
+            ept_alternate_permissions: 0,
+            invept_count: 0,
+            invept_software_count: 0,
+            invvpid_count: 0,
+            invvpid_software_count: 0,
+            ept_observed_value_after_invept: 0,
+            ept02_initial_pointer: 0,
+            ept12_source_leaf_attributes: 0,
+            ept_observed_value_before_invept: 0,
         }
     }
 
@@ -129,6 +155,12 @@ impl NestedVmxState {
         target_gpa: u64,
         composed_hpa: u64,
         permissions: u64,
+        alternate_ept02_pointer: u64,
+        second_target_gpa: u64,
+        source_leaf: u64,
+        source_leaf_attributes: u64,
+        alternate_composed_hpa: u64,
+        alternate_permissions: u64,
     ) {
         self.ept12_pointer = ept12_pointer;
         self.ept02_pointer = ept02_pointer;
@@ -136,6 +168,13 @@ impl NestedVmxState {
         self.ept_target_gpa = target_gpa;
         self.ept_composed_hpa = composed_hpa;
         self.ept_permissions = permissions;
-        self.ept_composition_count = 1;
+        self.ept_composition_count = 2;
+        self.ept02_alternate_pointer = alternate_ept02_pointer;
+        self.ept_second_target_gpa = second_target_gpa;
+        self.ept12_source_leaf = source_leaf;
+        self.ept12_source_leaf_attributes = source_leaf_attributes;
+        self.ept_alternate_composed_hpa = alternate_composed_hpa;
+        self.ept_alternate_permissions = alternate_permissions;
+        self.ept02_initial_pointer = ept02_pointer;
     }
 }

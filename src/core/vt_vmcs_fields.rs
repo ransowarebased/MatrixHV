@@ -6,7 +6,6 @@ pub const GUEST_FS_SELECTOR: u64 = 0x0808;
 pub const GUEST_GS_SELECTOR: u64 = 0x080a;
 pub const GUEST_LDTR_SELECTOR: u64 = 0x080c;
 pub const GUEST_TR_SELECTOR: u64 = 0x080e;
-
 pub const HOST_ES_SELECTOR: u64 = 0x0c00;
 pub const HOST_CS_SELECTOR: u64 = 0x0c02;
 pub const HOST_SS_SELECTOR: u64 = 0x0c04;
@@ -46,6 +45,7 @@ pub const SECONDARY_VM_EXEC_CONTROL: u64 = 0x401e;
 
 pub const VM_INSTRUCTION_ERROR: u64 = 0x4400;
 pub const VM_EXIT_REASON: u64 = 0x4402;
+pub const VM_EXIT_INTR_INFO: u64 = 0x4404;
 pub const VM_EXIT_INSTRUCTION_LEN: u64 = 0x440c;
 
 pub const GUEST_ES_LIMIT: u64 = 0x4800;

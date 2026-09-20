@@ -26,11 +26,20 @@ pub const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
 pub const VM_ENTRY_IA32E_MODE_GUEST: u32 = 1 << 9;
 pub const VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 pub const VMX_SECONDARY_ENABLE_EPT: u32 = 1 << 1;
+pub const VMX_SECONDARY_ENABLE_VPID: u32 = 1 << 5;
 pub const VMX_EPT_PAGE_WALK_LENGTH_4: u64 = 1 << 6;
 pub const VMX_EPT_MEMORY_TYPE_WB: u64 = 1 << 14;
 pub const VMX_EPT_2MB_PAGE: u64 = 1 << 16;
+pub const VMX_EPT_INVEPT: u64 = 1 << 20;
+pub const VMX_EPT_INVEPT_SINGLE_CONTEXT: u64 = 1 << 25;
+pub const VMX_VPID_INVVPID: u64 = 1 << 32;
+pub const VMX_VPID_INVVPID_SINGLE_CONTEXT: u64 = 1 << 41;
 pub const VMX_EPT_CAPABILITIES: u64 =
     VMX_EPT_PAGE_WALK_LENGTH_4 | VMX_EPT_MEMORY_TYPE_WB | VMX_EPT_2MB_PAGE;
+pub const VMX_SOFTWARE_INVALIDATION_CAPABILITIES: u64 = VMX_EPT_INVEPT
+    | VMX_EPT_INVEPT_SINGLE_CONTEXT
+    | VMX_VPID_INVVPID
+    | VMX_VPID_INVVPID_SINGLE_CONTEXT;
 pub const VMCS12_MAX_ENUM_INDEX: u64 = 22;
 
 pub const CPUID_VMX_BIT: u32 = 1 << 5;
@@ -132,8 +141,9 @@ impl NestedVmxCapabilities {
         } else {
             0
         };
+        let secondary_ept = restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_EPT, 0);
         let secondary_supported = if ept_supported {
-            VMX_SECONDARY_ENABLE_EPT
+            secondary_ept | (u64::from(VMX_SECONDARY_ENABLE_VPID) << 32)
         } else {
             0
         };
@@ -183,9 +193,9 @@ impl NestedVmxCapabilities {
             vmx_cr4_fixed0: host.cr4_fixed0,
             vmx_cr4_fixed1: host.cr4_fixed1,
             vmx_vmcs_enum: restrict_vmcs_enum(host.vmcs_enum),
-            vmx_procbased_ctls2: restrict_control(host.procbased_ctls2, secondary_supported, 0),
+            vmx_procbased_ctls2: secondary_supported,
             vmx_ept_vpid_cap: if ept_supported {
-                host.ept_vpid_cap & VMX_EPT_CAPABILITIES
+                (host.ept_vpid_cap & VMX_EPT_CAPABILITIES) | VMX_SOFTWARE_INVALIDATION_CAPABILITIES
             } else {
                 0
             },

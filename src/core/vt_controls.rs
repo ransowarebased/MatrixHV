@@ -93,7 +93,7 @@ pub fn configure_resident_boot(
             | VM_EXIT_SAVE_IA32_EFER
             | VM_EXIT_LOAD_IA32_EFER,
         vm_entry: VM_ENTRY_LOAD_IA32_PAT | VM_ENTRY_LOAD_IA32_EFER,
-        exception_bitmap: 0,
+        exception_bitmap: 1 << 6,
         msr_bitmap: Some(msr_bitmap),
         ept_pointer: Some(ept_pointer),
     })

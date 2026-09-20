@@ -16,10 +16,11 @@ use capabilities::{
     VMX_MEMORY_TYPE_WRITE_BACK, VMX_REGION_SIZE,
 };
 use instructions::{
-    VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
-    VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR, VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR,
-    VMCLEAR_VMXON_POINTER_ERROR, VMCS_UNSUPPORTED_COMPONENT_ERROR, VMFAIL_INVALID_STATUS,
-    VMFAIL_VALID_STATUS, VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR,
+    INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR,
+    VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR, VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR,
+    VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
+    VMCS_UNSUPPORTED_COMPONENT_ERROR, VMFAIL_INVALID_STATUS, VMFAIL_VALID_STATUS,
+    VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR,
     VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR, VMPTRLD_VMXON_POINTER_ERROR,
     VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR, VMX_STATUS_FLAGS,
     VMX_STATUS_FLAGS_CLEAR_MASK, VMXON_IN_VMX_ROOT_ERROR,
@@ -131,7 +132,10 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     );
     let primary_control =
         control_capabilities(0, capabilities::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS);
-    let secondary_control = control_capabilities(0, capabilities::VMX_SECONDARY_ENABLE_EPT);
+    let secondary_control = control_capabilities(
+        0,
+        capabilities::VMX_SECONDARY_ENABLE_EPT | capabilities::VMX_SECONDARY_ENABLE_VPID,
+    );
 
     assert_eq!(capabilities.vmx_pinbased_ctls, 0);
     assert_eq!(capabilities.vmx_procbased_ctls, primary_control);
@@ -149,10 +153,13 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     assert_eq!(capabilities.vmx_procbased_ctls2, secondary_control);
     assert_eq!(
         capabilities.vmx_ept_vpid_cap,
-        capabilities::VMX_EPT_CAPABILITIES
+        capabilities::VMX_EPT_CAPABILITIES | capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES
     );
     assert_eq!(capabilities::VMX_EPT_CAPABILITIES, 0x1_4040);
-    assert_eq!(capabilities.vmx_ept_vpid_cap & !0x1_4040, 0);
+    assert_eq!(
+        capabilities.vmx_ept_vpid_cap & capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES,
+        capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES
+    );
     assert_eq!(capabilities.vmx_true_pinbased_ctls, 0);
     assert_eq!(capabilities.vmx_true_procbased_ctls, primary_control);
     assert_eq!(capabilities.vmx_true_exit_ctls, host_address_size_control);
@@ -189,6 +196,27 @@ fn nested_ept_is_hidden_when_the_host_contract_is_incomplete() {
     assert_eq!(capabilities.vmx_procbased_ctls2, 0);
     assert_eq!(capabilities.vmx_ept_vpid_cap, 0);
     assert_eq!(capabilities.vmx_true_procbased_ctls, 0);
+}
+
+#[test]
+fn software_invalidations_do_not_require_host_invept_or_invvpid() {
+    let mut host = host_vmx_capabilities();
+    host.ept_vpid_cap = capabilities::VMX_EPT_CAPABILITIES;
+    host.procbased_ctls2 = control_capabilities(0, capabilities::VMX_SECONDARY_ENABLE_EPT);
+
+    let capabilities = NestedVmxCapabilities::from_host(host);
+
+    assert_eq!(
+        capabilities.vmx_procbased_ctls2,
+        control_capabilities(
+            0,
+            capabilities::VMX_SECONDARY_ENABLE_EPT | capabilities::VMX_SECONDARY_ENABLE_VPID
+        )
+    );
+    assert_eq!(
+        capabilities.vmx_ept_vpid_cap,
+        capabilities::VMX_EPT_CAPABILITIES | capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES
+    );
 }
 
 #[test]
@@ -348,13 +376,29 @@ fn per_cpu_nested_state_starts_independent_and_inactive() {
     assert_eq!(bsp.ept_composition_count, 0);
     assert_eq!(bsp.ept_probe_count, 0);
     assert_eq!(bsp.ept_observed_value, 0);
+    assert_eq!(bsp.ept02_alternate_pointer, 0);
+    assert_eq!(bsp.ept_second_target_gpa, 0);
+    assert_eq!(bsp.ept12_source_leaf, 0);
+    assert_eq!(bsp.ept_alternate_composed_hpa, 0);
+    assert_eq!(bsp.ept_alternate_permissions, 0);
+    assert_eq!(bsp.invept_count, 0);
+    assert_eq!(bsp.invept_software_count, 0);
+    assert_eq!(bsp.invvpid_count, 0);
+    assert_eq!(bsp.invvpid_software_count, 0);
+    assert_eq!(bsp.ept_observed_value_after_invept, 0);
+    assert_eq!(bsp.ept02_initial_pointer, 0);
+    assert_eq!(bsp.ept12_source_leaf_attributes, 0);
+    assert_eq!(bsp.ept_observed_value_before_invept, 0);
 }
 
 #[test]
 fn nested_state_records_ept_composition() {
     let mut state = nested_state(0);
 
-    state.configure_ept(0x60_001e, 0x70_001e, 0x80_0000, 0x90_0000, 0x90_0000, 0x5);
+    state.configure_ept(
+        0x60_001e, 0x70_001e, 0x80_0000, 0x90_0000, 0x90_0000, 0x5, 0x71_001e, 0xa0_0000,
+        0xb0_0128, 0x7, 0xa0_0000, 0x3,
+    );
 
     assert_eq!(state.ept12_pointer, 0x60_001e);
     assert_eq!(state.ept02_pointer, 0x70_001e);
@@ -362,7 +406,14 @@ fn nested_state_records_ept_composition() {
     assert_eq!(state.ept_target_gpa, 0x90_0000);
     assert_eq!(state.ept_composed_hpa, 0x90_0000);
     assert_eq!(state.ept_permissions, 0x5);
-    assert_eq!(state.ept_composition_count, 1);
+    assert_eq!(state.ept_composition_count, 2);
+    assert_eq!(state.ept02_initial_pointer, 0x70_001e);
+    assert_eq!(state.ept02_alternate_pointer, 0x71_001e);
+    assert_eq!(state.ept_second_target_gpa, 0xa0_0000);
+    assert_eq!(state.ept12_source_leaf, 0xb0_0128);
+    assert_eq!(state.ept12_source_leaf_attributes, 0x7);
+    assert_eq!(state.ept_alternate_composed_hpa, 0xa0_0000);
+    assert_eq!(state.ept_alternate_permissions, 0x3);
 }
 
 #[test]
@@ -407,6 +458,8 @@ fn nested_exit_reasons_match_intel_basic_exit_reasons() {
     assert_eq!(exits::VMWRITE_EXIT_REASON, 25);
     assert_eq!(exits::VMXOFF_EXIT_REASON, 26);
     assert_eq!(exits::VMXON_EXIT_REASON, 27);
+    assert_eq!(exits::INVEPT_EXIT_REASON, 50);
+    assert_eq!(exits::INVVPID_EXIT_REASON, 53);
 }
 
 #[test]
@@ -416,6 +469,7 @@ fn vm_instruction_errors_and_status_flags_match_architecture() {
     assert_eq!(VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR, 7);
     assert_eq!(VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR, 8);
     assert_eq!(VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, 26);
+    assert_eq!(INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR, 28);
     assert_eq!(VMXON_IN_VMX_ROOT_ERROR, 15);
     assert_eq!(VMLAUNCH_NON_CLEAR_VMCS_ERROR, 4);
     assert_eq!(VMRESUME_NON_LAUNCHED_VMCS_ERROR, 5);

@@ -289,6 +289,31 @@ impl IdentityEpt {
         Ok(())
     }
 
+    pub fn leaf_entry_physical_address(
+        &mut self,
+        guest_physical_address: u64,
+    ) -> Result<u64, EptError> {
+        if guest_physical_address & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(EptError::InvalidRemapAddress(guest_physical_address));
+        }
+        if guest_physical_address >= self.mapped_end {
+            return Err(EptError::InvalidRemapAddress(guest_physical_address));
+        }
+        let (table, index) = self.ensure_4k_leaf(guest_physical_address)?;
+        Ok(table.physical_address + (index * size_of::<u64>()) as u64)
+    }
+
+    pub fn leaf_entry_value(&mut self, guest_physical_address: u64) -> Result<u64, EptError> {
+        if guest_physical_address & (PAGE_SIZE as u64 - 1) != 0 {
+            return Err(EptError::InvalidRemapAddress(guest_physical_address));
+        }
+        if guest_physical_address >= self.mapped_end {
+            return Err(EptError::InvalidRemapAddress(guest_physical_address));
+        }
+        let (table, index) = self.ensure_4k_leaf(guest_physical_address)?;
+        Ok(read_entry(table, index))
+    }
+
     pub fn compose_page(
         &mut self,
         ept12: &Self,
