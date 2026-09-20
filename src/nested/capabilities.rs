@@ -44,6 +44,7 @@ pub const VMX_SOFTWARE_INVALIDATION_CAPABILITIES: u64 = VMX_EPT_INVEPT
     | VMX_EPT_INVEPT_SINGLE_CONTEXT
     | VMX_VPID_INVVPID
     | VMX_VPID_INVVPID_SINGLE_CONTEXT;
+pub const VMX_CR3_TARGET_COUNT: u64 = 4;
 pub const VMCS12_MAX_ENUM_INDEX: u64 = 22;
 
 pub const CPUID_VMX_BIT: u32 = 1 << 5;
@@ -231,7 +232,7 @@ impl NestedVmxCapabilities {
             vmx_procbased_ctls: procbased_ctls,
             vmx_exit_ctls: exit_ctls,
             vmx_entry_ctls: entry_ctls,
-            vmx_misc: 0,
+            vmx_misc: VMX_CR3_TARGET_COUNT << 16,
             vmx_cr0_fixed0: host.cr0_fixed0,
             vmx_cr0_fixed1: host.cr0_fixed1,
             vmx_cr4_fixed0: host.cr4_fixed0,

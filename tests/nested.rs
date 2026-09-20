@@ -181,7 +181,10 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     assert_eq!(capabilities.vmx_procbased_ctls, primary_control);
     assert_eq!(capabilities.vmx_exit_ctls, legacy_exit_control);
     assert_eq!(capabilities.vmx_entry_ctls, legacy_entry_control);
-    assert_eq!(capabilities.vmx_misc, 0);
+    assert_eq!(
+        capabilities.vmx_misc,
+        capabilities::VMX_CR3_TARGET_COUNT << 16
+    );
     assert_eq!(capabilities.vmx_cr0_fixed0, host.cr0_fixed0);
     assert_eq!(capabilities.vmx_cr0_fixed1, host.cr0_fixed1);
     assert_eq!(capabilities.vmx_cr4_fixed0, host.cr4_fixed0);
