@@ -1,4 +1,5 @@
 pub const VMCS12_LAUNCH_STATE_CLEAR: u64 = 0;
+pub const VMCS12_LAUNCH_STATE_LAUNCHED: u64 = 1;
 pub const VMCS12_LAUNCH_STATE_UNINITIALIZED: u64 = u64::MAX;
 pub const VMCS_FIELD_VM_INSTRUCTION_ERROR: u64 = 0x4400;
 pub const VMCS_FIELD_GUEST_RIP: u64 = 0x681e;
@@ -19,6 +20,9 @@ pub struct NestedVmcs12State {
     pub vmwrite_count: u64,
     pub vmread_count: u64,
     pub probe_complete: u64,
+    pub vmlaunch_count: u64,
+    pub vmresume_count: u64,
+    pub entry_rejection_count: u64,
 }
 
 impl NestedVmcs12State {
@@ -37,6 +41,9 @@ impl NestedVmcs12State {
             vmwrite_count: 0,
             vmread_count: 0,
             probe_complete: 0,
+            vmlaunch_count: 0,
+            vmresume_count: 0,
+            entry_rejection_count: 0,
         }
     }
 }

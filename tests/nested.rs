@@ -16,16 +16,18 @@ use capabilities::{
     VMX_REGION_SIZE,
 };
 use instructions::{
+    VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
     VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
     VMCS_UNSUPPORTED_COMPONENT_ERROR, VMFAIL_INVALID_STATUS, VMFAIL_VALID_STATUS,
-    VMPTRLD_INCORRECT_REVISION_ERROR, VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR,
-    VMPTRLD_VMXON_POINTER_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR, VMX_STATUS_FLAGS,
-    VMX_STATUS_FLAGS_CLEAR_MASK,
+    VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR,
+    VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR, VMPTRLD_VMXON_POINTER_ERROR,
+    VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR, VMX_STATUS_FLAGS,
+    VMX_STATUS_FLAGS_CLEAR_MASK, VMXON_IN_VMX_ROOT_ERROR,
 };
 use state::{INVALID_VMCS_POINTER, NestedVmxState};
 use vmcs::{
     NestedVmcs12State, VMCS_FIELD_GUEST_RIP, VMCS_FIELD_VM_INSTRUCTION_ERROR,
-    VMCS12_LAUNCH_STATE_CLEAR, VMCS12_LAUNCH_STATE_UNINITIALIZED,
+    VMCS12_LAUNCH_STATE_CLEAR, VMCS12_LAUNCH_STATE_LAUNCHED, VMCS12_LAUNCH_STATE_UNINITIALIZED,
 };
 
 const HOST_VMX_BASIC: u64 = 0x00da_0400_0000_1234;
@@ -120,14 +122,19 @@ fn vmcs12_state_starts_uninitialized_with_zero_observability() {
     assert_eq!(vmcs12.vmwrite_count, 0);
     assert_eq!(vmcs12.vmread_count, 0);
     assert_eq!(vmcs12.probe_complete, 0);
+    assert_eq!(vmcs12.vmlaunch_count, 0);
+    assert_eq!(vmcs12.vmresume_count, 0);
+    assert_eq!(vmcs12.entry_rejection_count, 0);
 }
 
 #[test]
 fn nested_exit_reasons_match_intel_basic_exit_reasons() {
     assert_eq!(exits::VMCLEAR_EXIT_REASON, 19);
+    assert_eq!(exits::VMLAUNCH_EXIT_REASON, 20);
     assert_eq!(exits::VMPTRLD_EXIT_REASON, 21);
     assert_eq!(exits::VMPTRST_EXIT_REASON, 22);
     assert_eq!(exits::VMREAD_EXIT_REASON, 23);
+    assert_eq!(exits::VMRESUME_EXIT_REASON, 24);
     assert_eq!(exits::VMWRITE_EXIT_REASON, 25);
     assert_eq!(exits::VMXOFF_EXIT_REASON, 26);
     assert_eq!(exits::VMXON_EXIT_REASON, 27);
@@ -137,6 +144,11 @@ fn nested_exit_reasons_match_intel_basic_exit_reasons() {
 fn vm_instruction_errors_and_status_flags_match_architecture() {
     assert_eq!(VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, 2);
     assert_eq!(VMCLEAR_VMXON_POINTER_ERROR, 3);
+    assert_eq!(VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR, 7);
+    assert_eq!(VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, 26);
+    assert_eq!(VMXON_IN_VMX_ROOT_ERROR, 15);
+    assert_eq!(VMLAUNCH_NON_CLEAR_VMCS_ERROR, 4);
+    assert_eq!(VMRESUME_NON_LAUNCHED_VMCS_ERROR, 5);
     assert_eq!(VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR, 9);
     assert_eq!(VMPTRLD_VMXON_POINTER_ERROR, 10);
     assert_eq!(VMPTRLD_INCORRECT_REVISION_ERROR, 11);
@@ -152,4 +164,6 @@ fn vm_instruction_errors_and_status_flags_match_architecture() {
 fn supported_vmcs12_fields_match_intel_encodings() {
     assert_eq!(VMCS_FIELD_VM_INSTRUCTION_ERROR, 0x4400);
     assert_eq!(VMCS_FIELD_GUEST_RIP, 0x681e);
+    assert_eq!(VMCS12_LAUNCH_STATE_CLEAR, 0);
+    assert_eq!(VMCS12_LAUNCH_STATE_LAUNCHED, 1);
 }

@@ -23,19 +23,23 @@ use crate::nested::capabilities::{
     HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START, NestedVmxCapabilities,
 };
 use crate::nested::exits::{
-    VMCLEAR_EXIT_REASON, VMPTRLD_EXIT_REASON, VMPTRST_EXIT_REASON, VMREAD_EXIT_REASON,
-    VMWRITE_EXIT_REASON, VMXOFF_EXIT_REASON, VMXON_EXIT_REASON,
+    VMCLEAR_EXIT_REASON, VMLAUNCH_EXIT_REASON, VMPTRLD_EXIT_REASON, VMPTRST_EXIT_REASON,
+    VMREAD_EXIT_REASON, VMRESUME_EXIT_REASON, VMWRITE_EXIT_REASON, VMXOFF_EXIT_REASON,
+    VMXON_EXIT_REASON,
 };
 use crate::nested::instructions::{
+    VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
     VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
     VMCS_UNSUPPORTED_COMPONENT_ERROR, VMFAIL_INVALID_STATUS, VMFAIL_VALID_STATUS,
-    VMPTRLD_INCORRECT_REVISION_ERROR, VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR,
-    VMPTRLD_VMXON_POINTER_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR, VMX_STATUS_FLAGS_CLEAR_MASK,
+    VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR,
+    VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR, VMPTRLD_VMXON_POINTER_ERROR,
+    VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR,
+    VMX_STATUS_FLAGS_CLEAR_MASK, VMXON_IN_VMX_ROOT_ERROR,
 };
 use crate::nested::state::NestedVmxState;
 use crate::nested::vmcs::{
     NestedVmcs12State, VMCS_FIELD_GUEST_RIP, VMCS_FIELD_VM_INSTRUCTION_ERROR,
-    VMCS12_LAUNCH_STATE_CLEAR,
+    VMCS12_LAUNCH_STATE_CLEAR, VMCS12_LAUNCH_STATE_LAUNCHED,
 };
 use crate::smp::per_cpu::ResidentCpuResources;
 
@@ -336,7 +340,7 @@ struct ResidentBootContext {
     nested: NestedVmxState,
     original_gdtr: [u8; 10],
     original_idtr: [u8; 10],
-    alignment_padding: [u8; 28],
+    alignment_padding: [u8; 20],
     root_fx_state: [u8; 512],
 }
 
@@ -396,7 +400,7 @@ impl ResidentBootContext {
             nested,
             original_gdtr: [0; 10],
             original_idtr: [0; 10],
-            alignment_padding: [0; 28],
+            alignment_padding: [0; 20],
             root_fx_state: [0; 512],
         }
     }
@@ -514,6 +518,15 @@ const BCTX_NESTED_VMREAD_COUNT: usize = core::mem::offset_of!(ResidentBootContex
 const BCTX_NESTED_VMCS12_PROBE_COMPLETE: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, vmcs12)
     + core::mem::offset_of!(NestedVmcs12State, probe_complete);
+const BCTX_NESTED_VMLAUNCH_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmcs12)
+    + core::mem::offset_of!(NestedVmcs12State, vmlaunch_count);
+const BCTX_NESTED_VMRESUME_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmcs12)
+    + core::mem::offset_of!(NestedVmcs12State, vmresume_count);
+const BCTX_NESTED_ENTRY_REJECTION_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmcs12)
+    + core::mem::offset_of!(NestedVmcs12State, entry_rejection_count);
 const BCTX_ORIGINAL_GDTR: usize = core::mem::offset_of!(ResidentBootContext, original_gdtr);
 const BCTX_ORIGINAL_IDTR: usize = core::mem::offset_of!(ResidentBootContext, original_idtr);
 const BCTX_ROOT_FX_STATE: usize = core::mem::offset_of!(ResidentBootContext, root_fx_state);
@@ -1230,7 +1243,7 @@ pub fn run_windows_boot(
             unsafe { core::ptr::addr_of!((*ap_context).cpuid_hypervisor_eax).read_volatile() }
         ));
         crate::runtime::logger::info(format_args!(
-            "nested AP VMCS12 processor={} region={:#x} stored={:#x} guest_rip={:#x} vmclear={} vmptrld={} vmptrst={} vmwrite={} vmread={} complete={}",
+            "nested AP VMCS12 processor={} region={:#x} stored={:#x} guest_rip={:#x} vmclear={} vmptrld={} vmptrst={} vmwrite={} vmread={} vmlaunch={} vmresume={} complete={} entry_rejections={}",
             processor_number,
             nested.vmcs12.region,
             nested.vmcs12.last_stored_pointer,
@@ -1240,23 +1253,30 @@ pub fn run_windows_boot(
             nested.vmcs12.vmptrst_count,
             nested.vmcs12.vmwrite_count,
             nested.vmcs12.vmread_count,
-            nested.vmcs12.probe_complete
+            nested.vmcs12.vmlaunch_count,
+            nested.vmcs12.vmresume_count,
+            nested.vmcs12.probe_complete,
+            nested.vmcs12.entry_rejection_count
         ));
         if result.is_err()
             || started != 1
-            || nested.vmxon_count != 1
+            || nested.vmxon_count != 2
             || nested.vmxoff_count != 1
             || nested.active != 0
-            || nested.failure_count != 0
+            || nested.failure_count != 5
             || nested.probe_complete != 1
             || nested.vmcs12.last_stored_pointer != nested.vmcs12.region
             || nested.vmcs12.guest_rip != NESTED_VMCS12_TEST_VALUE
-            || nested.vmcs12.vmclear_count != 1
+            || nested.vmcs12.vmclear_count != 2
             || nested.vmcs12.vmptrld_count != 1
             || nested.vmcs12.vmptrst_count != 1
             || nested.vmcs12.vmwrite_count != 1
-            || nested.vmcs12.vmread_count != 1
+            || nested.vmcs12.vmread_count != 4
             || nested.vmcs12.probe_complete != 1
+            || nested.vmcs12.vmlaunch_count != 2
+            || nested.vmcs12.vmresume_count != 2
+            || nested.vmcs12.entry_rejection_count != 4
+            || nested.vmcs12.launch_state != VMCS12_LAUNCH_STATE_CLEAR
         {
             resident_startup_halt();
         }
@@ -1804,12 +1824,16 @@ global_asm!(
     "je .Lresident_dispatch_ept_violation",
     "cmp eax, {vmclear_reason}",
     "je .Lresident_dispatch_vmclear",
+    "cmp eax, {vmlaunch_reason}",
+    "je .Lresident_dispatch_vmlaunch",
     "cmp eax, {vmptrld_reason}",
     "je .Lresident_dispatch_vmptrld",
     "cmp eax, {vmptrst_reason}",
     "je .Lresident_dispatch_vmptrst",
     "cmp eax, {vmread_reason}",
     "je .Lresident_dispatch_vmread",
+    "cmp eax, {vmresume_reason}",
+    "je .Lresident_dispatch_vmresume",
     "cmp eax, {vmwrite_reason}",
     "je .Lresident_dispatch_vmwrite",
     "cmp eax, {vmxon_reason}",
@@ -1909,6 +1933,33 @@ global_asm!(
     "jmp .Lresident_nested_vmfail_with_error",
     ".Lresident_nested_vmclear_vmxon_pointer:",
     "mov r10d, {vmclear_vmxon_pointer_error}",
+    "jmp .Lresident_nested_vmfail_with_error",
+    ".Lresident_dispatch_vmlaunch:",
+    "inc qword ptr [r12 + {b_nested_vmlaunch_count}]",
+    "inc qword ptr [r12 + {b_nested_entry_rejection_count}]",
+    "cmp qword ptr [r12 + {b_nested_active}], 1",
+    "jne .Lresident_nested_inject_ud",
+    "mov rax, {guest_cs_selector}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "test r11b, 3",
+    "jnz .Lresident_nested_inject_gp",
+    "cmp qword ptr [r12 + {b_nested_current_vmcs}], -1",
+    "je .Lresident_nested_vmfail_invalid",
+    "mov rax, {guest_interruptibility_info}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "test r11b, 2",
+    "jnz .Lresident_nested_entry_mov_ss",
+    "cmp qword ptr [r12 + {b_nested_vmcs12_launch_state}], {vmcs12_launch_state_clear}",
+    "jne .Lresident_nested_vmlaunch_non_clear",
+    // The current VMCS12 has no control fields and cannot describe a valid entry.
+    "mov r10d, {vm_entry_invalid_control_fields_error}",
+    "jmp .Lresident_nested_vmfail_with_error",
+    ".Lresident_nested_vmlaunch_non_clear:",
+    "mov r10d, {vmlaunch_non_clear_vmcs_error}",
     "jmp .Lresident_nested_vmfail_with_error",
     ".Lresident_dispatch_vmptrld:",
     "inc qword ptr [r12 + {b_nested_vmptrld_count}]",
@@ -2038,22 +2089,37 @@ global_asm!(
     ".Lresident_nested_vmread_value:",
     "mov qword ptr [rsp + 16], r11",
     "jmp .Lresident_nested_succeed",
+    ".Lresident_dispatch_vmresume:",
+    "inc qword ptr [r12 + {b_nested_vmresume_count}]",
+    "inc qword ptr [r12 + {b_nested_entry_rejection_count}]",
+    "cmp qword ptr [r12 + {b_nested_active}], 1",
+    "jne .Lresident_nested_inject_ud",
+    "mov rax, {guest_cs_selector}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "test r11b, 3",
+    "jnz .Lresident_nested_inject_gp",
+    "cmp qword ptr [r12 + {b_nested_current_vmcs}], -1",
+    "je .Lresident_nested_vmfail_invalid",
+    "mov rax, {guest_interruptibility_info}",
+    "vmread r11, rax",
+    "jc .Lresident_dispatch_vmread_failed",
+    "jz .Lresident_dispatch_vmread_failed",
+    "test r11b, 2",
+    "jnz .Lresident_nested_entry_mov_ss",
+    "cmp qword ptr [r12 + {b_nested_vmcs12_launch_state}], {vmcs12_launch_state_launched}",
+    "jne .Lresident_nested_vmresume_non_launched",
+    "mov r10d, {vm_entry_invalid_control_fields_error}",
+    "jmp .Lresident_nested_vmfail_with_error",
+    ".Lresident_nested_entry_mov_ss:",
+    "mov r10d, {vm_entry_blocked_by_mov_ss_error}",
+    "jmp .Lresident_nested_vmfail_with_error",
+    ".Lresident_nested_vmresume_non_launched:",
+    "mov r10d, {vmresume_non_launched_vmcs_error}",
+    "jmp .Lresident_nested_vmfail_with_error",
     ".Lresident_dispatch_vmxon:",
     "inc qword ptr [r12 + {b_nested_vmxon_count}]",
-    "mov r10, qword ptr [rsp + 0]",
-    "cmp r10, qword ptr [r12 + {b_nested_vmxon_operand}]",
-    "jne .Lresident_nested_vmfail_invalid",
-    "mov r11, qword ptr [r10]",
-    "mov qword ptr [r12 + {b_nested_last_operand}], r11",
-    "cmp r11, qword ptr [r12 + {b_nested_vmxon_region}]",
-    "jne .Lresident_nested_vmfail_invalid",
-    "test r11, 0xfff",
-    "jnz .Lresident_nested_vmfail_invalid",
-    "mov edx, dword ptr [r11]",
-    "mov eax, dword ptr [r12 + {b_nested_vmx_basic}]",
-    "and eax, 0x7fffffff",
-    "cmp edx, eax",
-    "jne .Lresident_nested_vmfail_invalid",
     "mov rax, {guest_cr4}",
     "vmread r11, rax",
     "jc .Lresident_dispatch_vmread_failed",
@@ -2071,6 +2137,20 @@ global_asm!(
     "cmp r11d, 5",
     "jne .Lresident_nested_inject_gp",
     "cmp qword ptr [r12 + {b_nested_active}], 0",
+    "jne .Lresident_nested_vmxon_active",
+    "mov r10, qword ptr [rsp + 0]",
+    "cmp r10, qword ptr [r12 + {b_nested_vmxon_operand}]",
+    "jne .Lresident_nested_vmfail_invalid",
+    "mov r11, qword ptr [r10]",
+    "mov qword ptr [r12 + {b_nested_last_operand}], r11",
+    "cmp r11, qword ptr [r12 + {b_nested_vmxon_region}]",
+    "jne .Lresident_nested_vmfail_invalid",
+    "test r11, 0xfff",
+    "jnz .Lresident_nested_vmfail_invalid",
+    "mov edx, dword ptr [r11]",
+    "mov eax, dword ptr [r12 + {b_nested_vmx_basic}]",
+    "and eax, 0x7fffffff",
+    "cmp edx, eax",
     "jne .Lresident_nested_vmfail_invalid",
     "mov qword ptr [r12 + {b_nested_active}], 1",
     "mov qword ptr [r12 + {b_nested_current_vmcs}], -1",
@@ -2089,6 +2169,9 @@ global_asm!(
     "mov r9d, {state_newline_len}",
     "call .Lresident_serial_write",
     "jmp .Lresident_nested_succeed",
+    ".Lresident_nested_vmxon_active:",
+    "mov r10d, {vmxon_in_vmx_root_error}",
+    "jmp .Lresident_nested_vmfail_with_error",
     ".Lresident_dispatch_vmxoff:",
     "inc qword ptr [r12 + {b_nested_vmxoff_count}]",
     "cmp qword ptr [r12 + {b_nested_active}], 1",
@@ -3056,9 +3139,11 @@ global_asm!(
     ept_violation_reason = const EPT_VIOLATION_EXIT_REASON,
     ept_test_read_access = const EPT_TEST_READ_ACCESS,
     vmclear_reason = const VMCLEAR_EXIT_REASON,
+    vmlaunch_reason = const VMLAUNCH_EXIT_REASON,
     vmptrld_reason = const VMPTRLD_EXIT_REASON,
     vmptrst_reason = const VMPTRST_EXIT_REASON,
     vmread_reason = const VMREAD_EXIT_REASON,
+    vmresume_reason = const VMRESUME_EXIT_REASON,
     vmwrite_reason = const VMWRITE_EXIT_REASON,
     vmxon_reason = const VMXON_EXIT_REASON,
     vmxoff_reason = const VMXOFF_EXIT_REASON,
@@ -3115,11 +3200,16 @@ global_asm!(
     cpuid_osxsave_clear_mask = const !CPUID_OSXSAVE_BIT,
     cpuid_hypervisor_set_mask = const CPUID_HYPERVISOR_PRESENT_BIT,
     cpuid_hypervisor_clear_mask = const !CPUID_HYPERVISOR_PRESENT_BIT,
+    vmxon_in_vmx_root_error = const VMXON_IN_VMX_ROOT_ERROR,
     vmclear_invalid_physical_address_error = const VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR,
     vmclear_vmxon_pointer_error = const VMCLEAR_VMXON_POINTER_ERROR,
+    vm_entry_invalid_control_fields_error = const VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
+    vm_entry_blocked_by_mov_ss_error = const VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR,
+    vmlaunch_non_clear_vmcs_error = const VMLAUNCH_NON_CLEAR_VMCS_ERROR,
     vmptrld_invalid_physical_address_error = const VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR,
     vmptrld_vmxon_pointer_error = const VMPTRLD_VMXON_POINTER_ERROR,
     vmptrld_incorrect_revision_error = const VMPTRLD_INCORRECT_REVISION_ERROR,
+    vmresume_non_launched_vmcs_error = const VMRESUME_NON_LAUNCHED_VMCS_ERROR,
     vmcs_unsupported_component_error = const VMCS_UNSUPPORTED_COMPONENT_ERROR,
     vmwrite_read_only_component_error = const VMWRITE_READ_ONLY_COMPONENT_ERROR,
     vmx_status_flags_clear_mask = const VMX_STATUS_FLAGS_CLEAR_MASK,
@@ -3191,7 +3281,11 @@ global_asm!(
     b_nested_vmwrite_count = const BCTX_NESTED_VMWRITE_COUNT,
     b_nested_vmread_count = const BCTX_NESTED_VMREAD_COUNT,
     b_nested_vmcs12_probe_complete = const BCTX_NESTED_VMCS12_PROBE_COMPLETE,
+    b_nested_vmlaunch_count = const BCTX_NESTED_VMLAUNCH_COUNT,
+    b_nested_vmresume_count = const BCTX_NESTED_VMRESUME_COUNT,
+    b_nested_entry_rejection_count = const BCTX_NESTED_ENTRY_REJECTION_COUNT,
     vmcs12_launch_state_clear = const VMCS12_LAUNCH_STATE_CLEAR,
+    vmcs12_launch_state_launched = const VMCS12_LAUNCH_STATE_LAUNCHED,
     vmcs_field_guest_rip = const VMCS_FIELD_GUEST_RIP,
     vmcs_field_instruction_error = const VMCS_FIELD_VM_INSTRUCTION_ERROR,
     event_magic_offset = const EVENT_CTX_MAGIC,
