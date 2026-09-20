@@ -87,6 +87,7 @@
     je .Lap_write_cr0
     cmp r11d, 4
     jne .Lresident_dispatch_unsupported
+    mov [r12 + {b_nested_l1_cr4}], r10
     mov rax, {cr4_read_shadow}
     vmwrite rax, r10
     jc .Lresident_dispatch_vmwrite_failed

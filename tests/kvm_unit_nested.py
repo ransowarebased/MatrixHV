@@ -24,6 +24,7 @@ DEFAULT_CASES = (
     "test_vmptrst",
     "test_vmwrite_vmread",
     "test_vmx_caps",
+    "vmenter",
 )
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SUMMARY_PATTERN = re.compile(

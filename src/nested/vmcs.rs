@@ -613,3 +613,14 @@ impl NestedVmcs12State {
         }
     }
 }
+
+pub const VMCS12_BACKING_MAGIC: u64 = 0x4d48_5656_4d43_5331;
+pub const VMCS12_BACKING_MAGIC_OFFSET: usize = 0x20;
+pub const VMCS12_BACKING_STATE_OFFSET: usize = 0x100;
+pub const VMCS12_BACKING_QWORD_COUNT: usize =
+    core::mem::size_of::<NestedVmcs12State>() / core::mem::size_of::<u64>();
+
+const _: () = assert!(VMCS12_BACKING_MAGIC_OFFSET + core::mem::size_of::<u64>() <= 0x100);
+const _: () = assert!(VMCS12_BACKING_STATE_OFFSET & 7 == 0);
+const _: () =
+    assert!(VMCS12_BACKING_STATE_OFFSET + core::mem::size_of::<NestedVmcs12State>() <= 4096);

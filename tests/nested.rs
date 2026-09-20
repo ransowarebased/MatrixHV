@@ -30,7 +30,9 @@ use vmcs::{
     NestedVmcs12State, VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS,
     VMCS_FIELD_GUEST_RIP, VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
     VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR,
-    VMCS12_LAUNCH_STATE_CLEAR, VMCS12_LAUNCH_STATE_LAUNCHED, VMCS12_LAUNCH_STATE_UNINITIALIZED,
+    VMCS12_BACKING_MAGIC, VMCS12_BACKING_MAGIC_OFFSET, VMCS12_BACKING_QWORD_COUNT,
+    VMCS12_BACKING_STATE_OFFSET, VMCS12_LAUNCH_STATE_CLEAR, VMCS12_LAUNCH_STATE_LAUNCHED,
+    VMCS12_LAUNCH_STATE_UNINITIALIZED,
 };
 
 const HOST_VMX_BASIC: u64 = 0x00da_0400_0000_1234;
@@ -86,6 +88,30 @@ fn nested_state(region_offset: u64) -> NestedVmxState {
         VMCS01_REGION + region_offset,
         VMCS02_REGION + region_offset,
     )
+}
+
+#[test]
+fn nested_state_tracks_l1_cr4_independently() {
+    let mut state = nested_state(0);
+
+    assert_eq!(state.l1_cr4, 0);
+    state.l1_cr4 = 0x2660;
+    assert_eq!(state.l1_cr4, 0x2660);
+}
+
+#[test]
+fn vmcs12_backing_state_fits_in_each_vmcs_region() {
+    assert_ne!(VMCS12_BACKING_MAGIC, 0);
+    assert!(VMCS12_BACKING_MAGIC_OFFSET >= 8);
+    assert_eq!(VMCS12_BACKING_STATE_OFFSET & 7, 0);
+    assert_eq!(
+        VMCS12_BACKING_QWORD_COUNT * core::mem::size_of::<u64>(),
+        core::mem::size_of::<NestedVmcs12State>()
+    );
+    assert!(
+        VMCS12_BACKING_STATE_OFFSET + core::mem::size_of::<NestedVmcs12State>()
+            <= VMX_REGION_SIZE as usize
+    );
 }
 
 #[test]

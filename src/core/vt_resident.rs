@@ -50,8 +50,9 @@ use crate::nested::vmcs::{
     NestedVmcs12State, VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS,
     VMCS_FIELD_GUEST_RIP, VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
     VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR,
-    VMCS12_EXTENDED_FIELD_COUNT, VMCS12_EXTENDED_FIELDS, VMCS12_LAUNCH_STATE_CLEAR,
-    VMCS12_LAUNCH_STATE_LAUNCHED,
+    VMCS12_BACKING_MAGIC, VMCS12_BACKING_MAGIC_OFFSET, VMCS12_BACKING_QWORD_COUNT,
+    VMCS12_BACKING_STATE_OFFSET, VMCS12_EXTENDED_FIELD_COUNT, VMCS12_EXTENDED_FIELDS,
+    VMCS12_LAUNCH_STATE_CLEAR, VMCS12_LAUNCH_STATE_LAUNCHED,
 };
 use crate::smp::per_cpu::ResidentCpuResources;
 
@@ -366,7 +367,7 @@ struct ResidentBootContext {
     nested: NestedVmxState,
     original_gdtr: [u8; 10],
     original_idtr: [u8; 10],
-    alignment_padding: [u8; 60],
+    alignment_padding: [u8; 52],
     root_fx_state: [u8; 512],
 }
 
@@ -427,7 +428,7 @@ impl ResidentBootContext {
             nested,
             original_gdtr: [0; 10],
             original_idtr: [0; 10],
-            alignment_padding: [0; 60],
+            alignment_padding: [0; 52],
             root_fx_state: [0; 512],
         }
     }
@@ -521,6 +522,8 @@ const BCTX_NESTED_VMX_TRUE_ENTRY_CTLS: usize = core::mem::offset_of!(ResidentBoo
     + core::mem::offset_of!(NestedVmxState, vmx_true_entry_ctls);
 const BCTX_NESTED_EXPOSE_VMX: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, expose_vmx);
+const BCTX_NESTED_L1_CR4: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, l1_cr4);
 const BCTX_NESTED_VMXON_OPERAND: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, vmxon_operand);
 const BCTX_NESTED_VMXON_REGION: usize = core::mem::offset_of!(ResidentBootContext, nested)
@@ -1529,6 +1532,19 @@ fn seed_nested_vmcs12_core_state(
     set_vmcs12_extended_field(vmcs12, VMCS_FIELD_HOST_SYSENTER_EIP, sysenter_eip);
 }
 
+fn seed_nested_vmcs12_backing(region: &ResidentPages, vmcs12: &NestedVmcs12State) {
+    debug_assert!(region.byte_len() >= PAGE_SIZE);
+    unsafe {
+        let base = region.pointer().as_ptr();
+        base.add(VMCS12_BACKING_MAGIC_OFFSET)
+            .cast::<u64>()
+            .write(VMCS12_BACKING_MAGIC);
+        base.add(VMCS12_BACKING_STATE_OFFSET)
+            .cast::<NestedVmcs12State>()
+            .write(*vmcs12);
+    }
+}
+
 fn nested_vmx_capabilities(host_vmx_basic: u64) -> NestedVmxCapabilities {
     let has_true_controls = host_vmx_basic & VMX_BASIC_TRUE_CONTROLS != 0;
     let host = unsafe {
@@ -1775,6 +1791,7 @@ pub fn run_boot_loader(
         vmcs_physical_address,
         nested_vmcs02_physical_address,
     );
+    nested_state.l1_cr4 = guest.cr4;
     nested_state.configure_ept(NestedEptConfiguration {
         ept12_pointer: nested_ept12_pointer,
         ept02_pointer: nested_ept02_pointer,
@@ -1790,6 +1807,7 @@ pub fn run_boot_loader(
         alternate_permissions: nested_ept_alternate_composition.permissions,
     });
     seed_nested_vmcs12_core_state(&mut nested_state.vmcs12, root_segments);
+    seed_nested_vmcs12_backing(&cpu_resources.nested_vmcs12_pages, &nested_state.vmcs12);
 
     let context = cpu_resources
         .context_pages
@@ -1925,9 +1943,9 @@ pub fn run_boot_loader(
             || nested.vmcs12.vmwrite_count != 29
             || nested.vmcs12.vmread_count != 35
             || nested.vmcs12.probe_complete != 1
-            || nested.vmcs12.vmlaunch_count != 3
-            || nested.vmcs12.vmresume_count != 4
-            || nested.vmcs12.entry_rejection_count != 4
+            || nested.vmcs12.vmlaunch_count != 2
+            || nested.vmcs12.vmresume_count != 3
+            || nested.vmcs12.entry_rejection_count != 2
             || nested.vmcs12.control_validation_count != 3
             || nested.vmcs12.launch_state != VMCS12_LAUNCH_STATE_LAUNCHED
             || nested.vmcs12.extended_fields[0] != 1
@@ -2157,6 +2175,7 @@ impl ResidentApLaunch<'_> {
             vmcs,
             nested_vmcs02_region,
         );
+        nested_state.l1_cr4 = guest.cr4;
         nested_state.configure_ept(NestedEptConfiguration {
             ept12_pointer: nested_ept12_pointer,
             ept02_pointer: nested_ept02_pointer,
@@ -2172,6 +2191,7 @@ impl ResidentApLaunch<'_> {
             alternate_permissions: nested_ept_alternate_composition.permissions,
         });
         seed_nested_vmcs12_core_state(&mut nested_state.vmcs12, segments);
+        seed_nested_vmcs12_backing(&self.resources.nested_vmcs12_pages, &nested_state.vmcs12);
         let context = self
             .resources
             .context_pages
@@ -2640,7 +2660,7 @@ global_asm!(
     "je .Lresident_nested_l2_ept_probe_before_invept",
     "cmp qword ptr [r12 + {b_nested_l2_exit_count}], 2",
     "je .Lresident_nested_l2_ept_probe_after_invept",
-    "jmp .Lresident_dispatch_halt",
+    "jmp .Lresident_nested_l2_reflect_generic",
     ".Lresident_nested_l2_ept_probe_first:",
     "mov r11, qword ptr [rsp + 96]",
     "mov qword ptr [r12 + {b_nested_ept_observed_value}], r11",
@@ -2664,6 +2684,7 @@ global_asm!(
     "cmp r11, rax",
     "jne .Lresident_dispatch_halt",
     "inc qword ptr [r12 + {b_nested_ept_probe_count}]",
+    ".Lresident_nested_l2_reflect_generic:",
     ".Lresident_nested_l2_ept_probe_done:",
     "inc qword ptr [r12 + {b_nested_l2_exit_count}]",
     "inc qword ptr [r12 + {b_nested_l1_reflection_count}]",
@@ -2925,8 +2946,44 @@ global_asm!(
     ".Lresident_nested_physical_address_invalid:",
     "xor eax, eax",
     "ret",
+    ".Lresident_nested_store_current_vmcs12:",
+    "mov rdi, qword ptr [r12 + {b_nested_current_vmcs}]",
+    "cmp rdi, -1",
+    "je .Lresident_nested_store_current_vmcs12_done",
+    "mov rax, {vmcs12_backing_magic}",
+    "mov qword ptr [rdi + {vmcs12_backing_magic_offset}], rax",
+    "add rdi, {vmcs12_backing_state_offset}",
+    "lea rsi, [r12 + {b_nested_vmcs12_operand}]",
+    "mov ecx, {vmcs12_backing_qword_count}",
+    "cld",
+    "rep movsq",
+    ".Lresident_nested_store_current_vmcs12_done:",
+    "ret",
+    ".Lresident_nested_initialize_vmcs12_backing:",
+    "mov rax, {vmcs12_backing_magic}",
+    "cmp qword ptr [r11 + {vmcs12_backing_magic_offset}], rax",
+    "je .Lresident_nested_initialize_vmcs12_backing_done",
+    "lea rdi, [r11 + {vmcs12_backing_state_offset}]",
+    "xor eax, eax",
+    "mov ecx, {vmcs12_backing_qword_count}",
+    "cld",
+    "rep stosq",
+    "mov rax, qword ptr [r12 + {b_nested_vmcs12_revision_id}]",
+    "mov qword ptr [r11 + {vmcs12_backing_state_offset} + {vmcs12_revision_id_offset}], rax",
+    "mov qword ptr [r11 + {vmcs12_backing_state_offset} + {vmcs12_launch_state_offset}], {vmcs12_launch_state_clear}",
+    ".Lresident_nested_initialize_vmcs12_backing_mark:",
+    "mov rax, {vmcs12_backing_magic}",
+    "mov qword ptr [r11 + {vmcs12_backing_magic_offset}], rax",
+    ".Lresident_nested_initialize_vmcs12_backing_done:",
+    "ret",
+    ".Lresident_nested_load_vmcs12_backing:",
+    "lea rsi, [r11 + {vmcs12_backing_state_offset}]",
+    "lea rdi, [r12 + {b_nested_vmcs12_operand}]",
+    "mov ecx, {vmcs12_backing_qword_count}",
+    "cld",
+    "rep movsq",
+    "ret",
     ".Lresident_dispatch_vmclear:",
-    "inc qword ptr [r12 + {b_nested_vmclear_count}]",
     "cmp qword ptr [r12 + {b_nested_active}], 1",
     "jne .Lresident_nested_inject_ud",
     "mov rax, {guest_cs_selector}",
@@ -2944,13 +3001,22 @@ global_asm!(
     "jz .Lresident_nested_vmclear_invalid_address",
     "cmp r11, qword ptr [r12 + {b_nested_vmxon_region}]",
     "je .Lresident_nested_vmclear_vmxon_pointer",
+    "xor r13d, r13d",
+    "cmp r11, qword ptr [r12 + {b_nested_current_vmcs}]",
+    "jne .Lresident_nested_vmclear_not_current",
+    "mov r13d, 1",
+    "call .Lresident_nested_store_current_vmcs12",
+    ".Lresident_nested_vmclear_not_current:",
+    "call .Lresident_nested_initialize_vmcs12_backing",
+    "inc qword ptr [r11 + {vmcs12_backing_state_offset} + {vmcs12_vmclear_count_offset}]",
+    "mov qword ptr [r11 + {vmcs12_backing_state_offset} + {vmcs12_launch_state_offset}], {vmcs12_launch_state_clear}",
     "vmclear [r12 + {b_nested_vmcs02_region}]",
     "jna .Lresident_dispatch_halt",
-    "mov qword ptr [r12 + {b_nested_vmcs12_operand}], r14",
-    "mov qword ptr [r12 + {b_nested_vmcs12_region}], r11",
+    "test r13d, r13d",
+    "jz .Lresident_nested_succeed",
+    "mov rax, qword ptr [r11 + {vmcs12_backing_state_offset} + {vmcs12_vmclear_count_offset}]",
+    "mov qword ptr [r12 + {b_nested_vmclear_count}], rax",
     "mov qword ptr [r12 + {b_nested_vmcs12_launch_state}], {vmcs12_launch_state_clear}",
-    "cmp r11, qword ptr [r12 + {b_nested_current_vmcs}]",
-    "jne .Lresident_nested_succeed",
     "mov qword ptr [r12 + {b_nested_current_vmcs}], -1",
     "jmp .Lresident_nested_succeed",
     ".Lresident_nested_vmclear_invalid_address:",
@@ -3016,7 +3082,6 @@ global_asm!(
     "mov r10d, {vmlaunch_non_clear_vmcs_error}",
     "jmp .Lresident_nested_vmfail_with_error",
     ".Lresident_dispatch_vmptrld:",
-    "inc qword ptr [r12 + {b_nested_vmptrld_count}]",
     "cmp qword ptr [r12 + {b_nested_active}], 1",
     "jne .Lresident_nested_inject_ud",
     "mov rax, {guest_cs_selector}",
@@ -3040,9 +3105,16 @@ global_asm!(
     "jne .Lresident_nested_vmptrld_bad_revision",
     "bt dword ptr [r11], 31",
     "jc .Lresident_nested_vmptrld_bad_revision",
+    "cmp r11, qword ptr [r12 + {b_nested_current_vmcs}]",
+    "je .Lresident_nested_vmptrld_state_ready",
+    "call .Lresident_nested_store_current_vmcs12",
+    "call .Lresident_nested_initialize_vmcs12_backing",
+    "call .Lresident_nested_load_vmcs12_backing",
+    ".Lresident_nested_vmptrld_state_ready:",
     "mov qword ptr [r12 + {b_nested_vmcs12_operand}], r14",
     "mov qword ptr [r12 + {b_nested_vmcs12_region}], r11",
     "mov qword ptr [r12 + {b_nested_current_vmcs}], r11",
+    "inc qword ptr [r12 + {b_nested_vmptrld_count}]",
     "jmp .Lresident_nested_succeed",
     ".Lresident_nested_vmptrld_invalid_address:",
     "mov r10d, {vmptrld_invalid_physical_address_error}",
@@ -4120,10 +4192,7 @@ global_asm!(
     "jmp .Lresident_nested_vmfail_with_error",
     ".Lresident_dispatch_vmxon:",
     "inc qword ptr [r12 + {b_nested_vmxon_count}]",
-    "mov rax, {guest_cr4}",
-    "vmread r11, rax",
-    "jc .Lresident_dispatch_vmread_failed",
-    "jz .Lresident_dispatch_vmread_failed",
+    "mov r11, qword ptr [r12 + {b_nested_l1_cr4}]",
     "test r11, 0x2000",
     "jz .Lresident_nested_inject_ud",
     "mov rax, {guest_cs_selector}",
@@ -4187,6 +4256,7 @@ global_asm!(
     "vmwrite rax, r11",
     "jc .Lresident_dispatch_vmwrite_failed",
     "jz .Lresident_dispatch_vmwrite_failed",
+    "call .Lresident_nested_store_current_vmcs12",
     "mov qword ptr [r12 + {b_nested_active}], 0",
     "mov qword ptr [r12 + {b_nested_current_vmcs}], -1",
     "mov qword ptr [r12 + {b_nested_instruction_error}], 0",
@@ -5572,6 +5642,7 @@ global_asm!(
     b_nested_vmx_true_exit_ctls = const BCTX_NESTED_VMX_TRUE_EXIT_CTLS,
     b_nested_vmx_true_entry_ctls = const BCTX_NESTED_VMX_TRUE_ENTRY_CTLS,
     b_nested_expose_vmx = const BCTX_NESTED_EXPOSE_VMX,
+    b_nested_l1_cr4 = const BCTX_NESTED_L1_CR4,
     b_nested_vmxon_operand = const BCTX_NESTED_VMXON_OPERAND,
     b_nested_vmxon_region = const BCTX_NESTED_VMXON_REGION,
     b_nested_current_vmcs = const BCTX_NESTED_CURRENT_VMCS,
@@ -5700,6 +5771,13 @@ global_asm!(
     vmcs12_launch_state_clear = const VMCS12_LAUNCH_STATE_CLEAR,
     vmcs12_launch_state_launched = const VMCS12_LAUNCH_STATE_LAUNCHED,
     vmcs12_extended_field_count = const VMCS12_EXTENDED_FIELD_COUNT,
+    vmcs12_backing_magic = const VMCS12_BACKING_MAGIC,
+    vmcs12_backing_magic_offset = const VMCS12_BACKING_MAGIC_OFFSET,
+    vmcs12_backing_state_offset = const VMCS12_BACKING_STATE_OFFSET,
+    vmcs12_backing_qword_count = const VMCS12_BACKING_QWORD_COUNT,
+    vmcs12_revision_id_offset = const core::mem::offset_of!(NestedVmcs12State, revision_id),
+    vmcs12_launch_state_offset = const core::mem::offset_of!(NestedVmcs12State, launch_state),
+    vmcs12_vmclear_count_offset = const core::mem::offset_of!(NestedVmcs12State, vmclear_count),
     nested_guest_state_table_count = const 45,
     nested_host_state_table_count = const 18,
     vmcs_field_exit_qualification = const VMCS_FIELD_EXIT_QUALIFICATION,
