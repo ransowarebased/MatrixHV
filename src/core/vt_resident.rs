@@ -20,7 +20,13 @@ use crate::memory::resident::{
 };
 use crate::nested::capabilities::{
     CPUID_HYPERVISOR_PRESENT_BIT, CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, HYPERV_FEATURES_LEAF,
-    HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START, NestedVmxCapabilities,
+    HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START, HostVmxCapabilities, IA32_VMX_BASIC_MSR,
+    IA32_VMX_CR0_FIXED0_MSR, IA32_VMX_CR0_FIXED1_MSR, IA32_VMX_CR4_FIXED0_MSR,
+    IA32_VMX_CR4_FIXED1_MSR, IA32_VMX_ENTRY_CTLS_MSR, IA32_VMX_EPT_VPID_CAP_MSR,
+    IA32_VMX_EXIT_CTLS_MSR, IA32_VMX_MISC_MSR, IA32_VMX_PINBASED_CTLS_MSR,
+    IA32_VMX_PROCBASED_CTLS_MSR, IA32_VMX_PROCBASED_CTLS2_MSR, IA32_VMX_TRUE_ENTRY_CTLS_MSR,
+    IA32_VMX_TRUE_EXIT_CTLS_MSR, IA32_VMX_TRUE_PINBASED_CTLS_MSR, IA32_VMX_TRUE_PROCBASED_CTLS_MSR,
+    IA32_VMX_VMCS_ENUM_MSR, NestedVmxCapabilities, VMX_BASIC_TRUE_CONTROLS,
 };
 use crate::nested::exits::{
     VMCLEAR_EXIT_REASON, VMLAUNCH_EXIT_REASON, VMPTRLD_EXIT_REASON, VMPTRST_EXIT_REASON,
@@ -29,9 +35,9 @@ use crate::nested::exits::{
 };
 use crate::nested::instructions::{
     VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
-    VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
-    VMCS_UNSUPPORTED_COMPONENT_ERROR, VMFAIL_INVALID_STATUS, VMFAIL_VALID_STATUS,
-    VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR,
+    VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR, VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR,
+    VMCLEAR_VMXON_POINTER_ERROR, VMCS_UNSUPPORTED_COMPONENT_ERROR, VMFAIL_INVALID_STATUS,
+    VMFAIL_VALID_STATUS, VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR,
     VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR, VMPTRLD_VMXON_POINTER_ERROR,
     VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR,
     VMX_STATUS_FLAGS_CLEAR_MASK, VMXON_IN_VMX_ROOT_ERROR,
@@ -72,7 +78,6 @@ const IA32_TSC_ADJUST_MSR: u32 = 0x3b;
 const IA32_PLATFORM_ID_MSR: u32 = 0x17;
 const IA32_APIC_BASE_MSR: u32 = 0x1b;
 const IA32_FEATURE_CONTROL_MSR: u32 = 0x3a;
-const IA32_VMX_BASIC_MSR: u32 = 0x480;
 const IA32_BIOS_SIGN_ID_MSR: u32 = 0x8b;
 const IA32_MTRRCAP_MSR: u32 = 0xfe;
 const IA32_ARCH_CAPABILITIES_MSR: u32 = 0x10a;
@@ -346,7 +351,7 @@ struct ResidentBootContext {
     nested: NestedVmxState,
     original_gdtr: [u8; 10],
     original_idtr: [u8; 10],
-    alignment_padding: [u8; 20],
+    alignment_padding: [u8; 28],
     root_fx_state: [u8; 512],
 }
 
@@ -406,7 +411,7 @@ impl ResidentBootContext {
             nested,
             original_gdtr: [0; 10],
             original_idtr: [0; 10],
-            alignment_padding: [0; 20],
+            alignment_padding: [0; 28],
             root_fx_state: [0; 512],
         }
     }
@@ -463,6 +468,40 @@ const BCTX_NESTED_FEATURE_CONTROL: usize = core::mem::offset_of!(ResidentBootCon
     + core::mem::offset_of!(NestedVmxState, feature_control);
 const BCTX_NESTED_VMX_BASIC: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, vmx_basic);
+const BCTX_NESTED_VMX_PINBASED_CTLS: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_pinbased_ctls);
+const BCTX_NESTED_VMX_PROCBASED_CTLS: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_procbased_ctls);
+const BCTX_NESTED_VMX_EXIT_CTLS: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_exit_ctls);
+const BCTX_NESTED_VMX_ENTRY_CTLS: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_entry_ctls);
+const BCTX_NESTED_VMX_MISC: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_misc);
+const BCTX_NESTED_VMX_CR0_FIXED0: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_cr0_fixed0);
+const BCTX_NESTED_VMX_CR0_FIXED1: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_cr0_fixed1);
+const BCTX_NESTED_VMX_CR4_FIXED0: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_cr4_fixed0);
+const BCTX_NESTED_VMX_CR4_FIXED1: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_cr4_fixed1);
+const BCTX_NESTED_VMX_VMCS_ENUM: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_vmcs_enum);
+const BCTX_NESTED_VMX_PROCBASED_CTLS2: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_procbased_ctls2);
+const BCTX_NESTED_VMX_EPT_VPID_CAP: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_ept_vpid_cap);
+const BCTX_NESTED_VMX_TRUE_PINBASED_CTLS: usize =
+    core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, vmx_true_pinbased_ctls);
+const BCTX_NESTED_VMX_TRUE_PROCBASED_CTLS: usize =
+    core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, vmx_true_procbased_ctls);
+const BCTX_NESTED_VMX_TRUE_EXIT_CTLS: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_true_exit_ctls);
+const BCTX_NESTED_VMX_TRUE_ENTRY_CTLS: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, vmx_true_entry_ctls);
 const BCTX_NESTED_EXPOSE_VMX: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, expose_vmx);
 const BCTX_NESTED_VMXON_OPERAND: usize = core::mem::offset_of!(ResidentBootContext, nested)
@@ -533,6 +572,15 @@ const BCTX_NESTED_VMCS12_EXTENDED_FIELDS: usize =
     core::mem::offset_of!(ResidentBootContext, nested)
         + core::mem::offset_of!(NestedVmxState, vmcs12)
         + core::mem::offset_of!(NestedVmcs12State, extended_fields);
+const BCTX_NESTED_VMCS12_PIN_BASED_CONTROL: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 8;
+const BCTX_NESTED_VMCS12_PRIMARY_CONTROL: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 16;
+const BCTX_NESTED_VMCS12_SECONDARY_CONTROL: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 24;
+const BCTX_NESTED_VMCS12_VM_EXIT_CONTROLS: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 64;
+const BCTX_NESTED_VMCS12_VM_ENTRY_CONTROLS: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 88;
+const BCTX_NESTED_VMCS12_CONTROL_VALIDATION_COUNT: usize =
+    core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, vmcs12)
+        + core::mem::offset_of!(NestedVmcs12State, control_validation_count);
 const BCTX_NESTED_VMCLEAR_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, vmcs12)
     + core::mem::offset_of!(NestedVmcs12State, vmclear_count);
@@ -1154,6 +1202,53 @@ fn vmcs12_extended_fields_are_dense() -> bool {
         .all(|(index, field)| field.index == index)
 }
 
+fn nested_vmx_capabilities(host_vmx_basic: u64) -> NestedVmxCapabilities {
+    let has_true_controls = host_vmx_basic & VMX_BASIC_TRUE_CONTROLS != 0;
+    let host = unsafe {
+        HostVmxCapabilities {
+            vmx_basic: host_vmx_basic,
+            pinbased_ctls: msr::read(IA32_VMX_PINBASED_CTLS_MSR),
+            procbased_ctls: msr::read(IA32_VMX_PROCBASED_CTLS_MSR),
+            exit_ctls: msr::read(IA32_VMX_EXIT_CTLS_MSR),
+            entry_ctls: msr::read(IA32_VMX_ENTRY_CTLS_MSR),
+            misc: msr::read(IA32_VMX_MISC_MSR),
+            cr0_fixed0: msr::read(IA32_VMX_CR0_FIXED0_MSR),
+            cr0_fixed1: msr::read(IA32_VMX_CR0_FIXED1_MSR),
+            cr4_fixed0: msr::read(IA32_VMX_CR4_FIXED0_MSR),
+            cr4_fixed1: msr::read(IA32_VMX_CR4_FIXED1_MSR),
+            vmcs_enum: msr::read(IA32_VMX_VMCS_ENUM_MSR),
+            procbased_ctls2: msr::read(IA32_VMX_PROCBASED_CTLS2_MSR),
+            ept_vpid_cap: msr::read(IA32_VMX_EPT_VPID_CAP_MSR),
+            true_pinbased_ctls: if has_true_controls {
+                msr::read(IA32_VMX_TRUE_PINBASED_CTLS_MSR)
+            } else {
+                0
+            },
+            true_procbased_ctls: if has_true_controls {
+                msr::read(IA32_VMX_TRUE_PROCBASED_CTLS_MSR)
+            } else {
+                0
+            },
+            true_exit_ctls: if has_true_controls {
+                msr::read(IA32_VMX_TRUE_EXIT_CTLS_MSR)
+            } else {
+                0
+            },
+            true_entry_ctls: if has_true_controls {
+                msr::read(IA32_VMX_TRUE_ENTRY_CTLS_MSR)
+            } else {
+                0
+            },
+        }
+    };
+    let capabilities = NestedVmxCapabilities::from_host(host);
+    debug_assert_eq!(
+        capabilities.vmx_msr(IA32_VMX_BASIC_MSR),
+        Some(capabilities.vmx_basic)
+    );
+    capabilities
+}
+
 pub fn run_windows_boot(
     entry_rip: u64,
     event_context: u64,
@@ -1286,6 +1381,7 @@ pub fn run_windows_boot(
     configure_resident_host(host_space.host_cr3, &host_tables, root_segments)?;
     let guest_rsp = guest_stack.physical_address() + guest_stack.byte_len() as u64;
     let guest = vt_state::configure_guest_with_rflags(entry_rip, guest_rsp & !0xf, initial_rflags)?;
+    let nested_capabilities = nested_vmx_capabilities(vmx_basic);
 
     let context = context_pages
         .pointer()
@@ -1300,11 +1396,11 @@ pub fn run_windows_boot(
             ept_probe_fault_rip,
             ept_probe_resume_rip,
             NestedVmxState::new(
-                NestedVmxCapabilities::vmxon_vmxoff(vmx_basic),
+                nested_capabilities,
                 nested_vmxon_operand,
                 nested_vmxon_region,
                 NestedVmcs12State::new(
-                    NestedVmxCapabilities::vmxon_vmxoff(vmx_basic).revision_id,
+                    nested_capabilities.revision_id,
                     nested_vmcs12_operand,
                     nested_vmcs12_region,
                     nested_vmptrst_destination,
@@ -1426,12 +1522,13 @@ pub fn run_windows_boot(
             || nested.vmcs12.vmclear_count != 2
             || nested.vmcs12.vmptrld_count != 2
             || nested.vmcs12.vmptrst_count != 1
-            || nested.vmcs12.vmwrite_count != 10
-            || nested.vmcs12.vmread_count != 13
+            || nested.vmcs12.vmwrite_count != 15
+            || nested.vmcs12.vmread_count != 18
             || nested.vmcs12.probe_complete != 1
             || nested.vmcs12.vmlaunch_count != 3
             || nested.vmcs12.vmresume_count != 3
             || nested.vmcs12.entry_rejection_count != 4
+            || nested.vmcs12.control_validation_count != 2
             || nested.vmcs12.launch_state != VMCS12_LAUNCH_STATE_LAUNCHED
             || nested.vmcs01_region == nested.vmcs02_region
             || nested.l2_active != 0
@@ -1576,6 +1673,7 @@ impl ResidentApLaunch<'_> {
         configure_resident_msr_switch(&self.resources.resident_msr_state)?;
         configure_resident_host(self.host_cr3, &self.resources.host_tables, segments)?;
         let guest = vt_state::configure_guest(guest_rip, guest_rsp)?;
+        let nested_capabilities = nested_vmx_capabilities(vmx_basic);
         let context = self
             .resources
             .context_pages
@@ -1590,11 +1688,11 @@ impl ResidentApLaunch<'_> {
             0,
             0,
             NestedVmxState::new(
-                NestedVmxCapabilities::vmxon_vmxoff(vmx_basic),
+                nested_capabilities,
                 nested_vmxon_operand,
                 nested_vmxon_region,
                 NestedVmcs12State::new(
-                    NestedVmxCapabilities::vmxon_vmxoff(vmx_basic).revision_id,
+                    nested_capabilities.revision_id,
                     nested_vmcs12_operand,
                     nested_vmcs12_region,
                     nested_vmptrst_destination,
@@ -2222,16 +2320,9 @@ global_asm!(
     "jnz .Lresident_nested_entry_mov_ss",
     "cmp qword ptr [r12 + {b_nested_vmcs12_launch_state}], {vmcs12_launch_state_clear}",
     "jne .Lresident_nested_vmlaunch_non_clear",
-    "cmp qword ptr [r12 + {b_nested_vmcs12_guest_rip}], 0",
-    "je .Lresident_nested_entry_invalid_controls",
-    "cmp qword ptr [r12 + {b_nested_vmcs12_guest_rsp}], 0",
-    "je .Lresident_nested_entry_invalid_controls",
-    "cmp qword ptr [r12 + {b_nested_vmcs12_host_rip}], 0",
-    "je .Lresident_nested_entry_invalid_controls",
-    "cmp qword ptr [r12 + {b_nested_vmcs12_host_rsp}], 0",
-    "je .Lresident_nested_entry_invalid_controls",
-    "test qword ptr [r12 + {b_nested_vmcs12_guest_rflags}], 2",
-    "jz .Lresident_nested_entry_invalid_controls",
+    "call .Lresident_nested_validate_entry",
+    "test r10d, r10d",
+    "jnz .Lresident_nested_vmfail_with_error",
     "dec qword ptr [r12 + {b_nested_entry_rejection_count}]",
     "mov qword ptr [r12 + {b_nested_l2_active}], 1",
     "inc qword ptr [r12 + {b_nested_l2_entry_count}]",
@@ -2254,9 +2345,6 @@ global_asm!(
     "vmwrite rax, r11",
     "jna .Lresident_dispatch_vmwrite_failed",
     "jmp .Lresident_nested_l2_enter",
-    ".Lresident_nested_entry_invalid_controls:",
-    "mov r10d, {vm_entry_invalid_control_fields_error}",
-    "jmp .Lresident_nested_vmfail_with_error",
     ".Lresident_nested_vmlaunch_non_clear:",
     "mov r10d, {vmlaunch_non_clear_vmcs_error}",
     "jmp .Lresident_nested_vmfail_with_error",
@@ -2476,6 +2564,104 @@ global_asm!(
     ".Lresident_nested_vmread_value:",
     "mov qword ptr [rsp + 16], r11",
     "jmp .Lresident_nested_succeed",
+    ".Lresident_nested_validate_entry:",
+    "bt qword ptr [r12 + {b_nested_vmx_basic}], 55",
+    "jnc .Lresident_nested_validate_legacy_controls",
+    "mov edx, dword ptr [r12 + {b_nested_vmcs12_pin_based_control}]",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_true_pinbased_ctls}]",
+    "call .Lresident_nested_control_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_validate_invalid_controls",
+    "mov edx, dword ptr [r12 + {b_nested_vmcs12_primary_control}]",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_true_procbased_ctls}]",
+    "call .Lresident_nested_control_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_validate_invalid_controls",
+    "bt edx, 31",
+    "jnc .Lresident_nested_validate_true_secondary_done",
+    "mov edx, dword ptr [r12 + {b_nested_vmcs12_secondary_control}]",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_procbased_ctls2}]",
+    "call .Lresident_nested_control_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_validate_invalid_controls",
+    ".Lresident_nested_validate_true_secondary_done:",
+    "mov edx, dword ptr [r12 + {b_nested_vmcs12_vm_exit_controls}]",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_true_exit_ctls}]",
+    "call .Lresident_nested_control_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_validate_invalid_controls",
+    "mov edx, dword ptr [r12 + {b_nested_vmcs12_vm_entry_controls}]",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_true_entry_ctls}]",
+    "call .Lresident_nested_control_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_validate_invalid_controls",
+    "jmp .Lresident_nested_validate_host_state",
+    ".Lresident_nested_validate_legacy_controls:",
+    "mov edx, dword ptr [r12 + {b_nested_vmcs12_pin_based_control}]",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_pinbased_ctls}]",
+    "call .Lresident_nested_control_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_validate_invalid_controls",
+    "mov edx, dword ptr [r12 + {b_nested_vmcs12_primary_control}]",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_procbased_ctls}]",
+    "call .Lresident_nested_control_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_validate_invalid_controls",
+    "bt edx, 31",
+    "jnc .Lresident_nested_validate_legacy_secondary_done",
+    "mov edx, dword ptr [r12 + {b_nested_vmcs12_secondary_control}]",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_procbased_ctls2}]",
+    "call .Lresident_nested_control_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_validate_invalid_controls",
+    ".Lresident_nested_validate_legacy_secondary_done:",
+    "mov edx, dword ptr [r12 + {b_nested_vmcs12_vm_exit_controls}]",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_exit_ctls}]",
+    "call .Lresident_nested_control_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_validate_invalid_controls",
+    "mov edx, dword ptr [r12 + {b_nested_vmcs12_vm_entry_controls}]",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_entry_ctls}]",
+    "call .Lresident_nested_control_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_validate_invalid_controls",
+    ".Lresident_nested_validate_host_state:",
+    "mov rax, qword ptr [r12 + {b_nested_vmcs12_host_rip}]",
+    "mov r11, rax",
+    "shl r11, 16",
+    "sar r11, 16",
+    "cmp rax, r11",
+    "jne .Lresident_nested_validate_invalid_host_state",
+    "mov rax, qword ptr [r12 + {b_nested_vmcs12_host_rsp}]",
+    "mov r11, rax",
+    "shl r11, 16",
+    "sar r11, 16",
+    "cmp rax, r11",
+    "jne .Lresident_nested_validate_invalid_host_state",
+    "inc qword ptr [r12 + {b_nested_vmcs12_control_validation_count}]",
+    "xor r10d, r10d",
+    "ret",
+    ".Lresident_nested_validate_invalid_controls:",
+    "mov r10d, {vm_entry_invalid_control_fields_error}",
+    "ret",
+    ".Lresident_nested_validate_invalid_host_state:",
+    "mov r10d, {vm_entry_invalid_host_state_field_error}",
+    "ret",
+    ".Lresident_nested_control_is_valid:",
+    "mov eax, edx",
+    "mov ecx, r11d",
+    "and eax, ecx",
+    "cmp eax, ecx",
+    "jne .Lresident_nested_control_invalid",
+    "shr r11, 32",
+    "not r11d",
+    "test edx, r11d",
+    "jnz .Lresident_nested_control_invalid",
+    "mov eax, 1",
+    "ret",
+    ".Lresident_nested_control_invalid:",
+    "xor eax, eax",
+    "ret",
     ".Lresident_nested_l2_enter:",
     "pop rax",
     "pop rcx",
@@ -2604,16 +2790,9 @@ global_asm!(
     "jnz .Lresident_nested_entry_mov_ss",
     "cmp qword ptr [r12 + {b_nested_vmcs12_launch_state}], {vmcs12_launch_state_launched}",
     "jne .Lresident_nested_vmresume_non_launched",
-    "cmp qword ptr [r12 + {b_nested_vmcs12_guest_rip}], 0",
-    "je .Lresident_nested_entry_invalid_controls",
-    "cmp qword ptr [r12 + {b_nested_vmcs12_guest_rsp}], 0",
-    "je .Lresident_nested_entry_invalid_controls",
-    "cmp qword ptr [r12 + {b_nested_vmcs12_host_rip}], 0",
-    "je .Lresident_nested_entry_invalid_controls",
-    "cmp qword ptr [r12 + {b_nested_vmcs12_host_rsp}], 0",
-    "je .Lresident_nested_entry_invalid_controls",
-    "test qword ptr [r12 + {b_nested_vmcs12_guest_rflags}], 2",
-    "jz .Lresident_nested_entry_invalid_controls",
+    "call .Lresident_nested_validate_entry",
+    "test r10d, r10d",
+    "jnz .Lresident_nested_vmfail_with_error",
     "dec qword ptr [r12 + {b_nested_entry_rejection_count}]",
     "mov qword ptr [r12 + {b_nested_l2_active}], 1",
     "inc qword ptr [r12 + {b_nested_l2_entry_count}]",
@@ -2854,6 +3033,38 @@ global_asm!(
     "je .Lresident_dispatch_rdmsr_feature_control",
     "cmp ecx, {vmx_basic_msr}",
     "je .Lresident_dispatch_rdmsr_vmx_basic",
+    "cmp ecx, {vmx_pinbased_ctls_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_pinbased_ctls",
+    "cmp ecx, {vmx_procbased_ctls_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_procbased_ctls",
+    "cmp ecx, {vmx_exit_ctls_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_exit_ctls",
+    "cmp ecx, {vmx_entry_ctls_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_entry_ctls",
+    "cmp ecx, {vmx_misc_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_misc",
+    "cmp ecx, {vmx_cr0_fixed0_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_cr0_fixed0",
+    "cmp ecx, {vmx_cr0_fixed1_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_cr0_fixed1",
+    "cmp ecx, {vmx_cr4_fixed0_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_cr4_fixed0",
+    "cmp ecx, {vmx_cr4_fixed1_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_cr4_fixed1",
+    "cmp ecx, {vmx_vmcs_enum_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_vmcs_enum",
+    "cmp ecx, {vmx_procbased_ctls2_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_procbased_ctls2",
+    "cmp ecx, {vmx_ept_vpid_cap_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_ept_vpid_cap",
+    "cmp ecx, {vmx_true_pinbased_ctls_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_true_pinbased_ctls",
+    "cmp ecx, {vmx_true_procbased_ctls_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_true_procbased_ctls",
+    "cmp ecx, {vmx_true_exit_ctls_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_true_exit_ctls",
+    "cmp ecx, {vmx_true_entry_ctls_msr}",
+    "je .Lresident_dispatch_rdmsr_vmx_true_entry_ctls",
     "cmp ecx, {bios_sign_id_msr}",
     "je .Lresident_dispatch_rdmsr_passthrough",
     "cmp ecx, {mtrrcap_msr}",
@@ -2940,6 +3151,94 @@ global_asm!(
     "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
     "je .Lresident_dispatch_inject_gp",
     "mov r11, qword ptr [r12 + {b_nested_vmx_basic}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_pinbased_ctls:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_pinbased_ctls}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_procbased_ctls:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_procbased_ctls}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_exit_ctls:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_exit_ctls}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_entry_ctls:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_entry_ctls}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_misc:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_misc}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_cr0_fixed0:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_cr0_fixed0}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_cr0_fixed1:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_cr0_fixed1}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_cr4_fixed0:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_cr4_fixed0}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_cr4_fixed1:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_cr4_fixed1}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_vmcs_enum:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_vmcs_enum}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_procbased_ctls2:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_procbased_ctls2}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_ept_vpid_cap:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_ept_vpid_cap}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_true_pinbased_ctls:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "bt qword ptr [r12 + {b_nested_vmx_basic}], 55",
+    "jnc .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_true_pinbased_ctls}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_true_procbased_ctls:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "bt qword ptr [r12 + {b_nested_vmx_basic}], 55",
+    "jnc .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_true_procbased_ctls}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_true_exit_ctls:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "bt qword ptr [r12 + {b_nested_vmx_basic}], 55",
+    "jnc .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_true_exit_ctls}]",
+    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    ".Lresident_dispatch_rdmsr_vmx_true_entry_ctls:",
+    "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
+    "je .Lresident_dispatch_inject_gp",
+    "bt qword ptr [r12 + {b_nested_vmx_basic}], 55",
+    "jnc .Lresident_dispatch_inject_gp",
+    "mov r11, qword ptr [r12 + {b_nested_vmx_true_entry_ctls}]",
     ".Lresident_dispatch_rdmsr_nested_value:",
     "mov eax, r11d",
     "mov qword ptr [rsp + 0], rax",
@@ -3702,6 +4001,22 @@ global_asm!(
     apic_base_msr = const IA32_APIC_BASE_MSR,
     feature_control_msr = const IA32_FEATURE_CONTROL_MSR,
     vmx_basic_msr = const IA32_VMX_BASIC_MSR,
+    vmx_pinbased_ctls_msr = const IA32_VMX_PINBASED_CTLS_MSR,
+    vmx_procbased_ctls_msr = const IA32_VMX_PROCBASED_CTLS_MSR,
+    vmx_exit_ctls_msr = const IA32_VMX_EXIT_CTLS_MSR,
+    vmx_entry_ctls_msr = const IA32_VMX_ENTRY_CTLS_MSR,
+    vmx_misc_msr = const IA32_VMX_MISC_MSR,
+    vmx_cr0_fixed0_msr = const IA32_VMX_CR0_FIXED0_MSR,
+    vmx_cr0_fixed1_msr = const IA32_VMX_CR0_FIXED1_MSR,
+    vmx_cr4_fixed0_msr = const IA32_VMX_CR4_FIXED0_MSR,
+    vmx_cr4_fixed1_msr = const IA32_VMX_CR4_FIXED1_MSR,
+    vmx_vmcs_enum_msr = const IA32_VMX_VMCS_ENUM_MSR,
+    vmx_procbased_ctls2_msr = const IA32_VMX_PROCBASED_CTLS2_MSR,
+    vmx_ept_vpid_cap_msr = const IA32_VMX_EPT_VPID_CAP_MSR,
+    vmx_true_pinbased_ctls_msr = const IA32_VMX_TRUE_PINBASED_CTLS_MSR,
+    vmx_true_procbased_ctls_msr = const IA32_VMX_TRUE_PROCBASED_CTLS_MSR,
+    vmx_true_exit_ctls_msr = const IA32_VMX_TRUE_EXIT_CTLS_MSR,
+    vmx_true_entry_ctls_msr = const IA32_VMX_TRUE_ENTRY_CTLS_MSR,
     bios_sign_id_msr = const IA32_BIOS_SIGN_ID_MSR,
     mtrrcap_msr = const IA32_MTRRCAP_MSR,
     pkg_energy_status_msr = const MSR_PKG_ENERGY_STATUS,
@@ -3748,6 +4063,7 @@ global_asm!(
     vmclear_invalid_physical_address_error = const VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR,
     vmclear_vmxon_pointer_error = const VMCLEAR_VMXON_POINTER_ERROR,
     vm_entry_invalid_control_fields_error = const VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
+    vm_entry_invalid_host_state_field_error = const VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR,
     vm_entry_blocked_by_mov_ss_error = const VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR,
     vmlaunch_non_clear_vmcs_error = const VMLAUNCH_NON_CLEAR_VMCS_ERROR,
     vmptrld_invalid_physical_address_error = const VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR,
@@ -3801,6 +4117,22 @@ global_asm!(
     b_tsc_adjust = const BCTX_TSC_ADJUST,
     b_nested_feature_control = const BCTX_NESTED_FEATURE_CONTROL,
     b_nested_vmx_basic = const BCTX_NESTED_VMX_BASIC,
+    b_nested_vmx_pinbased_ctls = const BCTX_NESTED_VMX_PINBASED_CTLS,
+    b_nested_vmx_procbased_ctls = const BCTX_NESTED_VMX_PROCBASED_CTLS,
+    b_nested_vmx_exit_ctls = const BCTX_NESTED_VMX_EXIT_CTLS,
+    b_nested_vmx_entry_ctls = const BCTX_NESTED_VMX_ENTRY_CTLS,
+    b_nested_vmx_misc = const BCTX_NESTED_VMX_MISC,
+    b_nested_vmx_cr0_fixed0 = const BCTX_NESTED_VMX_CR0_FIXED0,
+    b_nested_vmx_cr0_fixed1 = const BCTX_NESTED_VMX_CR0_FIXED1,
+    b_nested_vmx_cr4_fixed0 = const BCTX_NESTED_VMX_CR4_FIXED0,
+    b_nested_vmx_cr4_fixed1 = const BCTX_NESTED_VMX_CR4_FIXED1,
+    b_nested_vmx_vmcs_enum = const BCTX_NESTED_VMX_VMCS_ENUM,
+    b_nested_vmx_procbased_ctls2 = const BCTX_NESTED_VMX_PROCBASED_CTLS2,
+    b_nested_vmx_ept_vpid_cap = const BCTX_NESTED_VMX_EPT_VPID_CAP,
+    b_nested_vmx_true_pinbased_ctls = const BCTX_NESTED_VMX_TRUE_PINBASED_CTLS,
+    b_nested_vmx_true_procbased_ctls = const BCTX_NESTED_VMX_TRUE_PROCBASED_CTLS,
+    b_nested_vmx_true_exit_ctls = const BCTX_NESTED_VMX_TRUE_EXIT_CTLS,
+    b_nested_vmx_true_entry_ctls = const BCTX_NESTED_VMX_TRUE_ENTRY_CTLS,
     b_nested_expose_vmx = const BCTX_NESTED_EXPOSE_VMX,
     b_nested_vmxon_operand = const BCTX_NESTED_VMXON_OPERAND,
     b_nested_vmxon_region = const BCTX_NESTED_VMXON_REGION,
@@ -3827,6 +4159,12 @@ global_asm!(
     b_nested_vmcs12_exit_instruction_len = const BCTX_NESTED_VMCS12_EXIT_INSTRUCTION_LEN,
     b_nested_vmcs12_exit_qualification = const BCTX_NESTED_VMCS12_EXIT_QUALIFICATION,
     b_nested_vmcs12_extended_fields = const BCTX_NESTED_VMCS12_EXTENDED_FIELDS,
+    b_nested_vmcs12_pin_based_control = const BCTX_NESTED_VMCS12_PIN_BASED_CONTROL,
+    b_nested_vmcs12_primary_control = const BCTX_NESTED_VMCS12_PRIMARY_CONTROL,
+    b_nested_vmcs12_secondary_control = const BCTX_NESTED_VMCS12_SECONDARY_CONTROL,
+    b_nested_vmcs12_vm_exit_controls = const BCTX_NESTED_VMCS12_VM_EXIT_CONTROLS,
+    b_nested_vmcs12_vm_entry_controls = const BCTX_NESTED_VMCS12_VM_ENTRY_CONTROLS,
+    b_nested_vmcs12_control_validation_count = const BCTX_NESTED_VMCS12_CONTROL_VALIDATION_COUNT,
     b_nested_vmclear_count = const BCTX_NESTED_VMCLEAR_COUNT,
     b_nested_vmptrld_count = const BCTX_NESTED_VMPTRLD_COUNT,
     b_nested_vmptrst_count = const BCTX_NESTED_VMPTRST_COUNT,

@@ -579,6 +579,7 @@ pub struct NestedVmcs12State {
     pub exit_instruction_len: u64,
     pub exit_qualification: u64,
     pub extended_fields: [u64; VMCS12_EXTENDED_FIELD_COUNT],
+    pub control_validation_count: u64,
 }
 
 impl NestedVmcs12State {
@@ -608,6 +609,7 @@ impl NestedVmcs12State {
             exit_instruction_len: 0,
             exit_qualification: 0,
             extended_fields: [0; VMCS12_EXTENDED_FIELD_COUNT],
+            control_validation_count: 0,
         }
     }
 }

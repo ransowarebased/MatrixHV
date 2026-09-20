@@ -11,15 +11,15 @@ mod vmcs;
 
 use capabilities::{
     CPUID_HYPERVISOR_PRESENT_BIT, CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, HYPERV_FEATURES_LEAF,
-    HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START, IA32_FEATURE_CONTROL_LOCKED,
-    IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX, NestedVmxCapabilities, VMX_MEMORY_TYPE_WRITE_BACK,
-    VMX_REGION_SIZE,
+    HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START, HostVmxCapabilities, IA32_FEATURE_CONTROL_LOCKED,
+    IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX, NestedVmxCapabilities, VMX_BASIC_TRUE_CONTROLS,
+    VMX_MEMORY_TYPE_WRITE_BACK, VMX_REGION_SIZE,
 };
 use instructions::{
     VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
-    VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
-    VMCS_UNSUPPORTED_COMPONENT_ERROR, VMFAIL_INVALID_STATUS, VMFAIL_VALID_STATUS,
-    VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR,
+    VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR, VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR,
+    VMCLEAR_VMXON_POINTER_ERROR, VMCS_UNSUPPORTED_COMPONENT_ERROR, VMFAIL_INVALID_STATUS,
+    VMFAIL_VALID_STATUS, VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR,
     VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR, VMPTRLD_VMXON_POINTER_ERROR,
     VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR, VMX_STATUS_FLAGS,
     VMX_STATUS_FLAGS_CLEAR_MASK, VMXON_IN_VMX_ROOT_ERROR,
@@ -40,6 +40,32 @@ const VMCS12_OPERAND: u64 = 0x31_0000;
 const VMPTRST_DESTINATION: u64 = VMCS12_OPERAND + 8;
 const VMCS01_REGION: u64 = 0x40_0000;
 const VMCS02_REGION: u64 = 0x50_0000;
+
+fn control_capabilities(must_be_one: u32, may_be_one: u32) -> u64 {
+    u64::from(must_be_one) | (u64::from(may_be_one) << 32)
+}
+
+fn host_vmx_capabilities() -> HostVmxCapabilities {
+    HostVmxCapabilities {
+        vmx_basic: HOST_VMX_BASIC,
+        pinbased_ctls: control_capabilities(0x16, u32::MAX),
+        procbased_ctls: control_capabilities(0x0400_6172, u32::MAX),
+        exit_ctls: control_capabilities(0x0003_6dfb, u32::MAX),
+        entry_ctls: control_capabilities(0x0000_11fb, u32::MAX),
+        misc: u64::MAX,
+        cr0_fixed0: 0x8000_0021,
+        cr0_fixed1: 0xffff_ffff,
+        cr4_fixed0: 0x0000_2000,
+        cr4_fixed1: 0x003f_ffff,
+        vmcs_enum: 31 << 1,
+        procbased_ctls2: control_capabilities(0, u32::MAX),
+        ept_vpid_cap: u64::MAX,
+        true_pinbased_ctls: control_capabilities(0, u32::MAX),
+        true_procbased_ctls: control_capabilities(0, u32::MAX),
+        true_exit_ctls: control_capabilities(0, u32::MAX),
+        true_entry_ctls: control_capabilities(0, u32::MAX),
+    }
+}
 
 fn vmcs12(region_offset: u64) -> NestedVmcs12State {
     NestedVmcs12State::new(
@@ -72,11 +98,186 @@ fn capabilities_normalize_vmx_basic_and_keep_vmx_internal() {
         (capabilities.vmx_basic >> 50) & 0xf,
         VMX_MEMORY_TYPE_WRITE_BACK
     );
+    assert_eq!(capabilities.vmx_basic & VMX_BASIC_TRUE_CONTROLS, 0);
     assert_eq!(
         capabilities.feature_control,
         IA32_FEATURE_CONTROL_LOCKED | IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX
     );
+    assert_eq!(capabilities.vmx_pinbased_ctls, 0);
+    assert_eq!(capabilities.vmx_procbased_ctls, 0);
+    assert_eq!(capabilities.vmx_exit_ctls, 0);
+    assert_eq!(capabilities.vmx_entry_ctls, 0);
+    assert_eq!(capabilities.vmx_cr0_fixed0, 0);
+    assert_eq!(capabilities.vmx_cr0_fixed1, 0);
+    assert_eq!(capabilities.vmx_cr4_fixed0, 0);
+    assert_eq!(capabilities.vmx_cr4_fixed1, 0);
+    assert_eq!(capabilities.vmx_vmcs_enum, 0);
+    assert_eq!(capabilities.vmx_procbased_ctls2, 0);
+    assert_eq!(capabilities.vmx_ept_vpid_cap, 0);
     assert!(!capabilities.expose_vmx);
+}
+
+#[test]
+fn host_derived_capabilities_expose_only_the_current_nested_contract() {
+    let host = host_vmx_capabilities();
+    let capabilities = NestedVmxCapabilities::from_host(host);
+    let ia32e_control = control_capabilities(
+        capabilities::VM_ENTRY_IA32E_MODE_GUEST,
+        capabilities::VM_ENTRY_IA32E_MODE_GUEST,
+    );
+    let host_address_size_control = control_capabilities(
+        capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
+        capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
+    );
+
+    assert_eq!(capabilities.vmx_pinbased_ctls, 0);
+    assert_eq!(capabilities.vmx_procbased_ctls, 0);
+    assert_eq!(capabilities.vmx_exit_ctls, host_address_size_control);
+    assert_eq!(capabilities.vmx_entry_ctls, ia32e_control);
+    assert_eq!(capabilities.vmx_misc, 0);
+    assert_eq!(capabilities.vmx_cr0_fixed0, host.cr0_fixed0);
+    assert_eq!(capabilities.vmx_cr0_fixed1, host.cr0_fixed1);
+    assert_eq!(capabilities.vmx_cr4_fixed0, host.cr4_fixed0);
+    assert_eq!(capabilities.vmx_cr4_fixed1, host.cr4_fixed1);
+    assert_eq!(
+        capabilities.vmx_vmcs_enum,
+        capabilities::VMCS12_MAX_ENUM_INDEX << 1
+    );
+    assert_eq!(capabilities.vmx_procbased_ctls2, 0);
+    assert_eq!(capabilities.vmx_ept_vpid_cap, 0);
+    assert_eq!(capabilities.vmx_true_pinbased_ctls, 0);
+    assert_eq!(capabilities.vmx_true_procbased_ctls, 0);
+    assert_eq!(capabilities.vmx_true_exit_ctls, host_address_size_control);
+    assert_eq!(capabilities.vmx_true_entry_ctls, ia32e_control);
+    assert!(!capabilities.expose_vmx);
+}
+
+#[test]
+fn host_derived_controls_never_invent_unsupported_one_settings() {
+    let mut host = host_vmx_capabilities();
+    let exit_supported = u32::MAX & !capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE;
+    let entry_supported = u32::MAX & !capabilities::VM_ENTRY_IA32E_MODE_GUEST;
+    host.exit_ctls = control_capabilities(0, exit_supported);
+    host.entry_ctls = control_capabilities(0, entry_supported);
+    host.true_exit_ctls = control_capabilities(0, exit_supported);
+    host.true_entry_ctls = control_capabilities(0, entry_supported);
+
+    let capabilities = NestedVmxCapabilities::from_host(host);
+
+    assert_eq!(capabilities.vmx_exit_ctls, 0);
+    assert_eq!(capabilities.vmx_entry_ctls, 0);
+    assert_eq!(capabilities.vmx_true_exit_ctls, 0);
+    assert_eq!(capabilities.vmx_true_entry_ctls, 0);
+}
+
+#[test]
+fn true_control_msrs_follow_vmx_basic_availability() {
+    let mut host = host_vmx_capabilities();
+    host.vmx_basic &= !VMX_BASIC_TRUE_CONTROLS;
+    let capabilities = NestedVmxCapabilities::from_host(host);
+
+    assert_eq!(capabilities.vmx_basic & VMX_BASIC_TRUE_CONTROLS, 0);
+    assert_eq!(capabilities.vmx_true_pinbased_ctls, 0);
+    assert_eq!(capabilities.vmx_true_procbased_ctls, 0);
+    assert_eq!(capabilities.vmx_true_exit_ctls, 0);
+    assert_eq!(capabilities.vmx_true_entry_ctls, 0);
+    assert_eq!(
+        capabilities.vmx_msr(capabilities::IA32_VMX_TRUE_PINBASED_CTLS_MSR),
+        None
+    );
+    assert_eq!(
+        capabilities.vmx_msr(capabilities::IA32_VMX_TRUE_ENTRY_CTLS_MSR),
+        None
+    );
+}
+
+#[test]
+fn virtual_vmx_msr_map_covers_the_supported_capability_range() {
+    let capabilities = NestedVmxCapabilities::from_host(host_vmx_capabilities());
+    let expected = [
+        (capabilities::IA32_VMX_BASIC_MSR, capabilities.vmx_basic),
+        (
+            capabilities::IA32_VMX_PINBASED_CTLS_MSR,
+            capabilities.vmx_pinbased_ctls,
+        ),
+        (
+            capabilities::IA32_VMX_PROCBASED_CTLS_MSR,
+            capabilities.vmx_procbased_ctls,
+        ),
+        (
+            capabilities::IA32_VMX_EXIT_CTLS_MSR,
+            capabilities.vmx_exit_ctls,
+        ),
+        (
+            capabilities::IA32_VMX_ENTRY_CTLS_MSR,
+            capabilities.vmx_entry_ctls,
+        ),
+        (capabilities::IA32_VMX_MISC_MSR, capabilities.vmx_misc),
+        (
+            capabilities::IA32_VMX_CR0_FIXED0_MSR,
+            capabilities.vmx_cr0_fixed0,
+        ),
+        (
+            capabilities::IA32_VMX_CR0_FIXED1_MSR,
+            capabilities.vmx_cr0_fixed1,
+        ),
+        (
+            capabilities::IA32_VMX_CR4_FIXED0_MSR,
+            capabilities.vmx_cr4_fixed0,
+        ),
+        (
+            capabilities::IA32_VMX_CR4_FIXED1_MSR,
+            capabilities.vmx_cr4_fixed1,
+        ),
+        (
+            capabilities::IA32_VMX_VMCS_ENUM_MSR,
+            capabilities.vmx_vmcs_enum,
+        ),
+        (
+            capabilities::IA32_VMX_PROCBASED_CTLS2_MSR,
+            capabilities.vmx_procbased_ctls2,
+        ),
+        (
+            capabilities::IA32_VMX_EPT_VPID_CAP_MSR,
+            capabilities.vmx_ept_vpid_cap,
+        ),
+        (
+            capabilities::IA32_VMX_TRUE_PINBASED_CTLS_MSR,
+            capabilities.vmx_true_pinbased_ctls,
+        ),
+        (
+            capabilities::IA32_VMX_TRUE_PROCBASED_CTLS_MSR,
+            capabilities.vmx_true_procbased_ctls,
+        ),
+        (
+            capabilities::IA32_VMX_TRUE_EXIT_CTLS_MSR,
+            capabilities.vmx_true_exit_ctls,
+        ),
+        (
+            capabilities::IA32_VMX_TRUE_ENTRY_CTLS_MSR,
+            capabilities.vmx_true_entry_ctls,
+        ),
+    ];
+
+    for (msr, value) in expected {
+        assert_eq!(capabilities.vmx_msr(msr), Some(value));
+    }
+    assert_eq!(capabilities.vmx_msr(0x491), None);
+}
+
+#[test]
+fn vmcs_enum_is_bounded_by_host_and_vmcs12_field_indices() {
+    let max_vmcs12_index = vmcs::VMCS12_EXTENDED_FIELDS
+        .iter()
+        .map(|field| (field.encoding >> 1) & 0x1ff)
+        .max()
+        .unwrap();
+    assert_eq!(max_vmcs12_index, capabilities::VMCS12_MAX_ENUM_INDEX);
+
+    let mut host = host_vmx_capabilities();
+    host.vmcs_enum = 9 << 1;
+    let capabilities = NestedVmxCapabilities::from_host(host);
+    assert_eq!(capabilities.vmx_vmcs_enum, 9 << 1);
 }
 
 #[test]
@@ -147,6 +348,7 @@ fn vmcs12_state_starts_uninitialized_with_zero_observability() {
     assert_eq!(vmcs12.exit_reason, 0);
     assert_eq!(vmcs12.exit_instruction_len, 0);
     assert_eq!(vmcs12.exit_qualification, 0);
+    assert_eq!(vmcs12.control_validation_count, 0);
 }
 
 #[test]
@@ -167,6 +369,7 @@ fn vm_instruction_errors_and_status_flags_match_architecture() {
     assert_eq!(VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, 2);
     assert_eq!(VMCLEAR_VMXON_POINTER_ERROR, 3);
     assert_eq!(VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR, 7);
+    assert_eq!(VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR, 8);
     assert_eq!(VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, 26);
     assert_eq!(VMXON_IN_VMX_ROOT_ERROR, 15);
     assert_eq!(VMLAUNCH_NON_CLEAR_VMCS_ERROR, 4);

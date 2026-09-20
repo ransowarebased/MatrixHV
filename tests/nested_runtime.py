@@ -42,12 +42,13 @@ def validate(start, end, cpu_count):
             "nested_vmclear_count": 2,
             "nested_vmptrld_count": 2,
             "nested_vmptrst_count": 1,
-            "nested_vmwrite_count": 10,
-            "nested_vmread_count": 13,
+            "nested_vmwrite_count": 15,
+            "nested_vmread_count": 18,
             "nested_vmcs12_probe_complete": 1,
             "nested_vmlaunch_count": 3,
             "nested_vmresume_count": 3,
             "nested_entry_rejection_count": 4,
+            "nested_vmcs12_control_validation_count": 2,
             "nested_l2_active": 0,
             "nested_l2_entry_count": 2,
             "nested_l2_exit_count": 2,
@@ -65,6 +66,25 @@ def validate(start, end, cpu_count):
         checks[prefix + "cpuid_bits"] = current["cpuid_leaf1_count"] > 0 and current["cpuid_leaf1_ecx"] & ((1 << 31) | (1 << 5)) == 0
         checks[prefix + "hypervisor_queries"] = current["cpuid_hypervisor_count"] >= 4
         checks[prefix + "vmcs_pointer"] = current["nested_last_stored_pointer"] == current["nested_vmcs12_region"]
+        checks[prefix + "control_pinbased"] = current["nested_vmcs12_pin_based_control"] == 0
+        checks[prefix + "control_primary"] = current["nested_vmcs12_primary_control"] == 0
+        checks[prefix + "control_secondary"] = current["nested_vmcs12_secondary_control"] == 0
+        checks[prefix + "control_exit"] = current["nested_vmcs12_vm_exit_controls"] == 1 << 9
+        checks[prefix + "control_entry"] = current["nested_vmcs12_vm_entry_controls"] == 1 << 9
+        control_capability = (1 << 9) | ((1 << 9) << 32)
+        checks[prefix + "vmx_pinbased_cap"] = current["nested_vmx_pinbased_ctls"] == 0
+        checks[prefix + "vmx_procbased_cap"] = current["nested_vmx_procbased_ctls"] == 0
+        checks[prefix + "vmx_secondary_cap"] = current["nested_vmx_procbased_ctls2"] == 0
+        checks[prefix + "vmx_exit_cap"] = current["nested_vmx_exit_ctls"] == control_capability
+        checks[prefix + "vmx_entry_cap"] = current["nested_vmx_entry_ctls"] == control_capability
+        checks[prefix + "vmx_misc_cap"] = current["nested_vmx_misc"] == 0
+        checks[prefix + "vmx_ept_vpid_hidden"] = current["nested_vmx_ept_vpid_cap"] == 0
+        checks[prefix + "vmx_vmcs_enum"] = 0 < (current["nested_vmx_vmcs_enum"] >> 1) <= 22
+        has_true_controls = bool(current["nested_vmx_basic"] & (1 << 55))
+        checks[prefix + "vmx_true_pinbased_cap"] = current["nested_vmx_true_pinbased_ctls"] == 0
+        checks[prefix + "vmx_true_procbased_cap"] = current["nested_vmx_true_procbased_ctls"] == 0
+        checks[prefix + "vmx_true_exit_cap"] = current["nested_vmx_true_exit_ctls"] == (control_capability if has_true_controls else 0)
+        checks[prefix + "vmx_true_entry_cap"] = current["nested_vmx_true_entry_ctls"] == (control_capability if has_true_controls else 0)
         checks[prefix + "extended_exception_bitmap"] = current["nested_vmcs12_exception_bitmap"] == 0x40
         checks[prefix + "extended_guest_cr3"] = current["nested_vmcs12_guest_cr3_field"] == current["initial_cr3"]
         checks[prefix + "extended_host_cr3"] = current["nested_vmcs12_host_cr3_field"] == current["initial_cr3"]
