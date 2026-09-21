@@ -8,3 +8,4 @@
 *.exp
 *.ilk
 *.log
+*.pyc

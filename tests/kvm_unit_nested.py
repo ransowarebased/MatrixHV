@@ -23,6 +23,8 @@ DEFAULT_CASES = (
     "test_vmclear",
     "test_vmptrst",
     "test_vmwrite_vmread",
+    "test_vmcs_high",
+    "test_vmcs_lifecycle",
     "test_vmx_caps",
     "vmenter",
     "vmx_controls_test",
@@ -37,14 +39,34 @@ DEFAULT_CASES = (
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SUMMARY_PATTERN = re.compile(
     r"SUMMARY:\s*(?P<tests>\d+)\s+tests"
+    r"(?:,\s*(?P<skipped>\d+)\s+skipped)?"
     r"(?:,\s*(?P<failures>\d+)\s+unexpected failures)?",
     re.IGNORECASE,
+)
+SKIP_PATTERN = re.compile(r"^\s*SKIP:\s*(?P<reason>.+?)\s*$", re.MULTILINE)
+EXPECTED_SKIP_MARKERS = {
+    "pml": "test_pml",
+    "mbec": "MBEC not supported",
+    "preemption_timer": "test_vmx_preemption_timer",
+    "host_efer": "test_efer",
+    "host_pat": "test_load_host_pat",
+    "host_perf_global_ctrl": "test_load_host_perf_global_ctrl",
+    "guest_pat": "test_load_guest_pat",
+    "guest_efer": "test_guest_efer",
+    "guest_perf_global_ctrl": "test_load_guest_perf_global_ctrl",
+    "guest_bndcfgs": "test_load_guest_bndcfgs",
+}
+REQUIRED_NMI_HLT_PASSES = (
+    "PASS: direct NMI + hlt",
+    "PASS: NMI intercept while running guest",
+    "PASS: intercepted NMI + hlt",
 )
 
 
 @dataclass(frozen=True)
 class TestSummary:
     tests: int
+    skipped: int
     unexpected_failures: int
 
 
@@ -54,6 +76,10 @@ def project_root() -> Path:
 
 def default_external_root() -> Path:
     return project_root() / "builds" / "kvm-unit-tests"
+
+
+def efi_patch_path() -> Path:
+    return project_root() / "tests" / "kvm_unit_efi.patch"
 
 
 def run_checked(arguments: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -118,29 +144,106 @@ def msys_path(path: Path) -> str:
     return f"/{drive}/{suffix}"
 
 
-def windows_build_tools() -> tuple[Path, Path]:
+def windows_build_tools() -> tuple[Path, Path, Path]:
     bash = Path(r"C:\msys64\usr\bin\bash.exe")
     toolchain = Path(r"D:\Programacao\x86_64-elf-tools-windows\bin")
+    objcopy = Path(r"C:\msys64\usr\bin\objcopy.exe")
     if not bash.is_file():
         raise RuntimeError(f"MSYS2 bash was not found: {bash}")
     if not (toolchain / "x86_64-elf-gcc.exe").is_file():
         raise RuntimeError(f"x86_64 cross compiler was not found: {toolchain}")
-    return bash, toolchain
+    if not objcopy.is_file():
+        raise RuntimeError(f"MSYS2 objcopy was not found: {objcopy}")
+    return bash, toolchain, objcopy
+
+
+def remove_managed_directory(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink():
+        path.unlink()
+    else:
+        shutil.rmtree(path)
+
+
+def prepare_efi_source(source_dir: Path, efi_source_dir: Path) -> None:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("git was not found in PATH")
+    patch_path = efi_patch_path()
+    if not patch_path.is_file():
+        raise RuntimeError(f"kvm-unit-tests EFI patch was not found: {patch_path}")
+
+    remove_managed_directory(efi_source_dir)
+    run_checked(
+        [
+            git,
+            "-c",
+            "core.autocrlf=false",
+            "clone",
+            "--quiet",
+            "--shared",
+            "--no-checkout",
+            str(source_dir),
+            str(efi_source_dir),
+        ]
+    )
+    run_checked(
+        [git, "-c", "core.autocrlf=false", "checkout", "--quiet", "--detach", UPSTREAM_REVISION],
+        cwd=efi_source_dir,
+    )
+    run_checked(
+        [git, "-c", "core.autocrlf=false", "apply", "--whitespace=error-all", str(patch_path)],
+        cwd=efi_source_dir,
+    )
+
+
+def package_windows_efi(build_dir: Path, toolchain: Path, objcopy: Path) -> Path:
+    binary_dir = build_dir / "x86"
+    shared_object = binary_dir / "vmx.so"
+    payload = binary_dir / "vmx.efi"
+    cross_objcopy = toolchain / "x86_64-elf-objcopy.exe"
+    if not shared_object.is_file():
+        raise RuntimeError(f"kvm-unit-tests did not produce a VMX shared object: {shared_object}")
+
+    run_checked([str(cross_objcopy), "--only-keep-debug", "vmx.so", "vmx.efi.debug"], cwd=binary_dir)
+    run_checked([str(cross_objcopy), "--strip-debug", "vmx.so"], cwd=binary_dir)
+    run_checked(
+        [str(cross_objcopy), "--add-gnu-debuglink=vmx.efi.debug", "vmx.so"], cwd=binary_dir
+    )
+    sections = (
+        ".text",
+        ".sdata",
+        ".data",
+        ".dynamic",
+        ".dynsym",
+        ".dynstr",
+        ".rel",
+        ".rela",
+        ".reloc",
+    )
+    arguments = [str(objcopy), "-I", "elf64-x86-64", "-O", "efi-app-x86_64"]
+    for section in sections:
+        arguments.extend(("-j", section))
+    arguments.extend(("-S", str(shared_object), str(payload)))
+    run_checked(arguments)
+    return payload
 
 
 def build_payload(source_dir: Path, build_dir: Path, jobs: int) -> Path:
+    remove_managed_directory(build_dir)
     build_dir.mkdir(parents=True, exist_ok=True)
     build_script = (
         'set -eu; source_dir="$1"; build_dir="$2"; jobs="$3"; '
         'cross_prefix="$4"; command -v make >/dev/null; '
         'command -v "${cross_prefix}gcc" >/dev/null; '
-        'command -v "${cross_prefix}objcopy" >/dev/null; cd "$build_dir"; '
-        'sh "$source_dir/configure" --arch=x86_64 --cross-prefix="$cross_prefix"; '
-        'make -j "$jobs" x86/vmx.flat'
+        'cd "$build_dir"; '
+        'sh "$source_dir/configure" --arch=x86_64 --enable-efi '
+        '--cross-prefix="$cross_prefix"; make -j "$jobs" x86/vmx.so'
     )
 
     if os.name == "nt":
-        bash, toolchain = windows_build_tools()
+        bash, toolchain, objcopy = windows_build_tools()
         source_argument = msys_path(source_dir)
         build_argument = msys_path(build_dir)
         toolchain_argument = msys_path(toolchain)
@@ -156,6 +259,7 @@ def build_payload(source_dir: Path, build_dir: Path, jobs: int) -> Path:
                 f"{toolchain_argument}/x86_64-elf-",
             ]
         )
+        payload = package_windows_efi(build_dir, toolchain, objcopy)
     else:
         run_checked(
             [
@@ -169,8 +273,9 @@ def build_payload(source_dir: Path, build_dir: Path, jobs: int) -> Path:
                 "",
             ]
         )
+        run_checked(["make", "-j", str(jobs), "x86/vmx.efi"], cwd=build_dir)
+        payload = build_dir / "x86" / "vmx.efi"
 
-    payload = build_dir / "x86" / "vmx.flat"
     if not payload.is_file() or payload.stat().st_size == 0:
         raise RuntimeError(f"kvm-unit-tests did not produce a VMX payload: {payload}")
     return payload
@@ -188,6 +293,8 @@ def write_manifest(path: Path, payload: Path, cases: tuple[str, ...]) -> None:
     manifest = {
         "upstream": UPSTREAM_URL,
         "revision": UPSTREAM_REVISION,
+        "efi_patch": str(efi_patch_path().resolve()),
+        "efi_patch_sha256": file_sha256(efi_patch_path()),
         "payload": str(payload.resolve()),
         "payload_sha256": file_sha256(payload),
         "cases": list(cases),
@@ -210,6 +317,7 @@ def parse_summary(output: str) -> TestSummary:
     match = matches[-1]
     summary = TestSummary(
         tests=int(match.group("tests")),
+        skipped=int(match.group("skipped") or 0),
         unexpected_failures=int(match.group("failures") or 0),
     )
     if summary.tests == 0:
@@ -218,6 +326,31 @@ def parse_summary(output: str) -> TestSummary:
         raise ValueError(
             f"kvm-unit-tests reported {summary.unexpected_failures} unexpected failures"
         )
+
+    missing_nmi_passes = [record for record in REQUIRED_NMI_HLT_PASSES if record not in clean_output]
+    if missing_nmi_passes:
+        raise ValueError(f"nmi_hlt did not complete required checks: {missing_nmi_passes}")
+
+    skip_records = [match.group("reason") for match in SKIP_PATTERN.finditer(clean_output)]
+    if summary.skipped != len(skip_records):
+        raise ValueError(
+            f"summary reports {summary.skipped} skips but {len(skip_records)} SKIP records were found"
+        )
+    matched_skips = {
+        name
+        for name, marker in EXPECTED_SKIP_MARKERS.items()
+        if any(marker in record for record in skip_records)
+    }
+    unexpected_skips = [
+        record
+        for record in skip_records
+        if not any(marker in record for marker in EXPECTED_SKIP_MARKERS.values())
+    ]
+    if unexpected_skips:
+        raise ValueError(f"kvm-unit-tests reported unexpected skips: {unexpected_skips}")
+    missing_skips = sorted(set(EXPECTED_SKIP_MARKERS) - matched_skips)
+    if missing_skips:
+        raise ValueError(f"kvm-unit-tests did not report the expected out-of-scope skips: {missing_skips}")
     return summary
 
 
@@ -234,10 +367,12 @@ def selected_cases(arguments: argparse.Namespace) -> tuple[str, ...]:
 def prepare(arguments: argparse.Namespace) -> tuple[Path, tuple[str, ...]]:
     external_root = arguments.external_root.resolve()
     source_dir = external_root / "src"
-    build_dir = external_root / "build-flat-x86_64-elf"
+    efi_source_dir = external_root / "src-efi"
+    build_dir = external_root / "build-efi-x86_64-elf"
     cases = selected_cases(arguments)
     ensure_source(source_dir)
-    payload = build_payload(source_dir, build_dir, arguments.jobs)
+    prepare_efi_source(source_dir, efi_source_dir)
+    payload = build_payload(efi_source_dir, build_dir, arguments.jobs)
     write_manifest(external_root / "manifest.json", payload, cases)
     return payload, cases
 
@@ -299,13 +434,13 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    build_parser = subparsers.add_parser("build", help="fetch and build x86/vmx.flat")
+    build_parser = subparsers.add_parser("build", help="fetch and build x86/vmx.efi")
     add_build_arguments(build_parser)
     build_parser.set_defaults(handler=build_command)
 
     run_parser = subparsers.add_parser(
         "run",
-        help="build and pass vmx.flat to a MatrixHV multiboot runner",
+        help="build and pass vmx.efi to a MatrixHV UEFI runner",
     )
     add_build_arguments(run_parser)
     run_parser.add_argument(
@@ -330,7 +465,7 @@ def create_parser() -> argparse.ArgumentParser:
 
     verify_parser = subparsers.add_parser(
         "verify-log",
-        help="validate a serial log captured from vmx.flat running over MatrixHV",
+        help="validate a serial log captured from vmx.efi running over MatrixHV",
     )
     verify_parser.add_argument("log", type=Path)
     verify_parser.set_defaults(handler=verify_log_command)
