@@ -31,6 +31,7 @@ pub(crate) const NESTED_INVVPID_AFTER_RIP_OFFSET: usize = 128;
 pub(crate) const NESTED_EPT_SOURCE_MARKER: u64 = 0x4e45_5054_5352_4331;
 pub(crate) const NESTED_EPT_TARGET_MARKER: u64 = 0x4e45_5054_5447_5431;
 pub(crate) const NESTED_EPT_SECOND_TARGET_MARKER: u64 = 0x4e45_5054_5447_5432;
+const NESTED_MSR_STATE_PAGES: usize = 7;
 
 pub(crate) struct ResidentCpuResources {
     pub(crate) vmxon_region: VmxonRegion,
@@ -41,6 +42,7 @@ pub(crate) struct ResidentCpuResources {
     pub(crate) guest_stack: ResidentPages,
     pub(crate) host_stack: ResidentPages,
     pub(crate) resident_msr_state: ResidentPages,
+    pub(crate) nested_msr_state: ResidentPages,
     pub(crate) nested_vmxon_page: ResidentPages,
     pub(crate) nested_vmcs12_pages: ResidentPages,
     nested_ept_source_page: ResidentPages,
@@ -72,6 +74,9 @@ impl ResidentCpuResources {
             .map_err(ResidentProbeError::Allocation)?;
         let resident_msr_state = ResidentPages::allocate(1, AddressConstraint::Any)
             .map_err(ResidentProbeError::Allocation)?;
+        let nested_msr_state =
+            ResidentPages::allocate(NESTED_MSR_STATE_PAGES, AddressConstraint::Any)
+                .map_err(ResidentProbeError::Allocation)?;
         let nested_vmxon_page = ResidentPages::allocate(1, AddressConstraint::Any)
             .map_err(ResidentProbeError::Allocation)?;
         let nested_vmcs12_pages = ResidentPages::allocate(2, AddressConstraint::Any)
@@ -137,6 +142,7 @@ impl ResidentCpuResources {
             guest_stack,
             host_stack,
             resident_msr_state,
+            nested_msr_state,
             nested_vmxon_page,
             nested_vmcs12_pages,
             nested_ept_source_page,
@@ -349,6 +355,11 @@ impl ResidentCpuResources {
         ept.conceal_guest_access(
             self.resident_msr_state.physical_address(),
             self.resident_msr_state.pages(),
+            zero_page_physical_address,
+        )?;
+        ept.conceal_guest_access(
+            self.nested_msr_state.physical_address(),
+            self.nested_msr_state.pages(),
             zero_page_physical_address,
         )?;
         Ok(())

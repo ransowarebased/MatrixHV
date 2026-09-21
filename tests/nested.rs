@@ -1,9 +1,5 @@
 #[path = "../src/nested/capabilities.rs"]
 mod capabilities;
-#[path = "../src/nested/exits.rs"]
-mod exits;
-#[path = "../src/nested/instructions.rs"]
-mod instructions;
 #[path = "../src/nested/state.rs"]
 mod state;
 #[path = "../src/nested/vmcs.rs"]
@@ -15,24 +11,21 @@ use capabilities::{
     IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX, NestedVmxCapabilities, VMX_BASIC_TRUE_CONTROLS,
     VMX_MEMORY_TYPE_WRITE_BACK, VMX_REGION_SIZE,
 };
-use instructions::{
-    INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR,
+use state::{INVALID_VMCS_POINTER, NestedEptConfiguration, NestedVmxState};
+use vmcs::{
+    INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR, NestedVmcs12State, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR,
     VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR, VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR,
     VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
-    VMCS_UNSUPPORTED_COMPONENT_ERROR, VMFAIL_INVALID_STATUS, VMFAIL_VALID_STATUS,
-    VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR,
+    VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS, VMCS_FIELD_GUEST_RIP,
+    VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
+    VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR,
+    VMCS_UNSUPPORTED_COMPONENT_ERROR, VMCS12_BACKING_MAGIC, VMCS12_BACKING_MAGIC_OFFSET,
+    VMCS12_BACKING_QWORD_COUNT, VMCS12_BACKING_STATE_OFFSET, VMCS12_LAUNCH_STATE_CLEAR,
+    VMCS12_LAUNCH_STATE_LAUNCHED, VMCS12_LAUNCH_STATE_UNINITIALIZED, VMFAIL_INVALID_STATUS,
+    VMFAIL_VALID_STATUS, VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR,
     VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR, VMPTRLD_VMXON_POINTER_ERROR,
     VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR, VMX_STATUS_FLAGS,
     VMX_STATUS_FLAGS_CLEAR_MASK, VMXON_IN_VMX_ROOT_ERROR,
-};
-use state::{INVALID_VMCS_POINTER, NestedEptConfiguration, NestedVmxState};
-use vmcs::{
-    NestedVmcs12State, VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS,
-    VMCS_FIELD_GUEST_RIP, VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
-    VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR,
-    VMCS12_BACKING_MAGIC, VMCS12_BACKING_MAGIC_OFFSET, VMCS12_BACKING_QWORD_COUNT,
-    VMCS12_BACKING_STATE_OFFSET, VMCS12_LAUNCH_STATE_CLEAR, VMCS12_LAUNCH_STATE_LAUNCHED,
-    VMCS12_LAUNCH_STATE_UNINITIALIZED,
 };
 
 const HOST_VMX_BASIC: u64 = 0x00da_0400_0000_1234;
@@ -97,6 +90,24 @@ fn nested_state_tracks_l1_cr4_independently() {
     assert_eq!(state.l1_cr4, 0);
     state.l1_cr4 = 0x2660;
     assert_eq!(state.l1_cr4, 0x2660);
+}
+
+#[test]
+fn nested_state_records_msr_composition_buffers() {
+    let mut state = nested_state(0);
+
+    state.configure_msr_composition(
+        0x60_0000, 0x61_0000, 0x62_0000, 0x62_0070, 0x63_0000, 0x65_0000, 0x67_0000,
+    );
+
+    assert_eq!(state.l0_msr_bitmap, 0x60_0000);
+    assert_eq!(state.composed_msr_bitmap, 0x61_0000);
+    assert_eq!(state.l0_msr_guest_list, 0x62_0000);
+    assert_eq!(state.l0_msr_host_list, 0x62_0070);
+    assert_eq!(state.vmcs02_entry_msr_list, 0x63_0000);
+    assert_eq!(state.vmcs02_exit_store_msr_list, 0x65_0000);
+    assert_eq!(state.vmcs01_entry_msr_list, 0x67_0000);
+    assert_eq!(state.vmcs01_msr_entry_composed, 0);
 }
 
 #[test]
@@ -166,6 +177,7 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     let primary_may_be_one = capabilities::VMX_LEGACY_PROCBASED_DEFAULT1
         | capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
         | capabilities::VMX_PRIMARY_USE_IO_BITMAPS
+        | capabilities::VMX_PRIMARY_USE_MSR_BITMAPS
         | capabilities::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS;
     let primary_control = control_capabilities(
         capabilities::VMX_LEGACY_PROCBASED_DEFAULT1,
@@ -223,7 +235,8 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
         0,
         u32::MAX
             & !capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
-            & !capabilities::VMX_PRIMARY_USE_IO_BITMAPS,
+            & !capabilities::VMX_PRIMARY_USE_IO_BITMAPS
+            & !capabilities::VMX_PRIMARY_USE_MSR_BITMAPS,
     );
     host.true_procbased_ctls = host.procbased_ctls;
 
@@ -251,6 +264,7 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
             & u64::from(
                 capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
                     | capabilities::VMX_PRIMARY_USE_IO_BITMAPS
+                    | capabilities::VMX_PRIMARY_USE_MSR_BITMAPS
             ),
         0
     );
@@ -259,6 +273,7 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
             & u64::from(
                 capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
                     | capabilities::VMX_PRIMARY_USE_IO_BITMAPS
+                    | capabilities::VMX_PRIMARY_USE_MSR_BITMAPS
             ),
         0
     );
@@ -583,17 +598,17 @@ fn vmcs12_state_starts_uninitialized_with_zero_observability() {
 
 #[test]
 fn nested_exit_reasons_match_intel_basic_exit_reasons() {
-    assert_eq!(exits::VMCLEAR_EXIT_REASON, 19);
-    assert_eq!(exits::VMLAUNCH_EXIT_REASON, 20);
-    assert_eq!(exits::VMPTRLD_EXIT_REASON, 21);
-    assert_eq!(exits::VMPTRST_EXIT_REASON, 22);
-    assert_eq!(exits::VMREAD_EXIT_REASON, 23);
-    assert_eq!(exits::VMRESUME_EXIT_REASON, 24);
-    assert_eq!(exits::VMWRITE_EXIT_REASON, 25);
-    assert_eq!(exits::VMXOFF_EXIT_REASON, 26);
-    assert_eq!(exits::VMXON_EXIT_REASON, 27);
-    assert_eq!(exits::INVEPT_EXIT_REASON, 50);
-    assert_eq!(exits::INVVPID_EXIT_REASON, 53);
+    assert_eq!(vmcs::VMCLEAR_EXIT_REASON, 19);
+    assert_eq!(vmcs::VMLAUNCH_EXIT_REASON, 20);
+    assert_eq!(vmcs::VMPTRLD_EXIT_REASON, 21);
+    assert_eq!(vmcs::VMPTRST_EXIT_REASON, 22);
+    assert_eq!(vmcs::VMREAD_EXIT_REASON, 23);
+    assert_eq!(vmcs::VMRESUME_EXIT_REASON, 24);
+    assert_eq!(vmcs::VMWRITE_EXIT_REASON, 25);
+    assert_eq!(vmcs::VMXOFF_EXIT_REASON, 26);
+    assert_eq!(vmcs::VMXON_EXIT_REASON, 27);
+    assert_eq!(vmcs::INVEPT_EXIT_REASON, 50);
+    assert_eq!(vmcs::INVVPID_EXIT_REASON, 53);
 }
 
 #[test]

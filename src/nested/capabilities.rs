@@ -26,6 +26,7 @@ pub const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
 pub const VM_ENTRY_IA32E_MODE_GUEST: u32 = 1 << 9;
 pub const VMX_PRIMARY_UNCONDITIONAL_IO_EXITING: u32 = 1 << 24;
 pub const VMX_PRIMARY_USE_IO_BITMAPS: u32 = 1 << 25;
+pub const VMX_PRIMARY_USE_MSR_BITMAPS: u32 = 1 << 28;
 pub const VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 pub const VMX_SECONDARY_ENABLE_EPT: u32 = 1 << 1;
 pub const VMX_SECONDARY_ENABLE_VPID: u32 = 1 << 5;
@@ -152,6 +153,7 @@ impl NestedVmxCapabilities {
         let procbased_supported = VMX_LEGACY_PROCBASED_DEFAULT1
             | VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
             | VMX_PRIMARY_USE_IO_BITMAPS
+            | VMX_PRIMARY_USE_MSR_BITMAPS
             | optional_primary;
         let exit_supported = VMX_LEGACY_EXIT_DEFAULT1 | VM_EXIT_HOST_ADDRESS_SPACE_SIZE;
         let entry_supported = VMX_LEGACY_ENTRY_DEFAULT1 | VM_ENTRY_IA32E_MODE_GUEST;

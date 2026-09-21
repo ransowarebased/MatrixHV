@@ -97,6 +97,14 @@ pub struct NestedVmxState {
     pub last_captured_guest_gs_base: u64,
     pub last_restored_host_gs_base: u64,
     pub last_restored_host_cs_ar: u64,
+    pub l0_msr_bitmap: u64,
+    pub composed_msr_bitmap: u64,
+    pub l0_msr_guest_list: u64,
+    pub l0_msr_host_list: u64,
+    pub vmcs02_entry_msr_list: u64,
+    pub vmcs02_exit_store_msr_list: u64,
+    pub vmcs01_entry_msr_list: u64,
+    pub vmcs01_msr_entry_composed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,7 +224,34 @@ impl NestedVmxState {
             last_captured_guest_gs_base: 0,
             last_restored_host_gs_base: 0,
             last_restored_host_cs_ar: 0,
+            l0_msr_bitmap: 0,
+            composed_msr_bitmap: 0,
+            l0_msr_guest_list: 0,
+            l0_msr_host_list: 0,
+            vmcs02_entry_msr_list: 0,
+            vmcs02_exit_store_msr_list: 0,
+            vmcs01_entry_msr_list: 0,
+            vmcs01_msr_entry_composed: 0,
         }
+    }
+
+    pub fn configure_msr_composition(
+        &mut self,
+        l0_msr_bitmap: u64,
+        composed_msr_bitmap: u64,
+        l0_msr_guest_list: u64,
+        l0_msr_host_list: u64,
+        vmcs02_entry_msr_list: u64,
+        vmcs02_exit_store_msr_list: u64,
+        vmcs01_entry_msr_list: u64,
+    ) {
+        self.l0_msr_bitmap = l0_msr_bitmap;
+        self.composed_msr_bitmap = composed_msr_bitmap;
+        self.l0_msr_guest_list = l0_msr_guest_list;
+        self.l0_msr_host_list = l0_msr_host_list;
+        self.vmcs02_entry_msr_list = vmcs02_entry_msr_list;
+        self.vmcs02_exit_store_msr_list = vmcs02_exit_store_msr_list;
+        self.vmcs01_entry_msr_list = vmcs01_entry_msr_list;
     }
 
     pub fn configure_ept(&mut self, configuration: NestedEptConfiguration) {

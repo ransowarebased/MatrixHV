@@ -50,16 +50,14 @@ MatrixHV/
 |   |-- nested/
 |   |   |-- mod.rs            Nested VMX module surface
 |   |   |-- capabilities.rs   Virtual capability and CPUID contracts
-|   |   |-- instructions.rs   Architectural status and instruction errors
 |   |   |-- state.rs          Per-vCPU nested operation state
-|   |   |-- vmcs.rs           VMCS12 state and supported field encodings
-|   |   `-- exits.rs          Nested VMX exit reasons
+|   |   `-- vmcs.rs           VMCS12 state, encodings, exit reasons, and instruction errors
 |   |-- runtime/              Serial logging and runtime support
 |   `-- smp/                  Topology, per-CPU state, and AP startup
 `-- tests/nested.rs           Host-runnable nested-state contract tests
 ```
 
-The nested subsystem is intentionally limited to these six cohesive source
+The nested subsystem is intentionally limited to these four cohesive source
 files. New nested behavior belongs in an existing module unless it establishes
 a genuinely distinct responsibility.
 
