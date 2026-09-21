@@ -22,6 +22,10 @@ pub const IA32_VMX_TRUE_PROCBASED_CTLS_MSR: u32 = 0x48e;
 pub const IA32_VMX_TRUE_EXIT_CTLS_MSR: u32 = 0x48f;
 pub const IA32_VMX_TRUE_ENTRY_CTLS_MSR: u32 = 0x490;
 
+pub const VMX_PIN_EXTERNAL_INTERRUPT_EXITING: u32 = 1 << 0;
+pub const VMX_PIN_NMI_EXITING: u32 = 1 << 3;
+pub const VMX_PIN_VIRTUAL_NMIS: u32 = 1 << 5;
+pub const VM_EXIT_ACK_INTERRUPT_ON_EXIT: u32 = 1 << 15;
 pub const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
 pub const VM_ENTRY_IA32E_MODE_GUEST: u32 = 1 << 9;
 pub const VMX_PRIMARY_UNCONDITIONAL_IO_EXITING: u32 = 1 << 24;
@@ -149,13 +153,18 @@ impl NestedVmxCapabilities {
         } else {
             0
         };
-        let pinbased_supported = VMX_LEGACY_PINBASED_DEFAULT1;
+        let pinbased_supported = VMX_LEGACY_PINBASED_DEFAULT1
+            | VMX_PIN_EXTERNAL_INTERRUPT_EXITING
+            | VMX_PIN_NMI_EXITING
+            | VMX_PIN_VIRTUAL_NMIS;
         let procbased_supported = VMX_LEGACY_PROCBASED_DEFAULT1
             | VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
             | VMX_PRIMARY_USE_IO_BITMAPS
             | VMX_PRIMARY_USE_MSR_BITMAPS
             | optional_primary;
-        let exit_supported = VMX_LEGACY_EXIT_DEFAULT1 | VM_EXIT_HOST_ADDRESS_SPACE_SIZE;
+        let exit_supported = VMX_LEGACY_EXIT_DEFAULT1
+            | VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+            | VM_EXIT_ACK_INTERRUPT_ON_EXIT;
         let entry_supported = VMX_LEGACY_ENTRY_DEFAULT1 | VM_ENTRY_IA32E_MODE_GUEST;
         let secondary_ept = restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_EPT, 0);
         let secondary_supported = if ept_supported {

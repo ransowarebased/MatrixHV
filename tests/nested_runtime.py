@@ -42,8 +42,8 @@ def validate(start, end, cpu_count):
             "nested_vmclear_count": 2,
             "nested_vmptrld_count": 2,
             "nested_vmptrst_count": 1,
-            "nested_vmwrite_count": 29,
-            "nested_vmread_count": 35,
+            "nested_vmwrite_count": 31,
+            "nested_vmread_count": 36,
             "nested_vmcs12_probe_complete": 1,
             "nested_vmlaunch_count": 3,
             "nested_vmresume_count": 4,
@@ -85,11 +85,13 @@ def validate(start, end, cpu_count):
         procbased_default = 0x0401E172
         exit_default = 0x00036DFF
         entry_default = 0x000011FF
-        pinbased_capability = pinbased_default | (pinbased_default << 32)
+        pinbased_may_be_one = pinbased_default | (1 << 0) | (1 << 3) | (1 << 5)
+        pinbased_capability = pinbased_default | (pinbased_may_be_one << 32)
         primary_may_be_one = procbased_default | (1 << 31)
         primary_capability = procbased_default | (primary_may_be_one << 32)
-        exit_bits = exit_default | (1 << 9)
-        exit_capability = exit_bits | (exit_bits << 32)
+        exit_required = exit_default | (1 << 9)
+        exit_bits = exit_required | (1 << 15)
+        exit_capability = exit_required | (exit_bits << 32)
         entry_bits = entry_default | (1 << 9)
         entry_capability = entry_bits | (entry_bits << 32)
         checks[prefix + "vmx_pinbased_cap"] = (
@@ -100,7 +102,7 @@ def validate(start, end, cpu_count):
         checks[prefix + "vmx_secondary_cap"] = current["nested_vmx_procbased_ctls2"] == secondary_capability
         checks[prefix + "vmx_exit_cap"] = current["nested_vmx_exit_ctls"] == exit_capability
         checks[prefix + "vmx_entry_cap"] = current["nested_vmx_entry_ctls"] == entry_capability
-        checks[prefix + "vmx_misc_cap"] = current["nested_vmx_misc"] == 0
+        checks[prefix + "vmx_misc_cap"] = current["nested_vmx_misc"] == 4 << 16
         software_invalidation_capability = (1 << 20) | (1 << 25) | (1 << 32) | (1 << 41)
         required_ept_capability = 0x4040 | software_invalidation_capability
         allowed_ept_capability = 0x14040 | software_invalidation_capability
@@ -110,10 +112,10 @@ def validate(start, end, cpu_count):
         )
         checks[prefix + "vmx_vmcs_enum"] = 0 < (current["nested_vmx_vmcs_enum"] >> 1) <= 22
         has_true_controls = bool(current["nested_vmx_basic"] & (1 << 55))
-        true_pinbased_capability = pinbased_default << 32
+        true_pinbased_capability = pinbased_may_be_one << 32
         true_primary_capability = primary_may_be_one << 32
-        true_exit_capability = (1 << 9) | (exit_bits << 32)
-        true_entry_capability = (1 << 9) | (entry_bits << 32)
+        true_exit_capability = exit_bits << 32
+        true_entry_capability = entry_bits << 32
         checks[prefix + "vmx_true_pinbased_cap"] = current["nested_vmx_true_pinbased_ctls"] == (
             true_pinbased_capability if has_true_controls else 0
         )

@@ -159,19 +159,22 @@ fn capabilities_normalize_vmx_basic_and_keep_vmx_internal() {
 fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     let host = host_vmx_capabilities();
     let capabilities = NestedVmxCapabilities::from_host(host);
-    let pinbased_control = control_capabilities(
-        capabilities::VMX_LEGACY_PINBASED_DEFAULT1,
-        capabilities::VMX_LEGACY_PINBASED_DEFAULT1,
-    );
-    let true_pinbased_control = control_capabilities(0, capabilities::VMX_LEGACY_PINBASED_DEFAULT1);
+    let pinbased_bits = capabilities::VMX_LEGACY_PINBASED_DEFAULT1
+        | capabilities::VMX_PIN_EXTERNAL_INTERRUPT_EXITING
+        | capabilities::VMX_PIN_NMI_EXITING
+        | capabilities::VMX_PIN_VIRTUAL_NMIS;
+    let pinbased_control =
+        control_capabilities(capabilities::VMX_LEGACY_PINBASED_DEFAULT1, pinbased_bits);
+    let true_pinbased_control = control_capabilities(0, pinbased_bits);
     let legacy_entry_bits =
         capabilities::VMX_LEGACY_ENTRY_DEFAULT1 | capabilities::VM_ENTRY_IA32E_MODE_GUEST;
     let ia32e_control = control_capabilities(0, legacy_entry_bits);
     let legacy_entry_control =
         control_capabilities(capabilities::VMX_LEGACY_ENTRY_DEFAULT1, legacy_entry_bits);
-    let legacy_exit_bits =
-        capabilities::VMX_LEGACY_EXIT_DEFAULT1 | capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE;
-    let host_address_size_control = control_capabilities(0, legacy_exit_bits);
+    let legacy_exit_bits = capabilities::VMX_LEGACY_EXIT_DEFAULT1
+        | capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+        | capabilities::VM_EXIT_ACK_INTERRUPT_ON_EXIT;
+    let true_exit_control = control_capabilities(0, legacy_exit_bits);
     let legacy_exit_control =
         control_capabilities(capabilities::VMX_LEGACY_EXIT_DEFAULT1, legacy_exit_bits);
     let primary_may_be_one = capabilities::VMX_LEGACY_PROCBASED_DEFAULT1
@@ -217,7 +220,7 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     );
     assert_eq!(capabilities.vmx_true_pinbased_ctls, true_pinbased_control);
     assert_eq!(capabilities.vmx_true_procbased_ctls, true_primary_control);
-    assert_eq!(capabilities.vmx_true_exit_ctls, host_address_size_control);
+    assert_eq!(capabilities.vmx_true_exit_ctls, true_exit_control);
     assert_eq!(capabilities.vmx_true_entry_ctls, ia32e_control);
     assert!(!capabilities.expose_vmx);
 }
@@ -225,12 +228,20 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
 #[test]
 fn host_derived_controls_never_invent_unsupported_one_settings() {
     let mut host = host_vmx_capabilities();
-    let exit_supported = u32::MAX & !capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE;
+    let pin_supported = u32::MAX
+        & !capabilities::VMX_PIN_EXTERNAL_INTERRUPT_EXITING
+        & !capabilities::VMX_PIN_NMI_EXITING
+        & !capabilities::VMX_PIN_VIRTUAL_NMIS;
+    let exit_supported = u32::MAX
+        & !capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+        & !capabilities::VM_EXIT_ACK_INTERRUPT_ON_EXIT;
     let entry_supported = u32::MAX & !capabilities::VM_ENTRY_IA32E_MODE_GUEST;
     host.exit_ctls = control_capabilities(0, exit_supported);
     host.entry_ctls = control_capabilities(0, entry_supported);
     host.true_exit_ctls = control_capabilities(0, exit_supported);
     host.true_entry_ctls = control_capabilities(0, entry_supported);
+    host.pinbased_ctls = control_capabilities(0, pin_supported);
+    host.true_pinbased_ctls = host.pinbased_ctls;
     host.procbased_ctls = control_capabilities(
         0,
         u32::MAX
@@ -242,8 +253,23 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
 
     let capabilities = NestedVmxCapabilities::from_host(host);
 
+    let nested_pin_controls = capabilities::VMX_PIN_EXTERNAL_INTERRUPT_EXITING
+        | capabilities::VMX_PIN_NMI_EXITING
+        | capabilities::VMX_PIN_VIRTUAL_NMIS;
     assert_eq!(
-        capabilities.vmx_exit_ctls >> 32 & u64::from(capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE),
+        capabilities.vmx_pinbased_ctls >> 32 & u64::from(nested_pin_controls),
+        0
+    );
+    assert_eq!(
+        capabilities.vmx_true_pinbased_ctls >> 32 & u64::from(nested_pin_controls),
+        0
+    );
+    assert_eq!(
+        capabilities.vmx_exit_ctls >> 32
+            & u64::from(
+                capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+                    | capabilities::VM_EXIT_ACK_INTERRUPT_ON_EXIT,
+            ),
         0
     );
     assert_eq!(
@@ -252,7 +278,10 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
     );
     assert_eq!(
         capabilities.vmx_true_exit_ctls >> 32
-            & u64::from(capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE),
+            & u64::from(
+                capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+                    | capabilities::VM_EXIT_ACK_INTERRUPT_ON_EXIT,
+            ),
         0
     );
     assert_eq!(

@@ -17,7 +17,7 @@ const UBUNTU_GRUB_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\ubuntu\grubx64.efi")
 const WINDOWS_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\Microsoft\Boot\bootmgfw.efi");
 const VMX_FLAT_BOOT_PATH: &uefi::CStr16 = cstr16!(r"\EFI\BOOT\VMXFLAT.EFI");
 const VMX_FLAT_LOAD_OPTIONS: &uefi::CStr16 = cstr16!(
-    "vmx.efi test_vmx_feature_control test_vmxon test_vmptrld test_vmclear test_vmptrst test_vmwrite_vmread test_vmx_caps vmenter vmx_controls_test vmx_host_state_area_test vmx_guest_state_area_test CR_shadowing I/O_bitmap MSR_switch"
+    "vmx.efi test_vmx_feature_control test_vmxon test_vmptrld test_vmclear test_vmptrst test_vmwrite_vmread test_vmx_caps vmenter vmx_controls_test vmx_host_state_area_test vmx_guest_state_area_test CR_shadowing I/O_bitmap MSR_switch interrupt nmi_hlt"
 );
 const HANDLE_COUNT_CAPACITY: usize = 128;
 

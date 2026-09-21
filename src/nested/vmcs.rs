@@ -85,6 +85,10 @@ pub const VMCS_FIELD_TPR_THRESHOLD: u64 = 0x401c;
 pub const VMCS_FIELD_SECONDARY_VM_EXEC_CONTROL: u64 = 0x401e;
 pub const VMCS_FIELD_VM_INSTRUCTION_ERROR: u64 = 0x4400;
 pub const VMCS_FIELD_VM_EXIT_REASON: u64 = 0x4402;
+pub const VMCS_FIELD_VM_EXIT_INTR_INFO: u64 = 0x4404;
+pub const VMCS_FIELD_VM_EXIT_INTR_ERROR_CODE: u64 = 0x4406;
+pub const VMCS_FIELD_IDT_VECTORING_INFO_FIELD: u64 = 0x4408;
+pub const VMCS_FIELD_IDT_VECTORING_ERROR_CODE: u64 = 0x440a;
 pub const VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN: u64 = 0x440c;
 pub const VMCS_FIELD_GUEST_ES_LIMIT: u64 = 0x4800;
 pub const VMCS_FIELD_GUEST_CS_LIMIT: u64 = 0x4802;
@@ -150,7 +154,7 @@ pub const VMCS_FIELD_HOST_SYSENTER_EIP: u64 = 0x6c12;
 pub const VMCS_FIELD_HOST_RSP: u64 = 0x6c14;
 pub const VMCS_FIELD_HOST_RIP: u64 = 0x6c16;
 
-pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 106;
+pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 110;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Vmcs12ExtendedField {
@@ -582,6 +586,22 @@ pub const VMCS12_EXTENDED_FIELDS: [Vmcs12ExtendedField; VMCS12_EXTENDED_FIELD_CO
     Vmcs12ExtendedField {
         encoding: VMCS_FIELD_VM_ENTRY_MSR_LOAD_ADDR,
         index: 105,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_VM_EXIT_INTR_INFO,
+        index: 106,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_VM_EXIT_INTR_ERROR_CODE,
+        index: 107,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_IDT_VECTORING_INFO_FIELD,
+        index: 108,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_IDT_VECTORING_ERROR_CODE,
+        index: 109,
     },
 ];
 

@@ -31,6 +31,8 @@ DEFAULT_CASES = (
     "CR_shadowing",
     "I/O_bitmap",
     "MSR_switch",
+    "interrupt",
+    "nmi_hlt",
 )
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SUMMARY_PATTERN = re.compile(
