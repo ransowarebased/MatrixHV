@@ -197,6 +197,7 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     let legacy_exit_control =
         control_capabilities(capabilities::VMX_LEGACY_EXIT_DEFAULT1, legacy_exit_bits);
     let primary_may_be_one = capabilities::VMX_LEGACY_PROCBASED_DEFAULT1
+        | capabilities::VMX_PRIMARY_KVM_EXITING_CONTROLS
         | capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
         | capabilities::VMX_PRIMARY_USE_IO_BITMAPS
         | capabilities::VMX_PRIMARY_USE_MSR_BITMAPS
@@ -264,6 +265,7 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
     host.procbased_ctls = control_capabilities(
         0,
         u32::MAX
+            & !capabilities::VMX_PRIMARY_KVM_EXITING_CONTROLS
             & !capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
             & !capabilities::VMX_PRIMARY_USE_IO_BITMAPS
             & !capabilities::VMX_PRIMARY_USE_MSR_BITMAPS,
@@ -311,6 +313,7 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
         capabilities.vmx_procbased_ctls >> 32
             & u64::from(
                 capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
+                    | capabilities::VMX_PRIMARY_KVM_EXITING_CONTROLS
                     | capabilities::VMX_PRIMARY_USE_IO_BITMAPS
                     | capabilities::VMX_PRIMARY_USE_MSR_BITMAPS
             ),
@@ -320,6 +323,7 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
         capabilities.vmx_true_procbased_ctls >> 32
             & u64::from(
                 capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
+                    | capabilities::VMX_PRIMARY_KVM_EXITING_CONTROLS
                     | capabilities::VMX_PRIMARY_USE_IO_BITMAPS
                     | capabilities::VMX_PRIMARY_USE_MSR_BITMAPS
             ),

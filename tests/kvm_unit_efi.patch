@@ -184,11 +184,22 @@ index 142c1d9..f08d660 100644
  
  	asm volatile (".section .text.pf \n\t"
  		      "page_fault: \n\t"
+diff --git a/x86/vmx.h b/x86/vmx.h
+index 956ed49..35f3190 100644
+--- a/x86/vmx.h
++++ b/x86/vmx.h
+@@ -466,5 +466,6 @@ enum Ctrl0 {
+ 	CPU_TPR_SHADOW		= 1ul << 21,
+ 	CPU_NMI_WINDOW		= 1ul << 22,
++	CPU_MOV_DR		= 1ul << 23,
+ 	CPU_IO			= 1ul << 24,
+ 	CPU_IO_BITMAP		= 1ul << 25,
+ 	CPU_MTF			= 1ul << 27,
 diff --git a/x86/vmx_tests.c b/x86/vmx_tests.c
-index 2c0feca..f0eb4e2 100644
+index 2c0feca..49e9ba3 100644
 --- a/x86/vmx_tests.c
 +++ b/x86/vmx_tests.c
-@@ -916,7 +916,7 @@ asm(
+@@ -916,19 +916,20 @@ asm(
  	"insn_mwait: xor %eax, %eax; xor %ecx, %ecx; mwait;ret\n\t"
  	"insn_rdpmc: xor %ecx, %ecx; rdpmc;ret\n\t"
  	"insn_rdtsc: rdtsc;ret\n\t"
@@ -197,7 +208,9 @@ index 2c0feca..f0eb4e2 100644
  	"insn_cr3_store: mov %cr3,%rax;ret\n\t"
  	"insn_cr8_load: xor %eax, %eax; mov %rax,%cr8;ret\n\t"
  	"insn_cr8_store: mov %cr8,%rax;ret\n\t"
-@@ -925,10 +925,10 @@ asm(
++	"insn_dr_store: mov %dr7,%rax;ret\n\t"
+ 	"insn_monitor: xor %eax, %eax; xor %ecx, %ecx; xor %edx, %edx; monitor;ret\n\t"
+ 	"insn_pause: pause;ret\n\t"
  	"insn_wbinvd: wbinvd;ret\n\t"
  	"insn_cpuid: mov $10, %eax; cpuid;ret\n\t"
  	"insn_invd: invd;ret\n\t"
@@ -212,7 +225,24 @@ index 2c0feca..f0eb4e2 100644
  	"insn_sldt: sldt %ax;ret\n\t"
  	"insn_lldt: xor %eax, %eax; lldt %ax;ret\n\t"
  	"insn_str: str %ax;ret\n\t"
-@@ -1207,9 +1207,14 @@ static int setup_ept(bool enable_ad)
+@@ -944,6 +945,7 @@ extern void insn_cr3_load(void);
+ extern void insn_cr3_store(void);
+ extern void insn_cr8_load(void);
+ extern void insn_cr8_store(void);
++extern void insn_dr_store(void);
+ extern void insn_monitor(void);
+ extern void insn_pause(void);
+ extern void insn_wbinvd(void);
+@@ -1008,6 +1010,8 @@ static struct insn_table insn_table[] = {
+ 		FIELD_EXIT_QUAL},
+ 	{"CR8 store", CPU_CR8_STORE, insn_cr8_store, INSN_CPU0, 28, 0x18, 0,
+ 		FIELD_EXIT_QUAL},
++	{"DR7 store", CPU_MOV_DR, insn_dr_store, INSN_CPU0, 29, 0x17, 0,
++		FIELD_EXIT_QUAL},
+ 	{"MONITOR", CPU_MONITOR, insn_monitor, INSN_CPU0, 39, 0, 0, 0, this_cpu_has_mwait},
+ 	{"PAUSE", CPU_PAUSE, insn_pause, INSN_CPU0, 40, 0, 0, 0},
+ 	// Flags for Secondary Processor-Based VM-Execution Controls
+@@ -1207,9 +1211,14 @@ static int setup_ept(bool enable_ad)
  	if (__setup_ept(virt_to_phys(pml4), enable_ad))
  		return 1;
  
@@ -227,7 +257,7 @@ index 2c0feca..f0eb4e2 100644
  	/* Cannot use large EPT pages if we need to track EPT
  	 * accessed/dirty bits at 4K granularity.
  	 */
-@@ -8763,7 +8763,7 @@ static void try_vmentry_in_movss_shadow(void)
+@@ -8763,7 +8772,7 @@ static void try_vmentry_in_movss_shadow(void)
  
  	__asm__ __volatile__ ("mov %[host_rsp], %%edx;"
  			      "vmwrite %%rsp, %%rdx;"

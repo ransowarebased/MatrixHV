@@ -33,8 +33,15 @@ DEFAULT_CASES = (
     "CR_shadowing",
     "I/O_bitmap",
     "MSR_switch",
+    "instruction_intercept",
+    "vmx_intr_window_test",
+    "vmx_nmi_window_test",
     "interrupt",
     "nmi_hlt",
+    "ept_access_test_not_present",
+    "ept_access_test_read_only",
+    "ept_access_test_read_write",
+    "ept_access_test_read_execute",
     "ept_access_test_read_write_execute",
 )
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -56,13 +63,38 @@ EXPECTED_SKIP_MARKERS = {
     "guest_efer": "test_guest_efer",
     "guest_perf_global_ctrl": "test_load_guest_perf_global_ctrl",
     "guest_bndcfgs": "test_load_guest_bndcfgs",
+    "activity_state_hlt": "CPU does not support activity state HLT.",
 }
 REQUIRED_NMI_HLT_PASSES = (
     "PASS: direct NMI + hlt",
     "PASS: NMI intercept while running guest",
     "PASS: intercepted NMI + hlt",
 )
-REQUIRED_EPT_PASSES = ("Test suite: ept_access_test_read_write_execute",)
+REQUIRED_INSTRUCTION_INTERCEPT_PASSES = (
+    "PASS: intercept HLT",
+    "PASS: intercept INVLPG",
+    "PASS: intercept RDPMC",
+    "PASS: intercept CR3 load",
+    "PASS: intercept CR3 store",
+    "PASS: intercept CR8 load",
+    "PASS: intercept CR8 store",
+    "PASS: intercept DR7 store",
+)
+REQUIRED_WINDOW_EXIT_PASSES = (
+    "Test suite: vmx_intr_window_test",
+    "Test suite: vmx_nmi_window_test",
+    "PASS: NMI-window: active, blocking by NMI: #DB handler executed once",
+    "PASS: interrupt-window: active, blocking by MOV-SS, RFLAGS.IF=1: RIP",
+    "PASS: interrupt-window: active, blocking by STI, RFLAGS.IF=1: RIP",
+    "PASS: interrupt-window: active, RFLAGS.IF = 0: RIP",
+)
+REQUIRED_EPT_PASSES = (
+    "Test suite: ept_access_test_not_present",
+    "Test suite: ept_access_test_read_only",
+    "Test suite: ept_access_test_read_write",
+    "Test suite: ept_access_test_read_execute",
+    "Test suite: ept_access_test_read_write_execute",
+)
 
 
 @dataclass(frozen=True)
@@ -332,6 +364,21 @@ def parse_summary(output: str) -> TestSummary:
     missing_nmi_passes = [record for record in REQUIRED_NMI_HLT_PASSES if record not in clean_output]
     if missing_nmi_passes:
         raise ValueError(f"nmi_hlt did not complete required checks: {missing_nmi_passes}")
+
+    missing_instruction_passes = [
+        record for record in REQUIRED_INSTRUCTION_INTERCEPT_PASSES if record not in clean_output
+    ]
+    if missing_instruction_passes:
+        raise ValueError(
+            "instruction intercept did not complete required checks: "
+            f"{missing_instruction_passes}"
+        )
+
+    missing_window_passes = [
+        record for record in REQUIRED_WINDOW_EXIT_PASSES if record not in clean_output
+    ]
+    if missing_window_passes:
+        raise ValueError(f"window-exit tests did not complete: {missing_window_passes}")
 
     missing_ept_passes = [record for record in REQUIRED_EPT_PASSES if record not in clean_output]
     if missing_ept_passes:
