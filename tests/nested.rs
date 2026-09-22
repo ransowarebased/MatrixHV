@@ -8,8 +8,9 @@ mod vmcs;
 use capabilities::{
     CPUID_HYPERVISOR_PRESENT_BIT, CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, HYPERV_FEATURES_LEAF,
     HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START, HostVmxCapabilities, IA32_FEATURE_CONTROL_LOCKED,
-    IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX, NestedVmxCapabilities, VMX_BASIC_TRUE_CONTROLS,
-    VMX_MEMORY_TYPE_WRITE_BACK, VMX_REGION_SIZE,
+    IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX, MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_PROTOCOL,
+    MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX, MATRIXHV_STATUS_SIGNATURE_ECX,
+    NestedVmxCapabilities, VMX_BASIC_TRUE_CONTROLS, VMX_MEMORY_TYPE_WRITE_BACK, VMX_REGION_SIZE,
 };
 use state::{INVALID_VMCS_POINTER, NestedEptConfiguration, NestedMsrComposition, NestedVmxState};
 use vmcs::{
@@ -504,6 +505,11 @@ fn cpuid_contract_uses_architectural_bits_and_hypervisor_namespace() {
     assert_eq!(CPUID_VMX_BIT, 1 << 5);
     assert_eq!(CPUID_OSXSAVE_BIT, 1 << 27);
     assert_eq!(CPUID_HYPERVISOR_PRESENT_BIT, 1 << 31);
+    assert!((0x4000_0000..=0x4fff_ffff).contains(&MATRIXHV_STATUS_LEAF));
+    assert_eq!(MATRIXHV_STATUS_SIGNATURE_EAX, 0x4d48_5631);
+    assert_eq!(MATRIXHV_STATUS_SIGNATURE_EBX.to_le_bytes(), *b"MATR");
+    assert_eq!(MATRIXHV_STATUS_SIGNATURE_ECX.to_le_bytes(), *b"IXHV");
+    assert_eq!(MATRIXHV_STATUS_PROTOCOL, 1);
     assert_eq!(HYPERVISOR_LEAF_START, 0x4000_0000);
     assert_eq!(HYPERV_FEATURES_LEAF, 0x4000_0003);
     assert_eq!(HYPERVISOR_LEAF_END, 0x4fff_ffff);
