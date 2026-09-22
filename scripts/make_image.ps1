@@ -9,6 +9,8 @@ param(
 
     [string]$ImagePath,
 
+    [string]$NeoSource,
+
     [ValidateRange(64, 2048)]
     [int]$ImageSizeMiB = 64,
 
@@ -269,9 +271,13 @@ if ([string]::IsNullOrWhiteSpace($BootBinary)) {
 if ([string]::IsNullOrWhiteSpace($ImagePath)) {
     $ImagePath = Join-Path $BuildRoot "$ConfigurationName\MatrixHV.img"
 }
+if ([string]::IsNullOrWhiteSpace($NeoSource)) {
+    $NeoSource = Join-Path $BuildRoot "$ConfigurationName\neo"
+}
 
 $BootBinary = [System.IO.Path]::GetFullPath($BootBinary)
 $ImagePath = [System.IO.Path]::GetFullPath($ImagePath)
+$NeoSource = [System.IO.Path]::GetFullPath($NeoSource)
 $BuildRootPrefix = $BuildRoot.TrimEnd('\') + '\'
 if (-not $ImagePath.StartsWith($BuildRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Image output must be under $BuildRoot"
@@ -279,8 +285,12 @@ if (-not $ImagePath.StartsWith($BuildRootPrefix, [System.StringComparison]::Ordi
 if (-not (Test-Path -LiteralPath $BootBinary -PathType Leaf)) {
     throw "UEFI boot binary not found: $BootBinary"
 }
+if (-not (Test-Path -LiteralPath $NeoSource -PathType Leaf)) {
+    throw "Linux neo binary not found: $NeoSource"
+}
 
 $ImageFiles = New-Object 'System.Collections.Generic.List[object]'
+$ImageFiles.Add((New-ImageFileDescriptor -Directory 'ROOT' -Name 'neo' -ShortName 'NEO        ' -LongName $null -SourcePath $NeoSource))
 $ImageFiles.Add((New-ImageFileDescriptor -Directory 'BOOT' -Name 'BOOTX64.EFI' -ShortName 'BOOTX64 EFI' -LongName $null -SourcePath $BootBinary))
 if (-not [string]::IsNullOrWhiteSpace($VmxFlatEfiSource)) {
     $VmxFlatEfiSource = [System.IO.Path]::GetFullPath($VmxFlatEfiSource)
@@ -445,7 +455,11 @@ try {
     $BootDirectoryOffset = Get-ClusterOffset -Cluster $BootDirectoryCluster -FirstDataSector $FirstDataSector -SectorsPerCluster $SectorsPerCluster -BytesPerSector $BytesPerSector
 
     $Index = 0
+    $Index = Write-FatNamedDirectoryEntry -Stream $Stream -DirectoryOffset $RootOffset -EntryIndex $Index -ShortName 'MATRIXHV   ' -LongName $null -Attributes 0x08 -FirstCluster 0
     $Index = Write-FatNamedDirectoryEntry -Stream $Stream -DirectoryOffset $RootOffset -EntryIndex $Index -ShortName 'EFI        ' -LongName $null -Attributes 0x10 -FirstCluster $EfiCluster
+    foreach ($ImageFile in @($ImageFiles | Where-Object { $_.Directory -eq 'ROOT' })) {
+        $Index = Write-FatNamedDirectoryEntry -Stream $Stream -DirectoryOffset $RootOffset -EntryIndex $Index -ShortName $ImageFile.ShortName -LongName $ImageFile.LongName -Attributes 0x20 -FirstCluster $ImageFile.FirstCluster -FileSize ([UInt32]$ImageFile.Bytes.Length)
+    }
 
     $Index = 0
     $Index = Write-FatNamedDirectoryEntry -Stream $Stream -DirectoryOffset $EfiOffset -EntryIndex $Index -ShortName '.          ' -LongName $null -Attributes 0x10 -FirstCluster $EfiCluster
