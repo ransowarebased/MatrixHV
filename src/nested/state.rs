@@ -105,6 +105,22 @@ pub struct NestedVmxState {
     pub vmcs02_exit_store_msr_list: u64,
     pub vmcs01_entry_msr_list: u64,
     pub vmcs01_msr_entry_composed: u64,
+    pub ept02_table_pool: u64,
+    pub ept02_table_pool_pages: u64,
+    pub ept02_table_pool_used: u64,
+    pub ept02_table_pool_reserved: u64,
+    pub ept02_invalidation_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NestedMsrComposition {
+    pub l0_msr_bitmap: u64,
+    pub composed_msr_bitmap: u64,
+    pub l0_msr_guest_list: u64,
+    pub l0_msr_host_list: u64,
+    pub vmcs02_entry_msr_list: u64,
+    pub vmcs02_exit_store_msr_list: u64,
+    pub vmcs01_entry_msr_list: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,26 +248,29 @@ impl NestedVmxState {
             vmcs02_exit_store_msr_list: 0,
             vmcs01_entry_msr_list: 0,
             vmcs01_msr_entry_composed: 0,
+            ept02_table_pool: 0,
+            ept02_table_pool_pages: 0,
+            ept02_table_pool_used: 0,
+            ept02_table_pool_reserved: 0,
+            ept02_invalidation_count: 0,
         }
     }
 
-    pub fn configure_msr_composition(
-        &mut self,
-        l0_msr_bitmap: u64,
-        composed_msr_bitmap: u64,
-        l0_msr_guest_list: u64,
-        l0_msr_host_list: u64,
-        vmcs02_entry_msr_list: u64,
-        vmcs02_exit_store_msr_list: u64,
-        vmcs01_entry_msr_list: u64,
-    ) {
-        self.l0_msr_bitmap = l0_msr_bitmap;
-        self.composed_msr_bitmap = composed_msr_bitmap;
-        self.l0_msr_guest_list = l0_msr_guest_list;
-        self.l0_msr_host_list = l0_msr_host_list;
-        self.vmcs02_entry_msr_list = vmcs02_entry_msr_list;
-        self.vmcs02_exit_store_msr_list = vmcs02_exit_store_msr_list;
-        self.vmcs01_entry_msr_list = vmcs01_entry_msr_list;
+    pub fn configure_msr_composition(&mut self, composition: NestedMsrComposition) {
+        self.l0_msr_bitmap = composition.l0_msr_bitmap;
+        self.composed_msr_bitmap = composition.composed_msr_bitmap;
+        self.l0_msr_guest_list = composition.l0_msr_guest_list;
+        self.l0_msr_host_list = composition.l0_msr_host_list;
+        self.vmcs02_entry_msr_list = composition.vmcs02_entry_msr_list;
+        self.vmcs02_exit_store_msr_list = composition.vmcs02_exit_store_msr_list;
+        self.vmcs01_entry_msr_list = composition.vmcs01_entry_msr_list;
+    }
+
+    pub fn configure_ept02_table_pool(&mut self, base: u64, pages: usize, used_pages: usize) {
+        self.ept02_table_pool = base;
+        self.ept02_table_pool_pages = pages as u64;
+        self.ept02_table_pool_used = used_pages as u64;
+        self.ept02_table_pool_reserved = used_pages as u64;
     }
 
     pub fn configure_ept(&mut self, configuration: NestedEptConfiguration) {

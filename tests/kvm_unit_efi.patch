@@ -212,6 +212,21 @@ index 2c0feca..f0eb4e2 100644
  	"insn_sldt: sldt %ax;ret\n\t"
  	"insn_lldt: xor %eax, %eax; lldt %ax;ret\n\t"
  	"insn_str: str %ax;ret\n\t"
+@@ -1207,9 +1207,14 @@ static int setup_ept(bool enable_ad)
+ 	if (__setup_ept(virt_to_phys(pml4), enable_ad))
+ 		return 1;
+ 
++#ifdef CONFIG_EFI
++	/* The EFI page tables identity-map the first 4 GiB. */
++	end_of_memory = 1ul << 32;
++#else
+ 	end_of_memory = fwcfg_get_u64(FW_CFG_RAM_SIZE);
+ 	if (end_of_memory < (1ul << 32))
+ 		end_of_memory = (1ul << 32);
++#endif
+ 	/* Cannot use large EPT pages if we need to track EPT
+ 	 * accessed/dirty bits at 4K granularity.
+ 	 */
 @@ -8763,7 +8763,7 @@ static void try_vmentry_in_movss_shadow(void)
  
  	__asm__ __volatile__ ("mov %[host_rsp], %%edx;"

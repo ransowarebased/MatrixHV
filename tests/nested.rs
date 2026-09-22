@@ -11,7 +11,7 @@ use capabilities::{
     IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX, NestedVmxCapabilities, VMX_BASIC_TRUE_CONTROLS,
     VMX_MEMORY_TYPE_WRITE_BACK, VMX_REGION_SIZE,
 };
-use state::{INVALID_VMCS_POINTER, NestedEptConfiguration, NestedVmxState};
+use state::{INVALID_VMCS_POINTER, NestedEptConfiguration, NestedMsrComposition, NestedVmxState};
 use vmcs::{
     INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR, NestedVmcs12State, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR,
     VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR, VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR,
@@ -96,9 +96,15 @@ fn nested_state_tracks_l1_cr4_independently() {
 fn nested_state_records_msr_composition_buffers() {
     let mut state = nested_state(0);
 
-    state.configure_msr_composition(
-        0x60_0000, 0x61_0000, 0x62_0000, 0x62_0070, 0x63_0000, 0x65_0000, 0x67_0000,
-    );
+    state.configure_msr_composition(NestedMsrComposition {
+        l0_msr_bitmap: 0x60_0000,
+        composed_msr_bitmap: 0x61_0000,
+        l0_msr_guest_list: 0x62_0000,
+        l0_msr_host_list: 0x62_0070,
+        vmcs02_entry_msr_list: 0x63_0000,
+        vmcs02_exit_store_msr_list: 0x65_0000,
+        vmcs01_entry_msr_list: 0x67_0000,
+    });
 
     assert_eq!(state.l0_msr_bitmap, 0x60_0000);
     assert_eq!(state.composed_msr_bitmap, 0x61_0000);
@@ -108,6 +114,19 @@ fn nested_state_records_msr_composition_buffers() {
     assert_eq!(state.vmcs02_exit_store_msr_list, 0x65_0000);
     assert_eq!(state.vmcs01_entry_msr_list, 0x67_0000);
     assert_eq!(state.vmcs01_msr_entry_composed, 0);
+}
+
+#[test]
+fn nested_state_records_dynamic_ept02_table_pool() {
+    let mut state = nested_state(0);
+
+    state.configure_ept02_table_pool(0x70_0000, 128, 9);
+
+    assert_eq!(state.ept02_table_pool, 0x70_0000);
+    assert_eq!(state.ept02_table_pool_pages, 128);
+    assert_eq!(state.ept02_table_pool_used, 9);
+    assert_eq!(state.ept02_table_pool_reserved, 9);
+    assert_eq!(state.ept02_invalidation_count, 0);
 }
 
 #[test]
@@ -668,6 +687,7 @@ fn supported_vmcs12_fields_match_intel_encodings() {
     assert_eq!(VMCS_FIELD_VM_EXIT_REASON, 0x4402);
     assert_eq!(VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, 0x440c);
     assert_eq!(VMCS_FIELD_EXIT_QUALIFICATION, 0x6400);
+    assert_eq!(vmcs::VMCS_FIELD_GUEST_PHYSICAL_ADDRESS, 0x2400);
     assert_eq!(VMCS_FIELD_GUEST_RSP, 0x681c);
     assert_eq!(VMCS_FIELD_GUEST_RIP, 0x681e);
     assert_eq!(VMCS_FIELD_GUEST_RFLAGS, 0x6820);
@@ -707,5 +727,10 @@ fn extended_vmcs12_fields_are_dense_unique_and_cover_entry_state() {
         vmcs::VMCS12_EXTENDED_FIELDS
             .iter()
             .any(|field| field.encoding == vmcs::VMCS_FIELD_HOST_CR3)
+    );
+    assert!(
+        vmcs::VMCS12_EXTENDED_FIELDS
+            .iter()
+            .any(|field| field.encoding == vmcs::VMCS_FIELD_GUEST_PHYSICAL_ADDRESS)
     );
 }

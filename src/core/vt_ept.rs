@@ -356,6 +356,14 @@ impl IdentityEpt {
         regions
     }
 
+    pub fn protection_table_pool(&self) -> (u64, usize, usize) {
+        (
+            self.protection_pool.pages.physical_address(),
+            self.protection_pool.pages.pages(),
+            self.protection_pool.used_pages,
+        )
+    }
+
     pub fn conceal_guest_access_to_regions(
         &mut self,
         regions: &[(u64, usize)],

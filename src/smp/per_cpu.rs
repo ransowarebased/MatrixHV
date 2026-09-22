@@ -262,6 +262,12 @@ impl ResidentCpuResources {
             .map(IdentityEpt::ept_pointer)
     }
 
+    pub(crate) fn nested_ept02_table_pool(&self) -> Option<(u64, usize, usize)> {
+        self.nested_ept02
+            .as_ref()
+            .map(IdentityEpt::protection_table_pool)
+    }
+
     pub(crate) fn nested_ept_source_gpa(&self) -> u64 {
         self.nested_ept_source_page.physical_address()
     }

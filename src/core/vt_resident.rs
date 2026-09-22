@@ -30,14 +30,14 @@ use crate::nested::capabilities::{
     IA32_VMX_VMCS_ENUM_MSR, NestedVmxCapabilities, VMX_BASIC_TRUE_CONTROLS,
     VMX_SECONDARY_ENABLE_EPT, VMX_SECONDARY_ENABLE_VPID,
 };
-use crate::nested::state::{NestedEptConfiguration, NestedVmxState};
+use crate::nested::state::{NestedEptConfiguration, NestedMsrComposition, NestedVmxState};
 use crate::nested::vmcs::{
     INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR, INVEPT_EXIT_REASON, INVVPID_EXIT_REASON,
     NestedVmcs12State, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
     VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR, VMCLEAR_EXIT_REASON,
     VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
-    VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS, VMCS_FIELD_GUEST_RIP,
-    VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
+    VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_PHYSICAL_ADDRESS, VMCS_FIELD_GUEST_RFLAGS,
+    VMCS_FIELD_GUEST_RIP, VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
     VMCS_FIELD_IDT_VECTORING_ERROR_CODE, VMCS_FIELD_IDT_VECTORING_INFO_FIELD,
     VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, VMCS_FIELD_VM_EXIT_INTR_ERROR_CODE,
     VMCS_FIELD_VM_EXIT_INTR_INFO, VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR,
@@ -57,7 +57,7 @@ const GUEST_STACK_PAGES: usize = 4;
 pub(crate) const BOOT_GUEST_STACK_PAGES: usize = 64;
 pub(crate) const HOST_STACK_PAGES: usize = 4;
 const HOST_TABLE_PAGES: usize = 2;
-const RESIDENT_CODE_PAGES: usize = 5;
+const RESIDENT_CODE_PAGES: usize = 6;
 const MSR_BITMAP_PAGES: usize = 1;
 const MSR_BITMAP_READ_HIGH_OFFSET: usize = 1024;
 const MSR_BITMAP_WRITE_LOW_OFFSET: usize = 2048;
@@ -615,6 +615,8 @@ const BCTX_NESTED_VMCS12_VM_ENTRY_INTR_INFO: usize = BCTX_NESTED_VMCS12_EXTENDED
 const BCTX_NESTED_VMCS12_VM_ENTRY_EXCEPTION_ERROR: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 112;
 const BCTX_NESTED_VMCS12_VM_ENTRY_INSTRUCTION_LEN: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 120;
 const BCTX_NESTED_VMCS12_EPT_POINTER: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 128;
+const BCTX_NESTED_VMCS12_GUEST_PHYSICAL_ADDRESS: usize =
+    BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 110 * size_of::<u64>();
 const BCTX_NESTED_VMCS12_CR0_MASK: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 152;
 const BCTX_NESTED_VMCS12_CR4_MASK: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 160;
 const BCTX_NESTED_VMCS12_CR0_SHADOW: usize = BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 168;
@@ -697,6 +699,8 @@ const BCTX_NESTED_EPT12_POINTER: usize = core::mem::offset_of!(ResidentBootConte
     + core::mem::offset_of!(NestedVmxState, ept12_pointer);
 const BCTX_NESTED_EPT_TARGET_GPA: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, ept_target_gpa);
+const BCTX_NESTED_EPT_COMPOSITION_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, ept_composition_count);
 const BCTX_NESTED_EPT_PROBE_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, ept_probe_count);
 const BCTX_NESTED_EPT_OBSERVED_VALUE: usize = core::mem::offset_of!(ResidentBootContext, nested)
@@ -727,6 +731,19 @@ const BCTX_NESTED_EPT_OBSERVED_VALUE_AFTER_INVEPT: usize =
         + core::mem::offset_of!(NestedVmxState, ept_observed_value_after_invept);
 const BCTX_NESTED_EPT02_INITIAL_POINTER: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, ept02_initial_pointer);
+const BCTX_NESTED_EPT02_TABLE_POOL: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, ept02_table_pool);
+const BCTX_NESTED_EPT02_TABLE_POOL_PAGES: usize =
+    core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, ept02_table_pool_pages);
+const BCTX_NESTED_EPT02_TABLE_POOL_USED: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, ept02_table_pool_used);
+const BCTX_NESTED_EPT02_TABLE_POOL_RESERVED: usize =
+    core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, ept02_table_pool_reserved);
+const BCTX_NESTED_EPT02_INVALIDATION_COUNT: usize =
+    core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, ept02_invalidation_count);
 const BCTX_NESTED_EPT_OBSERVED_VALUE_BEFORE_INVEPT: usize =
     core::mem::offset_of!(ResidentBootContext, nested)
         + core::mem::offset_of!(NestedVmxState, ept_observed_value_before_invept);
@@ -1354,15 +1371,15 @@ fn configure_nested_msr_composition(
 ) {
     let l0_msr_host_list =
         l0_msr_guest_list + (RESIDENT_MSR_SWITCH_COUNT * size_of::<VmxMsrEntry>()) as u64;
-    nested_state.configure_msr_composition(
+    nested_state.configure_msr_composition(NestedMsrComposition {
         l0_msr_bitmap,
-        nested_msr_state + NESTED_MSR_BITMAP_OFFSET,
+        composed_msr_bitmap: nested_msr_state + NESTED_MSR_BITMAP_OFFSET,
         l0_msr_guest_list,
         l0_msr_host_list,
-        nested_msr_state + NESTED_VMCS02_ENTRY_MSR_LIST_OFFSET,
-        nested_msr_state + NESTED_VMCS02_EXIT_STORE_MSR_LIST_OFFSET,
-        nested_msr_state + NESTED_VMCS01_ENTRY_MSR_LIST_OFFSET,
-    );
+        vmcs02_entry_msr_list: nested_msr_state + NESTED_VMCS02_ENTRY_MSR_LIST_OFFSET,
+        vmcs02_exit_store_msr_list: nested_msr_state + NESTED_VMCS02_EXIT_STORE_MSR_LIST_OFFSET,
+        vmcs01_entry_msr_list: nested_msr_state + NESTED_VMCS01_ENTRY_MSR_LIST_OFFSET,
+    });
 }
 
 struct NestedVmcs02Configuration<'a> {
@@ -1798,6 +1815,10 @@ pub fn run_boot_loader(
     let nested_ept02_alternate_pointer = cpu_resources
         .nested_ept02_alternate_pointer()
         .ok_or(EptError::InvalidPageTable)?;
+    let (nested_ept02_table_pool, nested_ept02_table_pool_pages, nested_ept02_table_pool_used) =
+        cpu_resources
+            .nested_ept02_table_pool()
+            .ok_or(EptError::InvalidPageTable)?;
     let nested_ept_source_gpa = cpu_resources.nested_ept_source_gpa();
     let nested_ept_target_gpa = cpu_resources.nested_ept_target_gpa();
     let nested_ept_second_target_gpa = cpu_resources.nested_ept_second_target_gpa();
@@ -1878,6 +1899,11 @@ pub fn run_boot_loader(
         alternate_composed_hpa: nested_ept_alternate_composition.host_physical_address,
         alternate_permissions: nested_ept_alternate_composition.permissions,
     });
+    nested_state.configure_ept02_table_pool(
+        nested_ept02_table_pool,
+        nested_ept02_table_pool_pages,
+        nested_ept02_table_pool_used,
+    );
     seed_nested_vmcs12_core_state(&mut nested_state.vmcs12, root_segments);
     seed_nested_vmcs12_backing(&cpu_resources.nested_vmcs12_pages, &nested_state.vmcs12);
 
@@ -2202,6 +2228,10 @@ impl ResidentApLaunch<'_> {
             .resources
             .nested_ept02_alternate_pointer()
             .ok_or(EptError::InvalidPageTable)?;
+        let (nested_ept02_table_pool, nested_ept02_table_pool_pages, nested_ept02_table_pool_used) =
+            self.resources
+                .nested_ept02_table_pool()
+                .ok_or(EptError::InvalidPageTable)?;
         let nested_ept_source_gpa = self.resources.nested_ept_source_gpa();
         let nested_ept_target_gpa = self.resources.nested_ept_target_gpa();
         let nested_ept_second_target_gpa = self.resources.nested_ept_second_target_gpa();
@@ -2270,6 +2300,11 @@ impl ResidentApLaunch<'_> {
             alternate_composed_hpa: nested_ept_alternate_composition.host_physical_address,
             alternate_permissions: nested_ept_alternate_composition.permissions,
         });
+        nested_state.configure_ept02_table_pool(
+            nested_ept02_table_pool,
+            nested_ept02_table_pool_pages,
+            nested_ept02_table_pool_used,
+        );
         seed_nested_vmcs12_core_state(&mut nested_state.vmcs12, segments);
         seed_nested_vmcs12_backing(&self.resources.nested_vmcs12_pages, &nested_state.vmcs12);
         let context = self
@@ -2744,6 +2779,14 @@ global_asm!(
     "mov r10, qword ptr [r12 + {b_last_reason}]",
     "mov eax, r10d",
     "and eax, 0xffff",
+    "cmp eax, {ept_violation_reason}",
+    "jne .Lresident_nested_l2_probe_reflection",
+    "call .Lresident_nested_resolve_ept02_violation",
+    "test eax, eax",
+    "jnz .Lresident_nested_l2_resume",
+    "mov r10, qword ptr [r12 + {b_last_reason}]",
+    "jmp .Lresident_nested_l2_reflect_generic",
+    ".Lresident_nested_l2_probe_reflection:",
     "cmp qword ptr [r12 + {b_nested_l2_exit_count}], 3",
     "jae .Lresident_nested_l2_reflect_generic",
     "cmp eax, {vmcall_reason}",
@@ -2802,6 +2845,13 @@ global_asm!(
     "sub r11, {resident_msr_switch_count}",
     ".Lresident_nested_l2_qualification_ready:",
     "mov qword ptr [r12 + {b_nested_vmcs12_exit_qualification}], r11",
+    "mov eax, r10d",
+    "and eax, 0xffff",
+    "cmp eax, {ept_violation_reason}",
+    "jne .Lresident_nested_l2_guest_physical_address_ready",
+    "mov r11, qword ptr [r12 + {b_last_guest_physical_address}]",
+    "mov qword ptr [r12 + {b_nested_vmcs12_guest_physical_address}], r11",
+    ".Lresident_nested_l2_guest_physical_address_ready:",
     "mov r11, qword ptr [r12 + {b_last_guest_rip}]",
     "mov qword ptr [r12 + {b_nested_l2_last_exit_rip}], r11",
     "mov qword ptr [r12 + {b_nested_vmcs12_guest_rip}], r11",
@@ -3076,6 +3126,259 @@ global_asm!(
     "ret",
     ".Lresident_nested_physical_address_invalid:",
     "xor eax, eax",
+    "ret",
+    ".Lresident_nested_resolve_ept02_violation:",
+    "xor r14d, r14d",
+    "mov rax, {guest_physical_address}",
+    "vmread r8, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "mov qword ptr [r12 + {b_last_guest_physical_address}], r8",
+    "bt dword ptr [r12 + {b_nested_vmcs12_secondary_control}], 1",
+    "jnc .Lresident_nested_ept02_unresolved",
+    "mov r9, qword ptr [r12 + {b_nested_vmcs12_ept_pointer}]",
+    "mov rdx, {host_page_address_mask}",
+    "and r9, rdx",
+    "test r9, r9",
+    "jz .Lresident_nested_ept02_unresolved",
+    "mov r14d, 7",
+    "mov r11, r9",
+    "call .Lresident_nested_host_page_is_mapped",
+    "test eax, eax",
+    "jz .Lresident_nested_ept02_unresolved",
+    "mov rcx, r8",
+    "shr rcx, 39",
+    "and ecx, 0x1ff",
+    "mov r10, qword ptr [r9 + rcx * 8]",
+    "mov eax, r10d",
+    "and eax, 7",
+    "and r14, rax",
+    "test eax, eax",
+    "jz .Lresident_nested_ept02_unresolved",
+    "mov r9, r10",
+    "mov rdx, {host_page_address_mask}",
+    "and r9, rdx",
+    "mov r11, r9",
+    "call .Lresident_nested_host_page_is_mapped",
+    "test eax, eax",
+    "jz .Lresident_nested_ept02_unresolved",
+    "mov rcx, r8",
+    "shr rcx, 30",
+    "and ecx, 0x1ff",
+    "mov r10, qword ptr [r9 + rcx * 8]",
+    "mov eax, r10d",
+    "and eax, 7",
+    "and r14, rax",
+    "test eax, eax",
+    "jz .Lresident_nested_ept02_unresolved",
+    "test r10b, 0x80",
+    "jnz .Lresident_nested_ept12_1g_leaf",
+    "mov r9, r10",
+    "mov rdx, {host_page_address_mask}",
+    "and r9, rdx",
+    "mov r11, r9",
+    "call .Lresident_nested_host_page_is_mapped",
+    "test eax, eax",
+    "jz .Lresident_nested_ept02_unresolved",
+    "mov rcx, r8",
+    "shr rcx, 21",
+    "and ecx, 0x1ff",
+    "mov r10, qword ptr [r9 + rcx * 8]",
+    "mov eax, r10d",
+    "and eax, 7",
+    "and r14, rax",
+    "test eax, eax",
+    "jz .Lresident_nested_ept02_unresolved",
+    "test r10b, 0x80",
+    "jnz .Lresident_nested_ept12_2m_leaf",
+    "mov r9, r10",
+    "mov rdx, {host_page_address_mask}",
+    "and r9, rdx",
+    "mov r11, r9",
+    "call .Lresident_nested_host_page_is_mapped",
+    "test eax, eax",
+    "jz .Lresident_nested_ept02_unresolved",
+    "mov rcx, r8",
+    "shr rcx, 12",
+    "and ecx, 0x1ff",
+    "mov r10, qword ptr [r9 + rcx * 8]",
+    "mov eax, r10d",
+    "and eax, 7",
+    "and r14, rax",
+    "test eax, eax",
+    "jz .Lresident_nested_ept02_unresolved",
+    "mov r13, r10",
+    "mov rdx, {host_page_address_mask}",
+    "and r13, rdx",
+    "mov eax, r8d",
+    "and eax, 0xfff",
+    "add r13, rax",
+    "jmp .Lresident_nested_ept12_translation_ready",
+    ".Lresident_nested_ept12_2m_leaf:",
+    "mov r13, r10",
+    "mov rdx, {host_page_address_mask}",
+    "and r13, rdx",
+    "and r13, -2097152",
+    "mov eax, r8d",
+    "and eax, 0x1fffff",
+    "add r13, rax",
+    "jmp .Lresident_nested_ept12_translation_ready",
+    ".Lresident_nested_ept12_1g_leaf:",
+    "mov r13, r10",
+    "mov rdx, {host_page_address_mask}",
+    "and r13, rdx",
+    "and r13, -1073741824",
+    "mov eax, r8d",
+    "and eax, 0x3fffffff",
+    "add r13, rax",
+    ".Lresident_nested_ept12_translation_ready:",
+    "mov eax, dword ptr [r12 + {b_last_qualification}]",
+    "and eax, 7",
+    "mov edx, r14d",
+    "and edx, eax",
+    "cmp edx, eax",
+    "jne .Lresident_nested_ept02_unresolved",
+    "and r13, -4096",
+    "mov r11, r13",
+    "call .Lresident_nested_host_page_is_mapped",
+    "test eax, eax",
+    "jz .Lresident_nested_ept02_unresolved",
+    "mov r9, qword ptr [r12 + {b_nested_ept02_pointer}]",
+    "mov rdx, {host_page_address_mask}",
+    "and r9, rdx",
+    "mov rcx, r8",
+    "shr rcx, 39",
+    "and ecx, 0x1ff",
+    "mov r10, qword ptr [r9 + rcx * 8]",
+    "test r10b, 7",
+    "jnz .Lresident_nested_ept02_pml4_ready",
+    "mov rdx, rcx",
+    "call .Lresident_nested_allocate_ept02_table",
+    "test r11, r11",
+    "jz .Lresident_nested_ept02_unresolved",
+    "mov r10, r11",
+    "or r10d, 7",
+    "mov qword ptr [r9 + rdx * 8], r10",
+    ".Lresident_nested_ept02_pml4_ready:",
+    "mov r9, r10",
+    "mov rdx, {host_page_address_mask}",
+    "and r9, rdx",
+    "mov rcx, r8",
+    "shr rcx, 30",
+    "and ecx, 0x1ff",
+    "mov r10, qword ptr [r9 + rcx * 8]",
+    "test r10b, 7",
+    "jnz .Lresident_nested_ept02_pdpt_ready",
+    "mov rdx, rcx",
+    "call .Lresident_nested_allocate_ept02_table",
+    "test r11, r11",
+    "jz .Lresident_nested_ept02_unresolved",
+    "mov r10, r11",
+    "or r10d, 7",
+    "mov qword ptr [r9 + rdx * 8], r10",
+    ".Lresident_nested_ept02_pdpt_ready:",
+    "test r10b, 0x80",
+    "jnz .Lresident_nested_ept02_unresolved",
+    "mov r9, r10",
+    "mov rdx, {host_page_address_mask}",
+    "and r9, rdx",
+    "mov rcx, r8",
+    "shr rcx, 21",
+    "and ecx, 0x1ff",
+    "mov r10, qword ptr [r9 + rcx * 8]",
+    "test r10b, 7",
+    "jnz .Lresident_nested_ept02_pd_ready",
+    "mov rdx, rcx",
+    "call .Lresident_nested_allocate_ept02_table",
+    "test r11, r11",
+    "jz .Lresident_nested_ept02_unresolved",
+    "mov r10, r11",
+    "or r10d, 7",
+    "mov qword ptr [r9 + rdx * 8], r10",
+    ".Lresident_nested_ept02_pd_ready:",
+    "test r10b, 0x80",
+    "jnz .Lresident_nested_ept02_unresolved",
+    "mov r9, r10",
+    "mov rdx, {host_page_address_mask}",
+    "and r9, rdx",
+    "mov rcx, r8",
+    "shr rcx, 12",
+    "and ecx, 0x1ff",
+    "or r13, r14",
+    "or r13, 0x30",
+    "mov qword ptr [r9 + rcx * 8], r13",
+    "inc qword ptr [r12 + {b_nested_ept_composition_count}]",
+    "mov eax, 1",
+    "ret",
+    ".Lresident_nested_ept02_unresolved:",
+    "mov r10, qword ptr [r12 + {b_last_qualification}]",
+    "and r10, -57",
+    "mov rax, r14",
+    "shl rax, 3",
+    "or r10, rax",
+    "mov qword ptr [r12 + {b_last_qualification}], r10",
+    "xor eax, eax",
+    "ret",
+    ".Lresident_nested_allocate_ept02_table:",
+    "mov rax, qword ptr [r12 + {b_nested_ept02_table_pool_used}]",
+    "cmp rax, qword ptr [r12 + {b_nested_ept02_table_pool_pages}]",
+    "jae .Lresident_nested_allocate_ept02_table_failed",
+    "mov r11, rax",
+    "shl r11, 12",
+    "add r11, qword ptr [r12 + {b_nested_ept02_table_pool}]",
+    "inc qword ptr [r12 + {b_nested_ept02_table_pool_used}]",
+    "mov rdi, r11",
+    "xor eax, eax",
+    "mov ecx, 512",
+    "cld",
+    "rep stosq",
+    "ret",
+    ".Lresident_nested_allocate_ept02_table_failed:",
+    "xor r11d, r11d",
+    "ret",
+    ".Lresident_nested_invalidate_ept02:",
+    "inc qword ptr [r12 + {b_nested_ept02_invalidation_count}]",
+    "mov r9, qword ptr [r12 + {b_nested_ept02_table_pool_reserved}]",
+    "mov r10, qword ptr [r12 + {b_nested_ept02_table_pool_used}]",
+    "cmp r10, r9",
+    "jbe .Lresident_nested_invalidate_ept02_hardware",
+    "shl r9, 12",
+    "add r9, qword ptr [r12 + {b_nested_ept02_table_pool}]",
+    "shl r10, 12",
+    "add r10, qword ptr [r12 + {b_nested_ept02_table_pool}]",
+    "mov r8, qword ptr [r12 + {b_nested_ept02_pointer}]",
+    "mov rdx, {host_page_address_mask}",
+    "and r8, rdx",
+    "xor ecx, ecx",
+    ".Lresident_nested_invalidate_ept02_root_loop:",
+    "mov rax, qword ptr [r8 + rcx * 8]",
+    "and rax, rdx",
+    "cmp rax, r9",
+    "jb .Lresident_nested_invalidate_ept02_root_next",
+    "cmp rax, r10",
+    "jae .Lresident_nested_invalidate_ept02_root_next",
+    "mov qword ptr [r8 + rcx * 8], 0",
+    ".Lresident_nested_invalidate_ept02_root_next:",
+    "inc ecx",
+    "cmp ecx, 512",
+    "jb .Lresident_nested_invalidate_ept02_root_loop",
+    "mov rdi, r9",
+    "mov rcx, r10",
+    "sub rcx, r9",
+    "shr rcx, 3",
+    "xor eax, eax",
+    "cld",
+    "rep stosq",
+    "mov rax, qword ptr [r12 + {b_nested_ept02_table_pool_reserved}]",
+    "mov qword ptr [r12 + {b_nested_ept02_table_pool_used}], rax",
+    ".Lresident_nested_invalidate_ept02_hardware:",
+    "sub rsp, 16",
+    "mov r11, qword ptr [r12 + {b_nested_ept02_pointer}]",
+    "mov qword ptr [rsp], r11",
+    "mov qword ptr [rsp + 8], 0",
+    "mov eax, 1",
+    "invept rax, xmmword ptr [rsp]",
+    "lea rsp, [rsp + 16]",
+    "jna .Lresident_dispatch_halt",
     "ret",
     ".Lresident_nested_host_page_is_mapped:",
     "mov rax, qword ptr [r12 + {b_expected_host_cr3}]",
@@ -3430,6 +3733,8 @@ global_asm!(
     "cmp r10, {vmcs_field_idt_vectoring_info}",
     "je .Lresident_nested_vmwrite_read_only",
     "cmp r10, {vmcs_field_idt_vectoring_error}",
+    "je .Lresident_nested_vmwrite_read_only",
+    "cmp r10, {vmcs_field_guest_physical_address}",
     "je .Lresident_nested_vmwrite_read_only",
     "mov rdx, r10",
     "mov rax, r10",
@@ -4757,6 +5062,16 @@ global_asm!(
     "jz .Lresident_dispatch_vmread_failed",
     "test r11b, 3",
     "jnz .Lresident_nested_inject_gp",
+    "mov r10, qword ptr [r12 + {b_nested_vmxon_region}]",
+    "mov rax, qword ptr [r12 + {b_last_guest_rip}]",
+    "cmp rax, qword ptr [r10 + {nested_invept_rip_offset}]",
+    "je .Lresident_dispatch_invept_probe",
+    "mov eax, dword ptr [r12 + {b_last_reason}]",
+    "and eax, 0xffff",
+    "cmp eax, {invept_reason}",
+    "je .Lresident_dispatch_invept_hardware",
+    "jmp .Lresident_nested_inject_ud",
+    ".Lresident_dispatch_invept_probe:",
     "inc qword ptr [r12 + {b_nested_invept_software_count}]",
     "mov r11, qword ptr [r12 + {b_nested_vmxon_operand}]",
     "cmp qword ptr [rsp + 24], r11",
@@ -4788,6 +5103,40 @@ global_asm!(
     ".Lresident_nested_invept_select_initial:",
     "mov r11, qword ptr [r12 + {b_nested_ept02_initial_pointer}]",
     "mov qword ptr [r12 + {b_nested_ept02_pointer}], r11",
+    "jmp .Lresident_nested_succeed",
+    ".Lresident_dispatch_invept_hardware:",
+    "mov rax, {exit_instruction_info}",
+    "vmread r13, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "mov eax, r13d",
+    "shr eax, 28",
+    "and eax, 15",
+    "mov r15, rsp",
+    "call .Lresident_nested_read_gpr",
+    "cmp r11, 1",
+    "jne .Lresident_nested_invalid_invalidation_operand",
+    "call .Lresident_nested_decode_memory_operand",
+    "cmp qword ptr [r10 + 8], 0",
+    "jne .Lresident_nested_invalid_invalidation_operand",
+    "mov r14, qword ptr [r10]",
+    "mov r11, r14",
+    "and r11d, 0x3f",
+    "cmp r11d, 0x1e",
+    "jne .Lresident_nested_invalid_invalidation_operand",
+    "test r14, 0xfc0",
+    "jnz .Lresident_nested_invalid_invalidation_operand",
+    "mov r11, r14",
+    "mov rdx, {host_page_address_mask}",
+    "and r11, rdx",
+    "call .Lresident_nested_physical_address_is_valid",
+    "test eax, eax",
+    "jz .Lresident_nested_invalid_invalidation_operand",
+    "call .Lresident_nested_host_page_is_mapped",
+    "test eax, eax",
+    "jz .Lresident_nested_invalid_invalidation_operand",
+    "cmp r14, qword ptr [r12 + {b_nested_vmcs12_ept_pointer}]",
+    "jne .Lresident_nested_succeed",
+    "call .Lresident_nested_invalidate_ept02",
     "jmp .Lresident_nested_succeed",
     ".Lresident_dispatch_invvpid:",
     "inc qword ptr [r12 + {b_nested_invvpid_count}]",
@@ -5847,7 +6196,7 @@ global_asm!(
     ".quad 0x481e, 0x4820, 0x4822, 0x4824, 0x4826, 0x482a, 0x6824, 0x6826",
     ".quad 0x4c00, 0x6c10, 0x6c12, 0x681a, 0x6822, 0x2000, 0x2002, 0x202c",
     ".quad 0x6008, 0x600a, 0x600c, 0x600e, 0x401c, 0x2012, 0x2014, 0x2006",
-    ".quad 0x2008, 0x200a, 0x4404, 0x4406, 0x4408, 0x440a",
+    ".quad 0x2008, 0x200a, 0x4404, 0x4406, 0x4408, 0x440a, 0x2400",
     ".balign 8",
     ".Lresident_guest_gpr_offsets:",
     ".byte 0, 8, 16, 24, 0, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112",
@@ -6347,6 +6696,7 @@ global_asm!(
     b_nested_vmcs12_idt_vectoring_info = const BCTX_NESTED_VMCS12_IDT_VECTORING_INFO,
     b_nested_vmcs12_idt_vectoring_error = const BCTX_NESTED_VMCS12_IDT_VECTORING_ERROR,
     b_nested_vmcs12_ept_pointer = const BCTX_NESTED_VMCS12_EPT_POINTER,
+    b_nested_vmcs12_guest_physical_address = const BCTX_NESTED_VMCS12_GUEST_PHYSICAL_ADDRESS,
     b_nested_vmcs12_cr0_mask = const BCTX_NESTED_VMCS12_CR0_MASK,
     b_nested_vmcs12_cr4_mask = const BCTX_NESTED_VMCS12_CR4_MASK,
     b_nested_vmcs12_cr0_shadow = const BCTX_NESTED_VMCS12_CR0_SHADOW,
@@ -6392,7 +6742,13 @@ global_asm!(
     b_nested_ept02_pointer = const BCTX_NESTED_EPT02_POINTER,
     b_nested_ept02_alternate_pointer = const BCTX_NESTED_EPT02_ALTERNATE_POINTER,
     b_nested_ept02_initial_pointer = const BCTX_NESTED_EPT02_INITIAL_POINTER,
+    b_nested_ept02_table_pool = const BCTX_NESTED_EPT02_TABLE_POOL,
+    b_nested_ept02_table_pool_pages = const BCTX_NESTED_EPT02_TABLE_POOL_PAGES,
+    b_nested_ept02_table_pool_used = const BCTX_NESTED_EPT02_TABLE_POOL_USED,
+    b_nested_ept02_table_pool_reserved = const BCTX_NESTED_EPT02_TABLE_POOL_RESERVED,
+    b_nested_ept02_invalidation_count = const BCTX_NESTED_EPT02_INVALIDATION_COUNT,
     b_nested_ept_target_gpa = const BCTX_NESTED_EPT_TARGET_GPA,
+    b_nested_ept_composition_count = const BCTX_NESTED_EPT_COMPOSITION_COUNT,
     b_nested_ept_second_target_gpa = const BCTX_NESTED_EPT_SECOND_TARGET_GPA,
     b_nested_ept12_source_leaf = const BCTX_NESTED_EPT12_SOURCE_LEAF,
     b_nested_ept12_source_leaf_attributes = const BCTX_NESTED_EPT12_SOURCE_LEAF_ATTRIBUTES,
@@ -6470,6 +6826,7 @@ global_asm!(
     vmcs_field_exit_intr_error = const VMCS_FIELD_VM_EXIT_INTR_ERROR_CODE,
     vmcs_field_idt_vectoring_info = const VMCS_FIELD_IDT_VECTORING_INFO_FIELD,
     vmcs_field_idt_vectoring_error = const VMCS_FIELD_IDT_VECTORING_ERROR_CODE,
+    vmcs_field_guest_physical_address = const VMCS_FIELD_GUEST_PHYSICAL_ADDRESS,
     vmcs_field_instruction_error = const VMCS_FIELD_VM_INSTRUCTION_ERROR,
     event_magic_offset = const EVENT_CTX_MAGIC,
     event_ebs_seen = const EVENT_CTX_EBS_SEEN,

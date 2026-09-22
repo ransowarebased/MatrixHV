@@ -35,6 +35,7 @@ DEFAULT_CASES = (
     "MSR_switch",
     "interrupt",
     "nmi_hlt",
+    "ept_access_test_read_write_execute",
 )
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SUMMARY_PATTERN = re.compile(
@@ -61,6 +62,7 @@ REQUIRED_NMI_HLT_PASSES = (
     "PASS: NMI intercept while running guest",
     "PASS: intercepted NMI + hlt",
 )
+REQUIRED_EPT_PASSES = ("Test suite: ept_access_test_read_write_execute",)
 
 
 @dataclass(frozen=True)
@@ -330,6 +332,10 @@ def parse_summary(output: str) -> TestSummary:
     missing_nmi_passes = [record for record in REQUIRED_NMI_HLT_PASSES if record not in clean_output]
     if missing_nmi_passes:
         raise ValueError(f"nmi_hlt did not complete required checks: {missing_nmi_passes}")
+
+    missing_ept_passes = [record for record in REQUIRED_EPT_PASSES if record not in clean_output]
+    if missing_ept_passes:
+        raise ValueError(f"EPT tests did not complete required checks: {missing_ept_passes}")
 
     skip_records = [match.group("reason") for match in SKIP_PATTERN.finditer(clean_output)]
     if summary.skipped != len(skip_records):

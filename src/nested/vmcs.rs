@@ -62,6 +62,7 @@ pub const VMCS_FIELD_APIC_ACCESS_ADDR: u64 = 0x2014;
 pub const VMCS_FIELD_EPT_POINTER: u64 = 0x201a;
 pub const VMCS_FIELD_XSS_EXITING_BITMAP: u64 = 0x202c;
 pub const VMCS_FIELD_VMCS_LINK_POINTER: u64 = 0x2800;
+pub const VMCS_FIELD_GUEST_PHYSICAL_ADDRESS: u64 = 0x2400;
 pub const VMCS_FIELD_GUEST_IA32_DEBUGCTL: u64 = 0x2802;
 pub const VMCS_FIELD_GUEST_IA32_PAT: u64 = 0x2804;
 pub const VMCS_FIELD_GUEST_IA32_EFER: u64 = 0x2806;
@@ -154,7 +155,7 @@ pub const VMCS_FIELD_HOST_SYSENTER_EIP: u64 = 0x6c12;
 pub const VMCS_FIELD_HOST_RSP: u64 = 0x6c14;
 pub const VMCS_FIELD_HOST_RIP: u64 = 0x6c16;
 
-pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 110;
+pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 111;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Vmcs12ExtendedField {
@@ -602,6 +603,10 @@ pub const VMCS12_EXTENDED_FIELDS: [Vmcs12ExtendedField; VMCS12_EXTENDED_FIELD_CO
     Vmcs12ExtendedField {
         encoding: VMCS_FIELD_IDT_VECTORING_ERROR_CODE,
         index: 109,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_GUEST_PHYSICAL_ADDRESS,
+        index: 110,
     },
 ];
 
