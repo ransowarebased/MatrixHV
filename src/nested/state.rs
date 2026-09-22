@@ -108,7 +108,7 @@ pub struct NestedVmxState {
     pub ept02_table_pool: u64,
     pub ept02_table_pool_pages: u64,
     pub ept02_table_pool_used: u64,
-    pub ept02_table_pool_reserved: u64,
+    pub ept01_pointer: u64,
     pub ept02_invalidation_count: u64,
 }
 
@@ -251,7 +251,7 @@ impl NestedVmxState {
             ept02_table_pool: 0,
             ept02_table_pool_pages: 0,
             ept02_table_pool_used: 0,
-            ept02_table_pool_reserved: 0,
+            ept01_pointer: 0,
             ept02_invalidation_count: 0,
         }
     }
@@ -270,7 +270,6 @@ impl NestedVmxState {
         self.ept02_table_pool = base;
         self.ept02_table_pool_pages = pages as u64;
         self.ept02_table_pool_used = used_pages as u64;
-        self.ept02_table_pool_reserved = used_pages as u64;
     }
 
     pub fn configure_ept(&mut self, configuration: NestedEptConfiguration) {

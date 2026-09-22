@@ -60,6 +60,7 @@ pub const VMX_PRIMARY_KVM_EXITING_CONTROLS: u32 = VMX_PRIMARY_INTERRUPT_WINDOW_E
     | VMX_PRIMARY_MONITOR_EXITING;
 pub const VMX_SECONDARY_ENABLE_EPT: u32 = 1 << 1;
 pub const VMX_SECONDARY_ENABLE_VPID: u32 = 1 << 5;
+pub const VMX_SECONDARY_UNRESTRICTED_GUEST: u32 = 1 << 7;
 pub const VMX_LEGACY_PINBASED_DEFAULT1: u32 = 0x0000_0016;
 pub const VMX_LEGACY_PROCBASED_DEFAULT1: u32 = 0x0401_e172;
 pub const VMX_LEGACY_EXIT_DEFAULT1: u32 = 0x0003_6dff;
@@ -69,12 +70,14 @@ pub const VMX_EPT_MEMORY_TYPE_WB: u64 = 1 << 14;
 pub const VMX_EPT_2MB_PAGE: u64 = 1 << 16;
 pub const VMX_EPT_INVEPT: u64 = 1 << 20;
 pub const VMX_EPT_INVEPT_SINGLE_CONTEXT: u64 = 1 << 25;
+pub const VMX_EPT_INVEPT_ALL_CONTEXTS: u64 = 1 << 26;
 pub const VMX_VPID_INVVPID: u64 = 1 << 32;
 pub const VMX_VPID_INVVPID_SINGLE_CONTEXT: u64 = 1 << 41;
 pub const VMX_EPT_CAPABILITIES: u64 =
     VMX_EPT_PAGE_WALK_LENGTH_4 | VMX_EPT_MEMORY_TYPE_WB | VMX_EPT_2MB_PAGE;
 pub const VMX_SOFTWARE_INVALIDATION_CAPABILITIES: u64 = VMX_EPT_INVEPT
     | VMX_EPT_INVEPT_SINGLE_CONTEXT
+    | VMX_EPT_INVEPT_ALL_CONTEXTS
     | VMX_VPID_INVVPID
     | VMX_VPID_INVVPID_SINGLE_CONTEXT;
 pub const VMX_CR3_TARGET_COUNT: u64 = 4;
@@ -199,8 +202,10 @@ impl NestedVmxCapabilities {
             | VM_EXIT_ACK_INTERRUPT_ON_EXIT;
         let entry_supported = VMX_LEGACY_ENTRY_DEFAULT1 | VM_ENTRY_IA32E_MODE_GUEST;
         let secondary_ept = restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_EPT, 0);
+        let secondary_unrestricted =
+            restrict_control(host.procbased_ctls2, VMX_SECONDARY_UNRESTRICTED_GUEST, 0);
         let secondary_supported = if ept_supported {
-            secondary_ept | (u64::from(VMX_SECONDARY_ENABLE_VPID) << 32)
+            secondary_ept | secondary_unrestricted | (u64::from(VMX_SECONDARY_ENABLE_VPID) << 32)
         } else {
             0
         };

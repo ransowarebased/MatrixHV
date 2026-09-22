@@ -111,6 +111,9 @@ impl ProtectionTablePool {
         let entries = unsafe {
             NonNull::new_unchecked(self.pages.pointer().as_ptr().add(page_offset).cast::<u64>())
         };
+        unsafe {
+            entries.as_ptr().write_bytes(0, EPT_ENTRY_COUNT);
+        }
         Ok(TablePage {
             physical_address,
             entries,
@@ -249,10 +252,10 @@ impl IdentityEpt {
         self.ept_pointer
     }
 
-    pub fn clone_shadow(&self) -> Result<Self, EptError> {
+    pub fn sparse_shadow(&self) -> Result<Self, EptError> {
         let protection_pool = ProtectionTablePool::allocate()?;
         let mut pages = Vec::new();
-        let root = clone_table(self.root, 4, &mut pages)?;
+        let root = allocate_table(&mut pages)?;
         let ept_pointer = root.physical_address | (self.ept_pointer & !EPT_ADDRESS_MASK);
         Ok(Self {
             pages,
@@ -475,14 +478,30 @@ impl IdentityEpt {
         let pt_index = ((physical_address / PAGE_SIZE as u64) & 0x1ff) as usize;
 
         let pml4_entry = read_entry(self.root, pml4_index);
-        let pdpt = table_from_entry(pml4_entry)?;
+        let pdpt = if pml4_entry & EPT_PERMISSIONS == 0 {
+            let pdpt = self.protection_pool.allocate_table()?;
+            write_entry(self.root, pml4_index, table_entry(pdpt.physical_address));
+            pdpt
+        } else {
+            table_from_entry(pml4_entry)?
+        };
         let pdpt_entry = read_entry(pdpt, pdpt_index);
         if pdpt_entry & EPT_LARGE_PAGE != 0 {
             return Err(EptError::InvalidPageTable);
         }
-        let pd = table_from_entry(pdpt_entry)?;
+        let pd = if pdpt_entry & EPT_PERMISSIONS == 0 {
+            let pd = self.protection_pool.allocate_table()?;
+            write_entry(pdpt, pdpt_index, table_entry(pd.physical_address));
+            pd
+        } else {
+            table_from_entry(pdpt_entry)?
+        };
         let pd_entry = read_entry(pd, pd_index);
-        let pt = if pd_entry & EPT_LARGE_PAGE != 0 {
+        let pt = if pd_entry & EPT_PERMISSIONS == 0 {
+            let pt = self.protection_pool.allocate_table()?;
+            write_entry(pd, pd_index, table_entry(pt.physical_address));
+            pt
+        } else if pd_entry & EPT_LARGE_PAGE != 0 {
             let pt = self.protection_pool.allocate_table()?;
             let base_address = (pd_entry & EPT_ADDRESS_MASK) & !(EPT_2MB_PAGE_SIZE - 1);
             let leaf_attributes = pd_entry & (EPT_PERMISSIONS | (0x7 << EPT_MEMORY_TYPE_SHIFT));
@@ -531,29 +550,6 @@ impl IdentityEpt {
     }
 }
 
-fn clone_table(
-    source: TablePage,
-    level: u8,
-    pages: &mut Vec<ResidentPages>,
-) -> Result<TablePage, EptError> {
-    let destination = allocate_table(pages)?;
-    for index in 0..EPT_ENTRY_COUNT {
-        let entry = read_entry(source, index);
-        if entry == 0 || level == 1 || entry & EPT_LARGE_PAGE != 0 {
-            write_entry(destination, index, entry);
-            continue;
-        }
-        let child = table_from_entry(entry)?;
-        let cloned_child = clone_table(child, level - 1, pages)?;
-        write_entry(
-            destination,
-            index,
-            (entry & !EPT_ADDRESS_MASK) | cloned_child.physical_address,
-        );
-    }
-    Ok(destination)
-}
-
 fn translation_from_leaf(
     entry: u64,
     guest_physical_address: u64,
@@ -576,6 +572,9 @@ fn allocate_table(pages: &mut Vec<ResidentPages>) -> Result<TablePage, EptError>
     let page = ResidentPages::allocate(1, AddressConstraint::Any).map_err(EptError::Allocation)?;
     let physical_address = page.physical_address();
     let entries = page.pointer().cast::<u64>();
+    unsafe {
+        entries.as_ptr().write_bytes(0, EPT_ENTRY_COUNT);
+    }
     pages.push(page);
     Ok(TablePage {
         physical_address,

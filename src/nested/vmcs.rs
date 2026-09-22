@@ -66,6 +66,10 @@ pub const VMCS_FIELD_GUEST_PHYSICAL_ADDRESS: u64 = 0x2400;
 pub const VMCS_FIELD_GUEST_IA32_DEBUGCTL: u64 = 0x2802;
 pub const VMCS_FIELD_GUEST_IA32_PAT: u64 = 0x2804;
 pub const VMCS_FIELD_GUEST_IA32_EFER: u64 = 0x2806;
+pub const VMCS_FIELD_GUEST_PDPTR0: u64 = 0x280a;
+pub const VMCS_FIELD_GUEST_PDPTR1: u64 = 0x280c;
+pub const VMCS_FIELD_GUEST_PDPTR2: u64 = 0x280e;
+pub const VMCS_FIELD_GUEST_PDPTR3: u64 = 0x2810;
 pub const VMCS_FIELD_HOST_IA32_PAT: u64 = 0x2c00;
 pub const VMCS_FIELD_HOST_IA32_EFER: u64 = 0x2c02;
 pub const VMCS_FIELD_PIN_BASED_VM_EXEC_CONTROL: u64 = 0x4000;
@@ -155,7 +159,7 @@ pub const VMCS_FIELD_HOST_SYSENTER_EIP: u64 = 0x6c12;
 pub const VMCS_FIELD_HOST_RSP: u64 = 0x6c14;
 pub const VMCS_FIELD_HOST_RIP: u64 = 0x6c16;
 
-pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 111;
+pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 115;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Vmcs12ExtendedField {
@@ -607,6 +611,22 @@ pub const VMCS12_EXTENDED_FIELDS: [Vmcs12ExtendedField; VMCS12_EXTENDED_FIELD_CO
     Vmcs12ExtendedField {
         encoding: VMCS_FIELD_GUEST_PHYSICAL_ADDRESS,
         index: 110,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_GUEST_PDPTR0,
+        index: 111,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_GUEST_PDPTR1,
+        index: 112,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_GUEST_PDPTR2,
+        index: 113,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_GUEST_PDPTR3,
+        index: 114,
     },
 ];
 

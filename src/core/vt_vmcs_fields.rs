@@ -1,3 +1,4 @@
+pub const VIRTUAL_PROCESSOR_ID: u64 = 0x0000;
 pub const GUEST_ES_SELECTOR: u64 = 0x0800;
 pub const GUEST_CS_SELECTOR: u64 = 0x0802;
 pub const GUEST_SS_SELECTOR: u64 = 0x0804;
@@ -18,6 +19,10 @@ pub const VMCS_LINK_POINTER: u64 = 0x2800;
 pub const GUEST_IA32_DEBUGCTL: u64 = 0x2802;
 pub const GUEST_IA32_PAT: u64 = 0x2804;
 pub const GUEST_IA32_EFER: u64 = 0x2806;
+pub const GUEST_PDPTR0: u64 = 0x280a;
+pub const GUEST_PDPTR1: u64 = 0x280c;
+pub const GUEST_PDPTR2: u64 = 0x280e;
+pub const GUEST_PDPTR3: u64 = 0x2810;
 pub const HOST_IA32_PAT: u64 = 0x2c00;
 pub const HOST_IA32_EFER: u64 = 0x2c02;
 pub const IO_BITMAP_A: u64 = 0x2000;

@@ -169,10 +169,10 @@ impl ResidentCpuResources {
         ept12.remap_page(source_gpa, target_gpa)?;
         let source_leaf = ept12.leaf_entry_physical_address(source_gpa)?;
         let source_leaf_attributes = ept12.leaf_entry_value(source_gpa)? & 0xfff;
-        let mut ept02 = ept01.clone_shadow()?;
+        let mut ept02 = ept01.sparse_shadow()?;
         let composition = ept02.compose_page(&ept12, ept01, source_gpa)?;
         ept12.remap_page(source_gpa, second_target_gpa)?;
-        let mut ept02_alternate = ept01.clone_shadow()?;
+        let mut ept02_alternate = ept01.sparse_shadow()?;
         let alternate_composition = ept02_alternate.compose_page(&ept12, ept01, source_gpa)?;
         ept12.remap_page(source_gpa, target_gpa)?;
         unsafe {

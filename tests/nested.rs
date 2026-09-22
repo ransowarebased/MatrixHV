@@ -126,7 +126,7 @@ fn nested_state_records_dynamic_ept02_table_pool() {
     assert_eq!(state.ept02_table_pool, 0x70_0000);
     assert_eq!(state.ept02_table_pool_pages, 128);
     assert_eq!(state.ept02_table_pool_used, 9);
-    assert_eq!(state.ept02_table_pool_reserved, 9);
+    assert_eq!(state.ept01_pointer, 0);
     assert_eq!(state.ept02_invalidation_count, 0);
 }
 
@@ -210,7 +210,9 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     let true_primary_control = control_capabilities(0, primary_may_be_one);
     let secondary_control = control_capabilities(
         0,
-        capabilities::VMX_SECONDARY_ENABLE_EPT | capabilities::VMX_SECONDARY_ENABLE_VPID,
+        capabilities::VMX_SECONDARY_ENABLE_EPT
+            | capabilities::VMX_SECONDARY_ENABLE_VPID
+            | capabilities::VMX_SECONDARY_UNRESTRICTED_GUEST,
     );
 
     assert_eq!(capabilities.vmx_pinbased_ctls, pinbased_control);
@@ -235,6 +237,10 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
         capabilities::VMX_EPT_CAPABILITIES | capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES
     );
     assert_eq!(capabilities::VMX_EPT_CAPABILITIES, 0x1_4040);
+    assert_ne!(
+        capabilities.vmx_ept_vpid_cap & capabilities::VMX_EPT_INVEPT_ALL_CONTEXTS,
+        0
+    );
     assert_eq!(
         capabilities.vmx_ept_vpid_cap & capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES,
         capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES
@@ -701,6 +707,10 @@ fn supported_vmcs12_fields_match_intel_encodings() {
     assert_eq!(VMCS_FIELD_GUEST_RSP, 0x681c);
     assert_eq!(VMCS_FIELD_GUEST_RIP, 0x681e);
     assert_eq!(VMCS_FIELD_GUEST_RFLAGS, 0x6820);
+    assert_eq!(vmcs::VMCS_FIELD_GUEST_PDPTR0, 0x280a);
+    assert_eq!(vmcs::VMCS_FIELD_GUEST_PDPTR1, 0x280c);
+    assert_eq!(vmcs::VMCS_FIELD_GUEST_PDPTR2, 0x280e);
+    assert_eq!(vmcs::VMCS_FIELD_GUEST_PDPTR3, 0x2810);
     assert_eq!(VMCS_FIELD_HOST_RSP, 0x6c14);
     assert_eq!(VMCS_FIELD_HOST_RIP, 0x6c16);
     assert_eq!(VMCS12_LAUNCH_STATE_CLEAR, 0);
@@ -743,4 +753,16 @@ fn extended_vmcs12_fields_are_dense_unique_and_cover_entry_state() {
             .iter()
             .any(|field| field.encoding == vmcs::VMCS_FIELD_GUEST_PHYSICAL_ADDRESS)
     );
+    for encoding in [
+        vmcs::VMCS_FIELD_GUEST_PDPTR0,
+        vmcs::VMCS_FIELD_GUEST_PDPTR1,
+        vmcs::VMCS_FIELD_GUEST_PDPTR2,
+        vmcs::VMCS_FIELD_GUEST_PDPTR3,
+    ] {
+        assert!(
+            vmcs::VMCS12_EXTENDED_FIELDS
+                .iter()
+                .any(|field| field.encoding == encoding)
+        );
+    }
 }
