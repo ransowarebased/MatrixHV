@@ -34,6 +34,7 @@ DEFAULT_CASES = (
     "I/O_bitmap",
     "MSR_switch",
     "instruction_intercept",
+    "vmx_store_tsc_test",
     "vmx_intr_window_test",
     "vmx_nmi_window_test",
     "interrupt",
@@ -79,6 +80,11 @@ REQUIRED_INSTRUCTION_INTERCEPT_PASSES = (
     "PASS: intercept CR8 load",
     "PASS: intercept CR8 store",
     "PASS: intercept DR7 store",
+)
+REQUIRED_TSC_OFFSET_PASSES = (
+    "Test suite: vmx_store_tsc_test",
+    "PASS: RDTSC value in the guest",
+    "PASS: IA32_TSC value saved in the VM-exit MSR-store list",
 )
 REQUIRED_WINDOW_EXIT_PASSES = (
     "Test suite: vmx_intr_window_test",
@@ -372,6 +378,15 @@ def parse_summary(output: str) -> TestSummary:
         raise ValueError(
             "instruction intercept did not complete required checks: "
             f"{missing_instruction_passes}"
+        )
+
+    missing_tsc_offset_passes = [
+        record for record in REQUIRED_TSC_OFFSET_PASSES if record not in clean_output
+    ]
+    if missing_tsc_offset_passes:
+        raise ValueError(
+            "TSC offset composition did not complete required checks: "
+            f"{missing_tsc_offset_passes}"
         )
 
     missing_window_passes = [

@@ -88,7 +88,8 @@ def validate(start, end, cpu_count):
         pinbased_may_be_one = pinbased_default | (1 << 0) | (1 << 3) | (1 << 5)
         pinbased_capability = pinbased_default | (pinbased_may_be_one << 32)
         primary_may_be_one = procbased_default | sum(
-            1 << bit for bit in (2, 7, 9, 11, 15, 16, 19, 20, 22, 23, 24, 25, 28, 31)
+            1 << bit
+            for bit in (2, 3, 7, 9, 10, 11, 15, 16, 19, 20, 22, 23, 24, 25, 28, 29, 31)
         )
         primary_capability = procbased_default | (primary_may_be_one << 32)
         exit_required = exit_default | (1 << 9)
