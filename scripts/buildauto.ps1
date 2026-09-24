@@ -164,6 +164,7 @@ if (-not $SkipImage) {
     $ImageArguments = @{
         Configuration = $Configuration
         BootBinary = $BootBinary
+        WindowsNeoSource = $BuiltWindowsNeo
     }
 
     if (-not [string]::IsNullOrWhiteSpace($VeraCryptEfiSource)) {

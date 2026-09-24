@@ -1,5 +1,5 @@
 use super::capabilities::NestedVmxCapabilities;
-use super::vmcs::NestedVmcs12State;
+use super::vmcs::{NestedVmcs12State, VMCS12_EXTENDED_FIELD_COUNT};
 
 pub const INVALID_VMCS_POINTER: u64 = u64::MAX;
 
@@ -110,6 +110,22 @@ pub struct NestedVmxState {
     pub ept02_table_pool_used: u64,
     pub ept01_pointer: u64,
     pub ept02_invalidation_count: u64,
+    pub vmcs02_launched: u64,
+    pub ept02_cache_initialized: u64,
+    pub ept02_cached_ept12_pointer: u64,
+    pub ept02_cached_pointer: u64,
+    pub ept02_cached_table_pool: u64,
+    pub ept02_cached_table_pool_pages: u64,
+    pub ept02_cached_table_pool_used: u64,
+    pub ept02_mbec: u64,
+    pub vmcs02_guest_cache_valid: u64,
+    pub vmcs02_control_cache_valid: [u64; 2],
+    pub vmcs02_field_cache: [u64; VMCS12_EXTENDED_FIELD_COUNT],
+    pub vmcs02_last_vpid: u64,
+    pub ept02_cached_mbec: u64,
+    pub exit_started_tsc: u64,
+    pub exit_handler_cycles: [u64; 4],
+    pub reflected_exit_counts: [u32; 44],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,6 +269,22 @@ impl NestedVmxState {
             ept02_table_pool_used: 0,
             ept01_pointer: 0,
             ept02_invalidation_count: 0,
+            vmcs02_launched: 0,
+            ept02_cache_initialized: 0,
+            ept02_cached_ept12_pointer: 0,
+            ept02_cached_pointer: 0,
+            ept02_cached_table_pool: 0,
+            ept02_cached_table_pool_pages: 0,
+            ept02_cached_table_pool_used: 0,
+            ept02_mbec: 0,
+            vmcs02_guest_cache_valid: 0,
+            vmcs02_control_cache_valid: [0; 2],
+            vmcs02_field_cache: [0; VMCS12_EXTENDED_FIELD_COUNT],
+            vmcs02_last_vpid: 0,
+            ept02_cached_mbec: 0,
+            exit_started_tsc: 0,
+            exit_handler_cycles: [0; 4],
+            reflected_exit_counts: [0; 44],
         }
     }
 
@@ -266,10 +298,17 @@ impl NestedVmxState {
         self.vmcs01_entry_msr_list = composition.vmcs01_entry_msr_list;
     }
 
-    pub fn configure_ept02_table_pool(&mut self, base: u64, pages: usize, used_pages: usize) {
+    pub fn configure_ept02_table_pools(&mut self, pools: [(u64, usize, usize); 2]) {
+        let [
+            (base, pages, used_pages),
+            (cached_base, cached_pages, cached_used_pages),
+        ] = pools;
         self.ept02_table_pool = base;
         self.ept02_table_pool_pages = pages as u64;
         self.ept02_table_pool_used = used_pages as u64;
+        self.ept02_cached_table_pool = cached_base;
+        self.ept02_cached_table_pool_pages = cached_pages as u64;
+        self.ept02_cached_table_pool_used = cached_used_pages as u64;
     }
 
     pub fn configure_ept(&mut self, configuration: NestedEptConfiguration) {
@@ -287,5 +326,6 @@ impl NestedVmxState {
         self.ept_alternate_composed_hpa = configuration.alternate_composed_hpa;
         self.ept_alternate_permissions = configuration.alternate_permissions;
         self.ept02_initial_pointer = configuration.ept02_pointer;
+        self.ept02_cached_pointer = configuration.alternate_ept02_pointer;
     }
 }

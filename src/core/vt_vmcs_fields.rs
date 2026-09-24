@@ -32,6 +32,7 @@ pub const VM_EXIT_MSR_STORE_ADDR: u64 = 0x2006;
 pub const VM_EXIT_MSR_LOAD_ADDR: u64 = 0x2008;
 pub const VM_ENTRY_MSR_LOAD_ADDR: u64 = 0x200a;
 pub const TSC_OFFSET: u64 = 0x2010;
+pub const VIRTUAL_APIC_PAGE_ADDR: u64 = 0x2012;
 pub const EPT_POINTER: u64 = 0x201a;
 pub const XSS_EXITING_BITMAP: u64 = 0x202c;
 
@@ -49,6 +50,7 @@ pub const VM_ENTRY_MSR_LOAD_COUNT: u64 = 0x4014;
 pub const VM_ENTRY_INTR_INFO_FIELD: u64 = 0x4016;
 pub const VM_ENTRY_EXCEPTION_ERROR_CODE: u64 = 0x4018;
 pub const VM_ENTRY_INSTRUCTION_LEN: u64 = 0x401a;
+pub const TPR_THRESHOLD: u64 = 0x401c;
 pub const SECONDARY_VM_EXEC_CONTROL: u64 = 0x401e;
 
 pub const VM_INSTRUCTION_ERROR: u64 = 0x4400;
@@ -90,6 +92,7 @@ pub const CR0_READ_SHADOW: u64 = 0x6004;
 pub const CR4_READ_SHADOW: u64 = 0x6006;
 
 pub const EXIT_QUALIFICATION: u64 = 0x6400;
+pub const GUEST_LINEAR_ADDRESS: u64 = 0x640a;
 pub const GUEST_PHYSICAL_ADDRESS: u64 = 0x2400;
 
 pub const GUEST_CR0: u64 = 0x6800;

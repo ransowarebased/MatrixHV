@@ -3,6 +3,7 @@ pub const IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX: u64 = 1 << 2;
 pub const VMX_MEMORY_TYPE_WRITE_BACK: u64 = 6;
 pub const VMX_REGION_SIZE: u64 = 4096;
 pub const VMX_BASIC_TRUE_CONTROLS: u64 = 1 << 55;
+pub const VMX_BASIC_IO_EXIT_INFORMATION: u64 = 1 << 54;
 
 pub const IA32_VMX_BASIC_MSR: u32 = 0x480;
 pub const IA32_VMX_PINBASED_CTLS_MSR: u32 = 0x481;
@@ -27,23 +28,30 @@ pub const VMX_PIN_NMI_EXITING: u32 = 1 << 3;
 pub const VMX_PIN_VIRTUAL_NMIS: u32 = 1 << 5;
 pub const VM_EXIT_ACK_INTERRUPT_ON_EXIT: u32 = 1 << 15;
 pub const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
+pub const VM_EXIT_LOAD_IA32_PAT: u32 = 1 << 19;
+pub const VM_EXIT_LOAD_IA32_EFER: u32 = 1 << 21;
 pub const VM_ENTRY_IA32E_MODE_GUEST: u32 = 1 << 9;
+pub const VM_ENTRY_LOAD_IA32_PAT: u32 = 1 << 14;
+pub const VM_ENTRY_LOAD_IA32_EFER: u32 = 1 << 15;
 pub const VMX_PRIMARY_INTERRUPT_WINDOW_EXITING: u32 = 1 << 2;
 pub const VMX_PRIMARY_USE_TSC_OFFSETTING: u32 = 1 << 3;
 pub const VMX_PRIMARY_HLT_EXITING: u32 = 1 << 7;
 pub const VMX_PRIMARY_INVLPG_EXITING: u32 = 1 << 9;
 pub const VMX_PRIMARY_MWAIT_EXITING: u32 = 1 << 10;
 pub const VMX_PRIMARY_RDPMC_EXITING: u32 = 1 << 11;
+pub const VMX_PRIMARY_RDTSC_EXITING: u32 = 1 << 12;
 pub const VMX_PRIMARY_CR3_LOAD_EXITING: u32 = 1 << 15;
 pub const VMX_PRIMARY_CR3_STORE_EXITING: u32 = 1 << 16;
 pub const VMX_PRIMARY_CR8_LOAD_EXITING: u32 = 1 << 19;
 pub const VMX_PRIMARY_CR8_STORE_EXITING: u32 = 1 << 20;
+pub const VMX_PRIMARY_TPR_SHADOW: u32 = 1 << 21;
 pub const VMX_PRIMARY_NMI_WINDOW_EXITING: u32 = 1 << 22;
 pub const VMX_PRIMARY_MOV_DR_EXITING: u32 = 1 << 23;
 pub const VMX_PRIMARY_UNCONDITIONAL_IO_EXITING: u32 = 1 << 24;
 pub const VMX_PRIMARY_USE_IO_BITMAPS: u32 = 1 << 25;
 pub const VMX_PRIMARY_USE_MSR_BITMAPS: u32 = 1 << 28;
 pub const VMX_PRIMARY_MONITOR_EXITING: u32 = 1 << 29;
+pub const VMX_PRIMARY_PAUSE_EXITING: u32 = 1 << 30;
 pub const VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 pub const VMX_PRIMARY_KVM_EXITING_CONTROLS: u32 = VMX_PRIMARY_INTERRUPT_WINDOW_EXITING
     | VMX_PRIMARY_USE_TSC_OFFSETTING
@@ -59,12 +67,21 @@ pub const VMX_PRIMARY_KVM_EXITING_CONTROLS: u32 = VMX_PRIMARY_INTERRUPT_WINDOW_E
     | VMX_PRIMARY_MOV_DR_EXITING
     | VMX_PRIMARY_MONITOR_EXITING;
 pub const VMX_SECONDARY_ENABLE_EPT: u32 = 1 << 1;
+pub const VMX_SECONDARY_DESCRIPTOR_TABLE_EXITING: u32 = 1 << 2;
+pub const VMX_SECONDARY_ENABLE_RDTSCP: u32 = 1 << 3;
 pub const VMX_SECONDARY_ENABLE_VPID: u32 = 1 << 5;
 pub const VMX_SECONDARY_UNRESTRICTED_GUEST: u32 = 1 << 7;
+pub const VMX_SECONDARY_RDRAND_EXITING: u32 = 1 << 11;
+pub const VMX_SECONDARY_ENABLE_INVPCID: u32 = 1 << 12;
+pub const VMX_SECONDARY_ENABLE_XSAVES: u32 = 1 << 20;
+pub const VMX_SECONDARY_MODE_BASED_EXECUTE: u32 = 1 << 22;
 pub const VMX_LEGACY_PINBASED_DEFAULT1: u32 = 0x0000_0016;
 pub const VMX_LEGACY_PROCBASED_DEFAULT1: u32 = 0x0401_e172;
 pub const VMX_LEGACY_EXIT_DEFAULT1: u32 = 0x0003_6dff;
 pub const VMX_LEGACY_ENTRY_DEFAULT1: u32 = 0x0000_11ff;
+pub const VMX_EPT_EXECUTE_ONLY: u64 = 1;
+pub const VMX_EPT_ADVANCED_EXIT_INFO: u64 = 1 << 22;
+pub const VMX_EPT_ACCESSED_DIRTY: u64 = 1 << 21;
 pub const VMX_EPT_PAGE_WALK_LENGTH_4: u64 = 1 << 6;
 pub const VMX_EPT_MEMORY_TYPE_WB: u64 = 1 << 14;
 pub const VMX_EPT_2MB_PAGE: u64 = 1 << 16;
@@ -72,14 +89,24 @@ pub const VMX_EPT_INVEPT: u64 = 1 << 20;
 pub const VMX_EPT_INVEPT_SINGLE_CONTEXT: u64 = 1 << 25;
 pub const VMX_EPT_INVEPT_ALL_CONTEXTS: u64 = 1 << 26;
 pub const VMX_VPID_INVVPID: u64 = 1 << 32;
+pub const VMX_VPID_INVVPID_INDIVIDUAL_ADDRESS: u64 = 1 << 40;
 pub const VMX_VPID_INVVPID_SINGLE_CONTEXT: u64 = 1 << 41;
-pub const VMX_EPT_CAPABILITIES: u64 =
-    VMX_EPT_PAGE_WALK_LENGTH_4 | VMX_EPT_MEMORY_TYPE_WB | VMX_EPT_2MB_PAGE;
+pub const VMX_VPID_INVVPID_ALL_CONTEXTS: u64 = 1 << 42;
+pub const VMX_VPID_INVVPID_SINGLE_CONTEXT_RETAINING_GLOBALS: u64 = 1 << 43;
+pub const VMX_EPT_CAPABILITIES: u64 = VMX_EPT_EXECUTE_ONLY
+    | VMX_EPT_PAGE_WALK_LENGTH_4
+    | VMX_EPT_MEMORY_TYPE_WB
+    | VMX_EPT_2MB_PAGE
+    | VMX_EPT_ACCESSED_DIRTY
+    | VMX_EPT_ADVANCED_EXIT_INFO;
 pub const VMX_SOFTWARE_INVALIDATION_CAPABILITIES: u64 = VMX_EPT_INVEPT
     | VMX_EPT_INVEPT_SINGLE_CONTEXT
     | VMX_EPT_INVEPT_ALL_CONTEXTS
     | VMX_VPID_INVVPID
-    | VMX_VPID_INVVPID_SINGLE_CONTEXT;
+    | VMX_VPID_INVVPID_INDIVIDUAL_ADDRESS
+    | VMX_VPID_INVVPID_SINGLE_CONTEXT
+    | VMX_VPID_INVVPID_ALL_CONTEXTS
+    | VMX_VPID_INVVPID_SINGLE_CONTEXT_RETAINING_GLOBALS;
 pub const VMX_CR3_TARGET_COUNT: u64 = 4;
 pub const VMCS12_MAX_ENUM_INDEX: u64 = 22;
 
@@ -193,19 +220,56 @@ impl NestedVmxCapabilities {
             | VMX_PIN_VIRTUAL_NMIS;
         let procbased_supported = VMX_LEGACY_PROCBASED_DEFAULT1
             | VMX_PRIMARY_KVM_EXITING_CONTROLS
+            | VMX_PRIMARY_RDTSC_EXITING
+            | VMX_PRIMARY_TPR_SHADOW
             | VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
             | VMX_PRIMARY_USE_IO_BITMAPS
             | VMX_PRIMARY_USE_MSR_BITMAPS
+            | VMX_PRIMARY_PAUSE_EXITING
             | optional_primary;
         let exit_supported = VMX_LEGACY_EXIT_DEFAULT1
             | VM_EXIT_HOST_ADDRESS_SPACE_SIZE
-            | VM_EXIT_ACK_INTERRUPT_ON_EXIT;
-        let entry_supported = VMX_LEGACY_ENTRY_DEFAULT1 | VM_ENTRY_IA32E_MODE_GUEST;
+            | VM_EXIT_ACK_INTERRUPT_ON_EXIT
+            | VM_EXIT_LOAD_IA32_PAT
+            | VM_EXIT_LOAD_IA32_EFER;
+        let entry_supported = VMX_LEGACY_ENTRY_DEFAULT1
+            | VM_ENTRY_IA32E_MODE_GUEST
+            | VM_ENTRY_LOAD_IA32_PAT
+            | VM_ENTRY_LOAD_IA32_EFER;
         let secondary_ept = restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_EPT, 0);
+        let secondary_descriptor_table = restrict_control(
+            host.procbased_ctls2,
+            VMX_SECONDARY_DESCRIPTOR_TABLE_EXITING,
+            0,
+        );
+        let secondary_rdtscp =
+            restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_RDTSCP, 0);
         let secondary_unrestricted =
             restrict_control(host.procbased_ctls2, VMX_SECONDARY_UNRESTRICTED_GUEST, 0);
+        let secondary_rdrand =
+            restrict_control(host.procbased_ctls2, VMX_SECONDARY_RDRAND_EXITING, 0);
+        let secondary_invpcid =
+            restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_INVPCID, 0);
+        let secondary_xsaves =
+            restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_XSAVES, 0);
+        let secondary_mbec = if host.ept_vpid_cap
+            & (VMX_EPT_EXECUTE_ONLY | VMX_EPT_ADVANCED_EXIT_INFO)
+            == (VMX_EPT_EXECUTE_ONLY | VMX_EPT_ADVANCED_EXIT_INFO)
+        {
+            restrict_control(host.procbased_ctls2, VMX_SECONDARY_MODE_BASED_EXECUTE, 0)
+        } else {
+            0
+        };
         let secondary_supported = if ept_supported {
-            secondary_ept | secondary_unrestricted | (u64::from(VMX_SECONDARY_ENABLE_VPID) << 32)
+            secondary_ept
+                | secondary_descriptor_table
+                | secondary_rdtscp
+                | secondary_unrestricted
+                | secondary_rdrand
+                | secondary_invpcid
+                | secondary_xsaves
+                | secondary_mbec
+                | (u64::from(VMX_SECONDARY_ENABLE_VPID) << 32)
         } else {
             0
         };
@@ -272,12 +336,12 @@ impl NestedVmxCapabilities {
             vmx_basic: u64::from(revision_id)
                 | (VMX_REGION_SIZE << 32)
                 | (VMX_MEMORY_TYPE_WRITE_BACK << 50)
-                | (host.vmx_basic & VMX_BASIC_TRUE_CONTROLS),
+                | (host.vmx_basic & (VMX_BASIC_TRUE_CONTROLS | VMX_BASIC_IO_EXIT_INFORMATION)),
             vmx_pinbased_ctls: pinbased_ctls,
             vmx_procbased_ctls: procbased_ctls,
             vmx_exit_ctls: exit_ctls,
             vmx_entry_ctls: entry_ctls,
-            vmx_misc: VMX_CR3_TARGET_COUNT << 16,
+            vmx_misc: (host.misc & !(0x1ff_u64 << 16)) | (VMX_CR3_TARGET_COUNT << 16),
             vmx_cr0_fixed0: host.cr0_fixed0,
             vmx_cr0_fixed1: host.cr0_fixed1,
             vmx_cr4_fixed0: host.cr4_fixed0,

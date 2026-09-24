@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use uefi::mem::memory_map::MemoryType;
 
 use crate::hv_core::vt_ept::{EptComposition, EptError, IdentityEpt};
 use crate::hv_core::vt_resident::{
@@ -68,8 +69,14 @@ impl ResidentCpuResources {
             ResidentHostTables::allocate(fatal_handler, ResidentHostSelectors::fixed())?;
         let context_pages = ResidentPages::allocate(1, AddressConstraint::Any)
             .map_err(ResidentProbeError::Allocation)?;
-        let guest_stack = ResidentPages::allocate(BOOT_GUEST_STACK_PAGES, AddressConstraint::Any)
-            .map_err(ResidentProbeError::Allocation)?;
+        // The OS loader accesses the firmware caller's stack before restoring firmware CR3.
+        // Reserved pages can be absent from the loader's identity mapping.
+        let guest_stack = ResidentPages::allocate_typed(
+            BOOT_GUEST_STACK_PAGES,
+            AddressConstraint::Any,
+            MemoryType::LOADER_DATA,
+        )
+        .map_err(ResidentProbeError::Allocation)?;
         let host_stack = ResidentPages::allocate(HOST_STACK_PAGES, AddressConstraint::Any)
             .map_err(ResidentProbeError::Allocation)?;
         let resident_msr_state = ResidentPages::allocate(1, AddressConstraint::Any)
@@ -262,10 +269,13 @@ impl ResidentCpuResources {
             .map(IdentityEpt::ept_pointer)
     }
 
-    pub(crate) fn nested_ept02_table_pool(&self) -> Option<(u64, usize, usize)> {
-        self.nested_ept02
-            .as_ref()
-            .map(IdentityEpt::protection_table_pool)
+    pub(crate) fn nested_ept02_table_pools(&self) -> Option<[(u64, usize, usize); 2]> {
+        Some([
+            self.nested_ept02.as_ref()?.protection_table_pool(),
+            self.nested_ept02_alternate
+                .as_ref()?
+                .protection_table_pool(),
+        ])
     }
 
     pub(crate) fn nested_ept_source_gpa(&self) -> u64 {

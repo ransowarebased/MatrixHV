@@ -95,6 +95,7 @@ pub const VMCS_FIELD_VM_EXIT_INTR_ERROR_CODE: u64 = 0x4406;
 pub const VMCS_FIELD_IDT_VECTORING_INFO_FIELD: u64 = 0x4408;
 pub const VMCS_FIELD_IDT_VECTORING_ERROR_CODE: u64 = 0x440a;
 pub const VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN: u64 = 0x440c;
+pub const VMCS_FIELD_VM_EXIT_INSTRUCTION_INFO: u64 = 0x440e;
 pub const VMCS_FIELD_GUEST_ES_LIMIT: u64 = 0x4800;
 pub const VMCS_FIELD_GUEST_CS_LIMIT: u64 = 0x4802;
 pub const VMCS_FIELD_GUEST_SS_LIMIT: u64 = 0x4804;
@@ -126,6 +127,7 @@ pub const VMCS_FIELD_CR3_TARGET_VALUE1: u64 = 0x600a;
 pub const VMCS_FIELD_CR3_TARGET_VALUE2: u64 = 0x600c;
 pub const VMCS_FIELD_CR3_TARGET_VALUE3: u64 = 0x600e;
 pub const VMCS_FIELD_EXIT_QUALIFICATION: u64 = 0x6400;
+pub const VMCS_FIELD_GUEST_LINEAR_ADDRESS: u64 = 0x640a;
 pub const VMCS_FIELD_GUEST_CR0: u64 = 0x6800;
 pub const VMCS_FIELD_GUEST_CR3: u64 = 0x6802;
 pub const VMCS_FIELD_GUEST_CR4: u64 = 0x6804;
@@ -159,7 +161,7 @@ pub const VMCS_FIELD_HOST_SYSENTER_EIP: u64 = 0x6c12;
 pub const VMCS_FIELD_HOST_RSP: u64 = 0x6c14;
 pub const VMCS_FIELD_HOST_RIP: u64 = 0x6c16;
 
-pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 115;
+pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 117;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Vmcs12ExtendedField {
@@ -627,6 +629,14 @@ pub const VMCS12_EXTENDED_FIELDS: [Vmcs12ExtendedField; VMCS12_EXTENDED_FIELD_CO
     Vmcs12ExtendedField {
         encoding: VMCS_FIELD_GUEST_PDPTR3,
         index: 114,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_VM_EXIT_INSTRUCTION_INFO,
+        index: 115,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_GUEST_LINEAR_ADDRESS,
+        index: 116,
     },
 ];
 

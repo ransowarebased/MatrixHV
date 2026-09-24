@@ -119,7 +119,7 @@ impl RunContextRegion {
                 .pointer()
                 .as_ptr()
                 .cast::<VmRunContext>()
-                .write(VmRunContext::default());
+                .write(VmRunContext::for_boot_target());
         }
         Ok(Self { pages })
     }

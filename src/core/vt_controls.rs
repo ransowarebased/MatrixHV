@@ -1,3 +1,5 @@
+use core::arch::asm;
+
 use crate::arch::x86_64::{msr, registers::CR4_VMXE};
 
 use super::vt_vmcs::{VmcsError, vmwrite};
@@ -10,6 +12,7 @@ const CPU_BASED_USE_MSR_BITMAPS: u32 = 1 << 28;
 const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
 const SECONDARY_ENABLE_RDTSCP: u32 = 1 << 3;
+const SECONDARY_ENABLE_VPID: u32 = 1 << 5;
 const SECONDARY_UNRESTRICTED_GUEST: u32 = 1 << 7;
 const SECONDARY_ENABLE_INVPCID: u32 = 1 << 12;
 const SECONDARY_ENABLE_XSAVES: u32 = 1 << 20;
@@ -46,6 +49,7 @@ pub enum VmxControlsError {
     XsavesUnavailable,
     PatControlsUnavailable,
     EferControlsUnavailable,
+    VpidInvalidationFailed,
 }
 
 struct RequestedControls {
@@ -124,6 +128,44 @@ pub(crate) fn configure_resident_ap(
 pub(crate) fn virtualize_resident_cr4_vmxe(guest_cr4: u64) -> Result<(), VmxControlsError> {
     vmwrite(CR4_GUEST_HOST_MASK, CR4_VMXE)?;
     vmwrite(CR4_READ_SHADOW, guest_cr4)?;
+    Ok(())
+}
+
+pub(crate) fn enable_resident_vpid(
+    controls: &mut VmxControls,
+    virtual_processor_id: u16,
+) -> Result<(), VmxControlsError> {
+    let secondary = unsafe { msr::read(msr::IA32_VMX_PROCBASED_CTLS2) };
+    let invalidation = unsafe { msr::read(msr::IA32_VMX_EPT_VPID_CAP) };
+    let required = (1_u64 << 32) | (1_u64 << 41);
+    if secondary & (u64::from(SECONDARY_ENABLE_VPID) << 32) == 0
+        || invalidation & required != required
+    {
+        return Ok(());
+    }
+
+    // Retire translations from an earlier VMX session before reusing this tag.
+    let descriptor = [u64::from(virtual_processor_id), 0];
+    let failed: u8;
+    unsafe {
+        asm!(
+            "invvpid {kind}, xmmword ptr [{descriptor}]",
+            "setna {failed}",
+            kind = in(reg) 1_u64,
+            descriptor = in(reg) descriptor.as_ptr(),
+            failed = lateout(reg_byte) failed,
+            options(nostack),
+        );
+    }
+    if failed != 0 {
+        return Err(VmxControlsError::VpidInvalidationFailed);
+    }
+    vmwrite(VIRTUAL_PROCESSOR_ID, u64::from(virtual_processor_id))?;
+    controls.secondary_processor_based |= SECONDARY_ENABLE_VPID;
+    vmwrite(
+        SECONDARY_VM_EXEC_CONTROL,
+        u64::from(controls.secondary_processor_based),
+    )?;
     Ok(())
 }
 
