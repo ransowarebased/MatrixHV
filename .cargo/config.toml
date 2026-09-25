@@ -1,0 +1,6 @@
+[build]
+target = "x86_64-unknown-uefi"
+target-dir = "builds/.cargo-target"
+
+[env]
+MATRIXHV_BUILD_ROOT = { value = "builds", relative = true }
