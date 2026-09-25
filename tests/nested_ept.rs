@@ -2,8 +2,226 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::HashMap;
 
 #[repr(C)]
+struct SuccessContext {
+    rflags: u64,
+    writes: u64,
+    advances: u64,
+}
+
+core::arch::global_asm!(
+    ".text",
+    ".globl complete_test_vmx_success",
+    "complete_test_vmx_success:",
+    "push r12", "mov r12, rcx",
+    "call .Ltest_nested_success",
+    "pop r12", "ret",
+    include_str!("../builds/nested-ept-tests/resident-success.S"),
+    guest_rflags = const 0,
+    vmx_status_flags_clear_mask = const !0x8d5_i32,
+    test_rflags = const std::mem::offset_of!(SuccessContext, rflags),
+    test_writes = const std::mem::offset_of!(SuccessContext, writes),
+    test_advances = const std::mem::offset_of!(SuccessContext, advances),
+);
+
+unsafe extern "win64" {
+    fn complete_test_vmx_success(context: *mut SuccessContext);
+}
+
+#[test]
+fn vmx_success_clears_status_flags_and_preserves_other_guest_flags() {
+    for combination in 0..64 {
+        let status = [0, 2, 4, 6, 7, 11]
+            .iter()
+            .enumerate()
+            .fold(0, |flags, (index, bit)| {
+                flags | (((combination >> index) & 1) << bit)
+            });
+        for preserved in [2, 0x247702] {
+            let mut state = SuccessContext {
+                rflags: preserved | status,
+                writes: 0,
+                advances: 0,
+            };
+            unsafe {
+                complete_test_vmx_success(&mut state);
+            }
+            assert_eq!(state.rflags, preserved);
+            assert_eq!(state.writes, u64::from(status != 0));
+            assert_eq!(state.advances, 1);
+        }
+    }
+}
+
+core::arch::global_asm!(
+    ".text",
+    ".globl compose_test_msr_bitmap",
+    "compose_test_msr_bitmap:",
+    "push rsi",
+    "push rdi",
+    "mov rsi, rcx",
+    "mov rdi, r8",
+    "mov ecx, 512",
+    "call .Lresident_nested_merge_msr_bitmap_loop",
+    "pop rdi",
+    "pop rsi",
+    "ret",
+    include_str!("../builds/nested-ept-tests/resident-msr-bitmap.S"),
+);
+
+unsafe extern "win64" {
+    fn compose_test_msr_bitmap(l0: *const u8, l1: *const u8, output: *mut u8);
+}
+
+#[test]
+fn apic_passthrough_keeps_l1_intercepts_and_tracks_bitmap_changes() {
+    let mut l0 = [0xff_u8; 4096];
+    let mut l1 = [0_u8; 4096];
+    let mut output = [0_u8; 4096];
+    for base in [0, 2048] {
+        for msr in 0x800..=0x8ff {
+            l0[base + msr / 8] &= !(1 << (msr % 8));
+        }
+        for msr in [0x80b, 0x830] {
+            l1[base + msr / 8] |= 1 << (msr % 8);
+        }
+    }
+    for revision in 0..3 {
+        if revision == 1 {
+            l1[2048 + 0x80b / 8] &= !(1 << (0x80b % 8));
+        } else if revision == 2 {
+            l1[2048 + 0x808 / 8] |= 1 << (0x808 % 8);
+        }
+        unsafe {
+            compose_test_msr_bitmap(l0.as_ptr(), l1.as_ptr(), output.as_mut_ptr());
+        }
+        for offset in 0..4096 {
+            assert_eq!(output[offset], l0[offset] | l1[offset]);
+        }
+    }
+}
+
+#[repr(C)]
+struct SnapshotContext {
+    values: [u64; 9],
+    hardware: [u64; 9],
+    reads: u64,
+}
+
+core::arch::global_asm!(
+    ".text",
+    ".globl snapshot_test_vmcs01",
+    "snapshot_test_vmcs01:",
+    "push r12", "mov r12, rcx",
+    "call .Lresident_nested_snapshot_vmcs01_effective_state",
+    "pop r12", "ret",
+    include_str!("../builds/nested-ept-tests/resident-snapshot.S"),
+    guest_pat = const 0,
+    guest_efer = const 1,
+    tsc_offset = const 2,
+    vm_entry_controls = const 3,
+    pin_based_vm_exec_control = const 4,
+    cpu_based_vm_exec_control = const 5,
+    secondary_vm_exec_control = const 6,
+    vm_exit_controls = const 7,
+    ept_pointer = const 8,
+    b_nested_inherited_l1_pat = const 0,
+    b_nested_inherited_l1_efer = const 8,
+    b_nested_inherited_l1_tsc_offset = const 16,
+    b_nested_vmcs01_entry_controls = const 24,
+    b_nested_vmcs01_pin_based_controls = const 32,
+    b_nested_vmcs01_primary_controls = const 40,
+    b_nested_vmcs01_secondary_controls = const 48,
+    b_nested_vmcs01_exit_controls = const 56,
+    b_nested_ept01_pointer = const 64,
+    test_hardware = const std::mem::offset_of!(SnapshotContext, hardware),
+    test_reads = const std::mem::offset_of!(SnapshotContext, reads),
+);
+
+unsafe extern "win64" {
+    fn snapshot_test_vmcs01(context: *mut SnapshotContext);
+}
+
+#[test]
+fn vmcs01_snapshot_retains_controls_and_refreshes_live_l1_state() {
+    let mut state = SnapshotContext {
+        values: [0; 9],
+        hardware: [
+            0x7040600070406,
+            0xd01,
+            0,
+            0x93fb,
+            0x1e,
+            0x92006172,
+            0xa2,
+            0x36ffb,
+            0x1234501e,
+        ],
+        reads: 0,
+    };
+    unsafe {
+        snapshot_test_vmcs01(&mut state);
+    }
+    assert_eq!(state.values, state.hardware);
+    assert_eq!(state.reads, 9);
+    let controls = state.values[4..].to_vec();
+    // Mode changes and TSC adjustment must propagate despite the fixed controls.
+    state.hardware[0] = 0x606060606060606;
+    state.hardware[1] = 0;
+    state.hardware[2] = u64::MAX - 100;
+    state.hardware[3] &= !0x200;
+    unsafe {
+        snapshot_test_vmcs01(&mut state);
+    }
+    assert_eq!(state.values[..4], state.hardware[..4]);
+    assert_eq!(state.values[4..], controls);
+    assert_eq!(state.reads, 13);
+}
+
+core::arch::global_asm!(
+    ".text",
+    ".globl validate_test_address",
+    "validate_test_address:",
+    "push r12", "mov r12, rcx", "mov r11, rdx",
+    "test r8, r8", "jz .Ltest_unaligned_address",
+    "call .Lresident_nested_physical_address_is_valid",
+    "pop r12", "ret",
+    ".Ltest_unaligned_address:",
+    "call .Lresident_nested_address_width_is_valid",
+    "pop r12", "ret",
+    include_str!("../builds/nested-ept-tests/resident-address.S"),
+    b_nested_physical_address_bits = const 0,
+);
+
+unsafe extern "win64" {
+    fn validate_test_address(width: *const u32, address: u64, aligned: u64) -> u64;
+}
+
+#[test]
+fn physical_address_validation_honors_cached_width_and_alignment() {
+    for width in [36, 39, 48, 52] {
+        let last_byte = (1_u64 << width) - 1;
+        for (address, aligned, valid) in [
+            (last_byte, 0, 1),
+            (last_byte, 1, 0),
+            (last_byte & !4095, 1, 1),
+            (last_byte + 1, 0, 0),
+            (last_byte + 1, 1, 0),
+            (u64::MAX, 0, 0),
+        ] {
+            assert_eq!(
+                unsafe { validate_test_address(&width, address, aligned) },
+                valid
+            );
+        }
+    }
+    assert_eq!(unsafe { validate_test_address(&0, 0, 1) }, 0);
+    assert_eq!(unsafe { validate_test_address(&64, u64::MAX, 0) }, 1);
+}
+
+#[repr(C)]
 struct MsrContext {
     host_cr3: u64,
+    host_mapping_cache: [u64; 4],
     exit_store: u64,
     root_guest: u64,
     l1_store: u64,
@@ -11,6 +229,9 @@ struct MsrContext {
     l1_load: u64,
     l1_load_count: u64,
     l1_entry: u64,
+    composed: u64,
+    hardware: [u64; 2],
+    writes: u64,
 }
 
 core::arch::global_asm!(
@@ -23,6 +244,11 @@ core::arch::global_asm!(
     "call .Lresident_nested_complete_vmcs02_msr_exit",
     "pop r15", "pop r14", "pop r13", "pop r12",
     "pop rsi", "pop rdi", "pop rbp", "pop rbx", "ret",
+    ".globl activate_test_msr_entry",
+    "activate_test_msr_entry:",
+    "push r12", "mov r12, rcx",
+    "call .Lresident_nested_activate_vmcs01_msr_entry",
+    "pop r12", "ret",
     include_str!("../builds/nested-ept-tests/resident-msr-exit.S"),
     b_nested_vmcs02_exit_store_msr_list = const std::mem::offset_of!(MsrContext, exit_store),
     b_nested_l0_msr_guest_list = const std::mem::offset_of!(MsrContext, root_guest),
@@ -31,6 +257,11 @@ core::arch::global_asm!(
     b_nested_vmcs12_vm_exit_msr_load_addr = const std::mem::offset_of!(MsrContext, l1_load),
     b_nested_vmcs12_vm_exit_msr_load_count = const std::mem::offset_of!(MsrContext, l1_load_count),
     b_nested_vmcs01_entry_msr_list = const std::mem::offset_of!(MsrContext, l1_entry),
+    b_nested_vmcs01_msr_entry_composed = const std::mem::offset_of!(MsrContext, composed),
+    test_hardware = const std::mem::offset_of!(MsrContext, hardware),
+    test_writes = const std::mem::offset_of!(MsrContext, writes),
+    vm_entry_msr_load_addr = const 0,
+    vm_entry_msr_load_count = const 1,
     resident_msr_switch_count = const 1,
     resident_msr_switch_qword_count = const 2,
     resident_msr_switch_byte_count = const 16,
@@ -38,6 +269,7 @@ core::arch::global_asm!(
 
 unsafe extern "win64" {
     fn complete_test_msr_exit(context: *mut MsrContext, exit_reason: u64);
+    fn activate_test_msr_entry(context: *mut MsrContext);
 }
 
 #[test]
@@ -46,6 +278,7 @@ fn nested_msr_exit_preserves_l1_lists_and_root_speculation_state() {
     let buffers = arena.pages(1);
     let mut state = MsrContext {
         host_cr3: arena.host_map(),
+        host_mapping_cache: [0; 4],
         exit_store: buffers,
         root_guest: buffers + 0x100,
         l1_store: buffers + 0x200,
@@ -53,6 +286,9 @@ fn nested_msr_exit_preserves_l1_lists_and_root_speculation_state() {
         l1_load: buffers + 0x300,
         l1_load_count: 2,
         l1_entry: buffers + 0x400,
+        composed: 0,
+        hardware: [buffers + 0x100, 1],
+        writes: 0,
     };
     unsafe {
         let source = std::slice::from_raw_parts_mut(state.exit_store as *mut u64, 8);
@@ -69,6 +305,20 @@ fn nested_msr_exit_preserves_l1_lists_and_root_speculation_state() {
         source[1] = 11;
         complete_test_msr_exit(&mut state, 0x80000021);
         assert_eq!(entry, &[0x48, 7, 0x48, 9, 0xc0000102, 0x5678]);
+        activate_test_msr_entry(&mut state);
+        assert_eq!(state.hardware, [state.l1_entry, 3]);
+        assert_eq!(state.composed, 1);
+        assert_eq!(state.writes, 2);
+        // The first L1 exit restores this base list before its next nested entry.
+        state.hardware = [state.root_guest, 1];
+        state.composed = 0;
+        state.l1_load_count = 0;
+        complete_test_msr_exit(&mut state, 18);
+        activate_test_msr_entry(&mut state);
+        assert_eq!(state.hardware, [state.root_guest, 1]);
+        assert_eq!(state.composed, 0);
+        assert_eq!(state.writes, 2);
+        assert_eq!((state.root_guest as *const u64).add(1).read(), 11);
     }
 }
 
@@ -83,6 +333,8 @@ struct VpidContext {
     flushes: u64,
     kind: u64,
     hardware_tag: u64,
+    cache: u64,
+    selected_tag: u64,
 }
 
 core::arch::global_asm!(
@@ -103,9 +355,12 @@ core::arch::global_asm!(
     b_nested_vmcs01_secondary_controls = const std::mem::offset_of!(VpidContext, hardware_controls),
     b_nested_vmcs12_vpid = const std::mem::offset_of!(VpidContext, virtual_tag),
     b_nested_vmcs02_last_vpid = const std::mem::offset_of!(VpidContext, last_tag),
+    b_nested_vmcs02_vpid_cache = const std::mem::offset_of!(VpidContext, cache),
+    virtual_processor_id = const 0,
     test_flushes = const std::mem::offset_of!(VpidContext, flushes),
     test_kind = const std::mem::offset_of!(VpidContext, kind),
     test_tag = const std::mem::offset_of!(VpidContext, hardware_tag),
+    test_selected_tag = const std::mem::offset_of!(VpidContext, selected_tag),
 );
 
 unsafe extern "win64" {
@@ -114,31 +369,44 @@ unsafe extern "win64" {
 }
 
 #[test]
-fn vpid_reuse_flushes_on_virtual_tag_changes_and_reenable() {
+fn vpid_cache_retains_vtl_translations_and_flushes_before_reassigning_a_tag() {
     let mut state = VpidContext {
         primary: 1 << 31,
         secondary: 1 << 5,
         hardware_controls: 1 << 5,
         virtual_tag: 1,
+        cache: 48 << 32,
         ..Default::default()
     };
-    for (tag, expected_flushes) in [(1, 1), (1, 1), (2, 2), (2, 2), (1, 3)] {
+    for (tag, selected, expected_flushes) in [
+        (1, 2, 1),
+        (1, 2, 1),
+        (2, 3, 2),
+        (2, 3, 2),
+        (1, 2, 2),
+        (3, 3, 3),
+        (1, 2, 3),
+        (2, 3, 4),
+    ] {
         state.virtual_tag = tag;
         unsafe { prepare_test_vpid(&mut state) };
         assert_eq!(state.flushes, expected_flushes);
-        assert_eq!((state.kind, state.hardware_tag), (1, 2));
+        assert_eq!(state.selected_tag, selected);
+        assert_eq!(state.kind, 1);
+        assert_ne!(state.hardware_tag, 1);
     }
     state.secondary = 0;
     unsafe { prepare_test_vpid(&mut state) };
     assert_eq!(state.last_tag, 0);
-    assert_eq!(state.flushes, 3);
+    assert_eq!(state.flushes, 6);
+    assert_eq!(state.cache, 48 << 32);
     state.secondary = 1 << 5;
     unsafe { prepare_test_vpid(&mut state) };
-    assert_eq!(state.flushes, 4);
+    assert_eq!(state.flushes, 7);
     state.hardware_controls = 0;
     state.virtual_tag = 3;
     unsafe { prepare_test_vpid(&mut state) };
-    assert_eq!(state.flushes, 4);
+    assert_eq!(state.flushes, 7);
 }
 
 #[test]
@@ -146,6 +414,7 @@ fn invvpid_preserves_l1_and_validates_only_architectural_operand_bits() {
     let mut state = VpidContext {
         hardware_controls: 1 << 5,
         last_tag: 5,
+        cache: 5 | (6 << 16),
         ..Default::default()
     };
     for kind in 0..4 {
@@ -159,9 +428,12 @@ fn invvpid_preserves_l1_and_validates_only_architectural_operand_bits() {
             unsafe { invalidate_test_vpid(&mut state, kind, descriptor.as_ptr()) },
             0
         );
-        assert_eq!((state.kind, state.hardware_tag), (1, 2));
+        assert_eq!(
+            (state.kind, state.hardware_tag),
+            (1, if kind == 2 { 3 } else { 2 })
+        );
     }
-    assert_eq!(state.flushes, 4);
+    assert_eq!(state.flushes, 5);
     for (kind, descriptor) in [
         (0, [5, 0x0001_0000_0000_0000]),
         (1, [0, 0]),
@@ -173,27 +445,34 @@ fn invvpid_preserves_l1_and_validates_only_architectural_operand_bits() {
             1
         );
     }
-    assert_eq!(state.flushes, 4);
+    assert_eq!(state.flushes, 5);
+    assert_eq!(
+        unsafe { invalidate_test_vpid(&mut state, 1, [7, 0].as_ptr()) },
+        0
+    );
+    assert_eq!(state.flushes, 5);
     assert_eq!(
         unsafe { invalidate_test_vpid(&mut state, 1, [6, 0].as_ptr()) },
         0
     );
-    assert_eq!(state.flushes, 4);
+    assert_eq!((state.flushes, state.hardware_tag), (6, 3));
     assert_eq!(
         unsafe { invalidate_test_vpid(&mut state, 2, [0, u64::MAX].as_ptr()) },
         0
     );
-    assert_eq!(state.flushes, 5);
+    assert_eq!(state.flushes, 8);
 }
 
 #[repr(C)]
 #[derive(Default)]
 struct Context {
     host_cr3: u64,
+    host_mapping_cache: [u64; 4],
     gpa: u64,
     qualification: u64,
     ept01: u64,
     invalidations: u64,
+    recycles: u64,
     ept02: u64,
     pool: u64,
     pool_pages: u64,
@@ -225,12 +504,17 @@ core::arch::global_asm!(
     "pop r15", "pop r14", "pop r13", "pop r12",
     "pop rsi", "pop rdi", "pop rbp", "pop rbx",
     "ret",
-    ".globl revalidate_test_ept",
-    "revalidate_test_ept:",
+    ".globl check_test_host_mapping",
+    "check_test_host_mapping:",
+    "push r12", "mov r12, rcx", "mov r11, rdx",
+    "call .Lresident_nested_host_page_is_mapped",
+    "pop r12", "ret",
+    ".globl discard_test_ept",
+    "discard_test_ept:",
     "push rbx", "push rbp", "push rdi", "push rsi",
     "push r12", "push r13", "push r14", "push r15",
     "mov r12, rcx",
-    "call .Lresident_nested_revalidate_ept02",
+    "call .Lresident_nested_invalidate_ept02",
     "pop r15", "pop r14", "pop r13", "pop r12",
     "pop rsi", "pop rdi", "pop rbp", "pop rbx",
     "ret",
@@ -254,10 +538,12 @@ core::arch::global_asm!(
     "ret",
     include_str!("../builds/nested-ept-tests/resident-ept.S"),
     b_expected_host_cr3 = const std::mem::offset_of!(Context, host_cr3),
+    b_nested_host_mapping_cache = const std::mem::offset_of!(Context, host_mapping_cache),
     b_last_guest_physical_address = const std::mem::offset_of!(Context, gpa),
     b_last_qualification = const std::mem::offset_of!(Context, qualification),
     b_nested_ept01_pointer = const std::mem::offset_of!(Context, ept01),
     b_nested_ept02_invalidation_count = const std::mem::offset_of!(Context, invalidations),
+    b_nested_ept02_recycle_count = const std::mem::offset_of!(Context, recycles),
     b_nested_ept02_pointer = const std::mem::offset_of!(Context, ept02),
     b_nested_ept02_table_pool = const std::mem::offset_of!(Context, pool),
     b_nested_ept02_table_pool_pages = const std::mem::offset_of!(Context, pool_pages),
@@ -281,8 +567,9 @@ core::arch::global_asm!(
 );
 
 unsafe extern "win64" {
+    fn check_test_host_mapping(context: *mut Context, address: u64) -> u64;
     fn resolve_test_ept(context: *mut Context) -> u64;
-    fn revalidate_test_ept(context: *mut Context);
+    fn discard_test_ept(context: *mut Context);
     fn prepare_test_ept(context: *mut Context);
     fn invalidate_test_ept_context(context: *mut Context, ept_pointer: u64);
 }
@@ -419,7 +706,7 @@ fn accessed_dirty_tracks_first_access_and_write_without_discarding_other_leaves(
 }
 
 #[test]
-fn accessed_dirty_revalidation_preserves_cleared_flags_until_real_access() {
+fn accessed_dirty_invalidation_preserves_cleared_flags_until_real_access() {
     let mut arena = Arena::new();
     let ept12 = arena.pages(1);
     let ept01 = arena.pages(1);
@@ -432,14 +719,14 @@ fn accessed_dirty_revalidation_preserves_cleared_flags_until_real_access() {
     let entries = entry_addresses(ept12, state.gpa);
     let last = *entries.last().unwrap() as *mut u64;
     unsafe { *last &= !0x200 };
-    unsafe { revalidate_test_ept(&mut state) };
+    unsafe { discard_test_ept(&mut state) };
     assert_eq!(unsafe { *last } & 0x300, 0x100);
     assert_eq!(leaf(state.ept02, state.gpa).1 & 2, 0);
     assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
     assert_eq!(unsafe { *last } & 0x300, 0x300);
     for address in entries {
         unsafe { *(address as *mut u64) &= !0x100 };
-        unsafe { revalidate_test_ept(&mut state) };
+        unsafe { discard_test_ept(&mut state) };
         assert_eq!(leaf(state.ept02, state.gpa).1, 0);
         assert_eq!(unsafe { *(address as *const u64) } & 0x100, 0);
         assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
@@ -491,6 +778,50 @@ fn context(arena: &mut Arena, ept12: u64, ept01: u64) -> Context {
         ..Default::default()
     }
 }
+
+#[test]
+fn host_mapping_cache_respects_large_page_boundaries_and_small_page_holes() {
+    let mut arena = Arena::new();
+    let root = arena.pages(1);
+    let pdpt = arena.pages(1);
+    let directory = arena.pages(1);
+    let small_pages = arena.pages(1);
+    unsafe {
+        (root as *mut u64).write(pdpt | 3);
+        (pdpt as *mut u64).write(directory | 3);
+        (pdpt as *mut u64).add(1).write(0x40000083);
+        (directory as *mut u64).write(0x83);
+        (directory as *mut u64).add(1).write(small_pages | 3);
+        (directory as *mut u64).add(4).write(0x800083);
+        (small_pages as *mut u64).write(0x200003);
+        (small_pages as *mut u64).add(511).write(0x3ff003);
+    }
+    let mut state = Context {
+        host_cr3: root,
+        ..Default::default()
+    };
+    for (address, expected) in [
+        (0, 1),
+        (0x1fffff, 1),
+        (0x200000, 1),
+        (0x201000, 0),
+        (0x3ff000, 1),
+        (0x400000, 0),
+        (0x800000, 1),
+        (0, 1),
+        (0x40000000, 1),
+        (0x7fffffff, 1),
+        (0x80000000, 0),
+    ] {
+        assert_eq!(
+            unsafe { check_test_host_mapping(&mut state, address) },
+            expected,
+            "{address:#x}"
+        );
+    }
+    assert_eq!(state.host_mapping_cache[1], 0);
+}
+
 #[test]
 fn ept_cache_retains_each_execution_mode_and_invalidates_both_by_root() {
     let mut arena = Arena::new();
@@ -529,6 +860,12 @@ fn ept_cache_retains_each_execution_mode_and_invalidates_both_by_root() {
     assert_eq!(state.ept02, mbec_root);
     assert_eq!(state.mbec, 1);
     assert_eq!(state.invalidations, invalidations + 2);
+    assert_eq!(leaf(supervisor_root, state.gpa).1, 0);
+    assert_eq!(leaf(mbec_root, state.gpa).1, 0);
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    state.secondary_control = 2;
+    unsafe { prepare_test_ept(&mut state) };
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
     assert_eq!(leaf(supervisor_root, state.gpa).1 & 0x407, 3);
     assert_eq!(leaf(mbec_root, state.gpa).1 & 0x407, 0x403);
     arena.map(ept12, 0x200000, 0, 21, 0);
@@ -600,6 +937,7 @@ fn recycles_exhausted_tables_without_reflecting_a_false_violation() {
     state.gpa = 0x40003000;
     assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
     assert_eq!(state.invalidations, 1);
+    assert_eq!(state.recycles, 1);
     assert_eq!(leaf(state.ept02, state.gpa), (12, 0x605037));
     assert_eq!(leaf(state.ept02, 0x203000).1, 0);
 }
@@ -621,7 +959,7 @@ fn replaces_a_cached_large_leaf_after_l1_relaxes_permissions() {
 }
 
 #[test]
-fn revalidation_updates_remaps_permissions_and_memory_type() {
+fn invalidation_rebuilds_remaps_permissions_and_memory_type_on_demand() {
     let mut arena = Arena::new();
     let ept12 = arena.pages(1);
     let ept01 = arena.pages(1);
@@ -634,23 +972,42 @@ fn revalidation_updates_remaps_permissions_and_memory_type() {
     assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
     state.gpa = 0x403000;
     assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
-    let used = state.pool_used;
+    let pool_before = unsafe {
+        std::slice::from_raw_parts(state.pool as *const u64, state.pool_used as usize * 512)
+            .to_vec()
+    };
     arena.map(ept12, 0x200000, 0xc00000, 21, 0x87);
     unsafe {
-        revalidate_test_ept(&mut state);
+        discard_test_ept(&mut state);
     }
-    assert_eq!(leaf(state.ept02, 0x203000), (21, 0xe00081));
+    assert_eq!(leaf(state.ept02, 0x203000).1, 0);
+    assert_eq!(leaf(state.ept02, 0x403000).1, 0);
+    assert_eq!(state.pool_used, 0);
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(state.pool as *const u64, pool_before.len()) },
+        pool_before
+    );
+    state.gpa = 0x203000;
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    assert_eq!(leaf(state.ept02, state.gpa), (21, 0xe00081));
+    // Reused pages must not make an old sibling mapping reachable again.
+    assert_eq!(leaf(state.ept02, 0x403000).1, 0);
+    state.gpa = 0x403000;
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
     assert_eq!(leaf(state.ept02, 0x403000), (21, 0xa000b7));
-    assert_eq!(state.pool_used, used);
     arena.map(ept12, 0x200000, 0, 21, 0);
     unsafe {
-        revalidate_test_ept(&mut state);
+        discard_test_ept(&mut state);
     }
-    assert_eq!(leaf(state.ept02, 0x203000), (21, 0));
+    assert_eq!(leaf(state.ept02, 0x203000).1, 0);
+    state.gpa = 0x203000;
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+    state.gpa = 0x403000;
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
     assert_eq!(leaf(state.ept02, 0x403000), (21, 0xa000b7));
 }
 #[test]
-fn revalidation_removes_a_large_mapping_when_l1_splits_it() {
+fn invalidation_removes_a_large_mapping_when_l1_splits_it() {
     let mut arena = Arena::new();
     let ept12 = arena.pages(1);
     let ept01 = arena.pages(1);
@@ -661,15 +1018,15 @@ fn revalidation_removes_a_large_mapping_when_l1_splits_it() {
     arena.map(ept12, 0x200000, 0, 21, 0);
     arena.map(ept12, 0x203000, 0x403000, 12, 0x31);
     unsafe {
-        revalidate_test_ept(&mut state);
+        discard_test_ept(&mut state);
     }
-    assert_eq!(leaf(state.ept02, state.gpa), (21, 0));
+    assert_eq!(leaf(state.ept02, state.gpa).1, 0);
     assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
     assert_eq!(leaf(state.ept02, state.gpa), (12, 0x603031));
     assert_eq!(leaf(state.ept02, 0x204000), (12, 0));
 }
 #[test]
-fn revalidation_visits_four_kib_leaves_and_upper_level_revocations() {
+fn invalidation_applies_four_kib_remaps_and_upper_level_revocations() {
     let mut arena = Arena::new();
     let ept12 = arena.pages(1);
     let ept01 = arena.pages(1);
@@ -679,14 +1036,17 @@ fn revalidation_visits_four_kib_leaves_and_upper_level_revocations() {
     assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
     arena.map(ept12, 0x203000, 0x405000, 12, 0x31);
     unsafe {
-        revalidate_test_ept(&mut state);
+        discard_test_ept(&mut state);
     }
+    assert_eq!(leaf(state.ept02, state.gpa).1, 0);
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
     assert_eq!(leaf(state.ept02, state.gpa), (12, 0x605031));
     unsafe {
         (ept12 as *mut u64).write(0);
-        revalidate_test_ept(&mut state);
+        discard_test_ept(&mut state);
     }
-    assert_eq!(leaf(state.ept02, state.gpa), (12, 0));
+    assert_eq!(leaf(state.ept02, state.gpa).1, 0);
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
 }
 
 #[repr(C)]
@@ -697,6 +1057,12 @@ struct GuestContext {
     cache: [u64; 117],
     hardware: [u64; 117],
     writes: u64,
+    rare_pending: u64,
+    vmcs01: u64,
+    vmcs02: u64,
+    selected_vmcs: u64,
+    switches: u64,
+    reads: u64,
 }
 core::arch::global_asm!(
     ".text",
@@ -706,16 +1072,47 @@ core::arch::global_asm!(
     "mov r12, rcx",
     "call .Lresident_nested_sync_vmcs02_guest_fields",
     "pop rsi", "pop r12", "ret",
+    ".globl capture_test_guest",
+    "capture_test_guest:",
+    "push r12", "push rsi", "mov r12, rcx",
+    "lea rsi, [rip + .Lresident_nested_guest_state_table]", "mov ecx, 50",
+    "call .Lresident_nested_capture_vmcs02_guest_state_loop",
+    "pop rsi", "pop r12", "ret",
+    ".globl materialize_test_guest",
+    "materialize_test_guest:",
+    "push r12", "mov r12, rcx", "mov rax, rdx",
+    "mov r11, r8", "mov r10, r9",
+    "call .Lresident_nested_materialize_guest_field",
+    "cmp rax, rdx", "jne .Lresident_dispatch_halt",
+    "cmp r11, r8", "jne .Lresident_dispatch_halt",
+    "cmp r10, r9", "jne .Lresident_dispatch_halt",
+    "pop r12", "ret",
+    ".globl materialize_test_all_guest",
+    "materialize_test_all_guest:",
+    "push r12", "mov r12, rcx",
+    "call .Lresident_nested_materialize_vmcs02_rare_state",
+    "pop r12", "ret",
     include_str!("../builds/nested-ept-tests/resident-guest.S"),
     b_nested_vmcs02_guest_cache_valid = const std::mem::offset_of!(GuestContext,valid),
     b_nested_vmcs02_field_cache = const std::mem::offset_of!(GuestContext,cache),
     b_nested_vmcs12_extended_fields = const std::mem::offset_of!(GuestContext,values),
     test_hardware = const std::mem::offset_of!(GuestContext,hardware),
     test_writes = const std::mem::offset_of!(GuestContext,writes),
+    test_reads = const std::mem::offset_of!(GuestContext,reads),
+    test_selected_vmcs = const std::mem::offset_of!(GuestContext,selected_vmcs),
+    test_switches = const std::mem::offset_of!(GuestContext,switches),
+    b_nested_vmcs01_region = const std::mem::offset_of!(GuestContext,vmcs01),
+    b_nested_vmcs02_region = const std::mem::offset_of!(GuestContext,vmcs02),
+    b_nested_vmcs02_rare_state_pending = const std::mem::offset_of!(GuestContext,rare_pending),
+    nested_rare_guest_fields_low = const (0xff_u64 << 35) | (0x3ff_u64 << 50),
+    nested_rare_guest_fields_high = const (0xffff_u64 << 1) | (1_u64 << 28),
     nested_guest_state_table_count = const 50,
 );
 unsafe extern "win64" {
     fn sync_test_guest(context: *mut GuestContext);
+    fn capture_test_guest(context: *mut GuestContext);
+    fn materialize_test_guest(context: *mut GuestContext, field: u64, value: u64, encoding: u64);
+    fn materialize_test_all_guest(context: *mut GuestContext);
 }
 #[test]
 fn guest_sync_retains_hardware_state_and_applies_l1_changes() {
@@ -726,6 +1123,12 @@ fn guest_sync_retains_hardware_state_and_applies_l1_changes() {
         cache: [0; 117],
         hardware: [u64::MAX; 117],
         writes: 0,
+        rare_pending: 0,
+        vmcs01: 1,
+        vmcs02: 2,
+        selected_vmcs: 2,
+        switches: 0,
+        reads: 0,
     };
     unsafe {
         sync_test_guest(&mut state);
@@ -750,6 +1153,109 @@ fn guest_sync_retains_hardware_state_and_applies_l1_changes() {
         sync_test_guest(&mut state);
     }
     assert_eq!(state.writes, 109);
+}
+
+#[test]
+fn deferred_guest_state_survives_resume_and_materializes_before_l1_access() {
+    let mut state = GuestContext {
+        valid: 0,
+        control_valid: [0; 2],
+        values: [0; 117],
+        cache: [0; 117],
+        hardware: [u64::MAX; 117],
+        writes: 0,
+        rare_pending: 0,
+        vmcs01: 1,
+        vmcs02: 2,
+        selected_vmcs: 2,
+        switches: 0,
+        reads: 0,
+    };
+    let rare = |index| {
+        (35..=42).contains(&index)
+            || (50..=59).contains(&index)
+            || (65..=80).contains(&index)
+            || index == 92
+    };
+    unsafe {
+        sync_test_guest(&mut state);
+    }
+    let fields: Vec<usize> = state
+        .hardware
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (*value != u64::MAX).then_some(index))
+        .collect();
+    assert_eq!(fields.len(), 50);
+    for &index in &fields {
+        state.hardware[index] = 0x10000 + index as u64;
+    }
+    unsafe {
+        capture_test_guest(&mut state);
+    }
+    assert_eq!(state.reads, 15);
+    assert_eq!(state.rare_pending, 1);
+    for &index in &fields {
+        assert_eq!(
+            state.values[index],
+            if rare(index) {
+                0
+            } else {
+                state.hardware[index]
+            }
+        );
+    }
+    state.selected_vmcs = 1;
+    unsafe {
+        materialize_test_guest(&mut state, 30, u64::MAX, 0x6802);
+    }
+    assert_eq!(state.switches, 0);
+    assert_eq!(state.rare_pending, 1);
+    state.selected_vmcs = 2;
+    unsafe {
+        sync_test_guest(&mut state);
+    }
+    assert_eq!(state.writes, 54);
+    for &index in &fields {
+        assert_eq!(state.hardware[index], 0x10000 + index as u64);
+    }
+    state.selected_vmcs = 1;
+    unsafe {
+        materialize_test_guest(&mut state, 50, 0xfeed_dead_beef, 0x6806);
+    }
+    assert_eq!(state.reads, 50);
+    assert_eq!(state.switches, 2);
+    assert_eq!(state.selected_vmcs, 1);
+    assert_eq!(state.rare_pending, 0);
+    for &index in &fields {
+        assert_eq!(state.values[index], state.hardware[index]);
+        assert_eq!(state.cache[index], state.hardware[index]);
+    }
+    state.values[50] = 0x87654000;
+    state.selected_vmcs = 2;
+    unsafe {
+        sync_test_guest(&mut state);
+    }
+    assert_eq!(state.hardware[50], 0x87654000);
+    assert_eq!(state.writes, 59);
+    // A VMCS switch or clear must save even fields L1 has not read.
+    for &index in &fields {
+        state.hardware[index] = 0x20000 + index as u64;
+    }
+    unsafe {
+        capture_test_guest(&mut state);
+    }
+    state.selected_vmcs = 1;
+    unsafe {
+        materialize_test_all_guest(&mut state);
+        materialize_test_all_guest(&mut state);
+    }
+    assert_eq!(state.reads, 100);
+    assert_eq!(state.switches, 4);
+    assert_eq!(state.selected_vmcs, 1);
+    for &index in &fields {
+        assert_eq!(state.values[index], state.hardware[index]);
+    }
 }
 
 core::arch::global_asm!(
@@ -819,6 +1325,12 @@ fn control_cache_writes_zero_initially_and_tracks_high_indices() {
         cache: [0; 117],
         hardware: [u64::MAX; 117],
         writes: 0,
+        rare_pending: 0,
+        vmcs01: 1,
+        vmcs02: 2,
+        selected_vmcs: 2,
+        switches: 0,
+        reads: 0,
     };
     unsafe {
         sync_test_control(&mut state, 0x4000, 0);
@@ -885,7 +1397,7 @@ fn mbec_enforces_distinct_user_and_supervisor_execute_permissions() {
     }
 }
 #[test]
-fn mbec_respects_l0_execute_denials_and_revalidates_user_only_leaves() {
+fn mbec_respects_l0_execute_denials_after_user_only_leaf_invalidation() {
     let mut arena = Arena::new();
     let ept12 = arena.pages(1);
     let ept01 = arena.pages(1);
@@ -897,7 +1409,7 @@ fn mbec_respects_l0_execute_denials_and_revalidates_user_only_leaves() {
     assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
     arena.map(ept01, 0x400000, 0x600000, 21, 0xb3);
     unsafe {
-        revalidate_test_ept(&mut state);
+        discard_test_ept(&mut state);
     }
     assert_eq!(leaf(state.ept02, state.gpa).1 & 0x407, 0);
     assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);

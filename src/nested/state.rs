@@ -1,3 +1,5 @@
+use core::arch::x86_64::__cpuid;
+
 use super::capabilities::NestedVmxCapabilities;
 use super::vmcs::{NestedVmcs12State, VMCS12_EXTENDED_FIELD_COUNT};
 
@@ -126,6 +128,11 @@ pub struct NestedVmxState {
     pub exit_started_tsc: u64,
     pub exit_handler_cycles: [u64; 4],
     pub reflected_exit_counts: [u32; 44],
+    pub vmcs02_vpid_cache: u32,
+    pub physical_address_bits: u32,
+    pub host_mapping_cache: [u64; 4],
+    pub vmcs02_rare_state_pending: u64,
+    pub ept02_recycle_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,6 +171,12 @@ impl NestedVmxState {
         vmcs01_region: u64,
         vmcs02_region: u64,
     ) -> Self {
+        // MAXPHYADDR is stable for this vCPU; avoid serializing CPUID on each entry.
+        let physical_address_bits = if __cpuid(0x8000_0000).eax >= 0x8000_0008 {
+            __cpuid(0x8000_0008).eax & 0xff
+        } else {
+            0
+        };
         Self {
             feature_control: capabilities.feature_control,
             vmx_basic: capabilities.vmx_basic,
@@ -285,6 +298,11 @@ impl NestedVmxState {
             exit_started_tsc: 0,
             exit_handler_cycles: [0; 4],
             reflected_exit_counts: [0; 44],
+            vmcs02_vpid_cache: 0,
+            physical_address_bits,
+            host_mapping_cache: [0; 4],
+            vmcs02_rare_state_pending: 0,
+            ept02_recycle_count: 0,
         }
     }
 

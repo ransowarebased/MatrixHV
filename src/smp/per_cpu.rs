@@ -5,8 +5,8 @@ use uefi::mem::memory_map::MemoryType;
 
 use crate::hv_core::vt_ept::{EptComposition, EptError, IdentityEpt};
 use crate::hv_core::vt_resident::{
-    BOOT_GUEST_STACK_PAGES, HOST_STACK_PAGES, ResidentHostSelectors, ResidentHostTables,
-    ResidentProbeError,
+    BOOT_GUEST_STACK_PAGES, HOST_STACK_PAGES, RESIDENT_BOOT_CONTEXT_PAGES, ResidentHostSelectors,
+    ResidentHostTables, ResidentProbeError,
 };
 use crate::hv_core::vt_vmcs::VmcsRegion;
 use crate::hv_core::vt_vmxon::{self, VmxonRegion};
@@ -67,8 +67,9 @@ impl ResidentCpuResources {
         nested_vmcs02_region.write_revision_id(vt_vmxon::revision_id(vmx_basic));
         let host_tables =
             ResidentHostTables::allocate(fatal_handler, ResidentHostSelectors::fixed())?;
-        let context_pages = ResidentPages::allocate(1, AddressConstraint::Any)
-            .map_err(ResidentProbeError::Allocation)?;
+        let context_pages =
+            ResidentPages::allocate(RESIDENT_BOOT_CONTEXT_PAGES, AddressConstraint::Any)
+                .map_err(ResidentProbeError::Allocation)?;
         // The OS loader accesses the firmware caller's stack before restoring firmware CR3.
         // Reserved pages can be absent from the loader's identity mapping.
         let guest_stack = ResidentPages::allocate_typed(
