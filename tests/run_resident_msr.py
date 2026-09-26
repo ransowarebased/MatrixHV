@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 import re
 import subprocess
@@ -8,20 +7,13 @@ project = Path(__file__).resolve().parents[1]
 output = project / "builds" / "resident-msr-tests"
 output.mkdir(parents=True, exist_ok=True)
 source = (project / "src/core/vt_resident.rs").read_text(encoding="utf-8")
-start = source.index('    ".Lresident_nested_complete_vmcs02_msr_exit:",')
-end = source.index('    ".Lresident_nested_activate_vmcs01_msr_entry:",', start)
-assembly = "\n".join(
-    json.loads(line.rstrip(","))
-    for line in map(str.strip, source[start:end].splitlines())
-    if line.startswith('"')
-)
-start = source.index('    ".Lresident_validate_efer:",')
-end = source.index('    ".Lresident_guarded_rdmsr:",', start)
-assembly += "\n" + "\n".join(
-    json.loads(line.rstrip(","))
-    for line in map(str.strip, source[start:end].splitlines())
-    if line.startswith('"')
-)
+assembly_source = (project / "src/asm/resident_island.S").read_text(encoding="utf-8")
+start = assembly_source.index('.Lresident_nested_complete_vmcs02_msr_exit:')
+end = assembly_source.index('.Lresident_nested_activate_vmcs01_msr_entry:', start)
+assembly = assembly_source[start:end].strip()
+start = assembly_source.index('.Lresident_validate_efer:')
+end = assembly_source.index('.Lresident_guarded_rdmsr:', start)
+assembly += "\n" + assembly_source[start:end].strip()
 wrapper = """
 .text
 .globl test_validate_efer
@@ -69,13 +61,9 @@ matrixhv_resident_island_msr_switch_count:
 .text
 """
 (output / "resident-msr.S").write_text(wrapper + assembly, encoding="utf-8")
-start = source.index('    ".Lresident_deliver_pending_nmi:",')
-end = source.index('    ".Lresident_validate_efer:",', start)
-nmi = "\n".join(
-    json.loads(line.rstrip(","))
-    for line in map(str.strip, source[start:end].splitlines())
-    if line.startswith('"')
-)
+start = assembly_source.index('.Lresident_deliver_pending_nmi:')
+end = assembly_source.index('.Lresident_validate_efer:', start)
+nmi = assembly_source[start:end].strip()
 nmi = nmi.replace("vmread r11, rax", "mov r11, [r12 + {test_vmcs} + rax * 8]\ncmp r12, 0")
 nmi = nmi.replace("vmwrite rax, r11", "mov [r12 + {test_vmcs} + rax * 8], r11\ncmp r12, 0")
 nmi += "\n.Lresident_dispatch_vmread_failed:\n.Lresident_dispatch_vmwrite_failed:\nud2\n"
@@ -89,13 +77,9 @@ test_deliver_nmi:
     ret
 """
 (output / "resident-nmi.S").write_text(nmi, encoding="utf-8")
-start = source.index('    ".Lresident_dispatch_cache_flush:",')
-end = source.index('    ".Lresident_nested_l2_reflect:",', start)
-cache_flush = "\n".join(
-    json.loads(line.rstrip(","))
-    for line in map(str.strip, source[start:end].splitlines())
-    if line.startswith('"')
-)
+start = assembly_source.index('.Lresident_dispatch_cache_flush:')
+end = assembly_source.index('.Lresident_nested_l2_reflect:', start)
+cache_flush = assembly_source[start:end].strip()
 cache_flush = cache_flush.replace("wbinvd", "inc qword ptr [r12 + 8]")
 cache_flush += """
 .Lresident_msr_privilege:

@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 import re
 import subprocess
@@ -7,49 +6,38 @@ import subprocess
 project = Path(__file__).resolve().parents[1]
 output = project / "builds" / "resident-visual-tests"
 output.mkdir(parents=True, exist_ok=True)
-source = (project / "src/core/vt_resident.rs").read_text(encoding="utf-8")
-start = source.index('    ".globl matrixhv_resident_ebs_callback",')
-end = source.index('    ".Lresident_serial_state:",', start)
-hex_start = source.index('    ".Lresident_paint_hex:",', end)
-hex_end = source.index('    ".Lresident_serial_write:",', hex_start)
-emit_start = source.index('    ".Lresident_diagnostic_emit_value:",', end)
-serial_char_start = source.index('    ".Lresident_serial_char:",', hex_end)
-serial_hex_start = source.index('    ".Lresident_serial_hex64:",', serial_char_start)
-serial_hex_end = source.index('    ".Lresident_vmcs12_field_index_table:",', serial_hex_start)
-msr_start = source.index('    ".Lresident_guarded_rdmsr:",')
-msr_end = source.index('    ".globl matrixhv_resident_island_gp",', msr_start)
-gp_end = source.index('    ".Lresident_host_gp_fatal:",', msr_end)
-exception_start = source.index('    ".globl matrixhv_resident_exception_stubs",', gp_end)
-exception_end = source.index('    ".globl matrixhv_resident_island_fatal",', exception_start)
-timer_start = source.index('    ".Lresident_reload_diagnostic_timer:",')
-timer_end = source.index('    ".Lresident_dispatch_resume:",', timer_start)
-timer_assembly = "\n".join(
-    json.loads(line.rstrip(","))
-    for line in map(str.strip, source[timer_start:timer_end].splitlines())
-    if line.startswith('"')
-)
+source = (project / "src/asm/resident_island.S").read_text(encoding="utf-8")
+start = source.index('.globl matrixhv_resident_ebs_callback')
+end = source.index('.Lresident_serial_state:', start)
+hex_start = source.index('.Lresident_paint_hex:', end)
+hex_end = source.index('.Lresident_serial_write:', hex_start)
+emit_start = source.index('.Lresident_diagnostic_emit_value:', end)
+serial_char_start = source.index('.Lresident_serial_char:', hex_end)
+serial_hex_start = source.index('.Lresident_serial_hex64:', serial_char_start)
+serial_hex_end = source.index('.Lresident_vmcs12_field_index_table:', serial_hex_start)
+msr_start = source.index('.Lresident_guarded_rdmsr:')
+msr_end = source.index('.globl matrixhv_resident_island_gp', msr_start)
+gp_end = source.index('.Lresident_host_gp_fatal:', msr_end)
+exception_start = source.index('.globl matrixhv_resident_exception_stubs', gp_end)
+exception_end = source.index('.globl matrixhv_resident_island_fatal', exception_start)
+timer_start = source.index('.Lresident_reload_diagnostic_timer:')
+timer_end = source.index('.Lresident_dispatch_resume:', timer_start)
+timer_assembly = source[timer_start:timer_end].strip()
 timer_assembly = timer_assembly.replace("rdtsc", "mov rax, rdi\nmov rdx, rdi\nshr rdx, 32")
 timer_assembly = timer_assembly.replace(
     "vmwrite rax, r11", "mov [rbx], r11\nmov [rbx + 8], rax\ncmp r11, 0"
 )
 timer_assembly += "\n.Lresident_dispatch_vmwrite_failed:\nud2"
-assembly = "\n".join(
-    json.loads(line.rstrip(","))
-    for line in map(
-        str.strip,
-        (
-            source[start:end]
-            + source[emit_start:hex_start]
-            + source[hex_start:hex_end]
-            + source[hex_end:serial_char_start]
-            + source[serial_hex_start:serial_hex_end]
-            + source[msr_start:gp_end]
-            + '    ".balign 16",\n'
-            + source[exception_start:exception_end]
-        ).splitlines(),
-    )
-    if line.startswith('"')
-)
+assembly = (
+    source[start:end]
+    + source[emit_start:hex_start]
+    + source[hex_start:hex_end]
+    + source[hex_end:serial_char_start]
+    + source[serial_hex_start:serial_hex_end]
+    + source[msr_start:gp_end]
+    + ".balign 16\n"
+    + source[exception_start:exception_end]
+).strip()
 assembly = assembly.replace(
     ".Lresident_host_nmi_return:\npop rax\niretq",
     ".Lresident_host_nmi_return:\npop rax\njmp .Ltest_nmi_return",
@@ -65,7 +53,7 @@ assembly = (
     .replace(".Lresident_island_fatal_serial", ".Ltest_exception_return")
 )
 assembly += "\njmp .Ltest_exception_return"
-screen = (project / "src/boot/mod.rs").read_text(encoding="utf-8")
+screen = (project / "src/boot.rs").read_text(encoding="utf-8")
 
 
 def marker_constant(name):

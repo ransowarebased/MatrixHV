@@ -20,7 +20,8 @@ struct IdentityEpt {
     large_pages_supported: bool,
 }
 
-mod cpuid {
+mod arch {
+    use std::cell::Cell;
     pub struct Leaf {
         pub eax: u32,
     }
@@ -28,10 +29,6 @@ mod cpuid {
     pub fn leaf(_selector: u32) -> Leaf {
         Leaf { eax: 39 }
     }
-}
-
-mod msr {
-    use std::cell::Cell;
 
     pub const IA32_VMX_EPT_VPID_CAP: u32 = 0x48c;
 
@@ -39,7 +36,7 @@ mod msr {
         static CAPABILITIES: Cell<u64> = const { Cell::new(1 << 17) };
     }
 
-    pub unsafe fn read(_register: u32) -> u64 {
+    pub unsafe fn read_msr(_register: u32) -> u64 {
         CAPABILITIES.with(Cell::get)
     }
 
@@ -130,7 +127,7 @@ fn relocated_pci_bar_is_uc_without_replacing_ram_or_firmware_bar() {
 
 #[test]
 fn two_megabyte_fallback_covers_high_pci_space() {
-    msr::set_capabilities(0);
+    arch::set_capabilities(0);
     let mut pages = Vec::new();
     let root = allocate_table(&mut pages).unwrap();
     let mut ept = IdentityEpt {

@@ -27,8 +27,7 @@ def structure(source, name):
 
 
 resident = (project / "src/core/vt_resident.rs").read_text()
-nested = (project / "src/nested/state.rs").read_text()
-vmcs = (project / "src/nested/vmcs.rs").read_text()
+nested = (project / "src/nested.rs").read_text()
 fields = {}
 offset = 0
 
@@ -44,8 +43,8 @@ def append_u64_fields(source, prefix):
 
 append_u64_fields(structure(resident, "ResidentBootContext"), "")
 append_u64_fields(structure(nested, "NestedVmxState"), "nested.")
-append_u64_fields(structure(vmcs, "NestedVmcs12State"), "nested.vmcs12.")
-extended_count = int(re.search(r"const VMCS12_EXTENDED_FIELD_COUNT: usize = (\d+)", vmcs)[1])
+append_u64_fields(structure(nested, "NestedVmcs12State"), "nested.vmcs12.")
+extended_count = int(re.search(r"const VMCS12_EXTENDED_FIELD_COUNT: usize = (\d+)", nested)[1])
 offset += extended_count * 8 + 8
 append_u64_fields(structure(nested, "NestedVmxState").split("pub vmcs12: NestedVmcs12State,", 1)[1], "nested.")
 reference_serial = os.environ.get("MATRIXHV_REFERENCE_SERIAL")

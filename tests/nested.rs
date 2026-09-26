@@ -1,24 +1,17 @@
-#[path = "../src/nested/capabilities.rs"]
-mod capabilities;
-#[path = "../src/nested/state.rs"]
-mod state;
-#[path = "../src/nested/vmcs.rs"]
-mod vmcs;
+#[path = "../src/nested.rs"]
+mod nested;
 
-use capabilities::{
+use nested::{
     CPUID_HYPERVISOR_PRESENT_BIT, CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, HYPERV_FEATURES_LEAF,
     HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START, HostVmxCapabilities, IA32_FEATURE_CONTROL_LOCKED,
-    IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX, MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_PROTOCOL,
+    IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX, INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR,
+    INVALID_VMCS_POINTER, MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_PROTOCOL,
     MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX, MATRIXHV_STATUS_SIGNATURE_ECX,
-    NestedVmxCapabilities, VMX_BASIC_TRUE_CONTROLS, VMX_MEMORY_TYPE_WRITE_BACK, VMX_REGION_SIZE,
-};
-use state::{INVALID_VMCS_POINTER, NestedEptConfiguration, NestedMsrComposition, NestedVmxState};
-use vmcs::{
-    INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR, NestedVmcs12State, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR,
-    VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR, VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR,
-    VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
-    VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS, VMCS_FIELD_GUEST_RIP,
-    VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
+    NestedEptConfiguration, NestedMsrComposition, NestedVmcs12State, NestedVmxCapabilities,
+    NestedVmxState, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
+    VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR, VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR,
+    VMCLEAR_VMXON_POINTER_ERROR, VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS,
+    VMCS_FIELD_GUEST_RIP, VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
     VMCS_FIELD_VM_EXIT_INSTRUCTION_INFO, VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN,
     VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR, VMCS_UNSUPPORTED_COMPONENT_ERROR,
     VMCS12_BACKING_MAGIC, VMCS12_BACKING_MAGIC_OFFSET, VMCS12_BACKING_QWORD_COUNT,
@@ -26,8 +19,9 @@ use vmcs::{
     VMCS12_LAUNCH_STATE_UNINITIALIZED, VMFAIL_INVALID_STATUS, VMFAIL_VALID_STATUS,
     VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR,
     VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR, VMPTRLD_VMXON_POINTER_ERROR,
-    VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR, VMX_STATUS_FLAGS,
-    VMX_STATUS_FLAGS_CLEAR_MASK, VMXON_IN_VMX_ROOT_ERROR,
+    VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR, VMX_BASIC_TRUE_CONTROLS,
+    VMX_MEMORY_TYPE_WRITE_BACK, VMX_REGION_SIZE, VMX_STATUS_FLAGS, VMX_STATUS_FLAGS_CLEAR_MASK,
+    VMXON_IN_VMX_ROOT_ERROR,
 };
 
 const HOST_VMX_BASIC: u64 = 0x00da_0400_0000_1234;
@@ -182,56 +176,76 @@ fn capabilities_normalize_vmx_basic_and_keep_vmx_internal() {
 }
 
 #[test]
+fn vmware_vhv_primary_intercepts_are_available() {
+    let capabilities = NestedVmxCapabilities::from_host(host_vmx_capabilities());
+    let required = 0xbff9_fffe;
+    assert_eq!(
+        (capabilities.vmx_true_procbased_ctls >> 32) as u32 & required,
+        required
+    );
+}
+
+#[test]
+fn vmware_vhv_secondary_intercepts_are_available() {
+    let capabilities = NestedVmxCapabilities::from_host(host_vmx_capabilities());
+    let required = 0x6e;
+    assert_eq!(
+        (capabilities.vmx_procbased_ctls2 >> 32) as u32 & required,
+        required
+    );
+}
+
+#[test]
 fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     let host = host_vmx_capabilities();
     let capabilities = NestedVmxCapabilities::from_host(host);
-    let pinbased_bits = capabilities::VMX_LEGACY_PINBASED_DEFAULT1
-        | capabilities::VMX_PIN_EXTERNAL_INTERRUPT_EXITING
-        | capabilities::VMX_PIN_NMI_EXITING
-        | capabilities::VMX_PIN_VIRTUAL_NMIS;
+    let pinbased_bits = nested::VMX_LEGACY_PINBASED_DEFAULT1
+        | nested::VMX_PIN_EXTERNAL_INTERRUPT_EXITING
+        | nested::VMX_PIN_NMI_EXITING
+        | nested::VMX_PIN_VIRTUAL_NMIS;
     let pinbased_control =
-        control_capabilities(capabilities::VMX_LEGACY_PINBASED_DEFAULT1, pinbased_bits);
+        control_capabilities(nested::VMX_LEGACY_PINBASED_DEFAULT1, pinbased_bits);
     let true_pinbased_control = control_capabilities(0, pinbased_bits);
-    let legacy_entry_bits = capabilities::VMX_LEGACY_ENTRY_DEFAULT1
-        | capabilities::VM_ENTRY_IA32E_MODE_GUEST
-        | capabilities::VM_ENTRY_LOAD_IA32_PAT
-        | capabilities::VM_ENTRY_LOAD_IA32_EFER;
+    let legacy_entry_bits = nested::VMX_LEGACY_ENTRY_DEFAULT1
+        | nested::VM_ENTRY_IA32E_MODE_GUEST
+        | nested::VM_ENTRY_LOAD_IA32_PAT
+        | nested::VM_ENTRY_LOAD_IA32_EFER;
     let ia32e_control = control_capabilities(0, legacy_entry_bits);
     let legacy_entry_control =
-        control_capabilities(capabilities::VMX_LEGACY_ENTRY_DEFAULT1, legacy_entry_bits);
-    let legacy_exit_bits = capabilities::VMX_LEGACY_EXIT_DEFAULT1
-        | capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
-        | capabilities::VM_EXIT_ACK_INTERRUPT_ON_EXIT
-        | capabilities::VM_EXIT_LOAD_IA32_PAT
-        | capabilities::VM_EXIT_LOAD_IA32_EFER;
+        control_capabilities(nested::VMX_LEGACY_ENTRY_DEFAULT1, legacy_entry_bits);
+    let legacy_exit_bits = nested::VMX_LEGACY_EXIT_DEFAULT1
+        | nested::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+        | nested::VM_EXIT_ACK_INTERRUPT_ON_EXIT
+        | nested::VM_EXIT_LOAD_IA32_PAT
+        | nested::VM_EXIT_LOAD_IA32_EFER;
     let true_exit_control = control_capabilities(0, legacy_exit_bits);
     let legacy_exit_control =
-        control_capabilities(capabilities::VMX_LEGACY_EXIT_DEFAULT1, legacy_exit_bits);
-    let primary_may_be_one = capabilities::VMX_LEGACY_PROCBASED_DEFAULT1
-        | capabilities::VMX_PRIMARY_KVM_EXITING_CONTROLS
-        | capabilities::VMX_PRIMARY_RDTSC_EXITING
-        | capabilities::VMX_PRIMARY_TPR_SHADOW
-        | capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
-        | capabilities::VMX_PRIMARY_USE_IO_BITMAPS
-        | capabilities::VMX_PRIMARY_USE_MSR_BITMAPS
-        | capabilities::VMX_PRIMARY_PAUSE_EXITING
-        | capabilities::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS;
-    let primary_control = control_capabilities(
-        capabilities::VMX_LEGACY_PROCBASED_DEFAULT1,
-        primary_may_be_one,
-    );
+        control_capabilities(nested::VMX_LEGACY_EXIT_DEFAULT1, legacy_exit_bits);
+    let primary_may_be_one = nested::VMX_LEGACY_PROCBASED_DEFAULT1
+        | nested::VMX_PRIMARY_KVM_EXITING_CONTROLS
+        | nested::VMX_PRIMARY_RDTSC_EXITING
+        | nested::VMX_PRIMARY_TPR_SHADOW
+        | nested::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
+        | nested::VMX_PRIMARY_USE_IO_BITMAPS
+        | nested::VMX_PRIMARY_MONITOR_TRAP_FLAG
+        | nested::VMX_PRIMARY_USE_MSR_BITMAPS
+        | nested::VMX_PRIMARY_PAUSE_EXITING
+        | nested::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS;
+    let primary_control =
+        control_capabilities(nested::VMX_LEGACY_PROCBASED_DEFAULT1, primary_may_be_one);
     let true_primary_control = control_capabilities(0, primary_may_be_one);
     let secondary_control = control_capabilities(
         0,
-        capabilities::VMX_SECONDARY_ENABLE_EPT
-            | capabilities::VMX_SECONDARY_DESCRIPTOR_TABLE_EXITING
-            | capabilities::VMX_SECONDARY_ENABLE_RDTSCP
-            | capabilities::VMX_SECONDARY_ENABLE_VPID
-            | capabilities::VMX_SECONDARY_UNRESTRICTED_GUEST
-            | capabilities::VMX_SECONDARY_RDRAND_EXITING
-            | capabilities::VMX_SECONDARY_ENABLE_INVPCID
-            | capabilities::VMX_SECONDARY_ENABLE_XSAVES
-            | capabilities::VMX_SECONDARY_MODE_BASED_EXECUTE,
+        nested::VMX_SECONDARY_ENABLE_EPT
+            | nested::VMX_SECONDARY_DESCRIPTOR_TABLE_EXITING
+            | nested::VMX_SECONDARY_ENABLE_RDTSCP
+            | nested::VMX_SECONDARY_ENABLE_VPID
+            | nested::VMX_SECONDARY_WBINVD_EXITING
+            | nested::VMX_SECONDARY_UNRESTRICTED_GUEST
+            | nested::VMX_SECONDARY_RDRAND_EXITING
+            | nested::VMX_SECONDARY_ENABLE_INVPCID
+            | nested::VMX_SECONDARY_ENABLE_XSAVES
+            | nested::VMX_SECONDARY_MODE_BASED_EXECUTE,
     );
 
     assert_eq!(capabilities.vmx_pinbased_ctls, pinbased_control);
@@ -240,7 +254,7 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     assert_eq!(capabilities.vmx_entry_ctls, legacy_entry_control);
     assert_eq!(
         capabilities.vmx_misc,
-        (host.misc & !(0x1ff_u64 << 16)) | (capabilities::VMX_CR3_TARGET_COUNT << 16)
+        (host.misc & !(0x1ff_u64 << 16)) | (nested::VMX_CR3_TARGET_COUNT << 16)
     );
     assert_eq!(capabilities.vmx_cr0_fixed0, host.cr0_fixed0);
     assert_eq!(capabilities.vmx_cr0_fixed1, host.cr0_fixed1);
@@ -248,26 +262,26 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     assert_eq!(capabilities.vmx_cr4_fixed1, host.cr4_fixed1);
     assert_eq!(
         capabilities.vmx_vmcs_enum,
-        capabilities::VMCS12_MAX_ENUM_INDEX << 1
+        nested::VMCS12_MAX_ENUM_INDEX << 1
     );
     assert_eq!(capabilities.vmx_procbased_ctls2, secondary_control);
     assert_eq!((capabilities.vmx_procbased_ctls2 >> 32) as u32 & 0x26, 0x26);
     assert_eq!(
         capabilities.vmx_ept_vpid_cap,
-        capabilities::VMX_EPT_CAPABILITIES | capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES
+        nested::VMX_EPT_CAPABILITIES | nested::VMX_SOFTWARE_INVALIDATION_CAPABILITIES
     );
     assert_eq!(
         capabilities.vmx_ept_vpid_cap & 0xF01_0610_4040,
         0xF01_0610_4040
     );
-    assert_eq!(capabilities::VMX_EPT_CAPABILITIES, 0x61_4041);
+    assert_eq!(nested::VMX_EPT_CAPABILITIES, 0x61_4041);
     assert_ne!(
-        capabilities.vmx_ept_vpid_cap & capabilities::VMX_EPT_INVEPT_ALL_CONTEXTS,
+        capabilities.vmx_ept_vpid_cap & nested::VMX_EPT_INVEPT_ALL_CONTEXTS,
         0
     );
     assert_eq!(
-        capabilities.vmx_ept_vpid_cap & capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES,
-        capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES
+        capabilities.vmx_ept_vpid_cap & nested::VMX_SOFTWARE_INVALIDATION_CAPABILITIES,
+        nested::VMX_SOFTWARE_INVALIDATION_CAPABILITIES
     );
     assert_eq!(capabilities.vmx_true_pinbased_ctls, true_pinbased_control);
     assert_eq!(capabilities.vmx_true_procbased_ctls, true_primary_control);
@@ -292,18 +306,18 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
 fn host_derived_controls_never_invent_unsupported_one_settings() {
     let mut host = host_vmx_capabilities();
     let pin_supported = u32::MAX
-        & !capabilities::VMX_PIN_EXTERNAL_INTERRUPT_EXITING
-        & !capabilities::VMX_PIN_NMI_EXITING
-        & !capabilities::VMX_PIN_VIRTUAL_NMIS;
+        & !nested::VMX_PIN_EXTERNAL_INTERRUPT_EXITING
+        & !nested::VMX_PIN_NMI_EXITING
+        & !nested::VMX_PIN_VIRTUAL_NMIS;
     let exit_supported = u32::MAX
-        & !capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
-        & !capabilities::VM_EXIT_ACK_INTERRUPT_ON_EXIT
-        & !capabilities::VM_EXIT_LOAD_IA32_PAT
-        & !capabilities::VM_EXIT_LOAD_IA32_EFER;
+        & !nested::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+        & !nested::VM_EXIT_ACK_INTERRUPT_ON_EXIT
+        & !nested::VM_EXIT_LOAD_IA32_PAT
+        & !nested::VM_EXIT_LOAD_IA32_EFER;
     let entry_supported = u32::MAX
-        & !capabilities::VM_ENTRY_IA32E_MODE_GUEST
-        & !capabilities::VM_ENTRY_LOAD_IA32_PAT
-        & !capabilities::VM_ENTRY_LOAD_IA32_EFER;
+        & !nested::VM_ENTRY_IA32E_MODE_GUEST
+        & !nested::VM_ENTRY_LOAD_IA32_PAT
+        & !nested::VM_ENTRY_LOAD_IA32_EFER;
     host.exit_ctls = control_capabilities(0, exit_supported);
     host.entry_ctls = control_capabilities(0, entry_supported);
     host.true_exit_ctls = control_capabilities(0, exit_supported);
@@ -313,30 +327,34 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
     host.procbased_ctls = control_capabilities(
         0,
         u32::MAX
-            & !capabilities::VMX_PRIMARY_KVM_EXITING_CONTROLS
-            & !capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
-            & !capabilities::VMX_PRIMARY_RDTSC_EXITING
-            & !capabilities::VMX_PRIMARY_TPR_SHADOW
-            & !capabilities::VMX_PRIMARY_USE_IO_BITMAPS
-            & !capabilities::VMX_PRIMARY_USE_MSR_BITMAPS
-            & !capabilities::VMX_PRIMARY_PAUSE_EXITING,
+            & !nested::VMX_PRIMARY_KVM_EXITING_CONTROLS
+            & !nested::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
+            & !nested::VMX_PRIMARY_RDTSC_EXITING
+            & !nested::VMX_PRIMARY_TPR_SHADOW
+            & !nested::VMX_PRIMARY_USE_IO_BITMAPS
+            & !nested::VMX_PRIMARY_MONITOR_TRAP_FLAG
+            & !nested::VMX_PRIMARY_USE_MSR_BITMAPS
+            & !nested::VMX_PRIMARY_PAUSE_EXITING,
     );
     host.true_procbased_ctls = host.procbased_ctls;
     host.procbased_ctls2 = control_capabilities(
         0,
-        u32::MAX & !capabilities::VMX_SECONDARY_DESCRIPTOR_TABLE_EXITING,
+        u32::MAX
+            & !nested::VMX_SECONDARY_DESCRIPTOR_TABLE_EXITING
+            & !nested::VMX_SECONDARY_WBINVD_EXITING,
     );
 
     let capabilities = NestedVmxCapabilities::from_host(host);
     assert_eq!(
         (capabilities.vmx_procbased_ctls2 >> 32) as u32
-            & capabilities::VMX_SECONDARY_DESCRIPTOR_TABLE_EXITING,
+            & (nested::VMX_SECONDARY_DESCRIPTOR_TABLE_EXITING
+                | nested::VMX_SECONDARY_WBINVD_EXITING),
         0
     );
 
-    let nested_pin_controls = capabilities::VMX_PIN_EXTERNAL_INTERRUPT_EXITING
-        | capabilities::VMX_PIN_NMI_EXITING
-        | capabilities::VMX_PIN_VIRTUAL_NMIS;
+    let nested_pin_controls = nested::VMX_PIN_EXTERNAL_INTERRUPT_EXITING
+        | nested::VMX_PIN_NMI_EXITING
+        | nested::VMX_PIN_VIRTUAL_NMIS;
     assert_eq!(
         capabilities.vmx_pinbased_ctls >> 32 & u64::from(nested_pin_controls),
         0
@@ -348,64 +366,66 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
     assert_eq!(
         capabilities.vmx_exit_ctls >> 32
             & u64::from(
-                capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
-                    | capabilities::VM_EXIT_ACK_INTERRUPT_ON_EXIT
-                    | capabilities::VM_EXIT_LOAD_IA32_PAT
-                    | capabilities::VM_EXIT_LOAD_IA32_EFER,
+                nested::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+                    | nested::VM_EXIT_ACK_INTERRUPT_ON_EXIT
+                    | nested::VM_EXIT_LOAD_IA32_PAT
+                    | nested::VM_EXIT_LOAD_IA32_EFER,
             ),
         0
     );
     assert_eq!(
         capabilities.vmx_entry_ctls >> 32
             & u64::from(
-                capabilities::VM_ENTRY_IA32E_MODE_GUEST
-                    | capabilities::VM_ENTRY_LOAD_IA32_PAT
-                    | capabilities::VM_ENTRY_LOAD_IA32_EFER,
+                nested::VM_ENTRY_IA32E_MODE_GUEST
+                    | nested::VM_ENTRY_LOAD_IA32_PAT
+                    | nested::VM_ENTRY_LOAD_IA32_EFER,
             ),
         0
     );
     assert_eq!(
         capabilities.vmx_true_exit_ctls >> 32
             & u64::from(
-                capabilities::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
-                    | capabilities::VM_EXIT_ACK_INTERRUPT_ON_EXIT
-                    | capabilities::VM_EXIT_LOAD_IA32_PAT
-                    | capabilities::VM_EXIT_LOAD_IA32_EFER,
+                nested::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+                    | nested::VM_EXIT_ACK_INTERRUPT_ON_EXIT
+                    | nested::VM_EXIT_LOAD_IA32_PAT
+                    | nested::VM_EXIT_LOAD_IA32_EFER,
             ),
         0
     );
     assert_eq!(
         capabilities.vmx_true_entry_ctls >> 32
             & u64::from(
-                capabilities::VM_ENTRY_IA32E_MODE_GUEST
-                    | capabilities::VM_ENTRY_LOAD_IA32_PAT
-                    | capabilities::VM_ENTRY_LOAD_IA32_EFER,
+                nested::VM_ENTRY_IA32E_MODE_GUEST
+                    | nested::VM_ENTRY_LOAD_IA32_PAT
+                    | nested::VM_ENTRY_LOAD_IA32_EFER,
             ),
         0
     );
     assert_eq!(
         capabilities.vmx_procbased_ctls >> 32
             & u64::from(
-                capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
-                    | capabilities::VMX_PRIMARY_KVM_EXITING_CONTROLS
-                    | capabilities::VMX_PRIMARY_RDTSC_EXITING
-                    | capabilities::VMX_PRIMARY_TPR_SHADOW
-                    | capabilities::VMX_PRIMARY_USE_IO_BITMAPS
-                    | capabilities::VMX_PRIMARY_USE_MSR_BITMAPS
-                    | capabilities::VMX_PRIMARY_PAUSE_EXITING
+                nested::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
+                    | nested::VMX_PRIMARY_KVM_EXITING_CONTROLS
+                    | nested::VMX_PRIMARY_RDTSC_EXITING
+                    | nested::VMX_PRIMARY_TPR_SHADOW
+                    | nested::VMX_PRIMARY_USE_IO_BITMAPS
+                    | nested::VMX_PRIMARY_MONITOR_TRAP_FLAG
+                    | nested::VMX_PRIMARY_USE_MSR_BITMAPS
+                    | nested::VMX_PRIMARY_PAUSE_EXITING
             ),
         0
     );
     assert_eq!(
         capabilities.vmx_true_procbased_ctls >> 32
             & u64::from(
-                capabilities::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
-                    | capabilities::VMX_PRIMARY_KVM_EXITING_CONTROLS
-                    | capabilities::VMX_PRIMARY_RDTSC_EXITING
-                    | capabilities::VMX_PRIMARY_TPR_SHADOW
-                    | capabilities::VMX_PRIMARY_USE_IO_BITMAPS
-                    | capabilities::VMX_PRIMARY_USE_MSR_BITMAPS
-                    | capabilities::VMX_PRIMARY_PAUSE_EXITING
+                nested::VMX_PRIMARY_UNCONDITIONAL_IO_EXITING
+                    | nested::VMX_PRIMARY_KVM_EXITING_CONTROLS
+                    | nested::VMX_PRIMARY_RDTSC_EXITING
+                    | nested::VMX_PRIMARY_TPR_SHADOW
+                    | nested::VMX_PRIMARY_USE_IO_BITMAPS
+                    | nested::VMX_PRIMARY_MONITOR_TRAP_FLAG
+                    | nested::VMX_PRIMARY_USE_MSR_BITMAPS
+                    | nested::VMX_PRIMARY_PAUSE_EXITING
             ),
         0
     );
@@ -430,20 +450,20 @@ fn emulated_true_controls_do_not_inherit_host_fixed_one_settings() {
 #[test]
 fn nested_ept_is_hidden_when_the_host_contract_is_incomplete() {
     let mut host = host_vmx_capabilities();
-    host.ept_vpid_cap &= !capabilities::VMX_EPT_MEMORY_TYPE_WB;
+    host.ept_vpid_cap &= !nested::VMX_EPT_MEMORY_TYPE_WB;
 
     let capabilities = NestedVmxCapabilities::from_host(host);
 
     assert_eq!(
         capabilities.vmx_procbased_ctls >> 32
-            & u64::from(capabilities::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS),
+            & u64::from(nested::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS),
         0
     );
     assert_eq!(capabilities.vmx_procbased_ctls2, 0);
     assert_eq!(capabilities.vmx_ept_vpid_cap, 0);
     assert_eq!(
         capabilities.vmx_true_procbased_ctls >> 32
-            & u64::from(capabilities::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS),
+            & u64::from(nested::VMX_PRIMARY_ACTIVATE_SECONDARY_CONTROLS),
         0
     );
 }
@@ -451,8 +471,8 @@ fn nested_ept_is_hidden_when_the_host_contract_is_incomplete() {
 #[test]
 fn software_invalidations_do_not_require_host_invept_or_invvpid() {
     let mut host = host_vmx_capabilities();
-    host.ept_vpid_cap = capabilities::VMX_EPT_CAPABILITIES;
-    host.procbased_ctls2 = control_capabilities(0, capabilities::VMX_SECONDARY_ENABLE_EPT);
+    host.ept_vpid_cap = nested::VMX_EPT_CAPABILITIES;
+    host.procbased_ctls2 = control_capabilities(0, nested::VMX_SECONDARY_ENABLE_EPT);
 
     let capabilities = NestedVmxCapabilities::from_host(host);
 
@@ -460,12 +480,12 @@ fn software_invalidations_do_not_require_host_invept_or_invvpid() {
         capabilities.vmx_procbased_ctls2,
         control_capabilities(
             0,
-            capabilities::VMX_SECONDARY_ENABLE_EPT | capabilities::VMX_SECONDARY_ENABLE_VPID
+            nested::VMX_SECONDARY_ENABLE_EPT | nested::VMX_SECONDARY_ENABLE_VPID
         )
     );
     assert_eq!(
         capabilities.vmx_ept_vpid_cap,
-        capabilities::VMX_EPT_CAPABILITIES | capabilities::VMX_SOFTWARE_INVALIDATION_CAPABILITIES
+        nested::VMX_EPT_CAPABILITIES | nested::VMX_SOFTWARE_INVALIDATION_CAPABILITIES
     );
 }
 
@@ -481,11 +501,11 @@ fn true_control_msrs_follow_vmx_basic_availability() {
     assert_eq!(capabilities.vmx_true_exit_ctls, 0);
     assert_eq!(capabilities.vmx_true_entry_ctls, 0);
     assert_eq!(
-        capabilities.vmx_msr(capabilities::IA32_VMX_TRUE_PINBASED_CTLS_MSR),
+        capabilities.vmx_msr(nested::IA32_VMX_TRUE_PINBASED_CTLS_MSR),
         None
     );
     assert_eq!(
-        capabilities.vmx_msr(capabilities::IA32_VMX_TRUE_ENTRY_CTLS_MSR),
+        capabilities.vmx_msr(nested::IA32_VMX_TRUE_ENTRY_CTLS_MSR),
         None
     );
 }
@@ -494,66 +514,45 @@ fn true_control_msrs_follow_vmx_basic_availability() {
 fn virtual_vmx_msr_map_covers_the_supported_capability_range() {
     let capabilities = NestedVmxCapabilities::from_host(host_vmx_capabilities());
     let expected = [
-        (capabilities::IA32_VMX_BASIC_MSR, capabilities.vmx_basic),
+        (nested::IA32_VMX_BASIC_MSR, capabilities.vmx_basic),
         (
-            capabilities::IA32_VMX_PINBASED_CTLS_MSR,
+            nested::IA32_VMX_PINBASED_CTLS_MSR,
             capabilities.vmx_pinbased_ctls,
         ),
         (
-            capabilities::IA32_VMX_PROCBASED_CTLS_MSR,
+            nested::IA32_VMX_PROCBASED_CTLS_MSR,
             capabilities.vmx_procbased_ctls,
         ),
+        (nested::IA32_VMX_EXIT_CTLS_MSR, capabilities.vmx_exit_ctls),
+        (nested::IA32_VMX_ENTRY_CTLS_MSR, capabilities.vmx_entry_ctls),
+        (nested::IA32_VMX_MISC_MSR, capabilities.vmx_misc),
+        (nested::IA32_VMX_CR0_FIXED0_MSR, capabilities.vmx_cr0_fixed0),
+        (nested::IA32_VMX_CR0_FIXED1_MSR, capabilities.vmx_cr0_fixed1),
+        (nested::IA32_VMX_CR4_FIXED0_MSR, capabilities.vmx_cr4_fixed0),
+        (nested::IA32_VMX_CR4_FIXED1_MSR, capabilities.vmx_cr4_fixed1),
+        (nested::IA32_VMX_VMCS_ENUM_MSR, capabilities.vmx_vmcs_enum),
         (
-            capabilities::IA32_VMX_EXIT_CTLS_MSR,
-            capabilities.vmx_exit_ctls,
-        ),
-        (
-            capabilities::IA32_VMX_ENTRY_CTLS_MSR,
-            capabilities.vmx_entry_ctls,
-        ),
-        (capabilities::IA32_VMX_MISC_MSR, capabilities.vmx_misc),
-        (
-            capabilities::IA32_VMX_CR0_FIXED0_MSR,
-            capabilities.vmx_cr0_fixed0,
-        ),
-        (
-            capabilities::IA32_VMX_CR0_FIXED1_MSR,
-            capabilities.vmx_cr0_fixed1,
-        ),
-        (
-            capabilities::IA32_VMX_CR4_FIXED0_MSR,
-            capabilities.vmx_cr4_fixed0,
-        ),
-        (
-            capabilities::IA32_VMX_CR4_FIXED1_MSR,
-            capabilities.vmx_cr4_fixed1,
-        ),
-        (
-            capabilities::IA32_VMX_VMCS_ENUM_MSR,
-            capabilities.vmx_vmcs_enum,
-        ),
-        (
-            capabilities::IA32_VMX_PROCBASED_CTLS2_MSR,
+            nested::IA32_VMX_PROCBASED_CTLS2_MSR,
             capabilities.vmx_procbased_ctls2,
         ),
         (
-            capabilities::IA32_VMX_EPT_VPID_CAP_MSR,
+            nested::IA32_VMX_EPT_VPID_CAP_MSR,
             capabilities.vmx_ept_vpid_cap,
         ),
         (
-            capabilities::IA32_VMX_TRUE_PINBASED_CTLS_MSR,
+            nested::IA32_VMX_TRUE_PINBASED_CTLS_MSR,
             capabilities.vmx_true_pinbased_ctls,
         ),
         (
-            capabilities::IA32_VMX_TRUE_PROCBASED_CTLS_MSR,
+            nested::IA32_VMX_TRUE_PROCBASED_CTLS_MSR,
             capabilities.vmx_true_procbased_ctls,
         ),
         (
-            capabilities::IA32_VMX_TRUE_EXIT_CTLS_MSR,
+            nested::IA32_VMX_TRUE_EXIT_CTLS_MSR,
             capabilities.vmx_true_exit_ctls,
         ),
         (
-            capabilities::IA32_VMX_TRUE_ENTRY_CTLS_MSR,
+            nested::IA32_VMX_TRUE_ENTRY_CTLS_MSR,
             capabilities.vmx_true_entry_ctls,
         ),
     ];
@@ -566,12 +565,12 @@ fn virtual_vmx_msr_map_covers_the_supported_capability_range() {
 
 #[test]
 fn vmcs_enum_is_bounded_by_host_and_vmcs12_field_indices() {
-    let max_vmcs12_index = vmcs::VMCS12_EXTENDED_FIELDS
+    let max_vmcs12_index = nested::VMCS12_EXTENDED_FIELDS
         .iter()
         .map(|field| (field.encoding >> 1) & 0x1ff)
         .max()
         .unwrap();
-    assert_eq!(max_vmcs12_index, capabilities::VMCS12_MAX_ENUM_INDEX);
+    assert_eq!(max_vmcs12_index, nested::VMCS12_MAX_ENUM_INDEX);
 
     let mut host = host_vmx_capabilities();
     host.vmcs_enum = 9 << 1;
@@ -588,7 +587,7 @@ fn cpuid_contract_uses_architectural_bits_and_hypervisor_namespace() {
     assert_eq!(MATRIXHV_STATUS_SIGNATURE_EAX, 0x4d48_5631);
     assert_eq!(MATRIXHV_STATUS_SIGNATURE_EBX.to_le_bytes(), *b"MATR");
     assert_eq!(MATRIXHV_STATUS_SIGNATURE_ECX.to_le_bytes(), *b"IXHV");
-    assert_eq!(MATRIXHV_STATUS_PROTOCOL, 2);
+    assert_eq!(MATRIXHV_STATUS_PROTOCOL, 4);
     assert_eq!(HYPERVISOR_LEAF_START, 0x4000_0000);
     assert_eq!(HYPERV_FEATURES_LEAF, 0x4000_0003);
     assert_eq!(HYPERVISOR_LEAF_END, 0x4fff_ffff);
@@ -735,17 +734,17 @@ fn vmcs12_state_starts_uninitialized_with_zero_observability() {
 
 #[test]
 fn nested_exit_reasons_match_intel_basic_exit_reasons() {
-    assert_eq!(vmcs::VMCLEAR_EXIT_REASON, 19);
-    assert_eq!(vmcs::VMLAUNCH_EXIT_REASON, 20);
-    assert_eq!(vmcs::VMPTRLD_EXIT_REASON, 21);
-    assert_eq!(vmcs::VMPTRST_EXIT_REASON, 22);
-    assert_eq!(vmcs::VMREAD_EXIT_REASON, 23);
-    assert_eq!(vmcs::VMRESUME_EXIT_REASON, 24);
-    assert_eq!(vmcs::VMWRITE_EXIT_REASON, 25);
-    assert_eq!(vmcs::VMXOFF_EXIT_REASON, 26);
-    assert_eq!(vmcs::VMXON_EXIT_REASON, 27);
-    assert_eq!(vmcs::INVEPT_EXIT_REASON, 50);
-    assert_eq!(vmcs::INVVPID_EXIT_REASON, 53);
+    assert_eq!(nested::VMCLEAR_EXIT_REASON, 19);
+    assert_eq!(nested::VMLAUNCH_EXIT_REASON, 20);
+    assert_eq!(nested::VMPTRLD_EXIT_REASON, 21);
+    assert_eq!(nested::VMPTRST_EXIT_REASON, 22);
+    assert_eq!(nested::VMREAD_EXIT_REASON, 23);
+    assert_eq!(nested::VMRESUME_EXIT_REASON, 24);
+    assert_eq!(nested::VMWRITE_EXIT_REASON, 25);
+    assert_eq!(nested::VMXOFF_EXIT_REASON, 26);
+    assert_eq!(nested::VMXON_EXIT_REASON, 27);
+    assert_eq!(nested::INVEPT_EXIT_REASON, 50);
+    assert_eq!(nested::INVVPID_EXIT_REASON, 53);
 }
 
 #[test]
@@ -777,15 +776,15 @@ fn supported_vmcs12_fields_match_intel_encodings() {
     assert_eq!(VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, 0x440c);
     assert_eq!(VMCS_FIELD_VM_EXIT_INSTRUCTION_INFO, 0x440e);
     assert_eq!(VMCS_FIELD_EXIT_QUALIFICATION, 0x6400);
-    assert_eq!(vmcs::VMCS_FIELD_GUEST_PHYSICAL_ADDRESS, 0x2400);
-    assert_eq!(vmcs::VMCS_FIELD_GUEST_LINEAR_ADDRESS, 0x640a);
+    assert_eq!(nested::VMCS_FIELD_GUEST_PHYSICAL_ADDRESS, 0x2400);
+    assert_eq!(nested::VMCS_FIELD_GUEST_LINEAR_ADDRESS, 0x640a);
     assert_eq!(VMCS_FIELD_GUEST_RSP, 0x681c);
     assert_eq!(VMCS_FIELD_GUEST_RIP, 0x681e);
     assert_eq!(VMCS_FIELD_GUEST_RFLAGS, 0x6820);
-    assert_eq!(vmcs::VMCS_FIELD_GUEST_PDPTR0, 0x280a);
-    assert_eq!(vmcs::VMCS_FIELD_GUEST_PDPTR1, 0x280c);
-    assert_eq!(vmcs::VMCS_FIELD_GUEST_PDPTR2, 0x280e);
-    assert_eq!(vmcs::VMCS_FIELD_GUEST_PDPTR3, 0x2810);
+    assert_eq!(nested::VMCS_FIELD_GUEST_PDPTR0, 0x280a);
+    assert_eq!(nested::VMCS_FIELD_GUEST_PDPTR1, 0x280c);
+    assert_eq!(nested::VMCS_FIELD_GUEST_PDPTR2, 0x280e);
+    assert_eq!(nested::VMCS_FIELD_GUEST_PDPTR3, 0x2810);
     assert_eq!(VMCS_FIELD_HOST_RSP, 0x6c14);
     assert_eq!(VMCS_FIELD_HOST_RIP, 0x6c16);
     assert_eq!(VMCS12_LAUNCH_STATE_CLEAR, 0);
@@ -794,7 +793,7 @@ fn supported_vmcs12_fields_match_intel_encodings() {
 
 #[test]
 fn resident_vmcs12_lookup_matches_the_canonical_field_table() {
-    let source = include_str!("../src/core/vt_resident.rs");
+    let source = include_str!("../src/asm/resident_island.S");
     let table = source
         .split(".Lresident_vmcs12_field_index_table:")
         .nth(1)
@@ -805,15 +804,15 @@ fn resident_vmcs12_lookup_matches_the_canonical_field_table() {
     let indices: Vec<u8> = table
         .lines()
         .filter_map(|line| line.split(".byte ").nth(1))
-        .flat_map(|line| line.trim_end_matches(['\"', ',']).split(", "))
+        .flat_map(|line| line.trim().split(", "))
         .map(|value| value.parse().unwrap())
         .collect();
     assert_eq!(indices.len(), 1024);
     assert_eq!(
         indices.iter().filter(|index| **index != 255).count(),
-        vmcs::VMCS12_EXTENDED_FIELD_COUNT
+        nested::VMCS12_EXTENDED_FIELD_COUNT
     );
-    for field in vmcs::VMCS12_EXTENDED_FIELDS {
+    for field in nested::VMCS12_EXTENDED_FIELDS {
         let key = ((field.encoding & 0x6c00) >> 5) | ((field.encoding & 0x3e) >> 1);
         assert_eq!(usize::from(indices[key as usize]), field.index);
     }
@@ -822,13 +821,13 @@ fn resident_vmcs12_lookup_matches_the_canonical_field_table() {
 #[test]
 fn extended_vmcs12_fields_are_dense_unique_and_cover_entry_state() {
     assert_eq!(
-        vmcs::VMCS12_EXTENDED_FIELDS.len(),
-        vmcs::VMCS12_EXTENDED_FIELD_COUNT
+        nested::VMCS12_EXTENDED_FIELDS.len(),
+        nested::VMCS12_EXTENDED_FIELD_COUNT
     );
-    for (index, field) in vmcs::VMCS12_EXTENDED_FIELDS.iter().enumerate() {
+    for (index, field) in nested::VMCS12_EXTENDED_FIELDS.iter().enumerate() {
         assert_eq!(field.index, index);
         assert_eq!(
-            vmcs::VMCS12_EXTENDED_FIELDS
+            nested::VMCS12_EXTENDED_FIELDS
                 .iter()
                 .filter(|candidate| candidate.encoding == field.encoding)
                 .count(),
@@ -836,41 +835,41 @@ fn extended_vmcs12_fields_are_dense_unique_and_cover_entry_state() {
         );
     }
     assert_eq!(
-        vmcs::VMCS12_EXTENDED_FIELDS[115].encoding,
+        nested::VMCS12_EXTENDED_FIELDS[115].encoding,
         VMCS_FIELD_VM_EXIT_INSTRUCTION_INFO
     );
     assert_eq!(
-        vmcs::VMCS12_EXTENDED_FIELDS[116].encoding,
-        vmcs::VMCS_FIELD_GUEST_LINEAR_ADDRESS
+        nested::VMCS12_EXTENDED_FIELDS[116].encoding,
+        nested::VMCS_FIELD_GUEST_LINEAR_ADDRESS
     );
     assert!(
-        vmcs::VMCS12_EXTENDED_FIELDS
+        nested::VMCS12_EXTENDED_FIELDS
             .iter()
-            .any(|field| field.encoding == vmcs::VMCS_FIELD_EXCEPTION_BITMAP)
+            .any(|field| field.encoding == nested::VMCS_FIELD_EXCEPTION_BITMAP)
     );
     assert!(
-        vmcs::VMCS12_EXTENDED_FIELDS
+        nested::VMCS12_EXTENDED_FIELDS
             .iter()
-            .any(|field| field.encoding == vmcs::VMCS_FIELD_GUEST_CR3)
+            .any(|field| field.encoding == nested::VMCS_FIELD_GUEST_CR3)
     );
     assert!(
-        vmcs::VMCS12_EXTENDED_FIELDS
+        nested::VMCS12_EXTENDED_FIELDS
             .iter()
-            .any(|field| field.encoding == vmcs::VMCS_FIELD_HOST_CR3)
+            .any(|field| field.encoding == nested::VMCS_FIELD_HOST_CR3)
     );
     assert!(
-        vmcs::VMCS12_EXTENDED_FIELDS
+        nested::VMCS12_EXTENDED_FIELDS
             .iter()
-            .any(|field| field.encoding == vmcs::VMCS_FIELD_GUEST_PHYSICAL_ADDRESS)
+            .any(|field| field.encoding == nested::VMCS_FIELD_GUEST_PHYSICAL_ADDRESS)
     );
     for encoding in [
-        vmcs::VMCS_FIELD_GUEST_PDPTR0,
-        vmcs::VMCS_FIELD_GUEST_PDPTR1,
-        vmcs::VMCS_FIELD_GUEST_PDPTR2,
-        vmcs::VMCS_FIELD_GUEST_PDPTR3,
+        nested::VMCS_FIELD_GUEST_PDPTR0,
+        nested::VMCS_FIELD_GUEST_PDPTR1,
+        nested::VMCS_FIELD_GUEST_PDPTR2,
+        nested::VMCS_FIELD_GUEST_PDPTR3,
     ] {
         assert!(
-            vmcs::VMCS12_EXTENDED_FIELDS
+            nested::VMCS12_EXTENDED_FIELDS
                 .iter()
                 .any(|field| field.encoding == encoding)
         );
@@ -880,25 +879,25 @@ fn extended_vmcs12_fields_are_dense_unique_and_cover_entry_state() {
 #[test]
 fn mbec_requires_host_execution_control_and_exit_information() {
     let mut host = host_vmx_capabilities();
-    let mbec = u64::from(capabilities::VMX_SECONDARY_MODE_BASED_EXECUTE) << 32;
+    let mbec = u64::from(nested::VMX_SECONDARY_MODE_BASED_EXECUTE) << 32;
     assert_ne!(
-        capabilities::NestedVmxCapabilities::from_host(host).vmx_procbased_ctls2 & mbec,
+        nested::NestedVmxCapabilities::from_host(host).vmx_procbased_ctls2 & mbec,
         0
     );
     for requirement in [
-        capabilities::VMX_EPT_EXECUTE_ONLY,
-        capabilities::VMX_EPT_ADVANCED_EXIT_INFO,
+        nested::VMX_EPT_EXECUTE_ONLY,
+        nested::VMX_EPT_ADVANCED_EXIT_INFO,
     ] {
         let mut missing = host;
         missing.ept_vpid_cap &= !requirement;
         assert_eq!(
-            capabilities::NestedVmxCapabilities::from_host(missing).vmx_procbased_ctls2 & mbec,
+            nested::NestedVmxCapabilities::from_host(missing).vmx_procbased_ctls2 & mbec,
             0
         );
     }
     host.procbased_ctls2 &= !mbec;
     assert_eq!(
-        capabilities::NestedVmxCapabilities::from_host(host).vmx_procbased_ctls2 & mbec,
+        nested::NestedVmxCapabilities::from_host(host).vmx_procbased_ctls2 & mbec,
         0
     );
 }

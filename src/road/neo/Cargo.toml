@@ -3,6 +3,3 @@ name = "neo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-[dependencies]
-road-server = { path = "../server" }

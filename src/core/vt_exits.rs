@@ -1,11 +1,11 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use super::vt_vmcs::{self, VmcsError};
-use super::vt_vmcs_fields::{
-    EXIT_QUALIFICATION, GUEST_CR3, GUEST_RIP, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_REASON,
+use super::vmcs::{
+    self, EXIT_QUALIFICATION, GUEST_CR3, GUEST_RIP, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_REASON,
+    VmcsError,
 };
-use crate::arch::x86_64::{control_regs, cpuid, msr};
-use crate::boot::logger;
+use crate::arch;
+use crate::runtime;
 
 pub const VM_ENTRY_FAILURE_BIT: u32 = 1 << 31;
 pub const BASIC_EXIT_REASON_MASK: u32 = 0xffff;
@@ -261,11 +261,11 @@ pub extern "efiapi" fn matrixhv_vmexit_dispatch(
             Ok(state) => state,
             Err(error) => {
                 FAILURE_CODE.store(DISPATCH_FAILURE_VMREAD, Ordering::Relaxed);
-                logger::error(format_args!("vmexit vmread error={error:?}"));
+                runtime::error(format_args!("vmexit vmread error={error:?}"));
                 return DispatchAction::Stop as u64;
             }
         };
-    let host_cr3 = control_regs::read_cr3();
+    let host_cr3 = arch::read_cr3();
     let _ = FIRST_HOST_CR3.compare_exchange(0, host_cr3, Ordering::Relaxed, Ordering::Relaxed);
     LAST_HOST_CR3.store(host_cr3, Ordering::Relaxed);
     LAST_GUEST_CR3.store(guest_cr3, Ordering::Relaxed);
@@ -274,11 +274,11 @@ pub extern "efiapi" fn matrixhv_vmexit_dispatch(
     let exit_index = EXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if exit_index > context.exit_limit {
         FAILURE_CODE.store(DISPATCH_FAILURE_EXIT_LIMIT, Ordering::Relaxed);
-        logger::error(format_args!(
+        runtime::error(format_args!(
             "vmexit exit_limit_exceeded count={} limit={}",
             exit_index, context.exit_limit
         ));
-        logger::phase("vmx.dispatch.exit_limit_exceeded");
+        runtime::phase("vmx.dispatch.exit_limit_exceeded");
         return DispatchAction::Stop as u64;
     }
     LAST_REASON.store(raw_reason, Ordering::Relaxed);
@@ -287,7 +287,7 @@ pub extern "efiapi" fn matrixhv_vmexit_dispatch(
     let trace_exit = context.trace_every_exit || exit_index <= 16 || exit_index.is_power_of_two();
 
     if trace_exit {
-        logger::info(format_args!(
+        runtime::info(format_args!(
             "vmexit dispatch index={} raw_reason={:#x} name={} basic_reason={} rip={:#x} len={} qualification={:#x} host_cr3={:#x} guest_cr3={:#x}",
             exit_index,
             raw_reason,
@@ -303,7 +303,7 @@ pub extern "efiapi" fn matrixhv_vmexit_dispatch(
 
     if is_vm_entry_failure(raw_reason) {
         FAILURE_CODE.store(DISPATCH_FAILURE_ENTRY, Ordering::Relaxed);
-        logger::phase("vmx.dispatch.vm_entry_failure");
+        runtime::phase("vmx.dispatch.vm_entry_failure");
         return DispatchAction::Stop as u64;
     }
 
@@ -314,13 +314,13 @@ pub extern "efiapi" fn matrixhv_vmexit_dispatch(
         VMCALL => dispatch_vmcall(registers, guest_rip, instruction_length),
         _ => {
             FAILURE_CODE.store(DISPATCH_FAILURE_UNEXPECTED_EXIT, Ordering::Relaxed);
-            logger::error(format_args!(
+            runtime::error(format_args!(
                 "vmexit unexpected reason={} name={} rip={:#x}",
                 basic_code,
                 reason_name(raw_reason),
                 guest_rip
             ));
-            logger::phase("vmx.dispatch.unexpected_exit");
+            runtime::phase("vmx.dispatch.unexpected_exit");
             DispatchAction::Stop as u64
         }
     }
@@ -333,14 +333,14 @@ fn dispatch_rdmsr(
     trace_exit: bool,
 ) -> u64 {
     if trace_exit {
-        logger::phase("vmx.dispatch.rdmsr.start");
+        runtime::phase("vmx.dispatch.rdmsr.start");
     }
     if instruction_length != 2 {
         FAILURE_CODE.store(DISPATCH_FAILURE_UNEXPECTED_EXIT, Ordering::Relaxed);
         return DispatchAction::Stop as u64;
     }
     let index = registers.rcx as u32;
-    let value = unsafe { msr::read(index) };
+    let value = unsafe { arch::read_msr(index) };
     registers.rax = u64::from(value as u32);
     registers.rdx = u64::from((value >> 32) as u32);
 
@@ -351,13 +351,13 @@ fn dispatch_rdmsr(
     RDMSR_COUNT.fetch_add(1, Ordering::Relaxed);
     RESUME_COUNT.fetch_add(1, Ordering::Relaxed);
     if trace_exit {
-        logger::info(format_args!(
+        runtime::info(format_args!(
             "vmexit rdmsr index={:#x} value={:#x} next_rip={:#x}",
             index,
             value,
             guest_rip + u64::from(instruction_length)
         ));
-        logger::phase("vmx.dispatch.rdmsr.resume");
+        runtime::phase("vmx.dispatch.rdmsr.resume");
     }
     DispatchAction::Resume as u64
 }
@@ -369,7 +369,7 @@ fn dispatch_wrmsr(
     trace_exit: bool,
 ) -> u64 {
     if trace_exit {
-        logger::phase("vmx.dispatch.wrmsr.start");
+        runtime::phase("vmx.dispatch.wrmsr.start");
     }
     if instruction_length != 2 {
         FAILURE_CODE.store(DISPATCH_FAILURE_UNEXPECTED_EXIT, Ordering::Relaxed);
@@ -378,7 +378,7 @@ fn dispatch_wrmsr(
     let index = registers.rcx as u32;
     let value = ((registers.rdx as u32 as u64) << 32) | u64::from(registers.rax as u32);
     unsafe {
-        msr::write(index, value);
+        arch::write_msr(index, value);
     }
     if advance_guest_rip(guest_rip, instruction_length).is_err() {
         FAILURE_CODE.store(DISPATCH_FAILURE_RIP_ADVANCE, Ordering::Relaxed);
@@ -387,13 +387,13 @@ fn dispatch_wrmsr(
     WRMSR_COUNT.fetch_add(1, Ordering::Relaxed);
     RESUME_COUNT.fetch_add(1, Ordering::Relaxed);
     if trace_exit {
-        logger::info(format_args!(
+        runtime::info(format_args!(
             "vmexit wrmsr index={:#x} value={:#x} next_rip={:#x}",
             index,
             value,
             guest_rip + u64::from(instruction_length)
         ));
-        logger::phase("vmx.dispatch.wrmsr.resume");
+        runtime::phase("vmx.dispatch.wrmsr.resume");
     }
     DispatchAction::Resume as u64
 }
@@ -405,7 +405,7 @@ fn dispatch_cpuid(
     trace_exit: bool,
 ) -> u64 {
     if trace_exit {
-        logger::phase("vmx.dispatch.cpuid.start");
+        runtime::phase("vmx.dispatch.cpuid.start");
     }
     if instruction_length != 2 {
         FAILURE_CODE.store(DISPATCH_FAILURE_CPUID_LENGTH, Ordering::Relaxed);
@@ -414,7 +414,7 @@ fn dispatch_cpuid(
 
     let leaf = registers.rax as u32;
     let subleaf = registers.rcx as u32;
-    let result = cpuid::leaf_with_subleaf(leaf, subleaf);
+    let result = arch::leaf_with_subleaf(leaf, subleaf);
 
     registers.rax = u64::from(result.eax);
     registers.rbx = u64::from(result.ebx);
@@ -437,7 +437,7 @@ fn dispatch_cpuid(
     RESUME_COUNT.fetch_add(1, Ordering::Relaxed);
 
     if trace_exit {
-        logger::info(format_args!(
+        runtime::info(format_args!(
             "vmexit cpuid leaf={:#x} subleaf={:#x} eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} next_rip={:#x}",
             leaf,
             subleaf,
@@ -447,13 +447,13 @@ fn dispatch_cpuid(
             result.edx,
             guest_rip + u64::from(instruction_length)
         ));
-        logger::phase("vmx.dispatch.cpuid.resume");
+        runtime::phase("vmx.dispatch.cpuid.resume");
     }
     DispatchAction::Resume as u64
 }
 
 fn dispatch_vmcall(registers: &GuestRegisters, guest_rip: u64, instruction_length: u32) -> u64 {
-    logger::phase("vmx.dispatch.vmcall.start");
+    runtime::phase("vmx.dispatch.vmcall.start");
     if instruction_length != 3 {
         FAILURE_CODE.store(DISPATCH_FAILURE_VMCALL_LENGTH, Ordering::Relaxed);
         return DispatchAction::Stop as u64;
@@ -466,26 +466,26 @@ fn dispatch_vmcall(registers: &GuestRegisters, guest_rip: u64, instruction_lengt
     FINAL_ECX.store(registers.rcx, Ordering::Relaxed);
     FINAL_EDX.store(registers.rdx, Ordering::Relaxed);
     FINAL_RSP.store(registers.rsp, Ordering::Relaxed);
-    logger::info(format_args!(
+    runtime::info(format_args!(
         "vmexit vmcall final_regs rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsp={:#x}",
         registers.rax, registers.rbx, registers.rcx, registers.rdx, registers.rsp
     ));
-    logger::phase("vmx.dispatch.vmcall.stop");
+    runtime::phase("vmx.dispatch.vmcall.stop");
     DispatchAction::Stop as u64
 }
 
 fn read_exit_state() -> Result<(u32, u64, u32, u64, u64), VmcsError> {
     Ok((
-        vt_vmcs::vmread(VM_EXIT_REASON)? as u32,
-        vt_vmcs::vmread(GUEST_RIP)?,
-        vt_vmcs::vmread(VM_EXIT_INSTRUCTION_LEN)? as u32,
-        vt_vmcs::vmread(EXIT_QUALIFICATION)?,
-        vt_vmcs::vmread(GUEST_CR3)?,
+        vmcs::vmread(VM_EXIT_REASON)? as u32,
+        vmcs::vmread(GUEST_RIP)?,
+        vmcs::vmread(VM_EXIT_INSTRUCTION_LEN)? as u32,
+        vmcs::vmread(EXIT_QUALIFICATION)?,
+        vmcs::vmread(GUEST_CR3)?,
     ))
 }
 
 fn advance_guest_rip(guest_rip: u64, instruction_length: u32) -> Result<(), VmcsError> {
-    vt_vmcs::vmwrite(
+    vmcs::vmwrite(
         GUEST_RIP,
         guest_rip.wrapping_add(u64::from(instruction_length)),
     )

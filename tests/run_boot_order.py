@@ -3,9 +3,9 @@ import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
-source = (ROOT / "src" / "boot" / "mod.rs").read_text(encoding="utf-8")
+source = (ROOT / "src" / "boot.rs").read_text(encoding="utf-8")
 start = source.index("mod boot_order {")
-end = source.index("\npub mod services;", start)
+end = source.index("\nmod memory_map {", start)
 parser = source[start:end]
 cases = (ROOT / "tests" / "boot_order.rs").read_text(encoding="utf-8")
 builds = ROOT / "builds"

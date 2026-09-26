@@ -2,8 +2,8 @@ use core::arch::asm;
 
 use uefi::Status;
 
-use crate::arch::x86_64::{control_regs, msr, registers, segmentation};
-use crate::memory::resident::{AddressConstraint, ResidentPages};
+use crate::arch;
+use crate::memory::{AddressConstraint, ResidentPages};
 
 const PAGE_SIZE: usize = 4096;
 const IA32_VMX_BASIC_REVISION_MASK: u32 = 0x7fff_ffff;
@@ -71,8 +71,8 @@ impl Drop for VmxRootSession {
         }
 
         unsafe {
-            control_regs::write_cr4(self.report.original_cr4);
-            control_regs::write_cr0(self.report.original_cr0);
+            arch::write_cr4(self.report.original_cr4);
+            arch::write_cr0(self.report.original_cr0);
         }
 
         let _ = &self.interrupt_guard;
@@ -96,8 +96,8 @@ impl Drop for BorrowedVmxRootSession<'_> {
         }
 
         unsafe {
-            control_regs::write_cr4(self.report.original_cr4);
-            control_regs::write_cr0(self.report.original_cr0);
+            arch::write_cr4(self.report.original_cr4);
+            arch::write_cr0(self.report.original_cr0);
         }
 
         let _ = &self.interrupt_guard;
@@ -144,7 +144,7 @@ pub fn probe_vmxon() -> Result<VmxonReport, VmxonError> {
 }
 
 pub fn enter_vmx_root() -> Result<VmxRootSession, VmxonError> {
-    let vmx_basic = unsafe { msr::read(msr::IA32_VMX_BASIC) };
+    let vmx_basic = unsafe { arch::read_msr(arch::IA32_VMX_BASIC) };
     let state = VmxRootState::capture(vmx_basic)?;
     let vmxon_region = VmxonRegion::allocate(vmx_basic)?;
     enter_vmx_root_with_state(vmxon_region, state)
@@ -189,16 +189,16 @@ impl VmxRootState {
             return Err(VmxonError::UnsupportedMemoryType(memory_type));
         }
 
-        let original_cr0 = control_regs::read_cr0();
-        let original_cr4 = control_regs::read_cr4();
-        let fixed_cr0_0 = unsafe { msr::read(msr::IA32_VMX_CR0_FIXED0) };
-        let fixed_cr0_1 = unsafe { msr::read(msr::IA32_VMX_CR0_FIXED1) };
-        let fixed_cr4_0 = unsafe { msr::read(msr::IA32_VMX_CR4_FIXED0) };
-        let fixed_cr4_1 = unsafe { msr::read(msr::IA32_VMX_CR4_FIXED1) };
+        let original_cr0 = arch::read_cr0();
+        let original_cr4 = arch::read_cr4();
+        let fixed_cr0_0 = unsafe { arch::read_msr(arch::IA32_VMX_CR0_FIXED0) };
+        let fixed_cr0_1 = unsafe { arch::read_msr(arch::IA32_VMX_CR0_FIXED1) };
+        let fixed_cr4_0 = unsafe { arch::read_msr(arch::IA32_VMX_CR4_FIXED0) };
+        let fixed_cr4_1 = unsafe { arch::read_msr(arch::IA32_VMX_CR4_FIXED1) };
 
         let vmx_cr0 = (original_cr0 | fixed_cr0_0) & fixed_cr0_1;
-        let vmx_cr4 = (original_cr4 | control_regs::CR4_VMXE | fixed_cr4_0) & fixed_cr4_1;
-        if vmx_cr4 & control_regs::CR4_VMXE == 0 {
+        let vmx_cr4 = (original_cr4 | arch::CR4_VMXE | fixed_cr4_0) & fixed_cr4_1;
+        if vmx_cr4 & arch::CR4_VMXE == 0 {
             return Err(VmxonError::InvalidControlRegisters);
         }
 
@@ -236,15 +236,15 @@ fn activate_vmx_root(
     let interrupt_guard = InterruptGuard::disable();
 
     unsafe {
-        control_regs::write_cr0(state.vmx_cr0);
-        control_regs::write_cr4(state.vmx_cr4);
+        arch::write_cr0(state.vmx_cr0);
+        arch::write_cr4(state.vmx_cr4);
     }
 
     let instruction_result = unsafe { vmxon(region_physical_address) };
     if instruction_result != VmxInstructionResult::Succeeded {
         unsafe {
-            control_regs::write_cr4(state.original_cr4);
-            control_regs::write_cr0(state.original_cr0);
+            arch::write_cr4(state.original_cr4);
+            arch::write_cr0(state.original_cr0);
         }
         drop(interrupt_guard);
         return Err(VmxonError::Instruction(instruction_result));
@@ -265,7 +265,7 @@ fn activate_vmx_root(
 }
 
 pub fn vmx_basic() -> u64 {
-    unsafe { msr::read(msr::IA32_VMX_BASIC) }
+    unsafe { arch::read_msr(arch::IA32_VMX_BASIC) }
 }
 
 pub fn revision_id(vmx_basic: u64) -> u32 {
@@ -319,8 +319,8 @@ unsafe fn vmxoff() {
 
 struct InterruptGuard {
     interrupts_were_enabled: bool,
-    gdtr: segmentation::DescriptorTablePointer,
-    idtr: segmentation::DescriptorTablePointer,
+    gdtr: arch::DescriptorTablePointer,
+    idtr: arch::DescriptorTablePointer,
     dr7: u64,
     debugctl: u64,
     fs_base: u64,
@@ -336,12 +336,12 @@ impl InterruptGuard {
         }
         Self {
             interrupts_were_enabled: rflags & (1 << 9) != 0,
-            gdtr: segmentation::read_gdtr(),
-            idtr: segmentation::read_idtr(),
-            dr7: registers::read_dr7(),
-            debugctl: unsafe { msr::read(msr::IA32_DEBUGCTL) },
-            fs_base: unsafe { msr::read(msr::IA32_FS_BASE) },
-            gs_base: unsafe { msr::read(msr::IA32_GS_BASE) },
+            gdtr: arch::read_gdtr(),
+            idtr: arch::read_idtr(),
+            dr7: arch::read_dr7(),
+            debugctl: unsafe { arch::read_msr(arch::IA32_DEBUGCTL) },
+            fs_base: unsafe { arch::read_msr(arch::IA32_FS_BASE) },
+            gs_base: unsafe { arch::read_msr(arch::IA32_GS_BASE) },
         }
     }
 }
@@ -359,9 +359,9 @@ impl Drop for InterruptGuard {
                 idtr = in(reg) &self.idtr,
                 options(nostack)
             );
-            msr::write(msr::IA32_DEBUGCTL, self.debugctl);
-            msr::write(msr::IA32_FS_BASE, self.fs_base);
-            msr::write(msr::IA32_GS_BASE, self.gs_base);
+            arch::write_msr(arch::IA32_DEBUGCTL, self.debugctl);
+            arch::write_msr(arch::IA32_FS_BASE, self.fs_base);
+            arch::write_msr(arch::IA32_GS_BASE, self.gs_base);
             asm!("mov dr7, {}", in(reg) self.dr7, options(nostack, preserves_flags));
             if self.interrupts_were_enabled {
                 asm!("sti", options(nomem, nostack));

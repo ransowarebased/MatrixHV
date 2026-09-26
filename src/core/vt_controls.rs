@@ -1,10 +1,9 @@
 use core::arch::asm;
 
-use crate::arch::x86_64::{msr, registers::CR4_VMXE};
-use crate::nested::capabilities::IA32_VMX_MISC_MSR;
+use crate::arch::{self, CR4_VMXE};
+use crate::nested::IA32_VMX_MISC_MSR;
 
-use super::vt_vmcs::{VmcsError, vmwrite};
-use super::vt_vmcs_fields::*;
+use super::vmcs::*;
 
 const IA32_VMX_BASIC_TRUE_CTLS: u64 = 1 << 55;
 const PIN_BASED_NMI_EXITING: u32 = 1 << 3;
@@ -90,7 +89,7 @@ pub fn configure_resident_boot(
     msr_bitmap: u64,
     ept_pointer: u64,
 ) -> Result<VmxControls, VmxControlsError> {
-    let cpuid = crate::arch::x86_64::cpuid::leaf;
+    let cpuid = crate::arch::leaf;
     let mut secondary = SECONDARY_ENABLE_EPT;
     if cpuid(0x8000_0001).edx & (1 << 27) != 0 {
         secondary |= SECONDARY_ENABLE_RDTSCP;
@@ -98,7 +97,7 @@ pub fn configure_resident_boot(
     if cpuid(7).ebx & (1 << 10) != 0 {
         secondary |= SECONDARY_ENABLE_INVPCID;
     }
-    if crate::arch::x86_64::cpuid::leaf_with_subleaf(0xd, 1).eax & (1 << 3) != 0 {
+    if crate::arch::leaf_with_subleaf(0xd, 1).eax & (1 << 3) != 0 {
         secondary |= SECONDARY_ENABLE_XSAVES;
     }
     let controls = configure_internal(RequestedControls {
@@ -117,10 +116,7 @@ pub fn configure_resident_boot(
         ept_pointer: Some(ept_pointer),
     })?;
     vmwrite(CR0_GUEST_HOST_MASK, (1 << 30) | (1 << 29))?;
-    vmwrite(
-        CR0_READ_SHADOW,
-        crate::arch::x86_64::control_regs::read_cr0(),
-    )?;
+    vmwrite(CR0_READ_SHADOW, crate::arch::read_cr0())?;
     Ok(controls)
 }
 
@@ -131,7 +127,7 @@ pub(crate) fn configure_resident_ap(
     let mut controls = configure_resident_boot(msr_bitmap, ept_pointer)?;
     controls.secondary_processor_based = adjust_control(
         controls.secondary_processor_based | SECONDARY_UNRESTRICTED_GUEST,
-        msr::IA32_VMX_PROCBASED_CTLS2,
+        arch::IA32_VMX_PROCBASED_CTLS2,
     );
     if controls.secondary_processor_based & SECONDARY_UNRESTRICTED_GUEST == 0 {
         return Err(VmxControlsError::UnrestrictedGuestUnavailable);
@@ -144,27 +140,31 @@ pub(crate) fn configure_resident_ap(
 }
 
 pub(crate) fn resident_boot_timer_parameters() -> (u64, u64) {
-    if !crate::runtime::logger::enabled() {
+    if !crate::runtime::enabled() {
         return (0, 0);
     }
-    let basic = unsafe { msr::read(msr::IA32_VMX_BASIC) };
+    let basic = unsafe { arch::read_msr(arch::IA32_VMX_BASIC) };
     let pin_msr = if basic & IA32_VMX_BASIC_TRUE_CTLS != 0 {
-        msr::IA32_VMX_TRUE_PINBASED_CTLS
+        arch::IA32_VMX_TRUE_PINBASED_CTLS
     } else {
-        msr::IA32_VMX_PINBASED_CTLS
+        arch::IA32_VMX_PINBASED_CTLS
     };
-    let capability = unsafe { msr::read(pin_msr) };
+    let capability = unsafe { arch::read_msr(pin_msr) };
     if capability >> 32 & u64::from(PIN_BASED_VMX_PREEMPTION_TIMER) == 0 {
         return (0, 0);
     }
-    let timer_rate = unsafe { msr::read(IA32_VMX_MISC_MSR) } & 31;
+    let timer_rate = unsafe { arch::read_msr(IA32_VMX_MISC_MSR) } & 31;
+    let interval_tsc = resident_tsc_hz();
+    (interval_tsc, timer_rate)
+}
+
+pub(crate) fn resident_tsc_hz() -> u64 {
     let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
     uefi::boot::stall(core::time::Duration::from_millis(10));
-    let interval_tsc = unsafe { core::arch::x86_64::_rdtsc() }
+    unsafe { core::arch::x86_64::_rdtsc() }
         .wrapping_sub(start_tsc)
         .saturating_mul(100)
-        .max(1);
-    (interval_tsc, timer_rate)
+        .max(1)
 }
 
 pub(crate) fn enable_resident_boot_timer(
@@ -193,8 +193,8 @@ pub(crate) fn enable_resident_vpid(
     controls: &mut VmxControls,
     virtual_processor_id: u16,
 ) -> Result<(), VmxControlsError> {
-    let secondary = unsafe { msr::read(msr::IA32_VMX_PROCBASED_CTLS2) };
-    let invalidation = unsafe { msr::read(msr::IA32_VMX_EPT_VPID_CAP) };
+    let secondary = unsafe { arch::read_msr(arch::IA32_VMX_PROCBASED_CTLS2) };
+    let invalidation = unsafe { arch::read_msr(arch::IA32_VMX_EPT_VPID_CAP) };
     let required = (1_u64 << 32) | (1_u64 << 41);
     if secondary & (u64::from(SECONDARY_ENABLE_VPID) << 32) == 0
         || invalidation & required != required
@@ -228,35 +228,35 @@ pub(crate) fn enable_resident_vpid(
 }
 
 fn configure_internal(requested: RequestedControls) -> Result<VmxControls, VmxControlsError> {
-    let basic = unsafe { msr::read(msr::IA32_VMX_BASIC) };
+    let basic = unsafe { arch::read_msr(arch::IA32_VMX_BASIC) };
     let use_true_controls = basic & IA32_VMX_BASIC_TRUE_CTLS != 0;
 
     let pin_msr = if use_true_controls {
-        msr::IA32_VMX_TRUE_PINBASED_CTLS
+        arch::IA32_VMX_TRUE_PINBASED_CTLS
     } else {
-        msr::IA32_VMX_PINBASED_CTLS
+        arch::IA32_VMX_PINBASED_CTLS
     };
     let proc_msr = if use_true_controls {
-        msr::IA32_VMX_TRUE_PROCBASED_CTLS
+        arch::IA32_VMX_TRUE_PROCBASED_CTLS
     } else {
-        msr::IA32_VMX_PROCBASED_CTLS
+        arch::IA32_VMX_PROCBASED_CTLS
     };
     let exit_msr = if use_true_controls {
-        msr::IA32_VMX_TRUE_EXIT_CTLS
+        arch::IA32_VMX_TRUE_EXIT_CTLS
     } else {
-        msr::IA32_VMX_EXIT_CTLS
+        arch::IA32_VMX_EXIT_CTLS
     };
     let entry_msr = if use_true_controls {
-        msr::IA32_VMX_TRUE_ENTRY_CTLS
+        arch::IA32_VMX_TRUE_ENTRY_CTLS
     } else {
-        msr::IA32_VMX_ENTRY_CTLS
+        arch::IA32_VMX_ENTRY_CTLS
     };
 
     let pin_based = adjust_control(requested.pin_based, pin_msr);
     if requested.pin_based & PIN_BASED_VIRTUAL_NMIS != 0
         && (pin_based & (PIN_BASED_NMI_EXITING | PIN_BASED_VIRTUAL_NMIS)
             != (PIN_BASED_NMI_EXITING | PIN_BASED_VIRTUAL_NMIS)
-            || unsafe { msr::read(proc_msr) } & (1_u64 << (32 + 22)) == 0)
+            || unsafe { arch::read_msr(proc_msr) } & (1_u64 << (32 + 22)) == 0)
     {
         return Err(VmxControlsError::VirtualNmisUnavailable);
     }
@@ -265,7 +265,7 @@ fn configure_internal(requested: RequestedControls) -> Result<VmxControls, VmxCo
         if primary_processor_based & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS != 0 {
             adjust_control(
                 requested.secondary_processor_based,
-                msr::IA32_VMX_PROCBASED_CTLS2,
+                arch::IA32_VMX_PROCBASED_CTLS2,
             )
         } else {
             0
@@ -381,7 +381,7 @@ fn configure_internal(requested: RequestedControls) -> Result<VmxControls, VmxCo
 }
 
 fn adjust_control(desired: u32, capability_msr: u32) -> u32 {
-    let capabilities = unsafe { msr::read(capability_msr) };
+    let capabilities = unsafe { arch::read_msr(capability_msr) };
     let must_be_one = capabilities as u32;
     let may_be_one = (capabilities >> 32) as u32;
     (desired | must_be_one) & may_be_one

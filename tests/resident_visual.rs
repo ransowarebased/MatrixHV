@@ -22,6 +22,7 @@ global_asm!(
 
 #[repr(C)]
 struct EventContext {
+    telemetry_enabled: u64,
     diagnostic_halted: u64,
     exit_boot_services_seen: u64,
     virtual_address_change_seen: u64,
@@ -59,6 +60,7 @@ global_asm!(
     event_host_fault_address = const core::mem::offset_of!(EventContext, host_fault_address),
     b_nmi_pending = const core::mem::offset_of!(EventContext, nmi_pending),
     b_nmi_count = const core::mem::offset_of!(EventContext, nmi_count),
+    b_telemetry_enabled = const core::mem::offset_of!(EventContext, telemetry_enabled),
     visual_marker_step_bytes = const MARKER_STEP * 4,
     visual_marker_row_step = const MARKER_ROW_STEP,
     visual_marker_side = const MARKER_SIDE,
@@ -239,6 +241,7 @@ fn disabled_boot_timer_does_not_access_unsupported_vmcs_field() {
 
 fn context(pixels: &mut [u32]) -> EventContext {
     EventContext {
+        telemetry_enabled: 1,
         nmi_pending: 0,
         nmi_count: 0,
         diagnostic_halted: 0,
@@ -342,6 +345,7 @@ fn byte_rows_preserve_bit_order_and_ignore_high_bits() {
 fn missing_framebuffer_is_ignored() {
     let _guard = TEST_LOCK.lock().unwrap();
     let event_context = EventContext {
+        telemetry_enabled: 1,
         nmi_pending: 0,
         nmi_count: 0,
         diagnostic_halted: 0,

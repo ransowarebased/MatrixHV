@@ -6,9 +6,8 @@ import subprocess
 project = Path(__file__).resolve().parents[1]
 output = project / "builds" / "logger-tests"
 output.mkdir(parents=True, exist_ok=True)
-logger = (project / "src/runtime/logger.rs").read_text(encoding="utf-8")
-serial = (project / "src/runtime/serial.rs").read_text(encoding="utf-8")
-screen = (project / "src/boot/mod.rs").read_text(encoding="utf-8")
+runtime = (project / "src/runtime.rs").read_text(encoding="utf-8")
+screen = (project / "src/boot.rs").read_text(encoding="utf-8")
 
 
 def item(source, declaration):
@@ -22,13 +21,13 @@ def item(source, declaration):
     return source[start:end]
 
 
-backend = "#[derive(Clone, Copy, Debug, Eq, PartialEq)]\n" + item(logger, "pub(crate) enum LogBackend")
-selector = item(logger, "fn select_backend(")
-probe = item(serial, "fn probe_com1(")
+backend = "#[derive(Clone, Copy, Debug, Eq, PartialEq)]\n" + item(runtime, "pub(crate) enum LogBackend")
+selector = item(runtime, "fn select_backend(")
+probe = item(runtime, "fn probe_com1(")
 firmware_guard = item(screen, "fn firmware_calls_allowed(")
 constants = "\n".join(
-    re.findall(r"(?:pub\(crate\) )?const (?:COM1|TRANSMIT_EMPTY|TX_WAIT_LIMIT):[^;]+;", serial)
-    + re.findall(r"pub\(crate\) const (?:SERIAL_SINK|FRAMEBUFFER_SINK):[^;]+;", logger)
+    re.findall(r"(?:pub\(crate\) )?const (?:COM1|TRANSMIT_EMPTY|TX_WAIT_LIMIT):[^;]+;", runtime)
+    + re.findall(r"pub\(crate\) const (?:SERIAL_SINK|FRAMEBUFFER_SINK):[^;]+;", runtime)
 )
 harness = output / "harness.rs"
 cases = (project / "tests/logger.rs").read_text(encoding="utf-8")

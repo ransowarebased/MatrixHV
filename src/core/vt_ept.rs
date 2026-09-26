@@ -10,8 +10,8 @@ use uefi::boot::{OpenProtocolAttributes, OpenProtocolParams};
 use uefi::mem::memory_map::{MemoryAttribute, MemoryDescriptor, MemoryMap, MemoryType};
 use uefi::proto::unsafe_protocol;
 
-use crate::arch::x86_64::{cpuid, msr};
-use crate::memory::resident::{AddressConstraint, PAGE_SIZE, ResidentPages};
+use crate::arch;
+use crate::memory::{AddressConstraint, PAGE_SIZE, ResidentPages};
 
 const EPT_READ: u64 = 1 << 0;
 const EPT_WRITE: u64 = 1 << 1;
@@ -64,10 +64,10 @@ const _: () = assert!(core::mem::offset_of!(MtrrState, variable_ranges) == 112);
 
 impl MtrrState {
     fn capture() -> Self {
-        let physical_bits = (cpuid::leaf(0x8000_0008).eax & 0xff).clamp(32, 52);
+        let physical_bits = (arch::leaf(0x8000_0008).eax & 0xff).clamp(32, 52);
         let mut state = Self {
-            capability: unsafe { msr::read(0xfe) },
-            default_type: unsafe { msr::read(0x2ff) },
+            capability: unsafe { arch::read_msr(0xfe) },
+            default_type: unsafe { arch::read_msr(0x2ff) },
             physical_mask: ((1_u64 << physical_bits) - 1) & !0xfff,
             fixed_types: [0; 11],
             variable_ranges: [[0, 0]; 255],
@@ -78,13 +78,13 @@ impl MtrrState {
                 .chain(0x268..=0x26f)
                 .enumerate()
             {
-                state.fixed_types[index] = unsafe { msr::read(register) };
+                state.fixed_types[index] = unsafe { arch::read_msr(register) };
             }
         }
         for index in 0..(state.capability & 0xff) as usize {
             let register = 0x200 + index as u32 * 2;
             state.variable_ranges[index] =
-                unsafe { [msr::read(register), msr::read(register + 1)] };
+                unsafe { [arch::read_msr(register), arch::read_msr(register + 1)] };
         }
         state
     }
@@ -260,7 +260,7 @@ impl ProtectionTablePool {
 
 impl IdentityEpt {
     pub fn build() -> Result<Self, EptError> {
-        let capabilities = unsafe { msr::read(msr::IA32_VMX_EPT_VPID_CAP) };
+        let capabilities = unsafe { arch::read_msr(arch::IA32_VMX_EPT_VPID_CAP) };
         if capabilities & EPT_CAP_PAGE_WALK_LENGTH_4 == 0 {
             return Err(EptError::FourLevelWalkUnavailable);
         }
@@ -273,7 +273,7 @@ impl IdentityEpt {
         if capabilities & ((1 << 20) | (1 << 25)) != ((1 << 20) | (1 << 25)) {
             return Err(EptError::InveptUnavailable);
         }
-        if cpuid::leaf(1).edx & (1 << 12) == 0 {
+        if arch::leaf(1).edx & (1 << 12) == 0 {
             return Err(EptError::MtrrUnavailable);
         }
         let mtrrs = MtrrState::capture();
@@ -511,10 +511,10 @@ impl IdentityEpt {
         if !self.large_pages_supported {
             return Ok(self.mapped_end);
         }
-        let physical_bits = (cpuid::leaf(0x8000_0008).eax & 0xff).clamp(32, 48);
+        let physical_bits = (arch::leaf(0x8000_0008).eax & 0xff).clamp(32, 48);
         let end = high_address_mapping_end(self.mapped_end, physical_bits)?;
         let one_gb_pages_supported =
-            unsafe { msr::read(msr::IA32_VMX_EPT_VPID_CAP) } & EPT_CAP_1GB_PAGE != 0;
+            unsafe { arch::read_msr(arch::IA32_VMX_EPT_VPID_CAP) } & EPT_CAP_1GB_PAGE != 0;
         let mut address = EPT_MINIMUM_MAPPED_END;
         while address < end {
             let pml4_index = ((address / EPT_512GB_PAGE_SIZE) & 0x1ff) as usize;

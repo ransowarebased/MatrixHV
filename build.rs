@@ -17,7 +17,7 @@ fn main() {
     validate_user_config(&config_path).expect("invalid MatrixConfig.bin");
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/boot/config.rs");
+    println!("cargo:rerun-if-changed=src/boot.rs");
     println!("cargo:rerun-if-changed=builds/MatrixConfig.bin");
 }
 

@@ -28,8 +28,8 @@ policy += "\n" + item("fn align_up(") + "\n" + item("fn high_address_mapping_end
 policy += "\n" + "\n".join(re.findall(
     r"const (?:EPT_GUEST_PHYSICAL_LIMIT|EPT_MINIMUM_MAPPED_END|EPT_2MB_PAGE_SIZE|EPT_1GB_PAGE_SIZE|EPT_512GB_PAGE_SIZE):[^;]+;", source
 ))
-assembly = (project / "asm/ept_cache.S").read_text(encoding="utf-8")
-transaction = assembly[:assembly.index(".Lresident_rebuild_ept_cache:")]
+assembly = (project / "src/asm/ept_cache.S").read_text(encoding="utf-8")
+transaction = assembly[assembly.index(".Lresident_update_dirty_mtrrs:"):assembly.index(".Lresident_rebuild_ept_cache:")]
 transaction = transaction.replace("{guest_cr0}", "0").replace("{cr0_read_shadow}", "1")
 transaction = transaction.replace("{b_mtrr_dirty}", "0")
 transaction = transaction.replace(

@@ -3,19 +3,5 @@
 version = 4
 
 [[package]]
-name = "control"
-version = "0.1.0"
-dependencies = [
- "road-server",
-]
-
-[[package]]
 name = "neo"
-version = "0.1.0"
-dependencies = [
- "road-server",
-]
-
-[[package]]
-name = "road-server"
 version = "0.1.0"

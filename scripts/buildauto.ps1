@@ -99,7 +99,6 @@ $RoadWindowsArguments = @(
     '--manifest-path', $RoadManifestPath,
     '--target', $WindowsTargetTriple,
     '--target-dir', $HostCargoTargetRoot,
-    '--bin', 'control',
     '--bin', 'neo'
 )
 $RoadLinuxArguments = @(
@@ -114,7 +113,7 @@ if ($Configuration -eq 'Release') {
     $RoadLinuxArguments += '--release'
 }
 
-Write-Host "Building ROAD controller and Windows agent ($Configuration)..."
+Write-Host "Building ROAD Windows agent ($Configuration)..."
 & $CargoCommand.Source @RoadWindowsArguments
 if ($LASTEXITCODE -ne 0) {
     throw "ROAD Windows build failed with exit code $LASTEXITCODE."
@@ -143,11 +142,9 @@ finally {
     }
 }
 
-$BuiltControl = Join-Path $HostCargoTargetRoot "$WindowsTargetTriple\$CargoProfile\control.exe"
 $BuiltWindowsNeo = Join-Path $HostCargoTargetRoot "$WindowsTargetTriple\$CargoProfile\neo.exe"
 $BuiltLinuxNeo = Join-Path $HostCargoTargetRoot "$LinuxTargetTriple\$CargoProfile\neo"
 $RoadArtifacts = @(
-    @{ Source = $BuiltControl; Destination = (Join-Path $OutputRoot 'control.exe') },
     @{ Source = $BuiltWindowsNeo; Destination = (Join-Path $OutputRoot 'neo.exe') },
     @{ Source = $BuiltLinuxNeo; Destination = (Join-Path $OutputRoot 'neo') }
 )

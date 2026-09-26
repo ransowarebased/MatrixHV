@@ -2,6 +2,64 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::HashMap;
 
 #[repr(C)]
+struct InterceptContext {
+    l0_primary: u64,
+    l1_primary: u64,
+    l0_secondary: u64,
+    l1_secondary: u64,
+    vpid: u64,
+    merged_secondary: u64,
+    hardware: [u64; 2],
+}
+
+core::arch::global_asm!(
+    ".text",
+    ".globl merge_test_intercepts",
+    "merge_test_intercepts:",
+    "push r12", "mov r12, rcx",
+    "call .Ltest_merge_intercepts",
+    "pop r12", "ret",
+    ".Ltest_merge_intercepts:",
+    include_str!("../builds/nested-ept-tests/resident-intercepts.S"),
+    cpu_based_vm_exec_control = const 0,
+    secondary_vm_exec_control = const 1,
+    b_nested_vmcs01_primary_controls = const std::mem::offset_of!(InterceptContext, l0_primary),
+    b_nested_vmcs12_primary_control = const std::mem::offset_of!(InterceptContext, l1_primary),
+    b_nested_vmcs01_secondary_controls = const std::mem::offset_of!(InterceptContext, l0_secondary),
+    b_nested_vmcs12_secondary_control = const std::mem::offset_of!(InterceptContext, l1_secondary),
+    b_nested_vmcs02_last_vpid = const std::mem::offset_of!(InterceptContext, vpid),
+    b_nested_last_merged_secondary_controls = const std::mem::offset_of!(InterceptContext, merged_secondary),
+    test_hardware = const std::mem::offset_of!(InterceptContext, hardware),
+);
+
+unsafe extern "win64" {
+    fn merge_test_intercepts(context: *mut InterceptContext);
+}
+
+#[test]
+fn l1_monitor_trap_and_wbinvd_controls_reach_vmcs02_and_can_be_cleared() {
+    let mut context = InterceptContext {
+        l0_primary: 1 << 28,
+        l1_primary: 1 << 27,
+        l0_secondary: 1 << 1,
+        l1_secondary: 1 << 6,
+        vpid: 0,
+        merged_secondary: 0,
+        hardware: [0; 2],
+    };
+    unsafe { merge_test_intercepts(&mut context) };
+    assert_eq!(
+        context.hardware,
+        [(1 << 28) | (1 << 27), (1 << 1) | (1 << 6)]
+    );
+    assert_eq!(context.merged_secondary, context.hardware[1]);
+    context.l1_primary = 0;
+    context.l1_secondary = 0;
+    unsafe { merge_test_intercepts(&mut context) };
+    assert_eq!(context.hardware, [1 << 28, 1 << 1]);
+}
+
+#[repr(C)]
 struct SuccessContext {
     rflags: u64,
     writes: u64,
@@ -469,6 +527,7 @@ struct Context {
     qualification: u64,
     ept01: u64,
     invalidations: u64,
+    native_invept: u64,
     recycles: u64,
     ept02: u64,
     pool: u64,
@@ -488,6 +547,7 @@ struct Context {
     alternate_pool_pages: u64,
     alternate_pool_used: u64,
     alternate_mbec: u64,
+    telemetry_active: u64,
 }
 
 core::arch::global_asm!(
@@ -544,11 +604,13 @@ core::arch::global_asm!(
     "ret",
     include_str!("../builds/nested-ept-tests/resident-ept.S"),
     b_expected_host_cr3 = const std::mem::offset_of!(Context, host_cr3),
+    b_telemetry_active = const std::mem::offset_of!(Context, telemetry_active),
     b_nested_host_mapping_cache = const std::mem::offset_of!(Context, host_mapping_cache),
     b_last_guest_physical_address = const std::mem::offset_of!(Context, gpa),
     b_last_qualification = const std::mem::offset_of!(Context, qualification),
     b_nested_ept01_pointer = const std::mem::offset_of!(Context, ept01),
     b_nested_ept02_invalidation_count = const std::mem::offset_of!(Context, invalidations),
+    b_invept_exits = const std::mem::offset_of!(Context, native_invept),
     b_nested_ept02_recycle_count = const std::mem::offset_of!(Context, recycles),
     b_nested_ept02_pointer = const std::mem::offset_of!(Context, ept02),
     b_nested_ept02_table_pool = const std::mem::offset_of!(Context, pool),
@@ -766,6 +828,7 @@ fn context(arena: &mut Arena, ept12: u64, ept01: u64) -> Context {
     let alternate_ept02 = arena.pages(1);
     let alternate_pool = arena.pages(16);
     Context {
+        telemetry_active: 1,
         host_cr3: arena.host_map(),
         gpa: 0x203000,
         qualification: 1,
@@ -784,6 +847,26 @@ fn context(arena: &mut Arena, ept12: u64, ept01: u64) -> Context {
         alternate_pool_pages: 16,
         ..Default::default()
     }
+}
+
+#[test]
+fn disabled_telemetry_keeps_ept_composition_and_invalidation_operational() {
+    let mut arena = Arena::new();
+    let ept12 = arena.pages(1);
+    let ept01 = arena.pages(1);
+    arena.map(ept12, 0x200000, 0x400000, 21, 0xb7);
+    arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+    let mut state = context(&mut arena, ept12, ept01);
+    state.telemetry_active = 0;
+    unsafe {
+        assert_eq!(resolve_test_ept(&mut state), 1);
+        discard_test_ept(&mut state);
+        assert_eq!(resolve_test_ept(&mut state), 1);
+    }
+    assert_eq!(state.compositions, 0);
+    assert_eq!(state.invalidations, 0);
+    assert_eq!(state.native_invept, 0);
+    assert!(state.pool_used > 0);
 }
 
 #[test]
@@ -1376,7 +1459,7 @@ unsafe extern "win64" {
 }
 #[test]
 fn vmcs_lookup_rejects_reserved_bits_and_resolves_every_index() {
-    let source = include_str!("../src/core/vt_resident.rs");
+    let source = include_str!("../src/asm/resident_island.S");
     let table = source
         .split(".Lresident_vmcs12_field_index_table:")
         .nth(1)
@@ -1387,7 +1470,7 @@ fn vmcs_lookup_rejects_reserved_bits_and_resolves_every_index() {
     let indices: Vec<u64> = table
         .lines()
         .filter_map(|line| line.split(".byte ").nth(1))
-        .flat_map(|line| line.trim_end_matches(['\"', ',']).split(", "))
+        .flat_map(|line| line.trim().split(", "))
         .map(|value| value.parse().unwrap())
         .collect();
     for encoding in 0_u64..0x10000 {
