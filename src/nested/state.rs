@@ -131,7 +131,7 @@ pub struct NestedVmxState {
     pub vmcs02_vpid_cache: u32,
     pub physical_address_bits: u32,
     pub host_mapping_cache: [u64; 4],
-    pub vmcs02_rare_state_pending: u64,
+    pub vmcs02_rare_state_pending: [u64; 2],
     pub ept02_recycle_count: u64,
 }
 
@@ -301,7 +301,7 @@ impl NestedVmxState {
             vmcs02_vpid_cache: 0,
             physical_address_bits,
             host_mapping_cache: [0; 4],
-            vmcs02_rare_state_pending: 0,
+            vmcs02_rare_state_pending: [0; 2],
             ept02_recycle_count: 0,
         }
     }

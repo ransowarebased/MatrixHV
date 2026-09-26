@@ -59,14 +59,23 @@ pub(crate) struct ResidentCpuResources {
 }
 
 impl ResidentCpuResources {
-    pub(crate) fn allocate(vmx_basic: u64, fatal_handler: u64) -> Result<Self, ResidentProbeError> {
+    pub(crate) fn allocate(
+        vmx_basic: u64,
+        fatal_handler: u64,
+        gp_handler: u64,
+        exception_stubs: u64,
+    ) -> Result<Self, ResidentProbeError> {
         let vmxon_region = VmxonRegion::allocate(vmx_basic).map_err(ResidentProbeError::Vmxon)?;
         let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
         vmcs_region.write_revision_id(vt_vmxon::revision_id(vmx_basic));
         let mut nested_vmcs02_region = VmcsRegion::allocate(vmx_basic)?;
         nested_vmcs02_region.write_revision_id(vt_vmxon::revision_id(vmx_basic));
-        let host_tables =
-            ResidentHostTables::allocate(fatal_handler, ResidentHostSelectors::fixed())?;
+        let host_tables = ResidentHostTables::allocate(
+            fatal_handler,
+            gp_handler,
+            exception_stubs,
+            ResidentHostSelectors::fixed(),
+        )?;
         let context_pages =
             ResidentPages::allocate(RESIDENT_BOOT_CONTEXT_PAGES, AddressConstraint::Any)
                 .map_err(ResidentProbeError::Allocation)?;
@@ -169,11 +178,12 @@ impl ResidentCpuResources {
     pub(crate) fn prepare_nested_ept(
         &mut self,
         ept01: &IdentityEpt,
+        ept12_template: &IdentityEpt,
     ) -> Result<EptComposition, EptError> {
         let source_gpa = self.nested_ept_source_page.physical_address();
         let target_gpa = self.nested_ept_target_page.physical_address();
         let second_target_gpa = self.nested_ept_second_target_page.physical_address();
-        let mut ept12 = IdentityEpt::build()?;
+        let mut ept12 = ept12_template.clone_identity_tables()?;
         ept12.remap_page(source_gpa, target_gpa)?;
         let source_leaf = ept12.leaf_entry_physical_address(source_gpa)?;
         let source_leaf_attributes = ept12.leaf_entry_value(source_gpa)? & 0xfff;
@@ -317,21 +327,6 @@ impl ResidentCpuResources {
             regions.extend(ept02.table_regions());
         }
         regions
-    }
-
-    pub(crate) fn conceal_nested_ept02_regions(
-        &mut self,
-        regions: &[(u64, usize)],
-        zero_page_physical_address: u64,
-    ) -> Result<(), EptError> {
-        self.nested_ept02
-            .as_mut()
-            .ok_or(EptError::InvalidPageTable)?
-            .conceal_guest_access_to_regions(regions, zero_page_physical_address)?;
-        self.nested_ept02_alternate
-            .as_mut()
-            .ok_or(EptError::InvalidPageTable)?
-            .conceal_guest_access_to_regions(regions, zero_page_physical_address)
     }
 
     pub(crate) fn conceal_guest_access(

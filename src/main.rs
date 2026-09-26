@@ -21,6 +21,8 @@ fn main() -> Status {
     crate::boot::config::apply(config);
     let active_config = crate::boot::config::current();
     crate::runtime::logger::set_enabled(active_config.logger);
+    crate::boot::screen::begin();
+    crate::runtime::logger::phase("logger.detect_com1");
     crate::runtime::logger::initialize();
     crate::runtime::logger::phase("boot.entry");
     crate::runtime::logger::info(format_args!(
@@ -30,20 +32,22 @@ fn main() -> Status {
         active_config.vt_nested,
         active_config.vmx_test
     ));
+    crate::runtime::logger::info(format_args!(
+        "logger backend={:?}",
+        crate::runtime::logger::backend()
+    ));
 
     if uefi::helpers::init().is_err() {
         crate::runtime::logger::error(format_args!("UEFI helper initialization failed"));
+        crate::boot::screen::hold_on_failure();
         return Status::ABORTED;
-    }
-    if !active_config.logger {
-        log::set_max_level(log::LevelFilter::Off);
     }
 
     match boot::run() {
         Ok(()) => Status::SUCCESS,
         Err(status) => {
-            log::error!("MatrixHV boot failed: {status:?}");
             crate::runtime::logger::error_status("boot.run", status);
+            crate::boot::screen::hold_on_failure();
             status
         }
     }

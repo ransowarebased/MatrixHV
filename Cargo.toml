@@ -10,7 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 log = { version = "0.4.28", default-features = false }
-uefi = { version = "0.40.0", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
+uefi = { version = "0.40.0", features = ["alloc", "global_allocator", "panic_handler"] }
+uefi-raw = "0.16.0"
 
 [profile.dev]
 panic = "abort"

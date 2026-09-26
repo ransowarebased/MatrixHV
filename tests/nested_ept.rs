@@ -262,9 +262,6 @@ core::arch::global_asm!(
     test_writes = const std::mem::offset_of!(MsrContext, writes),
     vm_entry_msr_load_addr = const 0,
     vm_entry_msr_load_count = const 1,
-    resident_msr_switch_count = const 1,
-    resident_msr_switch_qword_count = const 2,
-    resident_msr_switch_byte_count = const 16,
 );
 
 unsafe extern "win64" {
@@ -518,6 +515,15 @@ core::arch::global_asm!(
     "pop r15", "pop r14", "pop r13", "pop r12",
     "pop rsi", "pop rdi", "pop rbp", "pop rbx",
     "ret",
+    ".globl revalidate_test_ept",
+    "revalidate_test_ept:",
+    "push rbx", "push rbp", "push rdi", "push rsi",
+    "push r12", "push r13", "push r14", "push r15",
+    "mov r12, rcx",
+    "call .Lresident_nested_revalidate_ept02",
+    "pop r15", "pop r14", "pop r13", "pop r12",
+    "pop rsi", "pop rdi", "pop rbp", "pop rbx",
+    "ret",
     ".globl prepare_test_ept",
     "prepare_test_ept:",
     "push rbx", "push rbp", "push rdi", "push rsi",
@@ -570,6 +576,7 @@ unsafe extern "win64" {
     fn check_test_host_mapping(context: *mut Context, address: u64) -> u64;
     fn resolve_test_ept(context: *mut Context) -> u64;
     fn discard_test_ept(context: *mut Context);
+    fn revalidate_test_ept(context: *mut Context);
     fn prepare_test_ept(context: *mut Context);
     fn invalidate_test_ept_context(context: *mut Context, ept_pointer: u64);
 }
@@ -860,9 +867,8 @@ fn ept_cache_retains_each_execution_mode_and_invalidates_both_by_root() {
     assert_eq!(state.ept02, mbec_root);
     assert_eq!(state.mbec, 1);
     assert_eq!(state.invalidations, invalidations + 2);
-    assert_eq!(leaf(supervisor_root, state.gpa).1, 0);
-    assert_eq!(leaf(mbec_root, state.gpa).1, 0);
-    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    assert_eq!(leaf(supervisor_root, state.gpa).1 & 0x407, 3);
+    assert_eq!(leaf(mbec_root, state.gpa).1 & 0x407, 0x403);
     state.secondary_control = 2;
     unsafe { prepare_test_ept(&mut state) };
     assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
@@ -1049,6 +1055,75 @@ fn invalidation_applies_four_kib_remaps_and_upper_level_revocations() {
     assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
 }
 
+#[test]
+fn revalidation_updates_remaps_permissions_and_memory_type() {
+    let mut arena = Arena::new();
+    let ept12 = arena.pages(1);
+    let ept01 = arena.pages(1);
+    arena.map(ept12, 0x200000, 0x400000, 21, 0xb7);
+    arena.map(ept12, 0x400000, 0x800000, 21, 0xb7);
+    arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+    arena.map(ept01, 0x800000, 0xa00000, 21, 0xb7);
+    arena.map(ept01, 0xc00000, 0xe00000, 21, 0xb1);
+    let mut state = context(&mut arena, ept12, ept01);
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    state.gpa = 0x403000;
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    let used = state.pool_used;
+    arena.map(ept12, 0x200000, 0xc00000, 21, 0x87);
+    unsafe {
+        revalidate_test_ept(&mut state);
+    }
+    assert_eq!(leaf(state.ept02, 0x203000), (21, 0xe00081));
+    assert_eq!(leaf(state.ept02, 0x403000), (21, 0xa000b7));
+    assert_eq!(state.pool_used, used);
+    arena.map(ept12, 0x200000, 0, 21, 0);
+    unsafe {
+        revalidate_test_ept(&mut state);
+    }
+    assert_eq!(leaf(state.ept02, 0x203000), (21, 0));
+    assert_eq!(leaf(state.ept02, 0x403000), (21, 0xa000b7));
+}
+#[test]
+fn revalidation_removes_a_large_mapping_when_l1_splits_it() {
+    let mut arena = Arena::new();
+    let ept12 = arena.pages(1);
+    let ept01 = arena.pages(1);
+    arena.map(ept12, 0x200000, 0x400000, 21, 0xb7);
+    arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+    let mut state = context(&mut arena, ept12, ept01);
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    arena.map(ept12, 0x200000, 0, 21, 0);
+    arena.map(ept12, 0x203000, 0x403000, 12, 0x31);
+    unsafe {
+        revalidate_test_ept(&mut state);
+    }
+    assert_eq!(leaf(state.ept02, state.gpa), (21, 0));
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    assert_eq!(leaf(state.ept02, state.gpa), (12, 0x603031));
+    assert_eq!(leaf(state.ept02, 0x204000), (12, 0));
+}
+#[test]
+fn revalidation_visits_four_kib_leaves_and_upper_level_revocations() {
+    let mut arena = Arena::new();
+    let ept12 = arena.pages(1);
+    let ept01 = arena.pages(1);
+    arena.map(ept12, 0x203000, 0x403000, 12, 0x37);
+    arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+    let mut state = context(&mut arena, ept12, ept01);
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    arena.map(ept12, 0x203000, 0x405000, 12, 0x31);
+    unsafe {
+        revalidate_test_ept(&mut state);
+    }
+    assert_eq!(leaf(state.ept02, state.gpa), (12, 0x605031));
+    unsafe {
+        (ept12 as *mut u64).write(0);
+        revalidate_test_ept(&mut state);
+    }
+    assert_eq!(leaf(state.ept02, state.gpa), (12, 0));
+}
+
 #[repr(C)]
 struct GuestContext {
     valid: u64,
@@ -1057,7 +1132,7 @@ struct GuestContext {
     cache: [u64; 117],
     hardware: [u64; 117],
     writes: u64,
-    rare_pending: u64,
+    rare_pending: [u64; 2],
     vmcs01: u64,
     vmcs02: u64,
     selected_vmcs: u64,
@@ -1082,8 +1157,10 @@ core::arch::global_asm!(
     "materialize_test_guest:",
     "push r12", "mov r12, rcx", "mov rax, rdx",
     "mov r11, r8", "mov r10, r9",
+    "push rdx", "mov rdx, r9",
     "call .Lresident_nested_materialize_guest_field",
-    "cmp rax, rdx", "jne .Lresident_dispatch_halt",
+    "cmp rax, qword ptr [rsp]", "jne .Lresident_dispatch_halt",
+    "cmp rdx, r9", "jne .Lresident_dispatch_halt", "pop rdx",
     "cmp r11, r8", "jne .Lresident_dispatch_halt",
     "cmp r10, r9", "jne .Lresident_dispatch_halt",
     "pop r12", "ret",
@@ -1123,7 +1200,7 @@ fn guest_sync_retains_hardware_state_and_applies_l1_changes() {
         cache: [0; 117],
         hardware: [u64::MAX; 117],
         writes: 0,
-        rare_pending: 0,
+        rare_pending: [0; 2],
         vmcs01: 1,
         vmcs02: 2,
         selected_vmcs: 2,
@@ -1164,7 +1241,7 @@ fn deferred_guest_state_survives_resume_and_materializes_before_l1_access() {
         cache: [0; 117],
         hardware: [u64::MAX; 117],
         writes: 0,
-        rare_pending: 0,
+        rare_pending: [0; 2],
         vmcs01: 1,
         vmcs02: 2,
         selected_vmcs: 2,
@@ -1194,7 +1271,11 @@ fn deferred_guest_state_survives_resume_and_materializes_before_l1_access() {
         capture_test_guest(&mut state);
     }
     assert_eq!(state.reads, 15);
-    assert_eq!(state.rare_pending, 1);
+    let pending = [
+        (0xff_u64 << 35) | (0x3ff_u64 << 50),
+        (0xffff_u64 << 1) | (1_u64 << 28),
+    ];
+    assert_eq!(state.rare_pending, pending);
     for &index in &fields {
         assert_eq!(
             state.values[index],
@@ -1210,7 +1291,7 @@ fn deferred_guest_state_survives_resume_and_materializes_before_l1_access() {
         materialize_test_guest(&mut state, 30, u64::MAX, 0x6802);
     }
     assert_eq!(state.switches, 0);
-    assert_eq!(state.rare_pending, 1);
+    assert_eq!(state.rare_pending, pending);
     state.selected_vmcs = 2;
     unsafe {
         sync_test_guest(&mut state);
@@ -1223,14 +1304,22 @@ fn deferred_guest_state_survives_resume_and_materializes_before_l1_access() {
     unsafe {
         materialize_test_guest(&mut state, 50, 0xfeed_dead_beef, 0x6806);
     }
-    assert_eq!(state.reads, 50);
+    assert_eq!(state.reads, 16);
     assert_eq!(state.switches, 2);
     assert_eq!(state.selected_vmcs, 1);
-    assert_eq!(state.rare_pending, 0);
+    assert_eq!(state.rare_pending, [pending[0] & !(1 << 50), pending[1]]);
     for &index in &fields {
-        assert_eq!(state.values[index], state.hardware[index]);
-        assert_eq!(state.cache[index], state.hardware[index]);
+        let expected = if rare(index) && index != 50 {
+            0
+        } else {
+            state.hardware[index]
+        };
+        assert_eq!(state.values[index], expected);
+        assert_eq!(state.cache[index], expected);
     }
+    unsafe { materialize_test_guest(&mut state, 50, 0, 0x6806) };
+    assert_eq!(state.reads, 16);
+    assert_eq!(state.switches, 2);
     state.values[50] = 0x87654000;
     state.selected_vmcs = 2;
     unsafe {
@@ -1250,9 +1339,10 @@ fn deferred_guest_state_survives_resume_and_materializes_before_l1_access() {
         materialize_test_all_guest(&mut state);
         materialize_test_all_guest(&mut state);
     }
-    assert_eq!(state.reads, 100);
+    assert_eq!(state.reads, 66);
     assert_eq!(state.switches, 4);
     assert_eq!(state.selected_vmcs, 1);
+    assert_eq!(state.rare_pending, [0; 2]);
     for &index in &fields {
         assert_eq!(state.values[index], state.hardware[index]);
     }
@@ -1325,7 +1415,7 @@ fn control_cache_writes_zero_initially_and_tracks_high_indices() {
         cache: [0; 117],
         hardware: [u64::MAX; 117],
         writes: 0,
-        rare_pending: 0,
+        rare_pending: [0; 2],
         vmcs01: 1,
         vmcs02: 2,
         selected_vmcs: 2,

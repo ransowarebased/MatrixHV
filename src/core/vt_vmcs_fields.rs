@@ -19,6 +19,7 @@ pub const VMCS_LINK_POINTER: u64 = 0x2800;
 pub const GUEST_IA32_DEBUGCTL: u64 = 0x2802;
 pub const GUEST_IA32_PAT: u64 = 0x2804;
 pub const GUEST_IA32_EFER: u64 = 0x2806;
+pub const VMX_PREEMPTION_TIMER_VALUE: u64 = 0x482e;
 pub const GUEST_PDPTR0: u64 = 0x280a;
 pub const GUEST_PDPTR1: u64 = 0x280c;
 pub const GUEST_PDPTR2: u64 = 0x280e;

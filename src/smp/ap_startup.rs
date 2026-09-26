@@ -1,5 +1,6 @@
 use core::arch::global_asm;
 use core::ffi::c_void;
+use core::time::Duration;
 
 use uefi::boot;
 use uefi::proto::pi::mp::MpServices;
@@ -19,7 +20,7 @@ pub(crate) fn launch(
         callback,
         (launch as *mut ResidentApLaunch<'_>).cast(),
         None,
-        None,
+        Some(Duration::from_secs(10)),
     )
     .map_err(|error| ResidentProbeError::Allocation(error.status()))
 }

@@ -5,7 +5,7 @@ use uefi::Status;
 use uefi::boot;
 use uefi::proto::pi::mp::MpServices;
 
-use crate::arch::x86_64::{control_regs, cpuid, registers};
+use crate::arch::x86_64::{control_regs, cpuid, msr, registers, segmentation};
 use crate::hv_core::vt_entry::{
     VmlaunchError, VmlaunchProbeResourceAddresses, VmlaunchProbeResources, VmlaunchReport,
 };
@@ -20,10 +20,20 @@ pub(crate) struct CpuLocalState {
     pub(crate) cr3: u64,
     pub(crate) cr4: u64,
     pub(crate) rflags: u64,
+    pub(crate) dr7: u64,
+    pub(crate) debugctl: u64,
+    pub(crate) fs_base: u64,
+    pub(crate) gs_base: u64,
+    pub(crate) gdtr_base: u64,
+    pub(crate) gdtr_limit: u16,
+    pub(crate) idtr_base: u64,
+    pub(crate) idtr_limit: u16,
 }
 
 impl CpuLocalState {
     fn capture() -> Self {
+        let gdtr = segmentation::read_gdtr();
+        let idtr = segmentation::read_idtr();
         let max_basic_leaf = cpuid::leaf(0).eax;
         let apic_id = if max_basic_leaf >= 0xb {
             cpuid::leaf_with_subleaf(0xb, 0).edx
@@ -36,6 +46,14 @@ impl CpuLocalState {
             cr3: control_regs::read_cr3(),
             cr4: control_regs::read_cr4(),
             rflags: registers::read_rflags(),
+            dr7: registers::read_dr7(),
+            debugctl: unsafe { msr::read(msr::IA32_DEBUGCTL) },
+            fs_base: unsafe { msr::read(msr::IA32_FS_BASE) },
+            gs_base: unsafe { msr::read(msr::IA32_GS_BASE) },
+            gdtr_base: gdtr.base,
+            gdtr_limit: gdtr.limit,
+            idtr_base: idtr.base,
+            idtr_limit: idtr.limit,
         }
     }
 
@@ -45,6 +63,14 @@ impl CpuLocalState {
             && self.cr3 == after.cr3
             && self.cr4 == after.cr4
             && (self.rflags ^ after.rflags) & INTERRUPT_FLAG == 0
+            && self.dr7 == after.dr7
+            && self.debugctl == after.debugctl
+            && self.fs_base == after.fs_base
+            && self.gs_base == after.gs_base
+            && self.gdtr_base == after.gdtr_base
+            && self.gdtr_limit == after.gdtr_limit
+            && self.idtr_base == after.idtr_base
+            && self.idtr_limit == after.idtr_limit
     }
 }
 
@@ -123,6 +149,7 @@ pub(crate) fn prove_application_processor_vmx(
         .map_err(ApplicationProcessorVmxProofError::BspProbe)?;
     let bsp_final = CpuLocalState::capture();
     if !bsp_initial.vmx_state_restored(bsp_final) {
+        log_state_mismatch("bsp", bsp_initial, bsp_final);
         return Err(ApplicationProcessorVmxProofError::BspStateNotRestored);
     }
 
@@ -154,8 +181,16 @@ pub(crate) fn prove_application_processor_vmx(
         .ok_or(ApplicationProcessorVmxProofError::CallbackDidNotRun)?
         .map_err(ApplicationProcessorVmxProofError::ApProbe)?;
     if !initial_state.vmx_state_restored(final_state) {
+        log_state_mismatch("ap", initial_state, final_state);
         return Err(ApplicationProcessorVmxProofError::ApStateNotRestored);
     }
+    logger::info(format_args!(
+        "smp cpu={processor_number} restored gdtr={:#x}/{} idtr={:#x}/{}",
+        final_state.gdtr_base,
+        final_state.gdtr_limit,
+        final_state.idtr_base,
+        final_state.idtr_limit
+    ));
 
     Ok(ApplicationProcessorVmxProofReport {
         processor_number,
@@ -166,6 +201,11 @@ pub(crate) fn prove_application_processor_vmx(
         final_state,
         vmlaunch,
     })
+}
+
+fn log_state_mismatch(processor: &str, before: CpuLocalState, after: CpuLocalState) {
+    logger::error(format_args!("smp {processor} state before={before:?}"));
+    logger::error(format_args!("smp {processor} state after={after:?}"));
 }
 
 extern "efiapi" fn application_processor_vmx_callback(argument: *mut c_void) {

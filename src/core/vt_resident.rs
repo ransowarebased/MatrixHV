@@ -59,7 +59,7 @@ use crate::smp::per_cpu::ResidentCpuResources;
 const GUEST_STACK_PAGES: usize = 4;
 pub(crate) const BOOT_GUEST_STACK_PAGES: usize = 64;
 pub(crate) const HOST_STACK_PAGES: usize = 4;
-const HOST_TABLE_PAGES: usize = 2;
+const HOST_TABLE_PAGES: usize = 4;
 const MSR_BITMAP_PAGES: usize = 1;
 const MSR_BITMAP_READ_HIGH_OFFSET: usize = 1024;
 const MSR_BITMAP_WRITE_LOW_OFFSET: usize = 2048;
@@ -75,6 +75,7 @@ const RDMSR_EXIT_REASON: u64 = 31;
 const WRMSR_EXIT_REASON: u64 = 32;
 const XSETBV_EXIT_REASON: u64 = 55;
 const EPT_VIOLATION_EXIT_REASON: u64 = 48;
+const VMX_PREEMPTION_TIMER_EXIT_REASON: u64 = 52;
 const VM_ENTRY_FAILURE_MSR_LOADING_EXIT_REASON: u64 = 34;
 const EPT_TEST_READ_ACCESS: u64 = 1;
 const VMWARE_HYPERVISOR_MAGIC: u32 = 0x564d_5868;
@@ -139,13 +140,14 @@ const IA32_FS_BASE_MSR: u32 = 0xc000_0100;
 const IA32_GS_BASE_MSR: u32 = 0xc000_0101;
 const IA32_KERNEL_GS_BASE_MSR: u32 = 0xc000_0102;
 const IA32_TSC_AUX_MSR: u32 = 0xc000_0103;
-const RESIDENT_MSR_SWITCH_COUNT: usize = 1;
+const RESIDENT_MSR_SWITCH_CAPACITY: usize = 1;
 const NESTED_MSR_BITMAP_OFFSET: u64 = 0;
 const NESTED_VMCS02_ENTRY_MSR_LIST_OFFSET: u64 = PAGE_SIZE as u64;
 const NESTED_VMCS02_EXIT_STORE_MSR_LIST_OFFSET: u64 = (PAGE_SIZE * 3) as u64;
 const NESTED_VMCS01_ENTRY_MSR_LIST_OFFSET: u64 = (PAGE_SIZE * 5) as u64;
 const NESTED_MSR_LIST_CAPACITY: usize = (PAGE_SIZE * 2) / size_of::<VmxMsrEntry>();
-const NESTED_GUEST_MSR_LIST_CAPACITY: usize = NESTED_MSR_LIST_CAPACITY - RESIDENT_MSR_SWITCH_COUNT;
+const NESTED_GUEST_MSR_LIST_CAPACITY: usize =
+    NESTED_MSR_LIST_CAPACITY - RESIDENT_MSR_SWITCH_CAPACITY;
 const NESTED_MSR_BITMAP_QWORD_COUNT: usize = PAGE_SIZE / size_of::<u64>();
 const HOST_PAGE_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -186,13 +188,6 @@ const EPT_VIOLATION_RIP_LEN: usize = b" rip=0x".len();
 const EPT_VIOLATION_READ_LEN: usize = b" access=read qual=0x".len();
 const STATE_REASON_LEN: usize = b" reason=0x".len();
 const STATE_RIP_LEN: usize = b" rip=0x".len();
-const STATE_INSTRUCTION_LEN_LEN: usize = b" len=0x".len();
-const STATE_QUALIFICATION_LEN: usize = b" qual=0x".len();
-const STATE_GUEST_CR3_LEN: usize = b" guest_cr3=0x".len();
-const STATE_HOST_CR3_LEN: usize = b" host_cr3=0x".len();
-const STATE_RAX_LEN: usize = b" rax=0x".len();
-const STATE_RCX_LEN: usize = b" rcx=0x".len();
-const STATE_RDX_LEN: usize = b" rdx=0x".len();
 const STATE_NEWLINE_LEN: usize = b"\r\n".len();
 const NESTED_VMXON_MESSAGE_LEN: usize = b"[MATRIXHV][NESTED] VMXON cpu=0x".len();
 const NESTED_VMXOFF_MESSAGE_LEN: usize = b"[MATRIXHV][NESTED] VMXOFF cpu=0x".len();
@@ -212,6 +207,7 @@ pub const NESTED_L2_VMRESUME_MAGIC: u64 = 0x4c32_5245_5355_4d45;
 pub const NESTED_L2_POST_INVEPT_MAGIC: u64 = 0x4c32_494e_5645_5054;
 const RESIDENT_STOP_UNSUPPORTED_EXIT: u64 = 0x4856_554e_5355_5050;
 static EPT_TEST_PAGE_GPA: AtomicU64 = AtomicU64::new(0);
+static EVENT_CONTEXT_ADDRESS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResidentProbeError {
@@ -258,6 +254,8 @@ impl From<EptError> for ResidentProbeError {
 pub struct ResidentProbeReport {
     pub code_physical_address: u64,
     pub code_pages: usize,
+    pub host_table_pages: usize,
+    pub host_table_capacity: usize,
     pub data_memory_type: u32,
     pub code_memory_type: u32,
     pub host_cr3: u64,
@@ -321,10 +319,25 @@ pub struct ResidentBootReport {
 #[repr(C, align(16))]
 struct ResidentEventContext {
     magic: u64,
-    exit_boot_services_seen: u64,
+    exit_boot_services_seen: AtomicU64,
     virtual_address_change_seen: u64,
     canary: u64,
     serial_lock: AtomicU64,
+    visual_base: u64,
+    visual_stride_bytes: u64,
+    post_ebs_cpu_mask: AtomicU64,
+    diagnostic_halted: AtomicU64,
+    host_fault_vector: u64,
+    host_fault_rip: u64,
+    host_fault_error_code: u64,
+    host_fault_address: u64,
+    init_cpu_mask: AtomicU64,
+    sipi_cpu_mask: AtomicU64,
+    halted_cpu_mask: AtomicU64,
+    failed_processor: u64,
+    failed_exit_reason: u64,
+    failed_qualification: u64,
+    failed_stop_result: u64,
 }
 
 #[repr(C, align(16))]
@@ -349,9 +362,20 @@ struct ResidentBootContext {
     xsetbv_count: u64,
     vmcall_count: u64,
     start_checkpoint_seen: u64,
+    visual_first_exit_seen: u64,
     post_start_exit_count: u64,
     post_ebs_exit_count: u64,
     post_va_exit_count: u64,
+    msr_gp_count: u64,
+    last_gp_msr: u64,
+    diagnostic_interval_tsc: u64,
+    diagnostic_timer_rate: u64,
+    diagnostic_deadline_tsc: u64,
+    diagnostic_sample_count: u64,
+    diagnostic_expired: u64,
+    last_normal_reason: u64,
+    last_normal_rip: u64,
+    last_efer_write: u64,
     last_reason: u64,
     last_instruction_len: u64,
     last_qualification: u64,
@@ -374,7 +398,12 @@ struct ResidentBootContext {
     cpuid_hypervisor_count: u64,
     cpuid_leaf1_ecx: u64,
     cpuid_hypervisor_eax: u64,
-    tsc_adjust: u64,
+    cache_ept_pointer: u64,
+    cache_generation: u64,
+    mtrr_dirty: u64,
+    mtrr_updates: u64,
+    nmi_pending: u64,
+    nmi_count: u64,
     nested: NestedVmxState,
     original_gdtr: [u8; 10],
     original_idtr: [u8; 10],
@@ -412,9 +441,20 @@ impl ResidentBootContext {
             xsetbv_count: 0,
             vmcall_count: 0,
             start_checkpoint_seen: 0,
+            visual_first_exit_seen: 0,
             post_start_exit_count: 0,
             post_ebs_exit_count: 0,
             post_va_exit_count: 0,
+            msr_gp_count: 0,
+            last_gp_msr: 0,
+            diagnostic_interval_tsc: 0,
+            diagnostic_timer_rate: 0,
+            diagnostic_deadline_tsc: 0,
+            diagnostic_sample_count: 0,
+            diagnostic_expired: 0,
+            last_normal_reason: 0,
+            last_normal_rip: 0,
+            last_efer_write: 0,
             last_reason: 0,
             last_instruction_len: 0,
             last_qualification: 0,
@@ -437,7 +477,12 @@ impl ResidentBootContext {
             cpuid_hypervisor_count: 0,
             cpuid_leaf1_ecx: 0,
             cpuid_hypervisor_eax: 0,
-            tsc_adjust: 0,
+            cache_ept_pointer: 0,
+            cache_generation: 0,
+            mtrr_dirty: 0,
+            mtrr_updates: 0,
+            nmi_pending: 0,
+            nmi_count: 0,
             nested,
             original_gdtr: [0; 10],
             original_idtr: [0; 10],
@@ -466,10 +511,28 @@ const BCTX_XSETBV_COUNT: usize = core::mem::offset_of!(ResidentBootContext, xset
 const BCTX_VMCALL_COUNT: usize = core::mem::offset_of!(ResidentBootContext, vmcall_count);
 const BCTX_START_CHECKPOINT_SEEN: usize =
     core::mem::offset_of!(ResidentBootContext, start_checkpoint_seen);
+const BCTX_VISUAL_FIRST_EXIT_SEEN: usize =
+    core::mem::offset_of!(ResidentBootContext, visual_first_exit_seen);
 const BCTX_POST_START_COUNT: usize =
     core::mem::offset_of!(ResidentBootContext, post_start_exit_count);
 const BCTX_POST_EBS_COUNT: usize = core::mem::offset_of!(ResidentBootContext, post_ebs_exit_count);
 const BCTX_POST_VA_COUNT: usize = core::mem::offset_of!(ResidentBootContext, post_va_exit_count);
+const BCTX_MSR_GP_COUNT: usize = core::mem::offset_of!(ResidentBootContext, msr_gp_count);
+const BCTX_LAST_GP_MSR: usize = core::mem::offset_of!(ResidentBootContext, last_gp_msr);
+const BCTX_DIAGNOSTIC_INTERVAL: usize =
+    core::mem::offset_of!(ResidentBootContext, diagnostic_interval_tsc);
+const BCTX_DIAGNOSTIC_RATE: usize =
+    core::mem::offset_of!(ResidentBootContext, diagnostic_timer_rate);
+const BCTX_DIAGNOSTIC_DEADLINE: usize =
+    core::mem::offset_of!(ResidentBootContext, diagnostic_deadline_tsc);
+const BCTX_DIAGNOSTIC_SAMPLES: usize =
+    core::mem::offset_of!(ResidentBootContext, diagnostic_sample_count);
+const BCTX_DIAGNOSTIC_EXPIRED: usize =
+    core::mem::offset_of!(ResidentBootContext, diagnostic_expired);
+const BCTX_LAST_NORMAL_REASON: usize =
+    core::mem::offset_of!(ResidentBootContext, last_normal_reason);
+const BCTX_LAST_NORMAL_RIP: usize = core::mem::offset_of!(ResidentBootContext, last_normal_rip);
+const BCTX_LAST_EFER_WRITE: usize = core::mem::offset_of!(ResidentBootContext, last_efer_write);
 const BCTX_LAST_REASON: usize = core::mem::offset_of!(ResidentBootContext, last_reason);
 const BCTX_LAST_INSTRUCTION_LEN: usize =
     core::mem::offset_of!(ResidentBootContext, last_instruction_len);
@@ -493,7 +556,6 @@ const BCTX_CPUID_HYPERVISOR_COUNT: usize =
 const BCTX_CPUID_LEAF1_ECX: usize = core::mem::offset_of!(ResidentBootContext, cpuid_leaf1_ecx);
 const BCTX_CPUID_HYPERVISOR_EAX: usize =
     core::mem::offset_of!(ResidentBootContext, cpuid_hypervisor_eax);
-const BCTX_TSC_ADJUST: usize = core::mem::offset_of!(ResidentBootContext, tsc_adjust);
 const BCTX_NESTED_FEATURE_CONTROL: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, feature_control);
 const BCTX_NESTED_VMX_BASIC: usize = core::mem::offset_of!(ResidentBootContext, nested)
@@ -856,6 +918,20 @@ const EVENT_CTX_VA_SEEN: usize =
     core::mem::offset_of!(ResidentEventContext, virtual_address_change_seen);
 const EVENT_CTX_CANARY: usize = core::mem::offset_of!(ResidentEventContext, canary);
 const EVENT_CTX_SERIAL_LOCK: usize = core::mem::offset_of!(ResidentEventContext, serial_lock);
+const EVENT_CTX_VISUAL_BASE: usize = core::mem::offset_of!(ResidentEventContext, visual_base);
+const EVENT_CTX_VISUAL_STRIDE_BYTES: usize =
+    core::mem::offset_of!(ResidentEventContext, visual_stride_bytes);
+const EVENT_CTX_POST_EBS_CPU_MASK: usize =
+    core::mem::offset_of!(ResidentEventContext, post_ebs_cpu_mask);
+const EVENT_CTX_DIAGNOSTIC_HALTED: usize =
+    core::mem::offset_of!(ResidentEventContext, diagnostic_halted);
+const EVENT_CTX_HOST_FAULT_VECTOR: usize =
+    core::mem::offset_of!(ResidentEventContext, host_fault_vector);
+const EVENT_CTX_HOST_FAULT_RIP: usize = core::mem::offset_of!(ResidentEventContext, host_fault_rip);
+const EVENT_CTX_HOST_FAULT_ERROR_CODE: usize =
+    core::mem::offset_of!(ResidentEventContext, host_fault_error_code);
+const EVENT_CTX_HOST_FAULT_ADDRESS: usize =
+    core::mem::offset_of!(ResidentEventContext, host_fault_address);
 
 #[repr(C, align(16))]
 struct ResidentContext {
@@ -924,16 +1000,24 @@ struct ResidentCode {
     pages: ResidentPages,
     entry: u64,
     fatal: u64,
+    gp_handler: u64,
+    exception_stubs: u64,
     exit_boot_services_callback: u64,
     virtual_address_change_callback: u64,
     dispatch_entry: u64,
 }
 
 impl ResidentCode {
-    fn allocate() -> Result<Self, ResidentProbeError> {
+    fn allocate(event_context: u64) -> Result<Self, ResidentProbeError> {
         let start = core::ptr::addr_of!(matrixhv_resident_island_start) as u64;
         let entry = core::ptr::addr_of!(matrixhv_resident_island_entry) as u64;
         let fatal = core::ptr::addr_of!(matrixhv_resident_island_fatal) as u64;
+        let gp_handler = core::ptr::addr_of!(matrixhv_resident_island_gp) as u64;
+        let exception_stubs = core::ptr::addr_of!(matrixhv_resident_exception_stubs) as u64;
+        let event_context_slot = core::ptr::addr_of!(matrixhv_resident_island_event_context) as u64;
+        let log_backend = core::ptr::addr_of!(matrixhv_resident_island_log_backend) as u64;
+        let msr_count = core::ptr::addr_of!(matrixhv_resident_island_msr_switch_count) as u64;
+        let visual_callback = core::ptr::addr_of!(matrixhv_resident_island_visual_callback) as u64;
         let exit_boot_services_callback =
             core::ptr::addr_of!(matrixhv_resident_ebs_callback) as u64;
         let virtual_address_change_callback =
@@ -942,12 +1026,24 @@ impl ResidentCode {
         let end = core::ptr::addr_of!(matrixhv_resident_island_end) as u64;
         if entry < start
             || fatal < start
+            || gp_handler < start
+            || exception_stubs < start
+            || event_context_slot < start
+            || log_backend < start
+            || msr_count < start
+            || visual_callback < start
             || exit_boot_services_callback < start
             || virtual_address_change_callback < start
             || dispatch_entry < start
             || end <= start
             || entry >= end
             || fatal >= end
+            || gp_handler >= end
+            || exception_stubs >= end
+            || event_context_slot >= end
+            || log_backend >= end
+            || msr_count + 8 > end
+            || visual_callback >= end
             || exit_boot_services_callback >= end
             || virtual_address_change_callback >= end
             || dispatch_entry >= end
@@ -964,11 +1060,38 @@ impl ResidentCode {
         .map_err(ResidentProbeError::Allocation)?;
         unsafe {
             core::ptr::copy_nonoverlapping(start as *const u8, pages.pointer().as_ptr(), length);
+            pages
+                .pointer()
+                .as_ptr()
+                .add((msr_count - start) as usize)
+                .cast::<u64>()
+                .write_unaligned(resident_msr_switch_count());
+            pages
+                .pointer()
+                .as_ptr()
+                .add((log_backend - start) as usize)
+                .write(crate::runtime::logger::backend() as u8);
+            pages
+                .pointer()
+                .as_ptr()
+                .add((visual_callback - start) as usize)
+                .cast::<u64>()
+                .write_unaligned(
+                    crate::boot::screen::vmexit_diagnostic as *const () as usize as u64,
+                );
+            pages
+                .pointer()
+                .as_ptr()
+                .add((event_context_slot - start) as usize)
+                .cast::<u64>()
+                .write_unaligned(event_context);
         }
         let base = pages.physical_address();
         Ok(Self {
             entry: base + (entry - start),
             fatal: base + (fatal - start),
+            gp_handler: base + (gp_handler - start),
+            exception_stubs: base + (exception_stubs - start),
             exit_boot_services_callback: base + (exit_boot_services_callback - start),
             virtual_address_change_callback: base + (virtual_address_change_callback - start),
             dispatch_entry: base + (dispatch_entry - start),
@@ -1032,6 +1155,8 @@ impl ResidentHostSelectors {
 impl ResidentHostTables {
     pub(crate) fn allocate(
         fatal_handler: u64,
+        gp_handler: u64,
+        exception_stubs: u64,
         selectors: ResidentHostSelectors,
     ) -> Result<Self, ResidentProbeError> {
         let pages = ResidentPages::allocate(HOST_TABLE_PAGES, AddressConstraint::Any)
@@ -1065,12 +1190,28 @@ impl ResidentHostTables {
             gdt_pointer.add(tss_index + 1).write(tss_high);
 
             (tss as *mut u8).write_bytes(0, (TSS_LIMIT + 1) as usize);
+            ((tss + 36) as *mut u64).write_unaligned(base + 3 * PAGE_SIZE as u64);
+            ((tss + 44) as *mut u64).write_unaligned(base + 4 * PAGE_SIZE as u64);
+            ((tss + 102) as *mut u16).write_unaligned((TSS_LIMIT + 1) as u16);
 
             let idt_pointer = idt as *mut IdtEntry;
             for index in 0..IDT_ENTRY_COUNT {
-                idt_pointer
-                    .add(index)
-                    .write(IdtEntry::interrupt_gate(fatal_handler, selectors.cs));
+                let mut entry = IdtEntry::interrupt_gate(
+                    if index == 13 {
+                        gp_handler
+                    } else if index < 32 {
+                        exception_stubs + (index * 16) as u64
+                    } else {
+                        fatal_handler
+                    },
+                    selectors.cs,
+                );
+                entry.ist = match index {
+                    2 => 1,
+                    8 => 2,
+                    _ => 0,
+                };
+                idt_pointer.add(index).write(entry);
             }
         }
 
@@ -1089,10 +1230,11 @@ pub fn probe() -> Result<ResidentProbeReport, ResidentProbeError> {
         return Err(ResidentProbeError::Allocation(Status::OUT_OF_RESOURCES));
     }
 
-    let code = ResidentCode::allocate()?;
+    let code = ResidentCode::allocate(0)?;
     let root_segments = segmentation::capture();
     let selectors = ResidentHostSelectors::inherited(root_segments)?;
-    let mut tables = ResidentHostTables::allocate(code.fatal, selectors)?;
+    let mut tables =
+        ResidentHostTables::allocate(code.fatal, code.gp_handler, code.exception_stubs, selectors)?;
     let context_pages = ResidentPages::allocate(1, AddressConstraint::Any)
         .map_err(ResidentProbeError::Allocation)?;
     let guest_stack = ResidentPages::allocate(GUEST_STACK_PAGES, AddressConstraint::Any)
@@ -1106,11 +1248,10 @@ pub fn probe() -> Result<ResidentProbeReport, ResidentProbeError> {
     let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
     vmcs_region.write_revision_id(revision_id);
     let vmcs_physical_address = vmcs_region.physical_address();
-    let session = vt_vmxon::enter_vmx_root().map_err(ResidentProbeError::Vmxon)?;
-
     let host_space = host_address_space
         .clone_current()
         .map_err(ResidentProbeError::Paging)?;
+    let session = vt_vmxon::enter_vmx_root().map_err(ResidentProbeError::Vmxon)?;
     let source_cr3 = host_space.source_cr3;
     let context = context_pages.pointer().as_ptr().cast::<ResidentContext>();
     unsafe {
@@ -1177,6 +1318,8 @@ pub fn probe() -> Result<ResidentProbeReport, ResidentProbeError> {
     let report = ResidentProbeReport {
         code_physical_address: code.pages.physical_address(),
         code_pages: code.pages.pages(),
+        host_table_pages: host_space.table_pages,
+        host_table_capacity: host_space.arena_pages,
         data_memory_type: RESIDENT_MEMORY_TYPE.0,
         code_memory_type: RESIDENT_CODE_MEMORY_TYPE.0,
         host_cr3: host_space.host_cr3,
@@ -1211,8 +1354,18 @@ pub fn ept_test_page_gpa() -> u64 {
     EPT_TEST_PAGE_GPA.load(Ordering::Acquire)
 }
 
+pub(crate) fn boot_services_exited() -> bool {
+    let address = EVENT_CONTEXT_ADDRESS.load(Ordering::Acquire);
+    if address == 0 {
+        return false;
+    }
+    // The event context is retained runtime memory and is also mapped in L0.
+    let context = unsafe { &*(address as *const ResidentEventContext) };
+    context.exit_boot_services_seen.load(Ordering::Acquire) != 0
+}
+
 pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError> {
-    let mut code = ResidentCode::allocate()?;
+    let mut code = ResidentCode::allocate(0)?;
     let mut context_pages =
         ResidentPages::allocate_typed(1, AddressConstraint::Any, RESIDENT_EVENT_MEMORY_TYPE)
             .map_err(ResidentProbeError::Allocation)?;
@@ -1223,14 +1376,28 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
     unsafe {
         context.write(ResidentEventContext {
             magic: EVENT_CONTEXT_MAGIC,
-            exit_boot_services_seen: 0,
+            exit_boot_services_seen: AtomicU64::new(0),
             virtual_address_change_seen: 0,
             canary: EVENT_CONTEXT_CANARY,
             serial_lock: AtomicU64::new(0),
+            visual_base: 0,
+            visual_stride_bytes: 0,
+            post_ebs_cpu_mask: AtomicU64::new(0),
+            diagnostic_halted: AtomicU64::new(0),
+            host_fault_vector: u64::MAX,
+            host_fault_rip: 0,
+            host_fault_error_code: 0,
+            host_fault_address: 0,
+            init_cpu_mask: AtomicU64::new(0),
+            sipi_cpu_mask: AtomicU64::new(0),
+            halted_cpu_mask: AtomicU64::new(0),
+            failed_processor: u64::MAX,
+            failed_exit_reason: 0,
+            failed_qualification: 0,
+            failed_stop_result: 0,
         });
     }
     let serial_lock_address = context_pages.physical_address() + EVENT_CTX_SERIAL_LOCK as u64;
-    crate::runtime::serial::install_shared_lock(serial_lock_address);
     let notify_context = NonNull::new(context.cast::<c_void>())
         .ok_or(ResidentProbeError::Allocation(Status::OUT_OF_RESOURCES))?;
     let ebs_callback = unsafe {
@@ -1275,6 +1442,8 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
     };
     code.pages.preserve();
     context_pages.preserve();
+    EVENT_CONTEXT_ADDRESS.store(report.context_physical_address, Ordering::Release);
+    crate::runtime::serial::install_shared_lock(serial_lock_address);
     Ok(report)
 }
 
@@ -1335,30 +1504,39 @@ fn allow_high_msr_passthrough(bitmap: &ResidentPages, index: u32) {
     }
 }
 
+fn spec_ctrl_available(leaf7_edx: u32) -> bool {
+    leaf7_edx & ((1 << 26) | (1 << 27) | (1 << 31)) != 0
+}
+
+fn resident_msr_switch_count() -> u64 {
+    let cpuid = crate::arch::x86_64::cpuid::leaf;
+    u64::from(cpuid(0).eax >= 7 && spec_ctrl_available(cpuid(7).edx))
+}
+
 fn configure_resident_msr_switch(msr_state: &ResidentPages) -> Result<(), VmcsError> {
     let entries = msr_state.pointer().as_ptr().cast::<VmxMsrEntry>();
     // The resident assembly never executes SYSCALL, SWAPGS, or RDTSCP. Preserve
     // those MSRs naturally across exits; only root speculation policy needs a switch.
-    let initial_values = [(IA32_SPEC_CTRL_MSR, unsafe { msr::read(IA32_SPEC_CTRL_MSR) })];
-    for (offset, (index, value)) in initial_values.into_iter().enumerate() {
+    let count = resident_msr_switch_count();
+    if count != 0 {
         let entry = VmxMsrEntry {
-            index,
+            index: IA32_SPEC_CTRL_MSR,
             reserved: 0,
-            value,
+            value: unsafe { msr::read(IA32_SPEC_CTRL_MSR) },
         };
         unsafe {
-            entries.add(offset).write(entry);
-            entries.add(RESIDENT_MSR_SWITCH_COUNT + offset).write(entry);
+            entries.write(entry);
+            entries.add(RESIDENT_MSR_SWITCH_CAPACITY).write(entry);
         }
     }
     let guest_entry = msr_state.physical_address();
-    let host_entry = guest_entry + (RESIDENT_MSR_SWITCH_COUNT * size_of::<VmxMsrEntry>()) as u64;
+    let host_entry = guest_entry + (RESIDENT_MSR_SWITCH_CAPACITY * size_of::<VmxMsrEntry>()) as u64;
     vmwrite(VM_EXIT_MSR_STORE_ADDR, guest_entry)?;
     vmwrite(VM_EXIT_MSR_LOAD_ADDR, host_entry)?;
     vmwrite(VM_ENTRY_MSR_LOAD_ADDR, guest_entry)?;
-    vmwrite(VM_EXIT_MSR_STORE_COUNT, RESIDENT_MSR_SWITCH_COUNT as u64)?;
-    vmwrite(VM_EXIT_MSR_LOAD_COUNT, RESIDENT_MSR_SWITCH_COUNT as u64)?;
-    vmwrite(VM_ENTRY_MSR_LOAD_COUNT, RESIDENT_MSR_SWITCH_COUNT as u64)?;
+    vmwrite(VM_EXIT_MSR_STORE_COUNT, count)?;
+    vmwrite(VM_EXIT_MSR_LOAD_COUNT, count)?;
+    vmwrite(VM_ENTRY_MSR_LOAD_COUNT, count)?;
     Ok(())
 }
 
@@ -1369,7 +1547,7 @@ fn configure_nested_msr_composition(
     nested_msr_state: u64,
 ) {
     let l0_msr_host_list =
-        l0_msr_guest_list + (RESIDENT_MSR_SWITCH_COUNT * size_of::<VmxMsrEntry>()) as u64;
+        l0_msr_guest_list + (RESIDENT_MSR_SWITCH_CAPACITY * size_of::<VmxMsrEntry>()) as u64;
     nested_state.configure_msr_composition(NestedMsrComposition {
         l0_msr_bitmap,
         composed_msr_bitmap: nested_msr_state + NESTED_MSR_BITMAP_OFFSET,
@@ -1699,8 +1877,9 @@ pub fn run_boot_loader(
         return Err(ResidentProbeError::Allocation(Status::OUT_OF_RESOURCES));
     }
 
+    crate::boot::screen::stage("resident resource allocation");
     let initial_rflags = registers::read_rflags();
-    let code = ResidentCode::allocate()?;
+    let code = ResidentCode::allocate(event_context)?;
     let root_segments = segmentation::capture();
     let msr_bitmap = ResidentPages::allocate(MSR_BITMAP_PAGES, AddressConstraint::Any)
         .map_err(ResidentProbeError::Allocation)?;
@@ -1710,7 +1889,12 @@ pub fn run_boot_loader(
         .map_err(ResidentProbeError::Allocation)?;
     let mut host_address_space = HostAddressSpace::reserve().map_err(ResidentProbeError::Paging)?;
     let vmx_basic = vt_vmxon::vmx_basic();
-    let mut cpu_resources = ResidentCpuResources::allocate(vmx_basic, code.fatal)?;
+    let mut cpu_resources = ResidentCpuResources::allocate(
+        vmx_basic,
+        code.fatal,
+        code.gp_handler,
+        code.exception_stubs,
+    )?;
     let topology = crate::smp::topology::enumerate().map_err(ResidentProbeError::Allocation)?;
     let mut ap_resources = alloc::vec::Vec::new();
     {
@@ -1725,7 +1909,12 @@ pub fn run_boot_loader(
             if info.is_enabled() && !info.is_bsp() {
                 ap_resources.push((
                     processor_number,
-                    ResidentCpuResources::allocate(vmx_basic, code.fatal)?,
+                    ResidentCpuResources::allocate(
+                        vmx_basic,
+                        code.fatal,
+                        code.gp_handler,
+                        code.exception_stubs,
+                    )?,
                 ));
             }
         }
@@ -1749,7 +1938,11 @@ pub fn run_boot_loader(
     allow_low_msr_read_passthrough(&msr_bitmap, IA32_MCG_CAP_MSR);
     allow_low_msr_passthrough(&msr_bitmap, IA32_MCG_STATUS_MSR);
     allow_low_msr_passthrough(&msr_bitmap, IA32_MCG_CTL_MSR);
-    allow_low_msr_passthrough(&msr_bitmap, IA32_TSC_DEADLINE_MSR);
+    // Resident CPUs own their physical APIC. Keep TSC synchronization and its
+    // deadline timer in the same clock domain; L1 bitmap intercepts still apply to L2.
+    for index in [IA32_TSC_MSR, IA32_TSC_ADJUST_MSR, IA32_TSC_DEADLINE_MSR] {
+        allow_low_msr_passthrough(&msr_bitmap, index);
+    }
     // L1 owns the local APIC; trapping its accesses only repeats the same MSR
     // instruction in root mode. VMCS02 still includes every L1 bitmap intercept.
     for index in IA32_X2APIC_MSR_BASE..=IA32_X2APIC_MSR_END {
@@ -1781,10 +1974,24 @@ pub fn run_boot_loader(
     allow_high_msr_passthrough(&msr_bitmap, IA32_KERNEL_GS_BASE_MSR);
     allow_high_msr_passthrough(&msr_bitmap, IA32_TSC_AUX_MSR);
 
+    crate::boot::screen::stage("resident host paging");
     let host_space = host_address_space
         .clone_current()
         .map_err(ResidentProbeError::Paging)?;
+    crate::boot::screen::stage("resident EPT setup");
     let mut ept = vt_ept::IdentityEpt::build()?;
+    let pci_bar_ranges = ept.map_pci_bars()?;
+    let high_address_end = ept.map_high_address_gaps()?;
+    crate::boot::screen::message(format_args!(
+        "resident high address EPT coverage to={high_address_end:#x} UC gaps"
+    ));
+    for &(start, end) in &pci_bar_ranges {
+        if end > (1_u64 << 32) {
+            crate::boot::screen::message(format_args!(
+                "resident high PCI BAR EPT range={start:#x}..{end:#x} UC"
+            ));
+        }
+    }
     let zero_page_physical_address = zero_page.physical_address();
     ept.conceal_guest_access(
         zero_page_physical_address,
@@ -1812,21 +2019,20 @@ pub fn run_boot_loader(
         resources.conceal_guest_access(&mut ept, zero_page_physical_address)?;
     }
     ept.conceal_guest_access_to_tables(zero_page_physical_address)?;
-    let bsp_ept_composition = cpu_resources.prepare_nested_ept(&ept)?;
+    crate::boot::screen::stage("resident nested EPT setup");
+    let mut ept12_template = vt_ept::IdentityEpt::build()?;
+    ept12_template.map_high_address_gaps()?;
+    let bsp_ept_composition = cpu_resources.prepare_nested_ept(&ept, &ept12_template)?;
     for (_, resources) in &mut ap_resources {
-        resources.prepare_nested_ept(&ept)?;
+        resources.prepare_nested_ept(&ept, &ept12_template)?;
     }
+    drop(ept12_template);
     let mut nested_ept02_regions = cpu_resources.nested_ept02_table_regions();
     for (_, resources) in &ap_resources {
         nested_ept02_regions.extend(resources.nested_ept02_table_regions());
     }
     ept.conceal_guest_access_to_regions(&nested_ept02_regions, zero_page_physical_address)?;
-    cpu_resources
-        .conceal_nested_ept02_regions(&nested_ept02_regions, zero_page_physical_address)?;
-    for (_, resources) in &mut ap_resources {
-        resources
-            .conceal_nested_ept02_regions(&nested_ept02_regions, zero_page_physical_address)?;
-    }
+    // EPT02 starts sparse; later L2 compositions consult the protected EPT01.
 
     let nested_ept12_pointer = cpu_resources
         .nested_ept12_pointer()
@@ -1858,6 +2064,21 @@ pub fn run_boot_loader(
     let nested_vmcs02_physical_address = cpu_resources.nested_vmcs02_region.physical_address();
     let l0_msr_guest_list = cpu_resources.resident_msr_state.physical_address();
     let nested_msr_state = cpu_resources.nested_msr_state.physical_address();
+    // Calibration can call Stall; finish all diagnostic protocol work before VMXON.
+    let (diagnostic_interval_tsc, diagnostic_timer_rate) =
+        vt_controls::resident_boot_timer_parameters();
+    if crate::runtime::logger::framebuffer_enabled()
+        && crate::boot::screen::prepare_resident_visuals()
+        && let Some((visual_base, visual_stride_bytes)) =
+            crate::boot::screen::resident_marker_layout()
+    {
+        let event_context = event_context as *mut ResidentEventContext;
+        unsafe {
+            (*event_context).visual_base = visual_base;
+            (*event_context).visual_stride_bytes = visual_stride_bytes;
+        }
+    }
+    crate::boot::screen::stage("resident BSP VMCS setup");
     let session =
         vt_vmxon::enter_vmx_root_with_borrowed_region(vmx_basic, &mut cpu_resources.vmxon_region)
             .map_err(ResidentProbeError::Vmxon)?;
@@ -1877,6 +2098,11 @@ pub fn run_boot_loader(
     let mut controls =
         vt_controls::configure_resident_boot(msr_bitmap.physical_address(), ept.ept_pointer())?;
     vt_controls::enable_resident_vpid(&mut controls, 1)?;
+    vt_controls::enable_resident_boot_timer(
+        &mut controls,
+        diagnostic_interval_tsc,
+        diagnostic_timer_rate,
+    )?;
     configure_resident_msr_switch(&cpu_resources.resident_msr_state)?;
     configure_resident_host(
         host_space.host_cr3,
@@ -1941,6 +2167,12 @@ pub fn run_boot_loader(
             ept_probe_resume_rip,
             nested_state,
         ));
+        (*context).diagnostic_interval_tsc = diagnostic_interval_tsc;
+        (*context).cache_ept_pointer = ept.ept_pointer();
+        ((cpu_resources.host_tables.tss + 112) as *mut u64).write(context as u64);
+        (*context).diagnostic_timer_rate = diagnostic_timer_rate;
+        (*context).diagnostic_deadline_tsc =
+            core::arch::x86_64::_rdtsc().wrapping_add(diagnostic_interval_tsc);
     }
     let host_rsp = (cpu_resources.host_stack.physical_address()
         + cpu_resources.host_stack.byte_len() as u64
@@ -1966,7 +2198,16 @@ pub fn run_boot_loader(
         l1_cr4,
     })?;
 
+    // Firmware MP services run with the BSP's original CRs, tables, and IF.
+    // VMCLEAR retains the prepared fields while relinquishing CPU ownership.
+    let clear = unsafe { vt_vmcs::vmclear(vmcs_physical_address) };
+    drop(session);
+    if clear != VmxInstructionResult::Succeeded {
+        return Err(ResidentProbeError::Vmclear(clear));
+    }
+    crate::boot::screen::stage("resident AP launch");
     for (processor_number, resources) in &mut ap_resources {
+        crate::boot::screen::message(format_args!("resident AP {} starting", processor_number));
         let mut launch = ResidentApLaunch {
             resources,
             host_cr3: host_space.host_cr3,
@@ -2120,18 +2361,96 @@ pub fn run_boot_loader(
             || nested.inherited_l1_efer != nested.l2_saved_efer
             || nested.vmcs12.extended_fields[16] != nested.ept12_pointer
         {
+            crate::boot::screen::error(format_args!(
+                "resident AP {} failed: status={result:?} started={started} complete={} vmx_failures={}",
+                processor_number, nested.probe_complete, nested.failure_count
+            ));
             resident_startup_halt();
         }
+        crate::boot::screen::message(format_args!("resident AP {} ready", processor_number));
     }
     crate::runtime::logger::info(format_args!(
         "smp resident BSP context={:#x} vmcs={:#x} vmxon={:#x}",
         context as u64,
         vmcs_physical_address,
-        session.report().region_physical_address
+        cpu_resources.vmxon_region.physical_address()
     ));
+    crate::boot::screen::page("resident BSP VMLAUNCH");
+    crate::boot::screen::message(format_args!(
+        "resident APs ready={} BSP VMCS={:#x} EPT={:#x}",
+        ap_resources.len(),
+        vmcs_physical_address,
+        ept.ept_pointer()
+    ));
+    let first_high_bar = pci_bar_ranges
+        .iter()
+        .copied()
+        .find(|&(_, end)| end > (1_u64 << 32))
+        .unwrap_or((0, 0));
+    crate::boot::screen::message(format_args!(
+        "PCI BARs={} first high={:#x}..{:#x}",
+        pci_bar_ranges.len(),
+        first_high_bar.0,
+        first_high_bar.1
+    ));
+    crate::boot::screen::message(format_args!(
+        "runtime diagnostics use the saved framebuffer aperture without UEFI services"
+    ));
+    crate::boot::screen::message(format_args!(
+        "mark rows: first reason bits, VMRESUME error bits, first eight exits"
+    ));
+    crate::boot::screen::message(format_args!(
+        "hex rows: 0 exits 1 reason 2 RIP 3 RCX 4 MSR GP count 5 last GP MSR"
+    ));
+    crate::boot::screen::message(format_args!(
+        "hex rows: 6 GPA 7 qualification 8 CPU mask 9 CPU A host fault B host RIP"
+    ));
+    crate::boot::screen::message(format_args!("hex rows: C host error code D host CR2"));
+    crate::boot::screen::message(format_args!(
+        "hex left E timer samples F last normal reason; right 0 CR0 1 CR3 2 CR4 3 EFER"
+    ));
+    crate::boot::screen::message(format_args!(
+        "hex right 4 flags 5 activity 6 normal RIP 7 EFER write 8 RSP 9 interruptibility"
+    ));
+    crate::boot::screen::message(format_args!(
+        "hex right A RDMSR B WRMSR C L2 entries D nested failures E nested error F expired"
+    ));
+    crate::boot::screen::message(format_args!(
+        "BSP boot timer available={} interval TSC={:#x} rate={} samples=60",
+        diagnostic_interval_tsc != 0,
+        diagnostic_interval_tsc,
+        diagnostic_timer_rate
+    ));
+    crate::boot::screen::message(format_args!(
+        "EPT halt hex at right: GPA / guest RIP / qualification"
+    ));
+    let session = match vt_vmxon::enter_vmx_root_with_borrowed_region(
+        vmx_basic,
+        &mut cpu_resources.vmxon_region,
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            crate::boot::screen::error(format_args!("resident BSP VMXON failed: {error:?}"));
+            resident_startup_halt();
+        }
+    };
+    let load = unsafe { vt_vmcs::vmptrld(vmcs_physical_address) };
+    if load != VmxInstructionResult::Succeeded {
+        drop(session);
+        crate::boot::screen::error(format_args!("resident BSP VMPTRLD failed: {load:?}"));
+        resident_startup_halt();
+    }
     let raw_path =
         unsafe { matrixhv_resident_boot_run_asm(context, host_rsp, code.dispatch_entry) };
     if !ap_resources.is_empty() {
+        let boot_context = unsafe { &*context };
+        crate::boot::screen::error(format_args!(
+            "BSP returned with resident APs: path={} stop={:#x} exit={:#x} rip={:#x}",
+            raw_path,
+            boot_context.stop_result,
+            boot_context.last_reason,
+            boot_context.last_guest_rip
+        ));
         resident_startup_halt();
     }
     EPT_TEST_PAGE_GPA.store(0, Ordering::Release);
@@ -2342,12 +2661,14 @@ impl ResidentApLaunch<'_> {
             nested_state,
         );
         state.processor_number = self.processor_number as u64;
+        state.cache_ept_pointer = self.ept_pointer;
         let host_rsp = (self.resources.host_stack.physical_address()
             + self.resources.host_stack.byte_len() as u64
             - 8)
             & !0xf;
         unsafe {
             context.write(state);
+            ((self.resources.host_tables.tss + 112) as *mut u64).write(context as u64);
             (host_rsp as *mut u64).write(context as u64);
         }
         configure_nested_vmcs02(NestedVmcs02Configuration {
@@ -2392,7 +2713,7 @@ fn configure_resident_host(
     vmwrite(HOST_IA32_PAT, unsafe { msr::read(msr::IA32_PAT) })?;
     vmwrite(HOST_IA32_EFER, unsafe { msr::read(msr::IA32_EFER) })?;
     vmwrite(HOST_FS_BASE, segments.fs.base)?;
-    vmwrite(HOST_GS_BASE, segments.gs.base)?;
+    vmwrite(HOST_GS_BASE, tables.tss)?;
     vmwrite(HOST_TR_BASE, tables.tss)?;
     vmwrite(HOST_GDTR_BASE, tables.gdt)?;
     vmwrite(HOST_IDTR_BASE, tables.idt)?;
@@ -2459,6 +2780,12 @@ unsafe extern "C" {
     static matrixhv_resident_island_start: u8;
     static matrixhv_resident_island_entry: u8;
     static matrixhv_resident_island_fatal: u8;
+    static matrixhv_resident_island_gp: u8;
+    static matrixhv_resident_exception_stubs: u8;
+    static matrixhv_resident_island_event_context: u8;
+    static matrixhv_resident_island_log_backend: u8;
+    static matrixhv_resident_island_msr_switch_count: u8;
+    static matrixhv_resident_island_visual_callback: u8;
     static matrixhv_resident_ebs_callback: u8;
     static matrixhv_resident_va_callback: u8;
     static matrixhv_resident_dispatch_entry: u8;
@@ -2647,11 +2974,14 @@ global_asm!(
     "mov r12, qword ptr [rsp + 120]",
     "test r12, r12",
     "jz matrixhv_resident_island_fatal",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}",
+    "jz .Lresident_dispatch_profile_started",
     "lfence",
     "rdtsc",
     "shl rdx, 32",
     "or rax, rdx",
     "mov qword ptr [r12 + {b_nested_exit_started_tsc}], rax",
+    ".Lresident_dispatch_profile_started:",
     "mov rax, {boot_canary_start}",
     "cmp qword ptr [r12 + {b_canary_start}], rax",
     "jne matrixhv_resident_island_fatal",
@@ -2677,6 +3007,12 @@ global_asm!(
     "jc .Lresident_dispatch_vmread_failed",
     "jz .Lresident_dispatch_vmread_failed",
     "mov qword ptr [r12 + {b_last_guest_rip}], r11",
+    "mov eax, dword ptr [r12 + {b_last_reason}]",
+    "cmp eax, {preemption_timer_reason}",
+    "je .Lresident_normal_exit_recorded",
+    "mov qword ptr [r12 + {b_last_normal_reason}], rax",
+    "mov qword ptr [r12 + {b_last_normal_rip}], r11",
+    ".Lresident_normal_exit_recorded:",
     "mov rax, {exit_instruction_len}",
     "vmread r11, rax",
     "jc .Lresident_dispatch_vmread_failed",
@@ -2690,6 +3026,28 @@ global_asm!(
     "mov rax, qword ptr [r12 + {b_last_host_cr3}]",
     "cmp rax, qword ptr [r12 + {b_expected_host_cr3}]",
     "jne .Lresident_dispatch_host_cr3_mismatch",
+    "cmp qword ptr [r12 + {b_processor_number}], 0",
+    "jne .Lresident_visual_first_exit_done",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_framebuffer_sink}",
+    "jz .Lresident_visual_first_exit_done",
+    "cmp qword ptr [r12 + {b_visual_first_exit_seen}], 0",
+    "jne .Lresident_visual_first_exit_done",
+    "mov r10, qword ptr [r12 + {b_event_context}]",
+    "test r10, r10",
+    "jz .Lresident_visual_first_exit_call",
+    "cmp qword ptr [r10 + {event_ebs_seen}], 0",
+    "jne .Lresident_visual_first_exit_done",
+    ".Lresident_visual_first_exit_call:",
+    "mov rcx, qword ptr [r12 + {b_last_reason}]",
+    "xor edx, edx",
+    "mov r8, qword ptr [r12 + {b_last_guest_physical_address}]",
+    "mov r9, qword ptr [r12 + {b_last_guest_rip}]",
+    "mov r10, qword ptr [r12 + {b_last_qualification}]",
+    "call .Lresident_visual_callback",
+    "test rax, rax",
+    "jz .Lresident_visual_first_exit_done",
+    "mov qword ptr [r12 + {b_visual_first_exit_seen}], 1",
+    ".Lresident_visual_first_exit_done:",
     "cmp qword ptr [r12 + {b_nested_l2_active}], 1",
     "je .Lresident_nested_l2_reflect",
     "cmp qword ptr [r12 + {b_nested_vmcs01_msr_entry_composed}], 0",
@@ -2699,7 +3057,7 @@ global_asm!(
     "vmwrite rax, r11",
     "jna .Lresident_dispatch_vmwrite_failed",
     "mov rax, {vm_entry_msr_load_count}",
-    "mov r11d, {resident_msr_switch_count}",
+    "mov r11d, dword ptr [rip + matrixhv_resident_island_msr_switch_count]",
     "vmwrite rax, r11",
     "jna .Lresident_dispatch_vmwrite_failed",
     "mov qword ptr [r12 + {b_nested_vmcs01_msr_entry_composed}], 0",
@@ -2716,10 +3074,47 @@ global_asm!(
     "cmp qword ptr [rdi + {event_ebs_seen}], 0",
     "je .Lresident_dispatch_check_va",
     "inc qword ptr [r12 + {b_post_ebs_count}]",
+    "cmp qword ptr [r12 + {b_post_ebs_count}], 1",
+    "jne .Lresident_post_ebs_cpu_seen",
+    "mov rcx, qword ptr [r12 + {b_processor_number}]",
+    "cmp rcx, 64",
+    "jae .Lresident_post_ebs_cpu_seen",
+    "lock bts qword ptr [rdi + {event_post_ebs_cpu_mask}], rcx",
+    ".Lresident_post_ebs_cpu_seen:",
     "cmp qword ptr [r12 + {b_processor_number}], 0",
     "jne .Lresident_dispatch_check_va",
+    "cmp qword ptr [rdi + {event_diagnostic_halted}], 0",
+    "jne .Lresident_dispatch_after_events",
+    "mov rcx, qword ptr [r12 + {b_post_ebs_count}]",
+    "cmp rcx, 8",
+    "ja .Lresident_post_ebs_progress_done",
+    "add ecx, 20",
+    "mov r8, rdi",
+    "call .Lresident_paint_stage",
+    ".Lresident_post_ebs_progress_done:",
+    // Keep diagnostic refreshes bounded and reduce MMIO traffic after the first exits.
+    "cmp qword ptr [r12 + {b_diagnostic_expired}], 0",
+    "jne .Lresident_post_ebs_snapshot_done",
+    "mov rcx, qword ptr [r12 + {b_post_ebs_count}]",
+    "cmp rcx, 65536",
+    "ja .Lresident_post_ebs_snapshot_done",
+    "cmp rcx, 32",
+    "jbe .Lresident_post_ebs_snapshot",
+    "lea rax, [rcx - 1]",
+    "test rax, rcx",
+    "jnz .Lresident_post_ebs_snapshot_done",
+    ".Lresident_post_ebs_snapshot:",
+    "mov r8, rdi",
+    "call .Lresident_diagnostic_snapshot",
+    ".Lresident_post_ebs_snapshot_done:",
     "cmp qword ptr [r12 + {b_post_ebs_count}], 1",
     "jne .Lresident_dispatch_check_va",
+    "mov r8, rdi",
+    "mov ecx, 2",
+    "call .Lresident_paint_stage",
+    "mov eax, dword ptr [r12 + {b_last_reason}]",
+    "mov ecx, 5",
+    "call .Lresident_paint_byte",
     "lea rsi, [rip + .Lpost_ebs_exit_message]",
     "mov r9d, {post_ebs_exit_message_len}",
     "call .Lresident_serial_write",
@@ -2732,6 +3127,12 @@ global_asm!(
     "jne .Lresident_dispatch_after_events",
     "cmp qword ptr [r12 + {b_post_va_count}], 1",
     "jne .Lresident_dispatch_after_events",
+    "cmp qword ptr [rdi + {event_diagnostic_halted}], 0",
+    "jne .Lresident_dispatch_after_events",
+    "mov r8, rdi",
+    "mov ecx, 3",
+    "call .Lresident_paint_stage",
+    "call .Lresident_diagnostic_snapshot",
     "lea rsi, [rip + .Lpost_va_exit_message]",
     "mov r9d, {post_va_exit_message_len}",
     "call .Lresident_serial_write",
@@ -2753,12 +3154,18 @@ global_asm!(
     "and eax, 0xffff",
     "cmp eax, 0",
     "je .Lresident_dispatch_exception",
+    "cmp eax, 8",
+    "je .Lresident_dispatch_nmi_window",
     "cmp eax, 3",
     "je .Lresident_ap_init",
     "cmp eax, 4",
     "je .Lresident_ap_sipi",
     "cmp eax, 28",
     "je .Lresident_ap_cr_access",
+    "cmp eax, 13",
+    "je .Lresident_dispatch_cache_flush",
+    "cmp eax, 54",
+    "je .Lresident_dispatch_cache_flush",
     "cmp eax, {ept_violation_reason}",
     "je .Lresident_dispatch_ept_violation",
     "cmp eax, {vmclear_reason}",
@@ -2793,15 +3200,44 @@ global_asm!(
     "je .Lresident_dispatch_wrmsr",
     "cmp eax, {xsetbv_reason}",
     "je .Lresident_dispatch_xsetbv",
+    "cmp eax, {preemption_timer_reason}",
+    "je .Lresident_dispatch_boot_timer",
     "jmp .Lresident_dispatch_unsupported",
     include_str!("../../asm/ap_startup.S"),
+    ".Lresident_dispatch_cache_flush:",
+    "call .Lresident_msr_privilege",
+    "jc .Lresident_dispatch_inject_gp",
+    // INVD must not discard dirty host state on a CPU shared with the guest.
+    "wbinvd",
+    "call .Lresident_advance_guest_rip",
+    "jmp .Lresident_dispatch_resume",
     ".Lresident_nested_l2_reflect:",
+    "mov eax, dword ptr [r12 + {b_last_reason}]",
+    "test eax, eax",
+    "jne .Lresident_nested_check_nmi_window",
+    "bt qword ptr [r12 + {b_nested_vmcs12_pin_based_control}], 3",
+    "jc .Lresident_nested_nmi_reflect_ready",
+    "mov eax, {exit_intr_info}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "and r11d, 0x800007ff",
+    "cmp r11d, 0x80000202",
+    "je .Lresident_dispatch_nmi",
+    "jmp .Lresident_nested_nmi_reflect_ready",
+    ".Lresident_nested_check_nmi_window:",
+    "cmp eax, 8",
+    "jne .Lresident_nested_nmi_reflect_ready",
+    "bt qword ptr [r12 + {b_nested_vmcs12_primary_control}], 22",
+    "jnc .Lresident_dispatch_nmi_window",
+    ".Lresident_nested_nmi_reflect_ready:",
     "mov r10, qword ptr [r12 + {b_last_reason}]",
     "test r10d, 0x80000000",
     "jnz .Lresident_nested_l2_failure_dump",
     "mov qword ptr [r12 + {b_nested_vmcs02_launched}], 1",
     "jmp .Lresident_nested_l2_reflect_after_failure_dump",
     ".Lresident_nested_l2_failure_dump:",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}",
+    "jz .Lresident_nested_l2_reflect_after_failure_dump",
     "lea rsi, [rip + .Lnested_entry_failure_dump_message]",
     "mov r9d, {nested_entry_failure_dump_message_len}",
     "call .Lresident_serial_write",
@@ -2910,9 +3346,9 @@ global_asm!(
     "jne .Lresident_nested_l2_qualification_ready",
     "test r10d, 0x80000000",
     "jz .Lresident_nested_l2_qualification_ready",
-    "cmp r11, {resident_msr_switch_count}",
+    "cmp r11, qword ptr [rip + matrixhv_resident_island_msr_switch_count]",
     "jbe .Lresident_nested_l2_qualification_ready",
-    "sub r11, {resident_msr_switch_count}",
+    "sub r11, qword ptr [rip + matrixhv_resident_island_msr_switch_count]",
     ".Lresident_nested_l2_qualification_ready:",
     "mov qword ptr [r12 + {b_nested_vmcs12_exit_qualification}], r11",
     "mov eax, r10d",
@@ -3002,6 +3438,8 @@ global_asm!(
     "test rax, rdx",
     "jnz .Lresident_dispatch_resume",
     ".Lresident_nested_l2_log_exit:",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}",
+    "jz .Lresident_dispatch_resume",
     "lea rsi, [rip + .Lnested_l2_exit_message]",
     "mov r9d, {nested_l2_exit_message_len}",
     "call .Lresident_serial_write",
@@ -3676,10 +4114,6 @@ global_asm!(
     "mov ebx, r10d",
     "and ebx, 0x38",
     "and r13, -4096",
-    "mov r11, r13",
-    "call .Lresident_nested_host_page_is_mapped",
-    "test eax, eax",
-    "jz .Lresident_nested_translate_ept02_failed",
     // Large composed leaves require uniform permissions and translations in both EPTs.
     "mov r9, qword ptr [r12 + {b_nested_ept01_pointer}]",
     "mov rdx, {host_page_address_mask}",
@@ -3852,6 +4286,79 @@ global_asm!(
     "invept rax, xmmword ptr [rsp]",
     "lea rsp, [rsp + 16]",
     "jna .Lresident_dispatch_halt",
+    "ret",
+    // Re-read both EPT levels before retaining a cached leaf across an L1 invalidation.
+    // Revoked access and split large pages are removed before the hardware INVEPT.
+    ".Lresident_nested_revalidate_ept02:",
+    "cmp qword ptr [r12 + {b_nested_ept02_cache_initialized}], 0",
+    "je .Lresident_nested_invalidate_ept02",
+    "inc qword ptr [r12 + {b_nested_ept02_invalidation_count}]",
+    "mov rdi, qword ptr [r12 + {b_nested_ept02_pointer}]",
+    "mov rax, {host_page_address_mask}",
+    "and rdi, rax",
+    "xor r8d, r8d",
+    "mov ecx, 39",
+    "call .Lresident_nested_revalidate_ept02_table",
+    "jmp .Lresident_nested_flush_ept02",
+    ".Lresident_nested_revalidate_ept02_table:",
+    "sub rsp, 48",
+    "mov qword ptr [rsp], rdi",
+    "mov qword ptr [rsp + 8], r8",
+    "mov qword ptr [rsp + 16], rcx",
+    "mov qword ptr [rsp + 24], 0",
+    ".Lresident_nested_revalidate_ept02_entry:",
+    "mov rax, qword ptr [rsp + 24]",
+    "mov rdi, qword ptr [rsp]",
+    "lea rdi, [rdi + rax * 8]",
+    "mov r10, qword ptr [rdi]",
+    "test r10, 0x407",
+    "jz .Lresident_nested_revalidate_ept02_next",
+    "mov rcx, qword ptr [rsp + 16]",
+    "shl rax, cl",
+    "mov r8, qword ptr [rsp + 8]",
+    "or r8, rax",
+    "cmp ecx, 12",
+    "je .Lresident_nested_revalidate_ept02_leaf",
+    "test r10b, 0x80",
+    "jnz .Lresident_nested_revalidate_ept02_leaf",
+    "mov rdi, {host_page_address_mask}",
+    "and rdi, r10",
+    "sub ecx, 9",
+    "call .Lresident_nested_revalidate_ept02_table",
+    "jmp .Lresident_nested_revalidate_ept02_next",
+    ".Lresident_nested_revalidate_ept02_leaf:",
+    "mov qword ptr [rsp + 32], rdi",
+    "mov r9, qword ptr [r12 + {b_nested_ept12_pointer}]",
+    "xor edi, edi",
+    "call .Lresident_nested_translate_ept02",
+    "test eax, eax",
+    "jz .Lresident_nested_revalidate_ept02_remove",
+    "cmp qword ptr [rsp + 16], 12",
+    "je .Lresident_nested_revalidate_ept02_small_leaf",
+    "cmp qword ptr [rsp + 16], 21",
+    "jne .Lresident_nested_revalidate_ept02_remove",
+    "test r15b, 0x80",
+    "jz .Lresident_nested_revalidate_ept02_remove",
+    "and r13, -2097152",
+    "jmp .Lresident_nested_revalidate_ept02_write",
+    ".Lresident_nested_revalidate_ept02_small_leaf:",
+    "and r15d, 0x338",
+    ".Lresident_nested_revalidate_ept02_write:",
+    "or r13, r14",
+    "or r13, r15",
+    "mov rdi, qword ptr [rsp + 32]",
+    "cmp qword ptr [rdi], r13",
+    "je .Lresident_nested_revalidate_ept02_next",
+    "mov qword ptr [rdi], r13",
+    "jmp .Lresident_nested_revalidate_ept02_next",
+    ".Lresident_nested_revalidate_ept02_remove:",
+    "mov rdi, qword ptr [rsp + 32]",
+    "mov qword ptr [rdi], 0",
+    ".Lresident_nested_revalidate_ept02_next:",
+    "inc qword ptr [rsp + 24]",
+    "cmp qword ptr [rsp + 24], 512",
+    "jne .Lresident_nested_revalidate_ept02_entry",
+    "add rsp, 48",
     "ret",
     ".Lresident_nested_host_page_is_mapped:",
     // Root page tables never change after setup. Cache only fully mapped 2 MiB
@@ -4367,6 +4874,8 @@ global_asm!(
     "mov qword ptr [r12 + {b_nested_vmcs12_probe_complete}], 1",
     "cmp qword ptr [r12 + {b_nested_vmxoff_count}], 0",
     "jne .Lresident_nested_vmread_value",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}",
+    "jz .Lresident_nested_vmread_value",
     "push r13",
     "lea rsi, [rip + .Lnested_vmcs12_message]",
     "mov r9d, {nested_vmcs12_message_len}",
@@ -4807,6 +5316,8 @@ global_asm!(
     "mov r11, qword ptr [r12 + {b_nested_vmcs01_pin_based_controls}]",
     "mov edx, dword ptr [r12 + {b_nested_vmcs12_pin_based_control}]",
     "or r11d, edx",
+    // The boot sampling timer belongs to VMCS01 and is not advertised to L1.
+    "btr r11d, 6",
     "call .Lresident_nested_write_vmcs02_control",
     "mov rax, {cpu_based_vm_exec_control}",
     "mov r11, qword ptr [r12 + {b_nested_vmcs01_primary_controls}]",
@@ -5012,7 +5523,8 @@ global_asm!(
     "cld",
     "mov rsi, qword ptr [r12 + {b_nested_l0_msr_guest_list}]",
     "mov rdi, qword ptr [r12 + {b_nested_vmcs02_entry_msr_list}]",
-    "mov ecx, {resident_msr_switch_qword_count}",
+    "mov ecx, dword ptr [rip + matrixhv_resident_island_msr_switch_count]",
+    "shl ecx, 1",
     "rep movsq",
     "mov rsi, qword ptr [r12 + {b_nested_vmcs12_vm_entry_msr_load_addr}]",
     "mov r10d, dword ptr [r12 + {b_nested_vmcs12_vm_entry_msr_load_count}]",
@@ -5030,13 +5542,14 @@ global_asm!(
     "mov rax, {vm_entry_msr_load_addr}",
     "mov r11, qword ptr [r12 + {b_nested_vmcs02_entry_msr_list}]",
     "call .Lresident_nested_write_vmcs02_control",
-    "add r10d, {resident_msr_switch_count}",
+    "add r10d, dword ptr [rip + matrixhv_resident_island_msr_switch_count]",
     "mov rax, {vm_entry_msr_load_count}",
     "mov r11d, r10d",
     "call .Lresident_nested_write_vmcs02_control",
     "mov rsi, qword ptr [r12 + {b_nested_l0_msr_guest_list}]",
     "mov rdi, qword ptr [r12 + {b_nested_vmcs02_exit_store_msr_list}]",
-    "mov ecx, {resident_msr_switch_qword_count}",
+    "mov ecx, dword ptr [rip + matrixhv_resident_island_msr_switch_count]",
+    "shl ecx, 1",
     "rep movsq",
     "mov rsi, qword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_store_addr}]",
     "mov r10d, dword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_store_count}]",
@@ -5060,7 +5573,7 @@ global_asm!(
     "mov rax, {vm_exit_msr_store_addr}",
     "mov r11, qword ptr [r12 + {b_nested_vmcs02_exit_store_msr_list}]",
     "call .Lresident_nested_write_vmcs02_control",
-    "add r10d, {resident_msr_switch_count}",
+    "add r10d, dword ptr [rip + matrixhv_resident_island_msr_switch_count]",
     "mov rax, {vm_exit_msr_store_count}",
     "mov r11d, r10d",
     "call .Lresident_nested_write_vmcs02_control",
@@ -5068,7 +5581,7 @@ global_asm!(
     "mov r11, qword ptr [r12 + {b_nested_l0_msr_host_list}]",
     "call .Lresident_nested_write_vmcs02_control",
     "mov rax, {vm_exit_msr_load_count}",
-    "mov r11d, {resident_msr_switch_count}",
+    "mov r11d, dword ptr [rip + matrixhv_resident_island_msr_switch_count]",
     "call .Lresident_nested_write_vmcs02_control",
     "ret",
     ".Lresident_nested_snapshot_vmcs01_effective_state:",
@@ -5217,9 +5730,7 @@ global_asm!(
     ".Lresident_nested_sync_vmcs02_guest_state_loop:",
     "mov edx, dword ptr [rsi]",
     // Deferred fields remain authoritative in VMCS02 until L1 accesses them.
-    "cmp qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], 0",
-    "je .Lresident_nested_sync_vmcs02_guest_field_ready",
-    "bt qword ptr [rip + .Lresident_nested_rare_guest_fields], rdx",
+    "bt qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], rdx",
     "jc .Lresident_nested_sync_vmcs02_guest_field_done",
     ".Lresident_nested_sync_vmcs02_guest_field_ready:",
     "mov rax, qword ptr [rsi + 8]",
@@ -5279,15 +5790,40 @@ global_asm!(
     "vmread r11, rax",
     "jna .Lresident_dispatch_vmread_failed",
     "mov qword ptr [r12 + {b_nested_last_captured_guest_gs_base}], r11",
-    "mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], 1",
+    "mov rax, qword ptr [rip + .Lresident_nested_rare_guest_fields]",
+    "mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], rax",
+    "mov rax, qword ptr [rip + .Lresident_nested_rare_guest_fields + 8]",
+    "mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending} + 8], rax",
     "ret",
     ".Lresident_nested_materialize_guest_field:",
-    "bt qword ptr [rip + .Lresident_nested_rare_guest_fields], rax",
-    "jc .Lresident_nested_materialize_vmcs02_rare_state",
+    "bt qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], rax",
+    "jnc .Lresident_nested_materialize_guest_field_done",
+    // A single VMREAD or VMWRITE needs only its own deferred hardware field.
+    "push rax",
+    "push rdx",
+    "push r11",
+    "vmptrld [r12 + {b_nested_vmcs02_region}]",
+    "jna .Lresident_dispatch_halt",
+    "mov rax, rdx",
+    "mov rdx, qword ptr [rsp + 16]",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "mov qword ptr [r12 + {b_nested_vmcs02_field_cache} + rdx * 8], r11",
+    "mov qword ptr [r12 + {b_nested_vmcs12_extended_fields} + rdx * 8], r11",
+    "btr qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], rdx",
+    "vmptrld [r12 + {b_nested_vmcs01_region}]",
+    "jna .Lresident_dispatch_halt",
+    "pop r11",
+    "pop rdx",
+    "pop rax",
+    ".Lresident_nested_materialize_guest_field_done:",
     "ret",
     ".Lresident_nested_materialize_vmcs02_rare_state:",
     "cmp qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], 0",
+    "jne .Lresident_nested_materialize_vmcs02_rare_begin",
+    "cmp qword ptr [r12 + {b_nested_vmcs02_rare_state_pending} + 8], 0",
     "je .Lresident_nested_materialize_vmcs02_rare_done",
+    ".Lresident_nested_materialize_vmcs02_rare_begin:",
     // Preserve the VMREAD/VMWRITE operands and VMPTRLD/VMCLEAR target pointer.
     "push rax",
     "push rcx",
@@ -5300,7 +5836,7 @@ global_asm!(
     "mov ecx, {nested_guest_state_table_count}",
     ".Lresident_nested_materialize_vmcs02_rare_loop:",
     "mov edx, dword ptr [rsi]",
-    "bt qword ptr [rip + .Lresident_nested_rare_guest_fields], rdx",
+    "bt qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], rdx",
     "jnc .Lresident_nested_materialize_vmcs02_rare_next",
     "mov rax, qword ptr [rsi + 8]",
     "vmread r11, rax",
@@ -5314,6 +5850,7 @@ global_asm!(
     "vmptrld [r12 + {b_nested_vmcs01_region}]",
     "jna .Lresident_dispatch_halt",
     "mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], 0",
+    "mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending} + 8], 0",
     "pop r11",
     "pop rsi",
     "pop rdx",
@@ -5326,7 +5863,9 @@ global_asm!(
     "jnz .Lresident_nested_compose_vmcs01_msr_entry",
     "mov rsi, qword ptr [r12 + {b_nested_vmcs02_exit_store_msr_list}]",
     "mov rdi, qword ptr [r12 + {b_nested_l0_msr_guest_list}]",
-    "mov ecx, {resident_msr_switch_count}",
+    "mov ecx, dword ptr [rip + matrixhv_resident_island_msr_switch_count]",
+    "test ecx, ecx",
+    "jz .Lresident_nested_copy_l0_msr_store_done",
     ".Lresident_nested_copy_l0_msr_store_loop:",
     "mov rax, qword ptr [rsi + 8]",
     "mov qword ptr [rdi + 8], rax",
@@ -5334,8 +5873,11 @@ global_asm!(
     "add rdi, 16",
     "dec ecx",
     "jnz .Lresident_nested_copy_l0_msr_store_loop",
+    ".Lresident_nested_copy_l0_msr_store_done:",
     "mov rsi, qword ptr [r12 + {b_nested_vmcs02_exit_store_msr_list}]",
-    "add rsi, {resident_msr_switch_byte_count}",
+    "mov eax, dword ptr [rip + matrixhv_resident_island_msr_switch_count]",
+    "shl eax, 4",
+    "add rsi, rax",
     "mov rdx, qword ptr [r12 + {b_nested_vmcs02_exit_store_msr_list}]",
     "mov rdi, qword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_store_addr}]",
     "mov ecx, dword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_store_count}]",
@@ -5351,13 +5893,16 @@ global_asm!(
     ".Lresident_nested_copy_l1_msr_store_loop:",
     "mov eax, dword ptr [rdi]",
     "mov r8, rdx",
-    "mov r9d, {resident_msr_switch_count}",
+    "mov r9d, dword ptr [rip + matrixhv_resident_island_msr_switch_count]",
+    "test r9d, r9d",
+    "jz .Lresident_nested_use_l1_msr_store",
     ".Lresident_nested_find_l0_msr_store_loop:",
     "cmp eax, dword ptr [r8]",
     "je .Lresident_nested_use_l0_msr_store",
     "add r8, 16",
     "dec r9d",
     "jnz .Lresident_nested_find_l0_msr_store_loop",
+    ".Lresident_nested_use_l1_msr_store:",
     "mov rax, qword ptr [rsi + 8]",
     "jmp .Lresident_nested_write_l1_msr_store",
     ".Lresident_nested_use_l0_msr_store:",
@@ -5374,7 +5919,8 @@ global_asm!(
     "cld",
     "mov rsi, qword ptr [r12 + {b_nested_l0_msr_guest_list}]",
     "mov rdi, qword ptr [r12 + {b_nested_vmcs01_entry_msr_list}]",
-    "mov ecx, {resident_msr_switch_qword_count}",
+    "mov ecx, dword ptr [rip + matrixhv_resident_island_msr_switch_count]",
+    "shl ecx, 1",
     "rep movsq",
     "mov rsi, qword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_load_addr}]",
     "mov r10d, dword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_load_count}]",
@@ -5404,7 +5950,7 @@ global_asm!(
     "xor r10d, r10d",
     ".Lresident_nested_activate_vmcs01_guest_msr_entry:",
     "mov r11d, r10d",
-    "add r11d, {resident_msr_switch_count}",
+    "add r11d, dword ptr [rip + matrixhv_resident_island_msr_switch_count]",
     "mov rax, {vm_entry_msr_load_count}",
     "vmwrite rax, r11",
     "jna .Lresident_dispatch_vmwrite_failed",
@@ -5636,6 +6182,8 @@ global_asm!(
     "cmp qword ptr [r12 + {b_nested_vmcs02_launched}], 0",
     "jne .Lresident_nested_l2_resume_registers",
     ".Lresident_nested_l2_launch_registers:",
+    "call .Lresident_sync_ept_cache",
+    "call .Lresident_deliver_pending_nmi",
     "call .Lresident_profile_exit_handler",
     "pop rax",
     "pop rcx",
@@ -5700,7 +6248,7 @@ global_asm!(
     "mov r11, qword ptr [r12 + {b_nested_vmcs02_exit_store_msr_list}]",
     "call .Lresident_nested_write_vmcs02_control",
     "mov rax, {vm_entry_msr_load_count}",
-    "mov r11d, {resident_msr_switch_count}",
+    "mov r11d, dword ptr [rip + matrixhv_resident_island_msr_switch_count]",
     "call .Lresident_nested_write_vmcs02_control",
     // Internal EPT exits retry interrupted delivery, not an already delivered entry event.
     "mov rax, {idt_vectoring_info_field}",
@@ -5751,6 +6299,8 @@ global_asm!(
     "cmp qword ptr [r12 + {b_nested_vmcs02_launched}], 0",
     "je .Lresident_nested_l2_launch_registers",
     ".Lresident_nested_l2_resume_registers:",
+    "call .Lresident_sync_ept_cache",
+    "call .Lresident_deliver_pending_nmi",
     "call .Lresident_profile_exit_handler",
     "pop rax",
     "pop rcx",
@@ -5872,6 +6422,8 @@ global_asm!(
     "test r11d, 0x80000000",
     "jz .Lresident_dispatch_unsupported",
     "and r11d, 0x7ff",
+    "cmp r11d, 0x202",
+    "je .Lresident_dispatch_nmi",
     "cmp r11d, 0x306",
     "jne .Lresident_dispatch_reinject_exception",
     "cmp qword ptr [r12 + {b_nested_active}], 1",
@@ -5888,6 +6440,22 @@ global_asm!(
     "jc .Lresident_dispatch_vmwrite_failed",
     "jz .Lresident_dispatch_vmwrite_failed",
     "jmp .Lresident_dispatch_resume",
+    ".Lresident_dispatch_nmi:",
+    "mov qword ptr [r12 + {b_nmi_pending}], 1",
+    "inc qword ptr [r12 + {b_nmi_count}]",
+    ".Lresident_dispatch_nmi_window:",
+    "mov eax, {cpu_based_vm_exec_control}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "btr r11, 22",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    "cmp qword ptr [r12 + {b_nested_l2_active}], 0",
+    "je .Lresident_boot_timer_retry_event",
+    "mov qword ptr [r12 + {b_nested_vmcs02_launched}], 1",
+    "mov qword ptr [r12 + {b_nested_vmcs02_control_cache_valid}], 0",
+    "mov qword ptr [r12 + {b_nested_vmcs02_control_cache_valid} + 8], 0",
+    "jmp .Lresident_nested_l2_resume_ept",
     ".Lresident_dispatch_invept_software_prepare:",
     "mov r11, qword ptr [r10 + {nested_invept_after_rip_offset}]",
     "sub r11, qword ptr [r12 + {b_last_guest_rip}]",
@@ -6009,7 +6577,7 @@ global_asm!(
     "cmp r14, r11",
     "jne .Lresident_dispatch_invept_cached_context",
     "push r14",
-    "call .Lresident_nested_invalidate_ept02",
+    "call .Lresident_nested_revalidate_ept02",
     "pop r14",
     ".Lresident_dispatch_invept_cached_context:",
     "cmp qword ptr [r12 + {b_nested_ept02_cache_initialized}], 0",
@@ -6019,7 +6587,7 @@ global_asm!(
     "cmp r14, rax",
     "jne .Lresident_nested_succeed",
     "call .Lresident_nested_swap_ept02_cache",
-    "call .Lresident_nested_invalidate_ept02",
+    "call .Lresident_nested_revalidate_ept02",
     "call .Lresident_nested_swap_ept02_cache",
     "jmp .Lresident_nested_succeed",
     ".Lresident_dispatch_invept_all_contexts:",
@@ -6027,11 +6595,11 @@ global_asm!(
     "jne .Lresident_nested_invalid_invalidation_operand",
     "cmp qword ptr [r10 + 8], 0",
     "jne .Lresident_nested_invalid_invalidation_operand",
-    "call .Lresident_nested_invalidate_ept02",
+    "call .Lresident_nested_revalidate_ept02",
     "cmp qword ptr [r12 + {b_nested_ept02_cache_initialized}], 0",
     "je .Lresident_nested_succeed",
     "call .Lresident_nested_swap_ept02_cache",
-    "call .Lresident_nested_invalidate_ept02",
+    "call .Lresident_nested_revalidate_ept02",
     "call .Lresident_nested_swap_ept02_cache",
     "jmp .Lresident_nested_succeed",
     ".Lresident_dispatch_invvpid:",
@@ -6283,6 +6851,7 @@ global_asm!(
     "jmp .Lresident_dispatch_resume",
     ".Lresident_nested_inject_ud:",
     "inc qword ptr [r12 + {b_nested_failure_count}]",
+    ".Lresident_dispatch_inject_ud:",
     "mov rax, {vm_entry_intr_info_field}",
     "mov r10d, 0x80000306",
     "vmwrite rax, r10",
@@ -6327,6 +6896,8 @@ global_asm!(
     "jmp .Lresident_dispatch_cpuid_advance",
     ".Lresident_dispatch_cpuid_matrixhv:",
     "inc qword ptr [r12 + {b_cpuid_hypervisor_count}]",
+    "test ecx, ecx",
+    "jnz .Lresident_dispatch_cpuid_diagnostic",
     "mov r10d, {matrixhv_status_signature_eax}",
     "mov qword ptr [rsp + 0], r10",
     "mov qword ptr [r12 + {b_cpuid_hypervisor_eax}], r10",
@@ -6336,6 +6907,41 @@ global_asm!(
     "mov qword ptr [rsp + 8], r10",
     "mov r10d, {matrixhv_status_protocol}",
     "mov qword ptr [rsp + 16], r10",
+    "jmp .Lresident_dispatch_cpuid_advance",
+    // Diagnostic subleaves return snapshots, never resident pointers or guest-selected memory.
+    ".Lresident_dispatch_cpuid_diagnostic:",
+    "xor eax, eax",
+    "xor ebx, ebx",
+    "xor edx, edx",
+    "mov r9, qword ptr [r12 + {b_event_context}]",
+    "test r9, r9",
+    "jz .Lresident_dispatch_cpuid_diagnostic_zero",
+    "cmp ecx, 1",
+    "je .Lresident_dispatch_cpuid_masks_low",
+    "cmp ecx, 2",
+    "je .Lresident_dispatch_cpuid_masks_high",
+    "cmp ecx, 3",
+    "jne .Lresident_dispatch_cpuid_diagnostic_zero",
+    "mov eax, dword ptr [r9 + {event_failed_processor}]",
+    "mov ebx, dword ptr [r9 + {event_failed_exit_reason}]",
+    "mov ecx, dword ptr [r9 + {event_failed_qualification}]",
+    "mov edx, dword ptr [r9 + {event_failed_stop_result}]",
+    "jmp .Lresident_dispatch_cpuid_diagnostic_store",
+    ".Lresident_dispatch_cpuid_masks_high:",
+    "add r9, 4",
+    ".Lresident_dispatch_cpuid_masks_low:",
+    "mov eax, dword ptr [r9 + {event_init_cpu_mask}]",
+    "mov ebx, dword ptr [r9 + {event_sipi_cpu_mask}]",
+    "mov ecx, dword ptr [r9 + {event_post_ebs_cpu_mask}]",
+    "mov edx, dword ptr [r9 + {event_halted_cpu_mask}]",
+    "jmp .Lresident_dispatch_cpuid_diagnostic_store",
+    ".Lresident_dispatch_cpuid_diagnostic_zero:",
+    "xor ecx, ecx",
+    ".Lresident_dispatch_cpuid_diagnostic_store:",
+    "mov qword ptr [rsp], rax",
+    "mov qword ptr [rsp + 24], rbx",
+    "mov qword ptr [rsp + 8], rcx",
+    "mov qword ptr [rsp + 16], rdx",
     "jmp .Lresident_dispatch_cpuid_advance",
     ".Lresident_dispatch_cpuid_standard:",
     "cmp r8d, 1",
@@ -6370,11 +6976,9 @@ global_asm!(
     "jmp .Lresident_dispatch_resume",
     ".Lresident_dispatch_rdmsr:",
     "inc qword ptr [r12 + {b_rdmsr_count}]",
+    "call .Lresident_msr_privilege",
+    "jc .Lresident_dispatch_inject_gp",
     "mov ecx, dword ptr [rsp + 8]",
-    "cmp ecx, {tsc_msr}",
-    "je .Lresident_dispatch_rdmsr_passthrough",
-    "cmp ecx, {tsc_adjust_msr}",
-    "je .Lresident_dispatch_rdmsr_tsc_adjust",
     "cmp ecx, {platform_id_msr}",
     "je .Lresident_dispatch_rdmsr_passthrough",
     "cmp ecx, {apic_base_msr}",
@@ -6488,16 +7092,13 @@ global_asm!(
     "cmp ecx, {amd_sev_status_msr}",
     "je .Lresident_dispatch_rdmsr_zero",
     "cmp ecx, {kernel_gs_base_msr}",
-    "je .Lresident_dispatch_rdmsr_kernel_gs_base",
+    "je .Lresident_dispatch_rdmsr_passthrough",
     "cmp ecx, 0x480",
     "jb .Lresident_dispatch_rdmsr_not_vmx",
-    "cmp ecx, 0x490",
+    "cmp ecx, 0x49f",
     "jbe .Lresident_dispatch_inject_gp",
     ".Lresident_dispatch_rdmsr_not_vmx:",
-    "jmp .Lresident_dispatch_inject_gp",
-    ".Lresident_dispatch_rdmsr_tsc_adjust:",
-    "mov r11, qword ptr [r12 + {b_tsc_adjust}]",
-    "jmp .Lresident_dispatch_rdmsr_nested_value",
+    "jmp .Lresident_dispatch_rdmsr_passthrough",
     ".Lresident_dispatch_rdmsr_feature_control:",
     "mov r11, qword ptr [r12 + {b_nested_feature_control}]",
     "cmp qword ptr [r12 + {b_nested_expose_vmx}], 0",
@@ -6612,11 +7213,12 @@ global_asm!(
     "mov ecx, {mtrrcap_msr}",
     "rdmsr",
     "test eax, 0x100",
-    "jz .Lresident_dispatch_unsupported",
+    "jz .Lresident_dispatch_inject_gp",
     "mov ecx, r10d",
     "jmp .Lresident_dispatch_rdmsr_passthrough",
     ".Lresident_dispatch_rdmsr_passthrough:",
-    "rdmsr",
+    "call .Lresident_guarded_rdmsr",
+    "jc .Lresident_dispatch_inject_gp",
     "mov qword ptr [rsp + 0], rax",
     "mov qword ptr [rsp + 16], rdx",
     "call .Lresident_advance_guest_rip",
@@ -6667,26 +7269,11 @@ global_asm!(
     "mov qword ptr [rsp + 16], rax",
     "call .Lresident_advance_guest_rip",
     "jmp .Lresident_dispatch_resume",
-    ".Lresident_dispatch_rdmsr_kernel_gs_base:",
-    "mov rax, {vm_entry_msr_load_addr}",
-    "vmread r10, rax",
-    "jc .Lresident_dispatch_vmread_failed",
-    "jz .Lresident_dispatch_vmread_failed",
-    "mov r11, qword ptr [r10 + 8]",
-    "mov eax, r11d",
-    "mov qword ptr [rsp + 0], rax",
-    "shr r11, 32",
-    "mov eax, r11d",
-    "mov qword ptr [rsp + 16], rax",
-    "call .Lresident_advance_guest_rip",
-    "jmp .Lresident_dispatch_resume",
     ".Lresident_dispatch_wrmsr:",
     "inc qword ptr [r12 + {b_wrmsr_count}]",
+    "call .Lresident_msr_privilege",
+    "jc .Lresident_dispatch_inject_gp",
     "mov ecx, dword ptr [rsp + 8]",
-    "cmp ecx, {tsc_msr}",
-    "je .Lresident_dispatch_wrmsr_tsc",
-    "cmp ecx, {tsc_adjust_msr}",
-    "je .Lresident_dispatch_wrmsr_tsc_adjust",
     "cmp ecx, {apic_base_msr}",
     "je .Lresident_dispatch_wrmsr_passthrough",
     "cmp ecx, {xss_msr}",
@@ -6694,7 +7281,7 @@ global_asm!(
     "cmp ecx, {bios_sign_id_msr}",
     "je .Lresident_dispatch_wrmsr_passthrough",
     "cmp ecx, {mtrr_def_type_msr}",
-    "je .Lresident_dispatch_wrmsr_passthrough",
+    "je .Lresident_dispatch_wrmsr_mtrr",
     "cmp ecx, {x2apic_msr_base}",
     "jb .Lresident_dispatch_wrmsr_before_x2apic",
     "cmp ecx, {x2apic_msr_end}",
@@ -6711,7 +7298,7 @@ global_asm!(
     "cmp r10d, eax",
     "jae .Lresident_dispatch_wrmsr_after_variable_mtrr",
     "mov ecx, r10d",
-    "jmp .Lresident_dispatch_wrmsr_passthrough",
+    "jmp .Lresident_dispatch_wrmsr_mtrr",
     ".Lresident_dispatch_wrmsr_after_variable_mtrr:",
     "mov ecx, dword ptr [rsp + 8]",
     "cmp ecx, {mtrr_fix64k_00000_msr}",
@@ -6752,64 +7339,37 @@ global_asm!(
     "cmp ecx, {fs_base_msr}",
     "je .Lresident_dispatch_wrmsr_fs_base",
     "cmp ecx, {kernel_gs_base_msr}",
-    "je .Lresident_dispatch_wrmsr_kernel_gs_base",
+    "je .Lresident_dispatch_wrmsr_passthrough",
     "cmp ecx, {feature_control_msr}",
     "je .Lresident_dispatch_inject_gp",
     "cmp ecx, 0x480",
     "jb .Lresident_dispatch_wrmsr_not_vmx",
-    "cmp ecx, 0x490",
+    "cmp ecx, 0x49f",
     "jbe .Lresident_dispatch_inject_gp",
     ".Lresident_dispatch_wrmsr_not_vmx:",
     "cmp ecx, {efer_msr}",
-    "jne .Lresident_dispatch_inject_gp",
+    "jne .Lresident_dispatch_wrmsr_passthrough",
     "mov eax, dword ptr [rsp + 0]",
     "mov edx, dword ptr [rsp + 16]",
     "shl rdx, 32",
     "or rax, rdx",
     "mov r11, rax",
+    "mov eax, {guest_cr0}",
+    "vmread r9, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "mov eax, {guest_efer}",
+    "vmread r8, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "mov eax, 0x80000001",
+    "xor ecx, ecx",
+    "cpuid",
+    "call .Lresident_validate_efer",
+    "jc .Lresident_dispatch_inject_gp",
     "mov rax, {guest_efer}",
     "vmwrite rax, r11",
     "jc .Lresident_dispatch_vmwrite_failed",
     "jz .Lresident_dispatch_vmwrite_failed",
-    "call .Lresident_advance_guest_rip",
-    "jmp .Lresident_dispatch_resume",
-    ".Lresident_dispatch_wrmsr_tsc:",
-    "mov r10d, dword ptr [rsp + 0]",
-    "mov r11d, dword ptr [rsp + 16]",
-    "shl r11, 32",
-    "or r10, r11",
-    "rdtsc",
-    "shl rdx, 32",
-    "or rax, rdx",
-    "sub r10, rax",
-    "mov r11, r10",
-    "mov rax, {tsc_offset}",
-    "vmread rdx, rax",
-    "jc .Lresident_dispatch_vmread_failed",
-    "jz .Lresident_dispatch_vmread_failed",
-    "sub r11, rdx",
-    "add qword ptr [r12 + {b_tsc_adjust}], r11",
-    "vmwrite rax, r10",
-    "jc .Lresident_dispatch_vmwrite_failed",
-    "jz .Lresident_dispatch_vmwrite_failed",
-    "call .Lresident_advance_guest_rip",
-    "jmp .Lresident_dispatch_resume",
-    ".Lresident_dispatch_wrmsr_tsc_adjust:",
-    "mov r10d, dword ptr [rsp + 0]",
-    "mov r11d, dword ptr [rsp + 16]",
-    "shl r11, 32",
-    "or r10, r11",
-    "mov r11, qword ptr [r12 + {b_tsc_adjust}]",
-    "mov qword ptr [r12 + {b_tsc_adjust}], r10",
-    "sub r10, r11",
-    "mov rax, {tsc_offset}",
-    "vmread r11, rax",
-    "jc .Lresident_dispatch_vmread_failed",
-    "jz .Lresident_dispatch_vmread_failed",
-    "add r11, r10",
-    "vmwrite rax, r11",
-    "jc .Lresident_dispatch_vmwrite_failed",
-    "jz .Lresident_dispatch_vmwrite_failed",
+    "mov qword ptr [r12 + {b_last_efer_write}], r11",
     "call .Lresident_advance_guest_rip",
     "jmp .Lresident_dispatch_resume",
     ".Lresident_dispatch_wrmsr_fs_base:",
@@ -6829,53 +7389,61 @@ global_asm!(
     "shl rdx, 32",
     "or rax, rdx",
     "mov r11, rax",
+    "cmp r10, {guest_sysenter_cs}",
+    "je .Lresident_dispatch_wrmsr_sysenter_selector",
+    "mov eax, {guest_cr4}",
+    "vmread r9, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "call .Lresident_validate_canonical_msr",
+    "jc .Lresident_dispatch_inject_gp",
+    "jmp .Lresident_dispatch_wrmsr_vmcs_validated",
+    ".Lresident_dispatch_wrmsr_sysenter_selector:",
+    "mov rax, r11",
+    "shr rax, 32",
+    "jnz .Lresident_dispatch_inject_gp",
+    ".Lresident_dispatch_wrmsr_vmcs_validated:",
     "vmwrite r10, r11",
     "jc .Lresident_dispatch_vmwrite_failed",
     "jz .Lresident_dispatch_vmwrite_failed",
     "call .Lresident_advance_guest_rip",
     "jmp .Lresident_dispatch_resume",
-    ".Lresident_dispatch_wrmsr_kernel_gs_base:",
-    "mov eax, dword ptr [rsp + 0]",
-    "mov edx, dword ptr [rsp + 16]",
-    "shl rdx, 32",
-    "or rax, rdx",
-    "mov r11, rax",
-    "mov rax, {vm_entry_msr_load_addr}",
-    "vmread r10, rax",
-    "jc .Lresident_dispatch_vmread_failed",
-    "jz .Lresident_dispatch_vmread_failed",
-    "mov qword ptr [r10 + 8], r11",
-    "call .Lresident_advance_guest_rip",
-    "jmp .Lresident_dispatch_resume",
     ".Lresident_dispatch_wrmsr_gs_base:",
-    "mov eax, dword ptr [rsp + 0]",
-    "mov edx, dword ptr [rsp + 16]",
-    "shl rdx, 32",
-    "or rax, rdx",
-    "mov r11, rax",
-    "mov rax, {guest_gs_base}",
-    "vmwrite rax, r11",
-    "jc .Lresident_dispatch_vmwrite_failed",
-    "jz .Lresident_dispatch_vmwrite_failed",
-    "call .Lresident_advance_guest_rip",
-    "jmp .Lresident_dispatch_resume",
+    "mov r10, {guest_gs_base}",
+    "jmp .Lresident_dispatch_wrmsr_vmcs_value",
     ".Lresident_dispatch_wrmsr_fixed_mtrr:",
     "mov r10d, ecx",
     "mov ecx, {mtrrcap_msr}",
     "rdmsr",
     "test eax, 0x100",
-    "jz .Lresident_dispatch_unsupported",
+    "jz .Lresident_dispatch_inject_gp",
     "mov ecx, r10d",
+    ".Lresident_dispatch_wrmsr_mtrr:",
+    "mov eax, dword ptr [rsp + 0]",
+    "mov edx, dword ptr [rsp + 16]",
+    "call .Lresident_guarded_wrmsr",
+    "jc .Lresident_dispatch_inject_gp",
+    "mov qword ptr [r12 + {b_mtrr_dirty}], 1",
+    "call .Lresident_update_dirty_mtrrs",
+    "call .Lresident_advance_guest_rip",
+    "jmp .Lresident_dispatch_resume",
     ".Lresident_dispatch_wrmsr_passthrough:",
     "mov eax, dword ptr [rsp + 0]",
     "mov edx, dword ptr [rsp + 16]",
-    "wrmsr",
+    "call .Lresident_guarded_wrmsr",
+    "jc .Lresident_dispatch_inject_gp",
     "call .Lresident_advance_guest_rip",
     "jmp .Lresident_dispatch_resume",
     ".Lresident_dispatch_xsetbv:",
     "inc qword ptr [r12 + {b_xsetbv_count}]",
-    "cmp qword ptr [rsp + 8], 0",
-    "jne .Lresident_dispatch_unsupported",
+    "mov eax, {guest_cr4}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "test r11d, 0x40000",
+    "jz .Lresident_dispatch_inject_ud",
+    "call .Lresident_msr_privilege",
+    "jc .Lresident_dispatch_inject_gp",
+    "cmp dword ptr [rsp + 8], 0",
+    "jne .Lresident_dispatch_inject_gp",
     "mov r11, cr4",
     "mov r10, r11",
     "or r10, 0x40000",
@@ -6883,8 +7451,9 @@ global_asm!(
     "mov eax, dword ptr [rsp + 0]",
     "mov edx, dword ptr [rsp + 16]",
     "xor ecx, ecx",
-    "xsetbv",
+    "call .Lresident_guarded_xsetbv",
     "mov cr4, r11",
+    "jc .Lresident_dispatch_inject_gp",
     "call .Lresident_advance_guest_rip",
     "jmp .Lresident_dispatch_resume",
     ".Lresident_dispatch_vmcall:",
@@ -6983,6 +7552,14 @@ global_asm!(
     "call .Lresident_serial_write",
     "jmp .Lresident_dispatch_halt",
     ".Lresident_dispatch_inject_gp:",
+    "mov eax, dword ptr [r12 + {b_last_reason}]",
+    "sub eax, {rdmsr_reason}",
+    "cmp eax, 1",
+    "ja .Lresident_dispatch_inject_gp_event",
+    "inc qword ptr [r12 + {b_msr_gp_count}]",
+    "mov eax, dword ptr [rsp + 8]",
+    "mov qword ptr [r12 + {b_last_gp_msr}], rax",
+    ".Lresident_dispatch_inject_gp_event:",
     "mov rax, {vm_entry_exception_error_code}",
     "xor r10d, r10d",
     "vmwrite rax, r10",
@@ -7008,7 +7585,113 @@ global_asm!(
     "call .Lresident_serial_write",
     "call .Lresident_serial_state",
     "jmp .Lresident_dispatch_halt",
+    ".Lresident_dispatch_boot_timer:",
+    "cmp qword ptr [r12 + {b_diagnostic_interval}], 0",
+    "je .Lresident_dispatch_unsupported",
+    "rdtsc",
+    "shl rdx, 32",
+    "or rax, rdx",
+    "add rax, qword ptr [r12 + {b_diagnostic_interval}]",
+    "mov qword ptr [r12 + {b_diagnostic_deadline}], rax",
+    "mov r8, qword ptr [r12 + {b_event_context}]",
+    "test r8, r8",
+    "jz .Lresident_boot_timer_retry_event",
+    "cmp qword ptr [r8 + {event_ebs_seen}], 0",
+    "je .Lresident_boot_timer_retry_event",
+    "inc qword ptr [r12 + {b_diagnostic_samples}]",
+    "cmp qword ptr [r12 + {b_diagnostic_samples}], 60",
+    "jb .Lresident_boot_timer_snapshot",
+    // Limit sampling to the first minute after the EBS notification.
+    "mov rax, {pin_based_vm_exec_control}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "btr r11d, 6",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    "btr qword ptr [r12 + {b_nested_vmcs01_pin_based_controls}], 6",
+    "mov qword ptr [r12 + {b_diagnostic_interval}], 0",
+    "mov qword ptr [r12 + {b_diagnostic_expired}], 1",
+    ".Lresident_boot_timer_snapshot:",
+    "cmp qword ptr [r8 + {event_diagnostic_halted}], 0",
+    "jne .Lresident_boot_timer_retry_event",
+    "call .Lresident_diagnostic_snapshot",
+    ".Lresident_boot_timer_retry_event:",
+    // A timer exit can interrupt event delivery; retry the undelivered event.
+    "mov rax, {idt_vectoring_info_field}",
+    "vmread r10, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "bt r10d, 31",
+    "jc .Lresident_boot_timer_event_valid",
+    "xor r10d, r10d",
+    "jmp .Lresident_boot_timer_event_ready",
+    ".Lresident_boot_timer_event_valid:",
+    "and r10d, 0x80000fff",
+    "bt r10d, 11",
+    "jnc .Lresident_boot_timer_event_type",
+    "mov rax, {idt_vectoring_error_code}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "mov rax, {vm_entry_exception_error_code}",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    ".Lresident_boot_timer_event_type:",
+    "mov edx, r10d",
+    "and edx, 0x700",
+    "cmp edx, 0x200",
+    "jne .Lresident_boot_timer_software_event",
+    "mov rax, {guest_interruptibility_info}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "btr r11, 3",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    "jmp .Lresident_boot_timer_event_ready",
+    ".Lresident_boot_timer_software_event:",
+    "cmp edx, 0x400",
+    "jb .Lresident_boot_timer_event_ready",
+    "cmp edx, 0x600",
+    "ja .Lresident_boot_timer_event_ready",
+    "mov rax, {exit_instruction_len}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "mov rax, {vm_entry_instruction_len}",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    ".Lresident_boot_timer_event_ready:",
+    "mov rax, {vm_entry_intr_info_field}",
+    "vmwrite rax, r10",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    "jmp .Lresident_dispatch_resume",
+    ".Lresident_reload_diagnostic_timer:",
+    "cmp qword ptr [r12 + {b_diagnostic_interval}], 0",
+    "je .Lresident_reload_diagnostic_done",
+    "rdtsc",
+    "shl rdx, 32",
+    "or rax, rdx",
+    "mov r11, qword ptr [r12 + {b_diagnostic_deadline}]",
+    "sub r11, rax",
+    "jbe .Lresident_reload_diagnostic_due",
+    "mov ecx, dword ptr [r12 + {b_diagnostic_rate}]",
+    "shr r11, cl",
+    "cmp r11, 2",
+    "jb .Lresident_reload_diagnostic_due",
+    "mov eax, 0xffffffff",
+    "cmp r11, rax",
+    "cmova r11, rax",
+    "jmp .Lresident_reload_diagnostic_write",
+    ".Lresident_reload_diagnostic_due:",
+    "mov r11d, 2",
+    ".Lresident_reload_diagnostic_write:",
+    // Keep a fixed deadline across ordinary exits so MSR traffic cannot starve sampling.
+    "mov rax, {vmx_preemption_timer_value}",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    ".Lresident_reload_diagnostic_done:",
+    "ret",
     ".Lresident_dispatch_resume:",
+    "call .Lresident_sync_ept_cache",
+    "call .Lresident_deliver_pending_nmi",
+    "call .Lresident_reload_diagnostic_timer",
     "call .Lresident_profile_exit_handler",
     "pop rax",
     "pop rcx",
@@ -7039,10 +7722,23 @@ global_asm!(
     ".Lresident_dispatch_vmresume_error_unknown:",
     "mov rax, -1",
     ".Lresident_dispatch_vmresume_error_print:",
+    "mov qword ptr [r12 + {b_stop_result}], rax",
+    "mov r8, qword ptr [r12 + {b_event_context}]",
+    "test r8, r8",
+    "jz .Lresident_dispatch_vmresume_error_drawn",
+    "cmp qword ptr [r8 + {event_ebs_seen}], 0",
+    "je .Lresident_dispatch_vmresume_error_drawn",
+    "mov ecx, 13",
+    "call .Lresident_paint_byte",
+    ".Lresident_dispatch_vmresume_error_drawn:",
+    "mov rax, qword ptr [r12 + {b_stop_result}]",
     "call .Lresident_serial_hex64",
     "call .Lresident_serial_state",
+    "jmp .Lresident_dispatch_halt",
     // Separate emulated VMCS access, entry, EPT invalidation, and other exit costs.
     ".Lresident_profile_exit_handler:",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}",
+    "jz .Lresident_profile_exit_handler_done",
     "mov ecx, 2",
     "mov r11d, dword ptr [r12 + {b_last_reason}]",
     "cmp r11d, {vmread_reason}",
@@ -7069,16 +7765,319 @@ global_asm!(
     "or rax, rdx",
     "sub rax, qword ptr [r12 + {b_nested_exit_started_tsc}]",
     "add qword ptr [r12 + {b_nested_exit_handler_cycles} + rcx * 8], rax",
+    ".Lresident_profile_exit_handler_done:",
     "ret",
     ".Lresident_dispatch_halt:",
+    "mov r10, qword ptr [r12 + {b_event_context}]",
+    "test r10, r10",
+    "jz .Lresident_visual_halt_pre_ebs",
+    "mov rcx, qword ptr [r12 + {b_processor_number}]",
+    "cmp rcx, 64",
+    "jae .Lresident_halted_cpu_recorded",
+    "lock bts qword ptr [r10 + {event_halted_cpu_mask}], rcx",
+    ".Lresident_halted_cpu_recorded:",
+    "mov rax, -1",
+    "lock cmpxchg qword ptr [r10 + {event_failed_processor}], rcx",
+    "jne .Lresident_first_cpu_failure_recorded",
+    "mov rax, qword ptr [r12 + {b_last_reason}]",
+    "mov qword ptr [r10 + {event_failed_exit_reason}], rax",
+    "mov rax, qword ptr [r12 + {b_last_qualification}]",
+    "mov qword ptr [r10 + {event_failed_qualification}], rax",
+    "mov rax, qword ptr [r12 + {b_stop_result}]",
+    "mov qword ptr [r10 + {event_failed_stop_result}], rax",
+    ".Lresident_first_cpu_failure_recorded:",
+    "cmp qword ptr [r10 + {event_ebs_seen}], 0",
+    "je .Lresident_visual_halt_pre_ebs",
+    "mov r8, r10",
+    "call .Lresident_claim_diagnostic",
+    "jne .Lresident_dispatch_halt_now",
+    "mov ecx, 4",
+    "call .Lresident_paint_stage",
+    "call .Lresident_diagnostic_snapshot",
+    "jmp .Lresident_dispatch_halt_now",
+    ".Lresident_visual_halt_pre_ebs:",
+    "cmp qword ptr [r12 + {b_processor_number}], 0",
+    "jne .Lresident_dispatch_halt_now",
+    "mov rcx, qword ptr [r12 + {b_last_reason}]",
+    "mov edx, 1",
+    "mov r8, qword ptr [r12 + {b_last_guest_physical_address}]",
+    "mov r9, qword ptr [r12 + {b_last_guest_rip}]",
+    "mov r10, qword ptr [r12 + {b_last_qualification}]",
+    "call .Lresident_visual_callback",
+    ".Lresident_dispatch_halt_now:",
     "cli",
     ".Lresident_dispatch_halt_loop:",
-    "pause",
+    "hlt",
     "jmp .Lresident_dispatch_halt_loop",
+    ".Lresident_visual_callback:",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_framebuffer_sink}",
+    "jz .Lresident_visual_callback_disabled",
+    "push r15",
+    "mov r15, rsp",
+    "and rsp, -16",
+    "sub rsp, 560",
+    "mov qword ptr [rsp + 32], r10",
+    "fxsave64 [rsp + 48]",
+    "call qword ptr [rip + matrixhv_resident_island_visual_callback]",
+    "fxrstor64 [rsp + 48]",
+    "mov rsp, r15",
+    "pop r15",
+    ".Lresident_visual_callback_disabled:",
+    "ret",
+    ".Lresident_msr_privilege:",
+    "mov rax, {guest_cr0}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "test r11d, 1",
+    "jz .Lresident_msr_privilege_ok",
+    "mov rax, {guest_rflags}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "test r11d, 0x20000",
+    "jnz .Lresident_msr_privilege_fault",
+    "mov rax, {guest_cs_selector}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "test r11d, 3",
+    "jnz .Lresident_msr_privilege_fault",
+    ".Lresident_msr_privilege_ok:",
+    "clc",
+    "ret",
+    ".Lresident_msr_privilege_fault:",
+    "stc",
+    "ret",
+    ".Lresident_deliver_pending_nmi:",
+    "cmp qword ptr [r12 + {b_nmi_pending}], 0",
+    "je .Lresident_deliver_nmi_done",
+    // An NMI received while root services L1 is delivered to L1 on return.
+    "cmp qword ptr [r12 + {b_nested_l2_active}], 0",
+    "je .Lresident_deliver_nmi_check_event",
+    "bt qword ptr [r12 + {b_nested_vmcs12_pin_based_control}], 3",
+    "jc .Lresident_deliver_nmi_done",
+    ".Lresident_deliver_nmi_check_event:",
+    "mov eax, {vm_entry_intr_info_field}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "bt r11d, 31",
+    "jc .Lresident_deliver_nmi_window",
+    "mov eax, {guest_interruptibility_info}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "test r11d, 0xb",
+    "jnz .Lresident_deliver_nmi_window",
+    "mov eax, {guest_activity_state}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "cmp r11d, 3",
+    "je .Lresident_deliver_nmi_done",
+    "xor eax, eax",
+    "xchg qword ptr [r12 + {b_nmi_pending}], rax",
+    "mov eax, {vm_entry_intr_info_field}",
+    "mov r11d, 0x80000202",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    "mov eax, {guest_activity_state}",
+    "xor r11d, r11d",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    "jmp .Lresident_deliver_nmi_done",
+    ".Lresident_deliver_nmi_window:",
+    "mov eax, {cpu_based_vm_exec_control}",
+    "vmread r11, rax",
+    "jna .Lresident_dispatch_vmread_failed",
+    "bts r11, 22",
+    "vmwrite rax, r11",
+    "jna .Lresident_dispatch_vmwrite_failed",
+    "cmp qword ptr [r12 + {b_nested_l2_active}], 0",
+    "je .Lresident_deliver_nmi_done",
+    "mov qword ptr [r12 + {b_nested_vmcs02_control_cache_valid}], 0",
+    "mov qword ptr [r12 + {b_nested_vmcs02_control_cache_valid} + 8], 0",
+    ".Lresident_deliver_nmi_done:",
+    "ret",
+    // Validate emulated MSRs before changing VMCS state; faults belong to the guest.
+    ".Lresident_validate_efer:",
+    "mov rax, r11",
+    "and rax, -3330",
+    "jnz .Lresident_invalid_msr_value",
+    "test r11d, 1",
+    "jz .Lresident_efer_check_lme",
+    "bt edx, 11",
+    "jnc .Lresident_invalid_msr_value",
+    ".Lresident_efer_check_lme:",
+    "test r11d, 0x100",
+    "jz .Lresident_efer_check_nxe",
+    "bt edx, 29",
+    "jnc .Lresident_invalid_msr_value",
+    ".Lresident_efer_check_nxe:",
+    "test r11d, 0x800",
+    "jz .Lresident_efer_check_paging",
+    "bt edx, 20",
+    "jnc .Lresident_invalid_msr_value",
+    ".Lresident_efer_check_paging:",
+    "bt r9, 31",
+    "jnc .Lresident_efer_preserve_lma",
+    "mov rax, r11",
+    "xor rax, r8",
+    "test eax, 0x100",
+    "jnz .Lresident_invalid_msr_value",
+    ".Lresident_efer_preserve_lma:",
+    "and r11, -1025",
+    "and r8d, 0x400",
+    "or r11, r8",
+    "clc",
+    "ret",
+    ".Lresident_validate_canonical_msr:",
+    "mov rax, r11",
+    "bt r9, 12",
+    "jc .Lresident_msr_canonical_57",
+    "shl rax, 16",
+    "sar rax, 16",
+    "jmp .Lresident_msr_canonical_compare",
+    ".Lresident_msr_canonical_57:",
+    "shl rax, 7",
+    "sar rax, 7",
+    ".Lresident_msr_canonical_compare:",
+    "cmp rax, r11",
+    "jne .Lresident_invalid_msr_value",
+    "clc",
+    "ret",
+    ".Lresident_invalid_msr_value:",
+    "stc",
+    "ret",
+    ".Lresident_guarded_rdmsr:",
+    ".Lresident_rdmsr_instruction:",
+    "rdmsr",
+    "clc",
+    "ret",
+    ".Lresident_guarded_wrmsr:",
+    ".Lresident_wrmsr_instruction:",
+    "wrmsr",
+    "clc",
+    "ret",
+    ".Lresident_guarded_xsetbv:",
+    ".Lresident_xsetbv_instruction:",
+    "xsetbv",
+    "clc",
+    "ret",
+    ".Lresident_msr_fault_return:",
+    "stc",
+    "ret",
+    ".Lresident_msr_fault_fixup:",
+    "lea rdx, [rip + .Lresident_rdmsr_instruction]",
+    "cmp rax, rdx",
+    "je .Lresident_msr_fault_match",
+    "lea rdx, [rip + .Lresident_wrmsr_instruction]",
+    "cmp rax, rdx",
+    "je .Lresident_msr_fault_match",
+    "lea rdx, [rip + .Lresident_xsetbv_instruction]",
+    "cmp rax, rdx",
+    "je .Lresident_msr_fault_match",
+    "xor eax, eax",
+    "ret",
+    ".Lresident_msr_fault_match:",
+    "lea rax, [rip + .Lresident_msr_fault_return]",
+    "ret",
+    ".globl matrixhv_resident_island_gp",
+    "matrixhv_resident_island_gp:",
+    "push rax",
+    "push rdx",
+    // The #GP frame contains an error code before RIP; the two saved registers add 16 bytes.
+    "mov rax, qword ptr [rsp + 24]",
+    "call .Lresident_msr_fault_fixup",
+    "test rax, rax",
+    "jz .Lresident_host_gp_fatal",
+    "mov qword ptr [rsp + 24], rax",
+    "pop rdx",
+    "pop rax",
+    "add rsp, 8",
+    "iretq",
+    ".Lresident_host_gp_fatal:",
+    "mov r8, qword ptr [rip + matrixhv_resident_island_event_context]",
+    "test r8, r8",
+    "jz matrixhv_resident_island_fatal",
+    "call .Lresident_claim_diagnostic",
+    "jne .Lresident_island_fatal_serial",
+    "mov qword ptr [r8 + {event_host_fault_vector}], 13",
+    "mov rax, qword ptr [rsp + 24]",
+    "mov qword ptr [r8 + {event_host_fault_rip}], rax",
+    "mov rax, qword ptr [rsp + 16]",
+    "mov qword ptr [r8 + {event_host_fault_error_code}], rax",
+    "jmp .Lresident_island_fatal_owned",
+    // Fixed-size entries normalize exception frames to vector, error code, and RIP.
+    ".balign 16",
+    ".globl matrixhv_resident_exception_stubs",
+    "matrixhv_resident_exception_stubs:",
+    ".set .Lresident_exception_vector, 0",
+    ".rept 32",
+    ".if .Lresident_exception_vector == 2",
+    "jmp .Lresident_host_nmi",
+    ".else",
+    ".if ((0x60227d00 >> .Lresident_exception_vector) & 1) == 0",
+    "push 0",
+    ".endif",
+    "push .Lresident_exception_vector",
+    "jmp .Lresident_host_exception",
+    ".endif",
+    ".balign 16",
+    ".set .Lresident_exception_vector, .Lresident_exception_vector + 1",
+    ".endr",
+    ".Lresident_host_exception:",
+    "cli",
+    "mov r8, qword ptr [rip + matrixhv_resident_island_event_context]",
+    "test r8, r8",
+    "jz matrixhv_resident_island_fatal",
+    "call .Lresident_claim_diagnostic",
+    "jne .Lresident_island_fatal_serial",
+    "mov rax, qword ptr [rsp]",
+    "mov qword ptr [r8 + {event_host_fault_vector}], rax",
+    "xor edx, edx",
+    "cmp eax, 14",
+    "jne .Lresident_host_exception_address",
+    "mov rdx, cr2",
+    ".Lresident_host_exception_address:",
+    "mov qword ptr [r8 + {event_host_fault_address}], rdx",
+    "mov rax, qword ptr [rsp + 8]",
+    "mov qword ptr [r8 + {event_host_fault_error_code}], rax",
+    "mov rax, qword ptr [rsp + 16]",
+    "mov qword ptr [r8 + {event_host_fault_rip}], rax",
+    "jmp .Lresident_island_fatal_owned",
+    ".Lresident_host_nmi:",
+    "push rax",
+    "mov rax, qword ptr gs:[112]",
+    "test rax, rax",
+    "jz .Lresident_host_nmi_return",
+    "mov qword ptr [rax + {b_nmi_pending}], 1",
+    "inc qword ptr [rax + {b_nmi_count}]",
+    ".Lresident_host_nmi_return:",
+    "pop rax",
+    "iretq",
     ".globl matrixhv_resident_island_fatal",
     "matrixhv_resident_island_fatal:",
     "cli",
-    "mov dx, 0x3f8",
+    "mov r8, qword ptr [rip + matrixhv_resident_island_event_context]",
+    "test r8, r8",
+    "jz .Lresident_island_fatal_serial",
+    "call .Lresident_claim_diagnostic",
+    "jne .Lresident_island_fatal_serial",
+    ".Lresident_island_fatal_owned:",
+    "mov ecx, 29",
+    "call .Lresident_paint_stage",
+    "mov rax, qword ptr [r8 + {event_host_fault_vector}]",
+    "mov ecx, 10",
+    "call .Lresident_paint_hex",
+    "mov rax, qword ptr [r8 + {event_host_fault_rip}]",
+    "mov ecx, 11",
+    "call .Lresident_paint_hex",
+    "mov rax, qword ptr [r8 + {event_host_fault_error_code}]",
+    "mov ecx, 12",
+    "call .Lresident_paint_hex",
+    "mov rax, qword ptr [r8 + {event_host_fault_address}]",
+    "mov ecx, 13",
+    "call .Lresident_paint_hex",
+    ".Lresident_island_fatal_serial:",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}",
+    "jz 1f",
+    "mov dx, {serial_port}",
     "mov al, 0x21",
     "out dx, al",
     "1:",
@@ -7086,15 +8085,515 @@ global_asm!(
     "jmp 1b",
     ".globl matrixhv_resident_ebs_callback",
     "matrixhv_resident_ebs_callback:",
-    "mov r8, rdx",
-    "mov qword ptr [r8 + {event_ebs_seen}], 1",
+    // Keep the notification independent of protocols, locks, and display MMIO.
+    // Resident exits render through the saved physical framebuffer aperture.
+    "mov qword ptr [rdx + {event_ebs_seen}], 1",
     "ret",
     ".globl matrixhv_resident_va_callback",
     "matrixhv_resident_va_callback:",
     "mov r8, rdx",
     "mov qword ptr [r8 + {event_va_seen}], 1",
     "ret",
+    // First-fault ownership is shared by every CPU and never waits on a lock.
+    ".Lresident_claim_diagnostic:",
+    "xor eax, eax",
+    "mov edx, 1",
+    "lock cmpxchg qword ptr [r8 + {event_diagnostic_halted}], rdx",
+    "ret",
+    ".Lresident_paint_stage:",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_framebuffer_sink}",
+    "jz .Lresident_paint_stage_done",
+    "lea eax, [rcx - 1]",
+    "cmp eax, 28",
+    "ja .Lresident_paint_stage_done",
+    "mov r9, qword ptr [r8 + {event_visual_base}]",
+    "test r9, r9",
+    "jz .Lresident_paint_stage_done",
+    "mov r10, qword ptr [r8 + {event_visual_stride_bytes}]",
+    "xor edx, edx",
+    "cmp eax, 28",
+    "jne .Lresident_paint_stage_grid",
+    "mov eax, 4",
+    "jmp .Lresident_paint_stage_position",
+    ".Lresident_paint_stage_grid:",
+    "cmp eax, 4",
+    "jb .Lresident_paint_stage_position",
+    "sub eax, 4",
+    "mov edx, 1",
+    "cmp eax, 8",
+    "jb .Lresident_paint_stage_position",
+    "sub eax, 8",
+    "mov edx, 2",
+    "cmp eax, 8",
+    "jb .Lresident_paint_stage_position",
+    "sub eax, 8",
+    "mov edx, 3",
+    ".Lresident_paint_stage_position:",
+    "imul edx, edx, {visual_marker_row_step}",
+    "imul rdx, r10",
+    "add r9, rdx",
+    "imul eax, eax, {visual_marker_step_bytes}",
+    "add r9, rax",
+    "xor edx, edx",
+    ".Lresident_paint_stage_row:",
+    "mov r11, r9",
+    "mov eax, {visual_marker_side}",
+    ".Lresident_paint_stage_column:",
+    "mov dword ptr [r11], -1",
+    "add r11, 4",
+    "dec eax",
+    "jne .Lresident_paint_stage_column",
+    "add r9, r10",
+    "inc edx",
+    "cmp edx, {visual_marker_side}",
+    "jne .Lresident_paint_stage_row",
+    "sfence",
+    ".Lresident_paint_stage_done:",
+    "ret",
+    ".Lresident_paint_byte:",
+    "push r13",
+    "push r14",
+    "mov r13d, eax",
+    "mov r14d, ecx",
+    "xor ecx, ecx",
+    ".Lresident_paint_byte_bit:",
+    "bt r13d, ecx",
+    "jnc .Lresident_paint_byte_next",
+    "push rcx",
+    "add ecx, r14d",
+    "call .Lresident_paint_stage",
+    "pop rcx",
+    ".Lresident_paint_byte_next:",
+    "inc ecx",
+    "cmp ecx, 8",
+    "jne .Lresident_paint_byte_bit",
+    "pop r14",
+    "pop r13",
+    "ret",
+    ".Lresident_serial_state:",
+    ".Lresident_diagnostic_snapshot:",
+    "cmp byte ptr [rip + matrixhv_resident_island_log_backend], 0",
+    "je .Lresident_diagnostic_snapshot_done",
+    "push r8",
+    "mov r8, qword ptr [r12 + {b_event_context}]",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}",
+    "jnz .Lresident_diagnostic_snapshot_ready",
+    "test r8, r8",
+    "jz .Lresident_diagnostic_snapshot_restore",
+    "cmp qword ptr [r8 + {event_ebs_seen}], 0",
+    "je .Lresident_diagnostic_snapshot_restore",
+    ".Lresident_diagnostic_snapshot_ready:",
+    "mov rax, qword ptr [r12 + {b_post_ebs_count}]",
+    "mov ecx, 0",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_reason}]",
+    "mov ecx, 1",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_guest_rip}]",
+    "mov ecx, 2",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_rcx}]",
+    "mov ecx, 3",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_msr_gp_count}]",
+    "mov ecx, 4",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_gp_msr}]",
+    "mov ecx, 5",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_guest_physical_address}]",
+    "mov ecx, 6",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_qualification}]",
+    "mov ecx, 7",
+    "call .Lresident_diagnostic_emit_value",
+    "mov eax, {event_post_ebs_cpu_mask}",
+    "call .Lresident_snapshot_event_value",
+    "mov ecx, 8",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_processor_number}]",
+    "mov ecx, 9",
+    "call .Lresident_diagnostic_emit_value",
+    "mov eax, {event_host_fault_vector}",
+    "call .Lresident_snapshot_event_value",
+    "mov ecx, 10",
+    "call .Lresident_diagnostic_emit_value",
+    "mov eax, {event_host_fault_rip}",
+    "call .Lresident_snapshot_event_value",
+    "mov ecx, 11",
+    "call .Lresident_diagnostic_emit_value",
+    "mov eax, {event_host_fault_error_code}",
+    "call .Lresident_snapshot_event_value",
+    "mov ecx, 12",
+    "call .Lresident_diagnostic_emit_value",
+    "mov eax, {event_host_fault_address}",
+    "call .Lresident_snapshot_event_value",
+    "mov ecx, 13",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_diagnostic_samples}]",
+    "mov ecx, 14",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_normal_reason}]",
+    "mov ecx, 15",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, {guest_cr0}",
+    "call .Lresident_snapshot_vmread",
+    "mov ecx, 16",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, {guest_cr3}",
+    "call .Lresident_snapshot_vmread",
+    "cmp rax, -1",
+    "je .Lresident_snapshot_cr3_ready",
+    "mov qword ptr [r12 + {b_last_guest_cr3}], rax",
+    ".Lresident_snapshot_cr3_ready:",
+    "mov ecx, 17",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, {guest_cr4}",
+    "call .Lresident_snapshot_vmread",
+    "mov ecx, 18",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, {guest_efer}",
+    "call .Lresident_snapshot_vmread",
+    "mov ecx, 19",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, {guest_rflags}",
+    "call .Lresident_snapshot_vmread",
+    "mov ecx, 20",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, {guest_activity_state}",
+    "call .Lresident_snapshot_vmread",
+    "mov ecx, 21",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_normal_rip}]",
+    "mov ecx, 22",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_efer_write}]",
+    "mov ecx, 23",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, {guest_rsp}",
+    "call .Lresident_snapshot_vmread",
+    "mov ecx, 24",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, {guest_interruptibility_info}",
+    "call .Lresident_snapshot_vmread",
+    "mov ecx, 25",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_rdmsr_count}]",
+    "mov ecx, 26",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_wrmsr_count}]",
+    "mov ecx, 27",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_nested_l2_entry_count}]",
+    "mov ecx, 28",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_nested_failure_count}]",
+    "mov ecx, 29",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_nested_instruction_error}]",
+    "mov ecx, 30",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_diagnostic_expired}]",
+    "mov ecx, 31",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_instruction_len}]",
+    "mov ecx, 32",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_host_cr3}]",
+    "mov ecx, 33",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_rax}]",
+    "mov ecx, 34",
+    "call .Lresident_diagnostic_emit_value",
+    "mov rax, qword ptr [r12 + {b_last_rdx}]",
+    "mov ecx, 35",
+    "call .Lresident_diagnostic_emit_value",
+    "mov al, 0x0a",
+    "call .Lresident_serial_char",
+    ".Lresident_diagnostic_snapshot_restore:",
+    "pop r8",
+    ".Lresident_diagnostic_snapshot_done:",
+    "ret",
+    ".Lresident_snapshot_event_value:",
+    "test r8, r8",
+    "jz .Lresident_snapshot_event_missing",
+    "mov rax, qword ptr [r8 + rax]",
+    "ret",
+    ".Lresident_snapshot_event_missing:",
+    "mov rax, -1",
+    "ret",
+    ".Lresident_snapshot_vmread:",
+    "vmread r11, rax",
+    "mov rax, -1",
+    "jna .Lresident_snapshot_vmread_done",
+    "mov rax, r11",
+    ".Lresident_snapshot_vmread_done:",
+    "ret",
+    ".Lresident_diagnostic_emit_value:",
+    "push rax",
+    "push rcx",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_framebuffer_sink}",
+    "jz .Lresident_diagnostic_emit_serial",
+    "test r8, r8",
+    "jz .Lresident_diagnostic_emit_serial",
+    "cmp qword ptr [r8 + {event_ebs_seen}], 0",
+    "je .Lresident_diagnostic_emit_serial",
+    "call .Lresident_paint_hex",
+    ".Lresident_diagnostic_emit_serial:",
+    "pop rcx",
+    "pop rax",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}",
+    "jz .Lresident_diagnostic_emit_done",
+    "cmp ecx, 35",
+    "ja .Lresident_diagnostic_emit_done",
+    "push rax",
+    "push rcx",
+    "push r8",
+    "push r9",
+    "push rbx",
+    "push r13",
+    "push rsi",
+    "mov al, 0x20",
+    "call .Lresident_serial_char",
+    "mov ecx, dword ptr [rsp + 40]",
+    "lea rdx, [rip + .Lresident_diagnostic_name_offsets]",
+    "movzx eax, word ptr [rdx + rcx * 2]",
+    "lea rsi, [rip + .Lresident_diagnostic_names]",
+    "add rsi, rax",
+    "lea rdx, [rip + .Lresident_diagnostic_name_lengths]",
+    "movzx r9d, byte ptr [rdx + rcx]",
+    "call .Lresident_serial_write",
+    "mov al, 0x3d",
+    "call .Lresident_serial_char",
+    "mov al, 0x30",
+    "call .Lresident_serial_char",
+    "mov al, 0x78",
+    "call .Lresident_serial_char",
+    "mov rax, qword ptr [rsp + 48]",
+    "call .Lresident_serial_hex64",
+    "pop rsi",
+    "pop r13",
+    "pop rbx",
+    "pop r9",
+    "pop r8",
+    "pop rcx",
+    "pop rax",
+    ".Lresident_diagnostic_emit_done:",
+    "ret",
+    ".Lresident_paint_hex:",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_framebuffer_sink}",
+    "jz .Lresident_paint_hex_done",
+    "cmp ecx, {visual_hex_last_row}",
+    "ja .Lresident_paint_hex_done",
+    "cmp qword ptr [r8 + {event_visual_base}], 0",
+    "je .Lresident_paint_hex_done",
+    "push rbx",
+    "push rdi",
+    "push rsi",
+    "push r13",
+    "push r14",
+    "mov rsi, rax",
+    "mov edi, ecx",
+    "and edi, 15",
+    "mov rbx, qword ptr [r8 + {event_visual_stride_bytes}]",
+    "mov r13d, ecx",
+    "shr r13d, 4",
+    "imul r13d, r13d, {visual_hex_column_step_bytes}",
+    "and ecx, 15",
+    "imul ecx, ecx, {visual_hex_row_step}",
+    "add ecx, {visual_hex_y}",
+    "imul rcx, rbx",
+    "add r13, qword ptr [r8 + {event_visual_base}]",
+    "add r13, rcx",
+    "xor r14d, r14d",
+    ".Lresident_paint_hex_cell:",
+    "mov eax, edi",
+    "test r14d, r14d",
+    "jz .Lresident_paint_hex_glyph",
+    "mov eax, 16",
+    "cmp r14d, 1",
+    "je .Lresident_paint_hex_glyph",
+    "mov ecx, 17",
+    "sub ecx, r14d",
+    "shl ecx, 2",
+    "mov rax, rsi",
+    "shr rax, cl",
+    "and eax, 15",
+    ".Lresident_paint_hex_glyph:",
+    "imul eax, eax, 5",
+    "lea r10, [rip + .Lresident_hex_digits]",
+    "add r10, rax",
+    "mov r11, r13",
+    "xor edx, edx",
+    ".Lresident_paint_hex_row:",
+    "mov eax, edx",
+    "shr eax, 1",
+    "movzx r9d, byte ptr [r10 + rax]",
+    "xor ecx, ecx",
+    ".Lresident_paint_hex_column:",
+    "xor eax, eax",
+    "cmp ecx, 6",
+    "jae .Lresident_paint_hex_pixel",
+    "mov eax, ecx",
+    "shr eax, 1",
+    "neg eax",
+    "add eax, 2",
+    "bt r9d, eax",
+    "sbb eax, eax",
+    ".Lresident_paint_hex_pixel:",
+    "mov dword ptr [r11 + rcx * 4], eax",
+    "inc ecx",
+    "cmp ecx, 8",
+    "jne .Lresident_paint_hex_column",
+    "add r11, rbx",
+    "inc edx",
+    "cmp edx, 10",
+    "jne .Lresident_paint_hex_row",
+    "add r13, 32",
+    "inc r14d",
+    "cmp r14d, 18",
+    "jne .Lresident_paint_hex_cell",
+    "sfence",
+    "pop r14",
+    "pop r13",
+    "pop rsi",
+    "pop rdi",
+    "pop rbx",
+    ".Lresident_paint_hex_done:",
+    "ret",
+    ".Lresident_hex_digits:",
+    ".byte 7, 5, 5, 5, 7",
+    ".byte 2, 6, 2, 2, 7",
+    ".byte 7, 1, 7, 4, 7",
+    ".byte 7, 1, 7, 1, 7",
+    ".byte 5, 5, 7, 1, 1",
+    ".byte 7, 4, 7, 1, 7",
+    ".byte 7, 4, 7, 5, 7",
+    ".byte 7, 1, 2, 2, 2",
+    ".byte 7, 5, 7, 5, 7",
+    ".byte 7, 5, 7, 1, 7",
+    ".byte 7, 5, 7, 5, 5",
+    ".byte 6, 5, 6, 5, 6",
+    ".byte 7, 4, 4, 4, 7",
+    ".byte 6, 5, 5, 5, 6",
+    ".byte 7, 4, 7, 4, 7",
+    ".byte 7, 4, 7, 4, 4",
+    ".byte 0, 0, 0, 0, 0",
+    ".Lresident_diagnostic_name_offsets:",
+    ".short .Lresident_diagnostic_name_0 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_1 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_2 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_3 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_4 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_5 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_6 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_7 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_8 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_9 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_10 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_11 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_12 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_13 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_14 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_15 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_16 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_17 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_18 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_19 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_20 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_21 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_22 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_23 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_24 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_25 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_26 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_27 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_28 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_29 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_30 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_31 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_32 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_33 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_34 - .Lresident_diagnostic_names",
+    ".short .Lresident_diagnostic_name_35 - .Lresident_diagnostic_names",
+    ".Lresident_diagnostic_name_lengths:",
+    ".byte 5, 6, 3, 3, 12, 11, 3, 13, 8, 3, 10, 8, 10, 8, 13, 13, 3, 9, 3, 4, 6, 8, 10, 10, 3, 16, 5, 5, 10, 15, 12, 7, 3, 8, 3, 3",
+    ".Lresident_diagnostic_names:",
+    ".Lresident_diagnostic_name_0:",
+    ".ascii \"exits\"",
+    ".Lresident_diagnostic_name_1:",
+    ".ascii \"reason\"",
+    ".Lresident_diagnostic_name_2:",
+    ".ascii \"rip\"",
+    ".Lresident_diagnostic_name_3:",
+    ".ascii \"rcx\"",
+    ".Lresident_diagnostic_name_4:",
+    ".ascii \"msr_gp_count\"",
+    ".Lresident_diagnostic_name_5:",
+    ".ascii \"last_gp_msr\"",
+    ".Lresident_diagnostic_name_6:",
+    ".ascii \"gpa\"",
+    ".Lresident_diagnostic_name_7:",
+    ".ascii \"qualification\"",
+    ".Lresident_diagnostic_name_8:",
+    ".ascii \"cpu_mask\"",
+    ".Lresident_diagnostic_name_9:",
+    ".ascii \"cpu\"",
+    ".Lresident_diagnostic_name_10:",
+    ".ascii \"host_fault\"",
+    ".Lresident_diagnostic_name_11:",
+    ".ascii \"host_rip\"",
+    ".Lresident_diagnostic_name_12:",
+    ".ascii \"host_error\"",
+    ".Lresident_diagnostic_name_13:",
+    ".ascii \"host_cr2\"",
+    ".Lresident_diagnostic_name_14:",
+    ".ascii \"timer_samples\"",
+    ".Lresident_diagnostic_name_15:",
+    ".ascii \"normal_reason\"",
+    ".Lresident_diagnostic_name_16:",
+    ".ascii \"cr0\"",
+    ".Lresident_diagnostic_name_17:",
+    ".ascii \"guest_cr3\"",
+    ".Lresident_diagnostic_name_18:",
+    ".ascii \"cr4\"",
+    ".Lresident_diagnostic_name_19:",
+    ".ascii \"efer\"",
+    ".Lresident_diagnostic_name_20:",
+    ".ascii \"rflags\"",
+    ".Lresident_diagnostic_name_21:",
+    ".ascii \"activity\"",
+    ".Lresident_diagnostic_name_22:",
+    ".ascii \"normal_rip\"",
+    ".Lresident_diagnostic_name_23:",
+    ".ascii \"efer_write\"",
+    ".Lresident_diagnostic_name_24:",
+    ".ascii \"rsp\"",
+    ".Lresident_diagnostic_name_25:",
+    ".ascii \"interruptibility\"",
+    ".Lresident_diagnostic_name_26:",
+    ".ascii \"rdmsr\"",
+    ".Lresident_diagnostic_name_27:",
+    ".ascii \"wrmsr\"",
+    ".Lresident_diagnostic_name_28:",
+    ".ascii \"l2_entries\"",
+    ".Lresident_diagnostic_name_29:",
+    ".ascii \"nested_failures\"",
+    ".Lresident_diagnostic_name_30:",
+    ".ascii \"nested_error\"",
+    ".Lresident_diagnostic_name_31:",
+    ".ascii \"expired\"",
+    ".Lresident_diagnostic_name_32:",
+    ".ascii \"len\"",
+    ".Lresident_diagnostic_name_33:",
+    ".ascii \"host_cr3\"",
+    ".Lresident_diagnostic_name_34:",
+    ".ascii \"rax\"",
+    ".Lresident_diagnostic_name_35:",
+    ".ascii \"rdx\"",
     ".Lresident_serial_write:",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}",
+    "jz .Lresident_serial_write_done",
     "test r9d, r9d",
     "jz .Lresident_serial_write_done",
     "lodsb",
@@ -7104,21 +8603,25 @@ global_asm!(
     ".Lresident_serial_write_done:",
     "ret",
     ".Lresident_serial_char:",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}",
+    "jz .Lresident_serial_char_done",
     "mov r10b, al",
     "call .Lresident_serial_acquire",
-    "mov dx, 0x3fd",
-    "mov ecx, 100000",
+    "mov dx, {serial_status_port}",
+    "mov ecx, {serial_wait_limit}",
     ".Lresident_serial_wait:",
     "in al, dx",
-    "test al, 0x20",
+    "test al, {serial_transmit_empty}",
     "jnz .Lresident_serial_ready",
     "dec ecx",
     "jnz .Lresident_serial_wait",
     "cmp r10b, 0x0a",
     "je .Lresident_serial_release",
     "ret",
+    ".Lresident_serial_char_done:",
+    "ret",
     ".Lresident_serial_ready:",
-    "mov dx, 0x3f8",
+    "mov dx, {serial_port}",
     "mov al, r10b",
     "out dx, al",
     "cmp r10b, 0x0a",
@@ -7149,6 +8652,8 @@ global_asm!(
     ".Lresident_serial_release_done:",
     "ret",
     ".Lresident_serial_hex64:",
+    "test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}",
+    "jz .Lresident_serial_hex64_done",
     "mov rbx, rax",
     "mov r13d, 16",
     ".Lresident_serial_hex64_loop:",
@@ -7165,61 +8670,7 @@ global_asm!(
     "call .Lresident_serial_char",
     "dec r13d",
     "jnz .Lresident_serial_hex64_loop",
-    "ret",
-    ".Lresident_serial_state:",
-    // CR3 is diagnostic data; read it only when a state record is emitted.
-    "mov rax, {guest_cr3}",
-    "vmread r11, rax",
-    "jna .Lresident_dispatch_vmread_failed",
-    "mov qword ptr [r12 + {b_last_guest_cr3}], r11",
-    "lea rsi, [rip + .Lstate_reason]",
-    "mov r9d, {state_reason_len}",
-    "call .Lresident_serial_write",
-    "mov rax, qword ptr [r12 + {b_last_reason}]",
-    "call .Lresident_serial_hex64",
-    "lea rsi, [rip + .Lstate_rip]",
-    "mov r9d, {state_rip_len}",
-    "call .Lresident_serial_write",
-    "mov rax, qword ptr [r12 + {b_last_guest_rip}]",
-    "call .Lresident_serial_hex64",
-    "lea rsi, [rip + .Lstate_len]",
-    "mov r9d, {state_instruction_len_len}",
-    "call .Lresident_serial_write",
-    "mov rax, qword ptr [r12 + {b_last_instruction_len}]",
-    "call .Lresident_serial_hex64",
-    "lea rsi, [rip + .Lstate_qualification]",
-    "mov r9d, {state_qualification_len}",
-    "call .Lresident_serial_write",
-    "mov rax, qword ptr [r12 + {b_last_qualification}]",
-    "call .Lresident_serial_hex64",
-    "lea rsi, [rip + .Lstate_guest_cr3]",
-    "mov r9d, {state_guest_cr3_len}",
-    "call .Lresident_serial_write",
-    "mov rax, qword ptr [r12 + {b_last_guest_cr3}]",
-    "call .Lresident_serial_hex64",
-    "lea rsi, [rip + .Lstate_host_cr3]",
-    "mov r9d, {state_host_cr3_len}",
-    "call .Lresident_serial_write",
-    "mov rax, qword ptr [r12 + {b_last_host_cr3}]",
-    "call .Lresident_serial_hex64",
-    "lea rsi, [rip + .Lstate_rax]",
-    "mov r9d, {state_rax_len}",
-    "call .Lresident_serial_write",
-    "mov rax, qword ptr [r12 + {b_last_rax}]",
-    "call .Lresident_serial_hex64",
-    "lea rsi, [rip + .Lstate_rcx]",
-    "mov r9d, {state_rcx_len}",
-    "call .Lresident_serial_write",
-    "mov rax, qword ptr [r12 + {b_last_rcx}]",
-    "call .Lresident_serial_hex64",
-    "lea rsi, [rip + .Lstate_rdx]",
-    "mov r9d, {state_rdx_len}",
-    "call .Lresident_serial_write",
-    "mov rax, qword ptr [r12 + {b_last_rdx}]",
-    "call .Lresident_serial_hex64",
-    "lea rsi, [rip + .Lstate_newline]",
-    "mov r9d, {state_newline_len}",
-    "call .Lresident_serial_write",
+    ".Lresident_serial_hex64_done:",
     "ret",
     ".balign 8",
     ".Lresident_vmcs12_field_index_table:",
@@ -7446,37 +8897,36 @@ global_asm!(
     ".Lstate_rip:",
     ".ascii \" rip=0x\"",
     ".Lstate_rip_end:",
-    ".Lstate_len:",
-    ".ascii \" len=0x\"",
-    ".Lstate_len_end:",
-    ".Lstate_qualification:",
-    ".ascii \" qual=0x\"",
-    ".Lstate_qualification_end:",
-    ".Lstate_guest_cr3:",
-    ".ascii \" guest_cr3=0x\"",
-    ".Lstate_guest_cr3_end:",
-    ".Lstate_host_cr3:",
-    ".ascii \" host_cr3=0x\"",
-    ".Lstate_host_cr3_end:",
-    ".Lstate_rax:",
-    ".ascii \" rax=0x\"",
-    ".Lstate_rax_end:",
-    ".Lstate_rcx:",
-    ".ascii \" rcx=0x\"",
-    ".Lstate_rcx_end:",
-    ".Lstate_rdx:",
-    ".ascii \" rdx=0x\"",
-    ".Lstate_rdx_end:",
     ".Lstate_newline:",
     ".ascii \"\\r\\n\"",
     ".Lstate_newline_end:",
+    ".globl matrixhv_resident_island_log_backend",
+    "matrixhv_resident_island_log_backend:",
+    ".byte 0",
+    ".balign 8",
+    ".globl matrixhv_resident_island_msr_switch_count",
+    "matrixhv_resident_island_msr_switch_count:",
+    ".quad 0",
+    ".globl matrixhv_resident_island_visual_callback",
+    "matrixhv_resident_island_visual_callback:",
+    ".quad 0",
+    ".globl matrixhv_resident_island_event_context",
+    "matrixhv_resident_island_event_context:",
+    ".quad 0",
     ".globl matrixhv_resident_island_end",
+    include_str!("../../asm/ept_cache.S"),
     "matrixhv_resident_island_end:",
     ".text",
     b_ap_started = const core::mem::offset_of!(ResidentBootContext, ap_started),
     b_processor_number = const core::mem::offset_of!(ResidentBootContext, processor_number),
     b_init_count = const core::mem::offset_of!(ResidentBootContext, init_count),
     b_sipi_count = const core::mem::offset_of!(ResidentBootContext, sipi_count),
+    b_cache_ept_pointer = const core::mem::offset_of!(ResidentBootContext, cache_ept_pointer),
+    b_cache_generation = const core::mem::offset_of!(ResidentBootContext, cache_generation),
+    b_mtrr_dirty = const core::mem::offset_of!(ResidentBootContext, mtrr_dirty),
+    b_mtrr_updates = const core::mem::offset_of!(ResidentBootContext, mtrr_updates),
+    b_nmi_pending = const core::mem::offset_of!(ResidentBootContext, nmi_pending),
+    b_nmi_count = const core::mem::offset_of!(ResidentBootContext, nmi_count),
     pin_based_vm_exec_control = const PIN_BASED_VM_EXEC_CONTROL,
     cpu_based_vm_exec_control = const CPU_BASED_VM_EXEC_CONTROL,
     virtual_apic_page_addr = const VIRTUAL_APIC_PAGE_ADDR,
@@ -7602,7 +9052,6 @@ global_asm!(
     xsetbv_reason = const XSETBV_EXIT_REASON,
     tsc_msr = const IA32_TSC_MSR,
     spec_ctrl_msr = const IA32_SPEC_CTRL_MSR,
-    tsc_adjust_msr = const IA32_TSC_ADJUST_MSR,
     platform_id_msr = const IA32_PLATFORM_ID_MSR,
     apic_base_msr = const IA32_APIC_BASE_MSR,
     feature_control_msr = const IA32_FEATURE_CONTROL_MSR,
@@ -7695,9 +9144,6 @@ global_asm!(
     vmx_status_flags_clear_mask = const VMX_STATUS_FLAGS_CLEAR_MASK,
     vmfail_invalid_status = const VMFAIL_INVALID_STATUS,
     vmfail_valid_status = const VMFAIL_VALID_STATUS,
-    resident_msr_switch_count = const RESIDENT_MSR_SWITCH_COUNT,
-    resident_msr_switch_qword_count = const RESIDENT_MSR_SWITCH_COUNT * 2,
-    resident_msr_switch_byte_count = const RESIDENT_MSR_SWITCH_COUNT * size_of::<VmxMsrEntry>(),
     nested_guest_msr_list_capacity = const NESTED_GUEST_MSR_LIST_CAPACITY,
     nested_msr_bitmap_qword_count = const NESTED_MSR_BITMAP_QWORD_COUNT,
     host_page_address_mask = const HOST_PAGE_ADDRESS_MASK,
@@ -7722,9 +9168,28 @@ global_asm!(
     b_xsetbv_count = const BCTX_XSETBV_COUNT,
     b_vmcall_count = const BCTX_VMCALL_COUNT,
     b_start_checkpoint_seen = const BCTX_START_CHECKPOINT_SEEN,
+    b_visual_first_exit_seen = const BCTX_VISUAL_FIRST_EXIT_SEEN,
     b_post_start_count = const BCTX_POST_START_COUNT,
     b_post_ebs_count = const BCTX_POST_EBS_COUNT,
     b_post_va_count = const BCTX_POST_VA_COUNT,
+    b_msr_gp_count = const BCTX_MSR_GP_COUNT,
+    b_last_gp_msr = const BCTX_LAST_GP_MSR,
+    b_diagnostic_interval = const BCTX_DIAGNOSTIC_INTERVAL,
+    log_serial_sink = const crate::runtime::logger::SERIAL_SINK,
+    log_framebuffer_sink = const crate::runtime::logger::FRAMEBUFFER_SINK,
+    serial_port = const crate::runtime::serial::COM1,
+    serial_status_port = const crate::runtime::serial::COM1 + 5,
+    serial_transmit_empty = const crate::runtime::serial::TRANSMIT_EMPTY,
+    serial_wait_limit = const crate::runtime::serial::TX_WAIT_LIMIT,
+    b_diagnostic_rate = const BCTX_DIAGNOSTIC_RATE,
+    b_diagnostic_deadline = const BCTX_DIAGNOSTIC_DEADLINE,
+    b_diagnostic_samples = const BCTX_DIAGNOSTIC_SAMPLES,
+    b_diagnostic_expired = const BCTX_DIAGNOSTIC_EXPIRED,
+    b_last_normal_reason = const BCTX_LAST_NORMAL_REASON,
+    b_last_normal_rip = const BCTX_LAST_NORMAL_RIP,
+    b_last_efer_write = const BCTX_LAST_EFER_WRITE,
+    preemption_timer_reason = const VMX_PREEMPTION_TIMER_EXIT_REASON,
+    vmx_preemption_timer_value = const VMX_PREEMPTION_TIMER_VALUE,
     b_last_reason = const BCTX_LAST_REASON,
     b_last_instruction_len = const BCTX_LAST_INSTRUCTION_LEN,
     b_last_qualification = const BCTX_LAST_QUALIFICATION,
@@ -7743,7 +9208,6 @@ global_asm!(
     b_cpuid_hypervisor_count = const BCTX_CPUID_HYPERVISOR_COUNT,
     b_cpuid_leaf1_ecx = const BCTX_CPUID_LEAF1_ECX,
     b_cpuid_hypervisor_eax = const BCTX_CPUID_HYPERVISOR_EAX,
-    b_tsc_adjust = const BCTX_TSC_ADJUST,
     b_nested_feature_control = const BCTX_NESTED_FEATURE_CONTROL,
     b_nested_vmx_basic = const BCTX_NESTED_VMX_BASIC,
     b_nested_vmx_pinbased_ctls = const BCTX_NESTED_VMX_PINBASED_CTLS,
@@ -7994,6 +9458,28 @@ global_asm!(
     event_ebs_seen = const EVENT_CTX_EBS_SEEN,
     event_va_seen = const EVENT_CTX_VA_SEEN,
     event_canary_offset = const EVENT_CTX_CANARY,
+    event_visual_base = const EVENT_CTX_VISUAL_BASE,
+    event_visual_stride_bytes = const EVENT_CTX_VISUAL_STRIDE_BYTES,
+    event_post_ebs_cpu_mask = const EVENT_CTX_POST_EBS_CPU_MASK,
+    event_diagnostic_halted = const EVENT_CTX_DIAGNOSTIC_HALTED,
+    event_host_fault_vector = const EVENT_CTX_HOST_FAULT_VECTOR,
+    event_host_fault_rip = const EVENT_CTX_HOST_FAULT_RIP,
+    event_host_fault_error_code = const EVENT_CTX_HOST_FAULT_ERROR_CODE,
+    event_host_fault_address = const EVENT_CTX_HOST_FAULT_ADDRESS,
+    event_init_cpu_mask = const core::mem::offset_of!(ResidentEventContext, init_cpu_mask),
+    event_sipi_cpu_mask = const core::mem::offset_of!(ResidentEventContext, sipi_cpu_mask),
+    event_halted_cpu_mask = const core::mem::offset_of!(ResidentEventContext, halted_cpu_mask),
+    event_failed_processor = const core::mem::offset_of!(ResidentEventContext, failed_processor),
+    event_failed_exit_reason = const core::mem::offset_of!(ResidentEventContext, failed_exit_reason),
+    event_failed_qualification = const core::mem::offset_of!(ResidentEventContext, failed_qualification),
+    event_failed_stop_result = const core::mem::offset_of!(ResidentEventContext, failed_stop_result),
+    visual_marker_step_bytes = const crate::boot::screen::RESIDENT_MARKER_STEP * 4,
+    visual_marker_row_step = const crate::boot::screen::RESIDENT_MARKER_ROW_STEP,
+    visual_marker_side = const crate::boot::screen::RESIDENT_MARKER_SIZE,
+    visual_hex_y = const crate::boot::screen::RESIDENT_HEX_Y,
+    visual_hex_row_step = const crate::boot::screen::RESIDENT_HEX_ROW_STEP,
+    visual_hex_last_row = const crate::boot::screen::RESIDENT_HEX_ROWS - 1,
+    visual_hex_column_step_bytes = const crate::boot::screen::RESIDENT_HEX_COLUMN_STEP * 4,
     post_ebs_exit_message_len = const POST_EBS_EXIT_MESSAGE_LEN,
     post_va_exit_message_len = const POST_VA_EXIT_MESSAGE_LEN,
     first_start_exit_message_len = const FIRST_START_EXIT_MESSAGE_LEN,
@@ -8022,12 +9508,5 @@ global_asm!(
     nested_l2_exit_message_len = const NESTED_L2_EXIT_MESSAGE_LEN,
     state_reason_len = const STATE_REASON_LEN,
     state_rip_len = const STATE_RIP_LEN,
-    state_instruction_len_len = const STATE_INSTRUCTION_LEN_LEN,
-    state_qualification_len = const STATE_QUALIFICATION_LEN,
-    state_guest_cr3_len = const STATE_GUEST_CR3_LEN,
-    state_host_cr3_len = const STATE_HOST_CR3_LEN,
-    state_rax_len = const STATE_RAX_LEN,
-    state_rcx_len = const STATE_RCX_LEN,
-    state_rdx_len = const STATE_RDX_LEN,
     state_newline_len = const STATE_NEWLINE_LEN,
 );

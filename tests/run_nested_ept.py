@@ -54,13 +54,18 @@ guest_assembly += "\n" + "\n".join(
     json.loads(line.rstrip(","))
     for line in map(str.strip, source[capture_start:capture_end].splitlines())
     if line.startswith('"')
-) + "\nmov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], 1\nret\n"
+) + (
+    "\nmov rax, qword ptr [rip + .Lresident_nested_rare_guest_fields]\n"
+    "mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], rax\n"
+    "mov rax, qword ptr [rip + .Lresident_nested_rare_guest_fields + 8]\n"
+    "mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending} + 8], rax\nret\n"
+)
 guest_assembly += "\n".join(
     json.loads(line.rstrip(","))
     for line in map(str.strip, source[rare_start:rare_end].splitlines())
     if line.startswith('"')
 )
-assert guest_assembly.count("vmread r11, rax") == 2
+assert guest_assembly.count("vmread r11, rax") == 3
 guest_assembly = guest_assembly.replace(
     "vmread r11, rax",
     "cmp qword ptr [r12 + {test_selected_vmcs}], 2\n"
@@ -139,6 +144,7 @@ msr_assembly = msr_assembly.replace(
     "mov qword ptr [r12 + {test_hardware} + rax * 8], r11\n"
     "push rax\nmov eax, 1\ntest eax, eax\npop rax",
 )
+msr_assembly += "\n.data\n.balign 8\nmatrixhv_resident_island_msr_switch_count:\n.quad 1\n.text\n"
 (output / "resident-msr-exit.S").write_text(msr_assembly)
 address_start = source.index('    ".Lresident_nested_physical_address_is_valid:",')
 address_end = source.index('    ".Lresident_nested_prepare_ept02:",')

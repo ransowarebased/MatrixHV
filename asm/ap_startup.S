@@ -8,6 +8,14 @@
     cmp qword ptr [r12 + {b_ap_started}], 1
     jne .Lresident_dispatch_unsupported
     inc qword ptr [r12 + {b_init_count}]
+    mov r8, qword ptr [r12 + {b_event_context}]
+    mov rcx, qword ptr [r12 + {b_processor_number}]
+    test r8, r8
+    jz .Lap_init_recorded
+    cmp rcx, 64
+    jae .Lap_init_recorded
+    lock bts qword ptr [r8 + {event_init_cpu_mask}], rcx
+.Lap_init_recorded:
     lea rsi, [rip + .Lap_reset_fields]
     lea rdi, [rip + .Lap_reset_fields_end]
 .Lap_reset_loop:
@@ -27,6 +35,9 @@
     vmwrite rax, r10
     jc .Lresident_dispatch_vmwrite_failed
     jz .Lresident_dispatch_vmwrite_failed
+    mov qword ptr [r12 + {b_nested_l1_cr4}], 0
+    mov qword ptr [r12 + {b_nmi_pending}], 0
+    call .Lap_flush_guest_tlb
     mov rdi, rsp
     xor eax, eax
     mov ecx, 15
@@ -40,6 +51,14 @@
     cmp qword ptr [r12 + {b_ap_started}], 1
     jne .Lresident_dispatch_unsupported
     inc qword ptr [r12 + {b_sipi_count}]
+    mov r8, qword ptr [r12 + {b_event_context}]
+    mov rcx, qword ptr [r12 + {b_processor_number}]
+    test r8, r8
+    jz .Lap_sipi_recorded
+    cmp rcx, 64
+    jae .Lap_sipi_recorded
+    lock bts qword ptr [r8 + {event_sipi_cpu_mask}], rcx
+.Lap_sipi_recorded:
     mov r10, [r12 + {b_last_qualification}]
     and r10, 255
     shl r10, 8
@@ -136,8 +155,31 @@
     jc .Lresident_dispatch_vmwrite_failed
     jz .Lresident_dispatch_vmwrite_failed
 .Lap_cr_done:
+    call .Lresident_update_dirty_mtrrs
+    call .Lap_flush_guest_tlb
     call .Lresident_advance_guest_rip
     jmp .Lresident_dispatch_resume
+
+// VMWRITE does not perform the TLB invalidation of INIT or MOV CR0/CR4.
+// Retained VPID translations must not carry firmware mappings into the OS.
+.Lap_flush_guest_tlb:
+    mov eax, {secondary_vm_exec_control}
+    vmread r11, rax
+    jna .Lresident_dispatch_vmread_failed
+    bt r11d, 5
+    jnc .Lap_flush_guest_tlb_done
+    mov eax, {virtual_processor_id}
+    vmread r11, rax
+    jna .Lresident_dispatch_vmread_failed
+    sub rsp, 16
+    mov qword ptr [rsp], r11
+    mov qword ptr [rsp + 8], 0
+    mov eax, 1
+    invvpid rax, xmmword ptr [rsp]
+    lea rsp, [rsp + 16]
+    jna .Lresident_dispatch_halt
+.Lap_flush_guest_tlb_done:
+    ret
 
 .Lap_gpr_offsets:
     .byte 0, 8, 16, 24, 0, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112
@@ -145,7 +187,7 @@
 .Lap_reset_fields:
     .quad {guest_cr0}, 0x60000030
     .quad {cr0_read_shadow}, 0x60000010
-    .quad {cr0_guest_host_mask}, 0x80000021
+    .quad {cr0_guest_host_mask}, 0xe0000021
     .quad {guest_cr3}, 0
     .quad {guest_cr4}, 0x2000
     .quad {cr4_read_shadow}, 0

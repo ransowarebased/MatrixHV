@@ -101,7 +101,7 @@ pub fn read_idtr() -> DescriptorTablePointer {
 }
 
 fn segment_from_gdt(selector: u16, gdtr: DescriptorTablePointer) -> SegmentState {
-    if selector & !0x7 == 0 {
+    if selector & !0x7 == 0 || selector & 0x4 != 0 {
         return SegmentState {
             selector,
             base: 0,
@@ -123,6 +123,14 @@ fn segment_from_gdt(selector: u16, gdtr: DescriptorTablePointer) -> SegmentState
     let descriptor_address = gdtr.base.wrapping_add(table_offset as u64) as *const u64;
     let descriptor = unsafe { descriptor_address.read_unaligned() };
     let access = ((descriptor >> 40) & 0xff) as u32;
+    if access & 0x10 == 0 && table_offset + 15 > usize::from(gdtr.limit) {
+        return SegmentState {
+            selector,
+            base: 0,
+            limit: 0,
+            access_rights: 1 << 16,
+        };
+    }
     let flags = ((descriptor >> 52) & 0xf) as u32;
     let mut limit = ((descriptor & 0xffff) | (((descriptor >> 48) & 0xf) << 16)) as u32;
     if flags & 0x8 != 0 {

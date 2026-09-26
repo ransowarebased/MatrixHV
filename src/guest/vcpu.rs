@@ -162,11 +162,11 @@ impl Vcpu {
         let mut host_address_space =
             HostAddressSpace::reserve().map_err(PersistentVcpuError::HostPaging)?;
 
-        let session = vt_vmxon::enter_vmx_root().map_err(PersistentVcpuError::Vmxon)?;
-        let vmxon = session.report();
         let host_address_space_report = host_address_space
             .clone_current()
             .map_err(PersistentVcpuError::HostPaging)?;
+        let session = vt_vmxon::enter_vmx_root().map_err(PersistentVcpuError::Vmxon)?;
+        let vmxon = session.report();
 
         logger::phase("vmx.vcpu.vmclear.start");
         let clear_result = unsafe { vt_vmcs::vmclear(vmcs_physical_address) };

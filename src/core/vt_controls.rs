@@ -1,12 +1,15 @@
 use core::arch::asm;
 
 use crate::arch::x86_64::{msr, registers::CR4_VMXE};
+use crate::nested::capabilities::IA32_VMX_MISC_MSR;
 
 use super::vt_vmcs::{VmcsError, vmwrite};
 use super::vt_vmcs_fields::*;
 
 const IA32_VMX_BASIC_TRUE_CTLS: u64 = 1 << 55;
 const PIN_BASED_NMI_EXITING: u32 = 1 << 3;
+const PIN_BASED_VIRTUAL_NMIS: u32 = 1 << 5;
+const PIN_BASED_VMX_PREEMPTION_TIMER: u32 = 1 << 6;
 const CPU_BASED_USE_TSC_OFFSETTING: u32 = 1 << 3;
 const CPU_BASED_USE_MSR_BITMAPS: u32 = 1 << 28;
 const CPU_BASED_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
@@ -50,6 +53,7 @@ pub enum VmxControlsError {
     PatControlsUnavailable,
     EferControlsUnavailable,
     VpidInvalidationFailed,
+    VirtualNmisUnavailable,
 }
 
 struct RequestedControls {
@@ -86,15 +90,23 @@ pub fn configure_resident_boot(
     msr_bitmap: u64,
     ept_pointer: u64,
 ) -> Result<VmxControls, VmxControlsError> {
-    configure_internal(RequestedControls {
-        pin_based: 0,
+    let cpuid = crate::arch::x86_64::cpuid::leaf;
+    let mut secondary = SECONDARY_ENABLE_EPT;
+    if cpuid(0x8000_0001).edx & (1 << 27) != 0 {
+        secondary |= SECONDARY_ENABLE_RDTSCP;
+    }
+    if cpuid(7).ebx & (1 << 10) != 0 {
+        secondary |= SECONDARY_ENABLE_INVPCID;
+    }
+    if crate::arch::x86_64::cpuid::leaf_with_subleaf(0xd, 1).eax & (1 << 3) != 0 {
+        secondary |= SECONDARY_ENABLE_XSAVES;
+    }
+    let controls = configure_internal(RequestedControls {
+        pin_based: PIN_BASED_NMI_EXITING | PIN_BASED_VIRTUAL_NMIS,
         primary_processor_based: CPU_BASED_USE_TSC_OFFSETTING
             | CPU_BASED_USE_MSR_BITMAPS
             | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
-        secondary_processor_based: SECONDARY_ENABLE_EPT
-            | SECONDARY_ENABLE_RDTSCP
-            | SECONDARY_ENABLE_INVPCID
-            | SECONDARY_ENABLE_XSAVES,
+        secondary_processor_based: secondary,
         vm_exit: VM_EXIT_SAVE_IA32_PAT
             | VM_EXIT_LOAD_IA32_PAT
             | VM_EXIT_SAVE_IA32_EFER
@@ -103,7 +115,13 @@ pub fn configure_resident_boot(
         exception_bitmap: 1 << 6,
         msr_bitmap: Some(msr_bitmap),
         ept_pointer: Some(ept_pointer),
-    })
+    })?;
+    vmwrite(CR0_GUEST_HOST_MASK, (1 << 30) | (1 << 29))?;
+    vmwrite(
+        CR0_READ_SHADOW,
+        crate::arch::x86_64::control_regs::read_cr0(),
+    )?;
+    Ok(controls)
 }
 
 pub(crate) fn configure_resident_ap(
@@ -123,6 +141,46 @@ pub(crate) fn configure_resident_ap(
         u64::from(controls.secondary_processor_based),
     )?;
     Ok(controls)
+}
+
+pub(crate) fn resident_boot_timer_parameters() -> (u64, u64) {
+    if !crate::runtime::logger::enabled() {
+        return (0, 0);
+    }
+    let basic = unsafe { msr::read(msr::IA32_VMX_BASIC) };
+    let pin_msr = if basic & IA32_VMX_BASIC_TRUE_CTLS != 0 {
+        msr::IA32_VMX_TRUE_PINBASED_CTLS
+    } else {
+        msr::IA32_VMX_PINBASED_CTLS
+    };
+    let capability = unsafe { msr::read(pin_msr) };
+    if capability >> 32 & u64::from(PIN_BASED_VMX_PREEMPTION_TIMER) == 0 {
+        return (0, 0);
+    }
+    let timer_rate = unsafe { msr::read(IA32_VMX_MISC_MSR) } & 31;
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    uefi::boot::stall(core::time::Duration::from_millis(10));
+    let interval_tsc = unsafe { core::arch::x86_64::_rdtsc() }
+        .wrapping_sub(start_tsc)
+        .saturating_mul(100)
+        .max(1);
+    (interval_tsc, timer_rate)
+}
+
+pub(crate) fn enable_resident_boot_timer(
+    controls: &mut VmxControls,
+    interval_tsc: u64,
+    timer_rate: u64,
+) -> Result<(), VmxControlsError> {
+    if interval_tsc == 0 {
+        return Ok(());
+    }
+    // Avoid timer values 0 and 1, including the value-1 erratum on recent Intel CPUs.
+    let timer_ticks = (interval_tsc >> timer_rate).clamp(2, u64::from(u32::MAX));
+    vmwrite(VMX_PREEMPTION_TIMER_VALUE, timer_ticks)?;
+    controls.pin_based |= PIN_BASED_VMX_PREEMPTION_TIMER;
+    vmwrite(PIN_BASED_VM_EXEC_CONTROL, u64::from(controls.pin_based))?;
+    Ok(())
 }
 
 pub(crate) fn virtualize_resident_cr4_vmxe(guest_cr4: u64) -> Result<(), VmxControlsError> {
@@ -195,6 +253,13 @@ fn configure_internal(requested: RequestedControls) -> Result<VmxControls, VmxCo
     };
 
     let pin_based = adjust_control(requested.pin_based, pin_msr);
+    if requested.pin_based & PIN_BASED_VIRTUAL_NMIS != 0
+        && (pin_based & (PIN_BASED_NMI_EXITING | PIN_BASED_VIRTUAL_NMIS)
+            != (PIN_BASED_NMI_EXITING | PIN_BASED_VIRTUAL_NMIS)
+            || unsafe { msr::read(proc_msr) } & (1_u64 << (32 + 22)) == 0)
+    {
+        return Err(VmxControlsError::VirtualNmisUnavailable);
+    }
     let primary_processor_based = adjust_control(requested.primary_processor_based, proc_msr);
     let secondary_processor_based =
         if primary_processor_based & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS != 0 {

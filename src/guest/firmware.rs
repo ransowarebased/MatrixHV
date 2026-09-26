@@ -1,6 +1,6 @@
 use core::arch::global_asm;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use uefi::boot::{self, SearchType};
 use uefi::proto::media::fs::SimpleFileSystem;
@@ -25,6 +25,10 @@ const FLAG_LOCATE_OK: u32 = 1 << 1;
 const FLAG_TARGET_PATH_OK: u32 = 1 << 2;
 const FLAG_TARGET_IMAGE_LOAD_OK: u32 = 1 << 3;
 const FLAG_TERMINAL_READY: u32 = 1 << 4;
+const FLAG_START_CHECKPOINT_COMPLETE: u32 = 1 << 5;
+const FLAG_EPT_PROBE_COMPLETE: u32 = 1 << 6;
+const FLAG_START_IMAGE_ENTERED: u32 = 1 << 7;
+const FLAG_START_IMAGE_RETURNED: u32 = 1 << 8;
 const HANDLE_CAPACITY: usize = 128;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -43,6 +47,7 @@ static REPORT_FLAGS: AtomicU32 = AtomicU32::new(0);
 static REPORT_STATUS: AtomicU64 = AtomicU64::new(0);
 static REPORT_HANDLE_COUNT: AtomicU32 = AtomicU32::new(0);
 static REPORT_REQUIRED_COUNT: AtomicU32 = AtomicU32::new(0);
+static START_IMAGE_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn reset_report() {
     REPORT_MAGIC.store(BOOT_STAGE_MAGIC, Ordering::Relaxed);
@@ -51,6 +56,10 @@ pub fn reset_report() {
     REPORT_STATUS.store(0, Ordering::Relaxed);
     REPORT_HANDLE_COUNT.store(0, Ordering::Relaxed);
     REPORT_REQUIRED_COUNT.store(0, Ordering::Relaxed);
+}
+
+pub fn set_start_image_handle(handle: Handle) {
+    START_IMAGE_HANDLE.store(handle.as_ptr() as usize, Ordering::Release);
 }
 
 pub fn report() -> BootStageReport {
@@ -62,6 +71,10 @@ pub fn report() -> BootStageReport {
         handle_count: REPORT_HANDLE_COUNT.load(Ordering::Acquire),
         required_count: REPORT_REQUIRED_COUNT.load(Ordering::Acquire),
     }
+}
+
+pub fn start_image_entered() -> bool {
+    REPORT_FLAGS.load(Ordering::Acquire) & FLAG_START_IMAGE_ENTERED != 0
 }
 
 pub fn proof_complete(report: BootStageReport) -> bool {
@@ -111,66 +124,54 @@ pub extern "efiapi" fn matrixhv_vt_nested_enabled() -> u64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "efiapi" fn matrixhv_vmx_test_enabled() -> u64 {
+    u64::from(crate::boot::config::current().vmx_test)
+}
+
+#[unsafe(no_mangle)]
 pub extern "efiapi" fn matrixhv_boot_loader_start_guest_stage() -> u64 {
     REPORT_FLAGS.fetch_or(FLAG_ENTERED, Ordering::Release);
-
-    let mut handles: [MaybeUninit<Handle>; HANDLE_CAPACITY] =
-        [const { MaybeUninit::uninit() }; HANDLE_CAPACITY];
-    let found =
-        match boot::locate_handle(SearchType::from_proto::<SimpleFileSystem>(), &mut handles) {
-            Ok(found) => found,
-            Err(error) => {
-                REPORT_STATUS.store(error.status().0 as u64, Ordering::Relaxed);
-                REPORT_FLAGS.fetch_or(FLAG_TERMINAL_READY, Ordering::Release);
-                return BOOT_STAGE_ERROR;
-            }
-        };
-    REPORT_HANDLE_COUNT.store(found.len() as u32, Ordering::Relaxed);
-    REPORT_FLAGS.fetch_or(FLAG_LOCATE_OK, Ordering::Release);
-
-    for target in services::boot_target_candidates() {
-        for handle in found.iter() {
-            if !services::volume_contains(*handle, target.path) {
-                continue;
-            }
-            REPORT_FLAGS.fetch_or(FLAG_TARGET_PATH_OK, Ordering::Release);
-
-            let child_handle = match services::load_image_on_volume(*handle, target.path) {
-                Ok(handle) => handle,
-                Err(status) => {
-                    REPORT_STATUS.store(status.0 as u64, Ordering::Relaxed);
-                    REPORT_FLAGS.fetch_or(FLAG_TERMINAL_READY, Ordering::Release);
-                    return BOOT_STAGE_START_IMAGE_ERROR;
-                }
-            };
+    crate::boot::screen::message(format_args!("resident guest stage entered"));
+    let handle_address = START_IMAGE_HANDLE.load(Ordering::Acquire);
+    let Some(child_handle) = (unsafe { Handle::from_ptr(handle_address as *mut _) }) else {
+        REPORT_STATUS.store(Status::NOT_FOUND.0 as u64, Ordering::Relaxed);
+        REPORT_FLAGS.fetch_or(FLAG_TERMINAL_READY, Ordering::Release);
+        return BOOT_STAGE_NOT_FOUND;
+    };
+    REPORT_FLAGS.fetch_or(FLAG_TARGET_IMAGE_LOAD_OK, Ordering::Release);
+    unsafe {
+        matrixhv_boot_loader_start_checkpoint_asm();
+    }
+    REPORT_FLAGS.fetch_or(FLAG_START_CHECKPOINT_COMPLETE, Ordering::Release);
+    crate::boot::screen::message(format_args!("resident guest checkpoint complete"));
+    let ept_test_page_gpa = vt_resident::ept_test_page_gpa();
+    if ept_test_page_gpa != 0 {
+        unsafe {
+            matrixhv_boot_loader_ept_probe_asm(ept_test_page_gpa);
+        }
+        REPORT_FLAGS.fetch_or(FLAG_EPT_PROBE_COMPLETE, Ordering::Release);
+        crate::boot::screen::message(format_args!("resident guest EPT probe complete"));
+    }
+    REPORT_FLAGS.fetch_or(FLAG_START_IMAGE_ENTERED, Ordering::Release);
+    crate::boot::screen::message(format_args!("resident guest starting boot target"));
+    match boot::start_image(child_handle) {
+        Ok(()) => {
             REPORT_STATUS.store(Status::SUCCESS.0 as u64, Ordering::Relaxed);
-            REPORT_FLAGS.fetch_or(FLAG_TARGET_IMAGE_LOAD_OK, Ordering::Release);
-            if let Err(status) = services::configure_image_load_options(child_handle) {
-                REPORT_STATUS.store(status.0 as u64, Ordering::Relaxed);
-                REPORT_FLAGS.fetch_or(FLAG_TERMINAL_READY, Ordering::Release);
-                let _ = boot::unload_image(child_handle);
-                return BOOT_STAGE_START_IMAGE_ERROR;
-            }
-
-            unsafe {
-                matrixhv_boot_loader_start_checkpoint_asm();
-            }
-            let ept_test_page_gpa = vt_resident::ept_test_page_gpa();
-            if ept_test_page_gpa != 0 {
-                unsafe {
-                    matrixhv_boot_loader_ept_probe_asm(ept_test_page_gpa);
-                }
-            }
-            return match boot::start_image(child_handle) {
-                Ok(()) => BOOT_STAGE_START_IMAGE_RETURNED,
-                Err(_) => BOOT_STAGE_START_IMAGE_ERROR,
-            };
+            REPORT_FLAGS.fetch_or(
+                FLAG_START_IMAGE_RETURNED | FLAG_TERMINAL_READY,
+                Ordering::Release,
+            );
+            BOOT_STAGE_START_IMAGE_RETURNED
+        }
+        Err(error) => {
+            REPORT_STATUS.store(error.status().0 as u64, Ordering::Relaxed);
+            REPORT_FLAGS.fetch_or(
+                FLAG_START_IMAGE_RETURNED | FLAG_TERMINAL_READY,
+                Ordering::Release,
+            );
+            BOOT_STAGE_START_IMAGE_ERROR
         }
     }
-
-    REPORT_STATUS.store(Status::NOT_FOUND.0 as u64, Ordering::Relaxed);
-    REPORT_FLAGS.fetch_or(FLAG_TERMINAL_READY, Ordering::Release);
-    BOOT_STAGE_NOT_FOUND
 }
 
 #[unsafe(no_mangle)]
@@ -272,6 +273,13 @@ global_asm!(
     "ret",
     ".globl matrixhv_boot_loader_start_guest_asm",
     "matrixhv_boot_loader_start_guest_asm:",
+    "mov rbx, rax",
+    "sub rsp, 32",
+    "call matrixhv_vmx_test_enabled",
+    "add rsp, 32",
+    "test rax, rax",
+    "jz .Lwindows_cpuid_done",
+    "mov rax, rbx",
     "mov r8, qword ptr [rax + 8]",
     "mov r9, qword ptr [rax + 16]",
     "mov rbx, rax",

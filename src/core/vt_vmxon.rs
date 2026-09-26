@@ -2,7 +2,7 @@ use core::arch::asm;
 
 use uefi::Status;
 
-use crate::arch::x86_64::{control_regs, msr};
+use crate::arch::x86_64::{control_regs, msr, registers, segmentation};
 use crate::memory::resident::{AddressConstraint, ResidentPages};
 
 const PAGE_SIZE: usize = 4096;
@@ -319,6 +319,12 @@ unsafe fn vmxoff() {
 
 struct InterruptGuard {
     interrupts_were_enabled: bool,
+    gdtr: segmentation::DescriptorTablePointer,
+    idtr: segmentation::DescriptorTablePointer,
+    dr7: u64,
+    debugctl: u64,
+    fs_base: u64,
+    gs_base: u64,
 }
 
 impl InterruptGuard {
@@ -330,15 +336,37 @@ impl InterruptGuard {
         }
         Self {
             interrupts_were_enabled: rflags & (1 << 9) != 0,
+            gdtr: segmentation::read_gdtr(),
+            idtr: segmentation::read_idtr(),
+            dr7: registers::read_dr7(),
+            debugctl: unsafe { msr::read(msr::IA32_DEBUGCTL) },
+            fs_base: unsafe { msr::read(msr::IA32_FS_BASE) },
+            gs_base: unsafe { msr::read(msr::IA32_GS_BASE) },
         }
     }
 }
 
 impl Drop for InterruptGuard {
     fn drop(&mut self) {
-        if self.interrupts_were_enabled {
-            unsafe {
+        unsafe {
+            // VM exit loads both descriptor-table limits with 0xffff. Restore
+            // the firmware's original bounds before enabling its interrupts.
+            asm!(
+                "cli",
+                "lgdt [{gdtr}]",
+                "lidt [{idtr}]",
+                gdtr = in(reg) &self.gdtr,
+                idtr = in(reg) &self.idtr,
+                options(nostack)
+            );
+            msr::write(msr::IA32_DEBUGCTL, self.debugctl);
+            msr::write(msr::IA32_FS_BASE, self.fs_base);
+            msr::write(msr::IA32_GS_BASE, self.gs_base);
+            asm!("mov dr7, {}", in(reg) self.dr7, options(nostack, preserves_flags));
+            if self.interrupts_were_enabled {
                 asm!("sti", options(nomem, nostack));
+            } else {
+                asm!("cli", options(nomem, nostack));
             }
         }
     }

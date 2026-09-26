@@ -2,9 +2,9 @@ use core::arch::asm;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-const COM1: u16 = 0x3f8;
-const TRANSMIT_EMPTY: u8 = 1 << 5;
-const TX_WAIT_LIMIT: usize = 100_000;
+pub(crate) const COM1: u16 = 0x3f8;
+pub(crate) const TRANSMIT_EMPTY: u8 = 1 << 5;
+pub(crate) const TX_WAIT_LIMIT: usize = 100_000;
 const RUST_LOCK_OWNER: u64 = 1;
 
 static FALLBACK_LOCK: AtomicU64 = AtomicU64::new(0);
@@ -24,16 +24,72 @@ impl Write for SerialWriter {
     }
 }
 
-pub fn initialize() {
-    unsafe {
-        out8(COM1 + 1, 0x00);
-        out8(COM1 + 3, 0x80);
-        out8(COM1, 0x01);
-        out8(COM1 + 1, 0x00);
-        out8(COM1 + 3, 0x03);
-        out8(COM1 + 2, 0xc7);
-        out8(COM1 + 4, 0x0b);
+pub fn initialize() -> bool {
+    probe_com1(
+        |port| unsafe { in8(port) },
+        |port, value| unsafe { out8(port, value) },
+    )
+}
+
+fn probe_com1(mut read: impl FnMut(u16) -> u8, mut write: impl FnMut(u16, u8)) -> bool {
+    if read(COM1 + 5) == 0xff {
+        return false;
     }
+    let scratch = read(COM1 + 7);
+    for pattern in [0x5a, 0xa5] {
+        write(COM1 + 7, pattern);
+        if read(COM1 + 7) != pattern {
+            write(COM1 + 7, scratch);
+            return false;
+        }
+    }
+    write(COM1 + 7, scratch);
+
+    let line_control = read(COM1 + 3);
+    let modem_control = read(COM1 + 4);
+    write(COM1 + 3, line_control & !0x80);
+    let interrupt_enable = read(COM1 + 1);
+    write(COM1 + 1, 0);
+    write(COM1 + 3, 0x80);
+    let divisor_low = read(COM1);
+    let divisor_high = read(COM1 + 1);
+    write(COM1, 1);
+    write(COM1 + 1, 0);
+    write(COM1 + 3, 0x03);
+    // Internal loopback verifies a UART without transmitting probe bytes to the cable.
+    write(COM1 + 4, 0x10);
+    for _ in 0..64 {
+        if read(COM1 + 5) & 1 == 0 {
+            break;
+        }
+        let _ = read(COM1);
+    }
+    write(COM1, 0xae);
+    let mut present = false;
+    for _ in 0..TX_WAIT_LIMIT {
+        let status = read(COM1 + 5);
+        if status == 0xff {
+            break;
+        }
+        if status & 1 != 0 {
+            present = read(COM1) == 0xae;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if present {
+        write(COM1 + 2, 0xc7);
+        write(COM1 + 4, 0x0b);
+    } else {
+        write(COM1 + 4, modem_control);
+        write(COM1 + 3, 0x80);
+        write(COM1, divisor_low);
+        write(COM1 + 1, divisor_high);
+        write(COM1 + 3, line_control & !0x80);
+        write(COM1 + 1, interrupt_enable);
+        write(COM1 + 3, line_control);
+    }
+    present
 }
 
 pub fn install_shared_lock(address: u64) {

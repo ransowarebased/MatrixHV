@@ -120,7 +120,7 @@ pub const MATRIXHV_STATUS_LEAF: u32 = 0x4d48_5652;
 pub const MATRIXHV_STATUS_SIGNATURE_EAX: u32 = 0x4d48_5631;
 pub const MATRIXHV_STATUS_SIGNATURE_EBX: u32 = u32::from_le_bytes(*b"MATR");
 pub const MATRIXHV_STATUS_SIGNATURE_ECX: u32 = u32::from_le_bytes(*b"IXHV");
-pub const MATRIXHV_STATUS_PROTOCOL: u32 = 1;
+pub const MATRIXHV_STATUS_PROTOCOL: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostVmxCapabilities {
