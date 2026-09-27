@@ -50,7 +50,7 @@ fn one_neo_binary_serves_remote_status_and_ping() {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
     let supports_telemetry = status_text.contains("matrixhv_present=true\n")
-        && (4..=6).contains(&protocol);
+        && (4..=7).contains(&protocol);
     let telemetry_format = if protocol >= 5 {
         "format=matrixhv-telemetry-v3"
     } else {

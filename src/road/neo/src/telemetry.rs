@@ -5,10 +5,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL: u32 = 4;
-const MATRIXHV_DIAGNOSTIC_PROTOCOL: u32 = 6;
+const MATRIXHV_DIAGNOSTIC_PROTOCOL: u32 = 7;
 const TELEMETRY_CONTROL_CAPABILITY: u32 = 1 << 8;
 const NESTED_FAILURE_TRACE_CAPABILITY: u32 = 1 << 9;
 const EXIT_PROFILE_CAPABILITY: u32 = 1 << 10;
+const EXIT_REASON_COUNTS_CAPABILITY: u32 = 1 << 11;
+const VMX_HARDWARE_CAPABILITY: u32 = 1 << 12;
+const EPT_RECYCLING_CAPABILITY: u32 = 1 << 13;
 const PROFILE_PAIR_NAMES: [[&str; 2]; 9] = [
     ["rdmsr", "wrmsr"],
     ["cpuid", "nested_invvpid_instructions"],
@@ -327,7 +330,7 @@ mod nested_failure_tests {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn append_nested_failure_trace(text: &mut String, cpu: u32) {
+fn append_nested_failure_trace(text: &mut String, cpu: u32, extended_invept: bool) {
     let prefix = format!("cpu.{cpu}");
     let metadata = diagnostic_cpu(0x100, cpu);
     let count = u64::from(metadata.eax) | (u64::from(metadata.ebx) << 32);
@@ -365,6 +368,12 @@ fn append_nested_failure_trace(text: &mut String, cpu: u32) {
         writeln!(text, "{entry}.code={code}").unwrap();
         if matches!(exit_reason & 0xffff, 23 | 25) {
             writeln!(text, "{entry}.vmcs_field=0x{vmcs_field:x}").unwrap();
+        }
+        if extended_invept && exit_reason & 0xffff == 50 {
+            writeln!(text, "{entry}.invalidation_type={vmcs_field}").unwrap();
+            if matches!(vmcs_field, 1 | 2) {
+                writeln!(text, "{entry}.descriptor_eptp=0x{operand:x}").unwrap();
+            }
         }
         let capability_field = if kind == 1 && code == 12 && matches!(exit_reason & 0xffff, 23 | 25)
         {
@@ -552,10 +561,28 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
                 }
             }
             if caps.eax & EXIT_PROFILE_CAPABILITY != 0 && mode == Mode::General {
+                writeln!(sample, "{prefix}.vmcs_instruction_counter_scope={}",
+                    if caps.eax & EXIT_REASON_COUNTS_CAPABILITY != 0 {
+                        "vcpu_cumulative"
+                    } else {
+                        "current_vmcs_snapshot"
+                    }).unwrap();
                 for (index, names) in PROFILE_PAIR_NAMES.iter().enumerate() {
                     let (first, second) = pair(diagnostic_cpu(index as u32 + 38, cpu));
                     writeln!(sample, "{prefix}.{}={first}", names[0]).unwrap();
                     writeln!(sample, "{prefix}.{}={second}", names[1]).unwrap();
+                }
+            }
+            if caps.eax & EPT_RECYCLING_CAPABILITY != 0 && mode != Mode::Watchdog {
+                let (resets, table_evictions) = pair(diagnostic_cpu(49, cpu));
+                writeln!(sample, "{prefix}.nested_ept02_full_recycles={resets}").unwrap();
+                writeln!(sample, "{prefix}.nested_ept02_table_evictions={table_evictions}").unwrap();
+            }
+            if caps.eax & EXIT_REASON_COUNTS_CAPABILITY != 0 && mode == Mode::General {
+                for index in 0..64 {
+                    let (first, second) = pair(diagnostic_cpu(0x300 + index, cpu));
+                    writeln!(sample, "{prefix}.exit_reason.{}={first}", index * 2).unwrap();
+                    writeln!(sample, "{prefix}.exit_reason.{}={second}", index * 2 + 1).unwrap();
                 }
             }
             if mode != Mode::EptDiagnostics {
@@ -573,7 +600,9 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
         writeln!(text, "{prefix}.coherent={}", u8::from(coherent)).unwrap();
         text.push_str(&sample);
         if protocol >= 5 && mode == Mode::General {
-            append_nested_failure_trace(&mut text, cpu);
+            append_nested_failure_trace(
+                &mut text, cpu, diagnostic_cpu(34, cpu).eax & VMX_HARDWARE_CAPABILITY != 0,
+            );
         }
         if cpu == cpus[0] {
             let low = diagnostic(1);
@@ -646,7 +675,7 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
             mask.count_ones().to_string()
         };
         let mut text = format!(
-            "capabilities=0x{:x}\ncapability_names=vcpu_counters,watchdog_sequence_phase,guest_triad,entry_failure_slot,host_exception_slot,ept_diagnostics,watchdog_lease,remote_vcpu_query{}{}{}\nlogical_processor_count={count}\n",
+            "capabilities=0x{:x}\ncapability_names=vcpu_counters,watchdog_sequence_phase,guest_triad,entry_failure_slot,host_exception_slot,ept_diagnostics,watchdog_lease,remote_vcpu_query{}{}{}{}{}{}\nlogical_processor_count={count}\n",
             caps.eax,
             if caps.eax & TELEMETRY_CONTROL_CAPABILITY != 0 {
                 ",telemetry_control"
@@ -663,6 +692,21 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
             } else {
                 ""
             },
+            if caps.eax & EXIT_REASON_COUNTS_CAPABILITY != 0 {
+                ",exit_reason_counts"
+            } else {
+                ""
+            },
+            if caps.eax & VMX_HARDWARE_CAPABILITY != 0 {
+                ",vmx_hardware"
+            } else {
+                ""
+            },
+            if caps.eax & EPT_RECYCLING_CAPABILITY != 0 {
+                ",ept_recycling"
+            } else {
+                ""
+            },
         );
         if caps.eax & TELEMETRY_CONTROL_CAPABILITY != 0 {
             writeln!(
@@ -672,10 +716,42 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
             )
             .unwrap();
         }
+        if caps.eax & VMX_HARDWARE_CAPABILITY != 0 {
+            let (host_secondary, nested_secondary) = pair(diagnostic(47));
+            let (host_misc, nested_misc) = pair(diagnostic(48));
+            text.push_str(&format_vmx_support(host_secondary, nested_secondary, host_misc, nested_misc));
+        } else {
+            text.push_str("vmcs_shadowing_host_supported=unknown\nvmcs_shadowing_query=requires_updated_matrixhv\n");
+        }
         return text;
     }
     let _ = (matrixhv_present, protocol);
-    "capabilities=none\nlogical_processor_count=unavailable\n".to_string()
+    "capabilities=none\nlogical_processor_count=unavailable\nvmcs_shadowing_host_supported=unknown\nvmcs_shadowing_query=requires_matrixhv_msr_telemetry\n".to_string()
+}
+
+fn format_vmx_support(host_secondary: u64, nested_secondary: u64, host_misc: u64, nested_misc: u64) -> String {
+    format!(
+        "vmx_capability_source=matrixhv_root_msr_snapshot\nvmx_host_secondary_controls=0x{host_secondary:x}\nvmx_nested_secondary_controls=0x{nested_secondary:x}\nvmcs_shadowing_host_supported={}\nvmcs_shadowing_nested_exposed={}\nvmx_host_vmwrite_read_only_supported={}\nvmx_nested_vmwrite_read_only_supported={}\n",
+        host_secondary & (1 << 46) != 0,
+        nested_secondary & (1 << 46) != 0,
+        host_misc & (1 << 29) != 0,
+        nested_misc & (1 << 29) != 0,
+    )
+}
+
+#[cfg(test)]
+mod vmx_support_tests {
+    #[test]
+    fn shadowing_uses_the_allowed_one_bit_and_reports_nested_filtering() {
+        let text = super::format_vmx_support(1 << 46, 1 << 14, 1 << 29, 0);
+        assert!(text.contains("vmcs_shadowing_host_supported=true\n"));
+        assert!(text.contains("vmcs_shadowing_nested_exposed=false\n"));
+        assert!(text.contains("vmx_host_vmwrite_read_only_supported=true\n"));
+        assert!(text.contains("vmx_nested_vmwrite_read_only_supported=false\n"));
+        let text = super::format_vmx_support(1 << 14, 1 << 46, 0, 1 << 29);
+        assert!(text.contains("vmcs_shadowing_host_supported=false\n"));
+        assert!(text.contains("vmcs_shadowing_nested_exposed=true\n"));
+    }
 }
 
 #[cfg(target_os = "windows")]

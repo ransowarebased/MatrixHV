@@ -6,10 +6,17 @@ const BACKGROUND: u32 = 0x1234_5678;
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[repr(C)]
+#[derive(Default)]
 struct TimerContext {
     interval_tsc: u64,
     rate: u64,
     deadline_tsc: u64,
+    samples: u64,
+    expired: u64,
+    pin_controls: u64,
+    cached_pin_controls: u64,
+    event_context: *mut EventContext,
+    snapshots: u64,
 }
 
 global_asm!(
@@ -17,6 +24,16 @@ global_asm!(
     b_diagnostic_interval = const core::mem::offset_of!(TimerContext, interval_tsc),
     b_diagnostic_rate = const core::mem::offset_of!(TimerContext, rate),
     b_diagnostic_deadline = const core::mem::offset_of!(TimerContext, deadline_tsc),
+    b_diagnostic_samples = const core::mem::offset_of!(TimerContext, samples),
+    b_diagnostic_expired = const core::mem::offset_of!(TimerContext, expired),
+    b_nested_vmcs01_pin_based_controls = const core::mem::offset_of!(TimerContext, cached_pin_controls),
+    b_event_context = const core::mem::offset_of!(TimerContext, event_context),
+    test_pin_controls = const core::mem::offset_of!(TimerContext, pin_controls),
+    test_snapshot_count = const core::mem::offset_of!(TimerContext, snapshots),
+    event_ebs_seen = const core::mem::offset_of!(EventContext, exit_boot_services_seen),
+    event_diagnostic_halted = const core::mem::offset_of!(EventContext, diagnostic_halted),
+    event_visual_deadline = const core::mem::offset_of!(EventContext, visual_deadline),
+    pin_based_vm_exec_control = const 0x4000,
     vmx_preemption_timer_value = const 0x482e,
 );
 
@@ -35,6 +52,8 @@ struct EventContext {
     nmi_pending: u64,
     sync_nmi: u64,
     nmi_count: u64,
+    tsc_hz: u64,
+    visual_deadline: u64,
 }
 
 #[repr(C)]
@@ -74,9 +93,13 @@ global_asm!(
     log_serial_sink = const 1,
     event_ebs_seen = const core::mem::offset_of!(EventContext, exit_boot_services_seen),
     event_va_seen = const core::mem::offset_of!(EventContext, virtual_address_change_seen),
+    event_tsc_hz = const core::mem::offset_of!(EventContext, tsc_hz),
+    event_visual_deadline = const core::mem::offset_of!(EventContext, visual_deadline),
 );
 
 unsafe extern "win64" {
+    fn test_dispatch_timer(context: *mut TimerContext);
+    static mut test_visual_tsc: u64;
     fn test_claim_diagnostic(context: *mut EventContext) -> u64;
     fn matrixhv_resident_ebs_callback(event: usize, context: *mut EventContext);
     fn matrixhv_resident_va_callback(event: usize, context: *mut EventContext);
@@ -220,6 +243,7 @@ fn boot_timer_reload_preserves_deadline_and_clamps_hardware_ticks() {
             interval_tsc: 1_000,
             rate,
             deadline_tsc,
+            ..Default::default()
         };
         let mut result = [u64::MAX; 2];
         unsafe { test_reload_timer(&context, now, &mut result) };
@@ -235,10 +259,43 @@ fn disabled_boot_timer_does_not_access_unsupported_vmcs_field() {
         interval_tsc: 0,
         rate: 0,
         deadline_tsc: 10_000,
+        ..Default::default()
     };
     let mut result = [u64::MAX; 2];
     unsafe { test_reload_timer(&context, 1_000, &mut result) };
     assert_eq!(result, [u64::MAX; 2]);
+}
+
+#[test]
+fn boot_timer_retires_after_the_visual_deadline() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let mut pixels = vec![BACKGROUND; WIDTH * HEIGHT];
+    let mut event_context = context(&mut pixels);
+    event_context.visual_deadline = 5_000;
+    let mut timer = TimerContext {
+        interval_tsc: 100,
+        pin_controls: 1 << 6,
+        cached_pin_controls: 1 << 6,
+        event_context: &mut event_context,
+        ..Default::default()
+    };
+    unsafe {
+        test_visual_tsc = 4_999;
+        test_dispatch_timer(&mut timer);
+    }
+    assert_eq!(timer.samples, 1);
+    assert_eq!(timer.snapshots, 1);
+    assert_eq!(timer.expired, 0);
+    unsafe {
+        test_visual_tsc = 5_000;
+        test_dispatch_timer(&mut timer);
+    }
+    assert_eq!(timer.interval_tsc, 0);
+    assert_eq!(timer.pin_controls & (1 << 6), 0);
+    assert_eq!(timer.cached_pin_controls & (1 << 6), 0);
+    assert_eq!(timer.expired, 1);
+    assert_eq!(event_context.visual_base, 0);
+    unsafe { test_set_backend(2) };
 }
 
 fn context(pixels: &mut [u32]) -> EventContext {
@@ -247,6 +304,8 @@ fn context(pixels: &mut [u32]) -> EventContext {
         nmi_pending: 0,
         sync_nmi: 0,
         nmi_count: 0,
+        tsc_hz: 100,
+        visual_deadline: u64::MAX,
         diagnostic_halted: 0,
         exit_boot_services_seen: 1,
         virtual_address_change_seen: 0,
@@ -283,6 +342,56 @@ fn runtime_callbacks_are_idempotent_and_preserve_framebuffer_diagnostics() {
         test_emit_value(&event_context, 0x1234, 2);
     }
     assert!(pixels.iter().any(|&pixel| pixel != BACKGROUND));
+}
+
+#[test]
+fn framebuffer_window_starts_at_ebs_and_expires_after_forty_seconds() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let mut pixels = vec![BACKGROUND; WIDTH * HEIGHT];
+    let mut event_context = context(&mut pixels);
+    event_context.exit_boot_services_seen = 0;
+    event_context.visual_deadline = 0;
+    unsafe {
+        test_visual_tsc = 1000;
+        test_set_backend(3);
+        test_paint_stage(&event_context, 1);
+        test_paint_hex(&event_context, 1, 0);
+    }
+    assert!(pixels.iter().all(|&pixel| pixel == BACKGROUND));
+    unsafe { matrixhv_resident_ebs_callback(0, &mut event_context) };
+    assert_eq!(event_context.visual_deadline, 5000);
+    unsafe {
+        test_visual_tsc = 4999;
+        matrixhv_resident_ebs_callback(0, &mut event_context);
+        matrixhv_resident_va_callback(0, &mut event_context);
+        test_paint_hex(&event_context, u64::MAX, 0);
+    }
+    assert_eq!(event_context.visual_deadline, 5000);
+    assert!(pixels.iter().any(|&pixel| pixel != BACKGROUND));
+    pixels.fill(BACKGROUND);
+    unsafe {
+        test_visual_tsc = 5000;
+        test_paint_stage(&event_context, 1);
+        test_paint_byte(&event_context, 0xff, 5);
+        test_paint_hex(&event_context, u64::MAX, 0);
+        test_emit_value(&event_context, 0x1234, 19);
+        let mut bytes = [0u8; 512];
+        let length = test_copy_serial(bytes.as_mut_ptr(), bytes.len());
+        assert_eq!(std::str::from_utf8(&bytes[..length]).unwrap(),
+                   " efer=0x0000000000001234");
+    }
+    assert_eq!(event_context.visual_base, 0);
+    assert!(pixels.iter().all(|&pixel| pixel == BACKGROUND));
+    unsafe {
+        // A repeated notification or a clock rollback must not revive the aperture.
+        test_visual_tsc = 1000;
+        matrixhv_resident_ebs_callback(0, &mut event_context);
+        test_paint_stage(&event_context, 1);
+        test_set_backend(2);
+    }
+    assert_eq!(event_context.visual_base, 0);
+    assert_eq!(event_context.visual_deadline, 5000);
+    assert!(pixels.iter().all(|&pixel| pixel == BACKGROUND));
 }
 
 fn check_pixels(pixels: &[u32], marker_indices: &[usize]) {
@@ -352,6 +461,8 @@ fn missing_framebuffer_is_ignored() {
         nmi_pending: 0,
         sync_nmi: 0,
         nmi_count: 0,
+        tsc_hz: 100,
+        visual_deadline: u64::MAX,
         diagnostic_halted: 0,
         exit_boot_services_seen: 1,
         virtual_address_change_seen: 0,

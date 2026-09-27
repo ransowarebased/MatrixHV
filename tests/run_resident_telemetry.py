@@ -23,7 +23,7 @@ offsets = {}
 cursor = 0
 for name in names:
     offsets[name] = cursor
-    cursor += 512 if name == "event_cpu_contexts" else (
+    cursor += 1024 if name == "b_nested_exit_reason_counts" else 512 if name == "event_cpu_contexts" else (
         192 * 8 if name == "b_nested_failure_trace" else (
         56 if name in {"b_watchdog_before", "b_watchdog_after", "b_watchdog_resume", "b_entry_failure_guest"}
         else 32 if name == "b_nested_exit_handler_cycles" else 8

@@ -337,6 +337,7 @@ struct ResidentEventContext {
     failed_stop_result: u64,
     watchdog_tsc_hz: u64,
     cpu_contexts: [u64; 64],
+    visual_deadline_tsc: u64,
 }
 
 #[repr(C, align(16))]
@@ -667,6 +668,10 @@ const BCTX_NESTED_VMX_ENTRY_CTLS: usize = core::mem::offset_of!(ResidentBootCont
     + core::mem::offset_of!(NestedVmxState, vmx_entry_ctls);
 const BCTX_NESTED_VMX_MISC: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, vmx_misc);
+const BCTX_NESTED_HOST_PROCBASED_CTLS2: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, host_procbased_ctls2);
+const BCTX_NESTED_HOST_MISC: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, host_misc);
 const BCTX_NESTED_VMX_CR0_FIXED0: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, vmx_cr0_fixed0);
 const BCTX_NESTED_VMX_CR0_FIXED1: usize = core::mem::offset_of!(ResidentBootContext, nested)
@@ -1496,6 +1501,7 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
             failed_stop_result: 0,
             watchdog_tsc_hz: 0,
             cpu_contexts: [0; 64],
+            visual_deadline_tsc: 0,
         });
     }
     let serial_lock_address = context_pages.physical_address() + EVENT_CTX_SERIAL_LOCK as u64;
@@ -2544,7 +2550,7 @@ pub fn run_boot_loader(
         first_high_bar.1
     ));
     crate::boot::screen::message(format_args!(
-        "runtime diagnostics retain counters and serial output; framebuffer writes stop at ExitBootServices"
+        "runtime framebuffer diagnostics stop 40 seconds after ExitBootServices"
     ));
     crate::boot::screen::message(format_args!(
         "mark rows: first reason bits, VMRESUME error bits, first eight exits"
@@ -3323,6 +3329,8 @@ global_asm!(
     b_nested_vmx_exit_ctls = const BCTX_NESTED_VMX_EXIT_CTLS,
     b_nested_vmx_entry_ctls = const BCTX_NESTED_VMX_ENTRY_CTLS,
     b_nested_vmx_misc = const BCTX_NESTED_VMX_MISC,
+    b_nested_host_procbased_ctls2 = const BCTX_NESTED_HOST_PROCBASED_CTLS2,
+    b_nested_host_misc = const BCTX_NESTED_HOST_MISC,
     b_nested_vmx_cr0_fixed0 = const BCTX_NESTED_VMX_CR0_FIXED0,
     b_nested_vmx_cr0_fixed1 = const BCTX_NESTED_VMX_CR0_FIXED1,
     b_nested_vmx_cr4_fixed0 = const BCTX_NESTED_VMX_CR4_FIXED0,
@@ -3449,6 +3457,7 @@ global_asm!(
     b_nested_reflected_exit_counts = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, reflected_exit_counts),
     b_nested_exit_started_tsc = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, exit_started_tsc),
     b_nested_exit_handler_cycles = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, exit_handler_cycles),
+    b_nested_exit_reason_counts = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, exit_reason_counts),
     b_nested_ept02_cached_mbec = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, ept02_cached_mbec),
     b_nested_l2_last_exit_rip = const BCTX_NESTED_L2_LAST_EXIT_RIP,
     b_nested_l2_last_exit_rsp = const BCTX_NESTED_L2_LAST_EXIT_RSP,
@@ -3479,6 +3488,10 @@ global_asm!(
     b_nested_ept01_pointer = const BCTX_NESTED_EPT01_POINTER,
     b_nested_ept02_recycle_count = const core::mem::offset_of!(ResidentBootContext, nested)
         + core::mem::offset_of!(NestedVmxState, ept02_recycle_count),
+    b_nested_ept02_eviction_cursor = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, ept02_eviction_cursor),
+    b_nested_ept02_table_eviction_count = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, ept02_table_eviction_count),
     b_nested_failure_trace = const core::mem::offset_of!(ResidentBootContext, nested)
         + core::mem::offset_of!(NestedVmxState, failure_trace),
     nested_failure_trace_capacity = const crate::nested::NESTED_FAILURE_TRACE_CAPACITY,
@@ -3573,6 +3586,8 @@ global_asm!(
     event_canary_offset = const EVENT_CTX_CANARY,
     event_visual_base = const EVENT_CTX_VISUAL_BASE,
     event_visual_stride_bytes = const EVENT_CTX_VISUAL_STRIDE_BYTES,
+    event_visual_deadline = const core::mem::offset_of!(ResidentEventContext, visual_deadline_tsc),
+    event_tsc_hz = const core::mem::offset_of!(ResidentEventContext, watchdog_tsc_hz),
     event_post_ebs_cpu_mask = const EVENT_CTX_POST_EBS_CPU_MASK,
     event_diagnostic_halted = const EVENT_CTX_DIAGNOSTIC_HALTED,
     event_host_fault_vector = const EVENT_CTX_HOST_FAULT_VECTOR,

@@ -199,6 +199,8 @@ fn vmware_vhv_secondary_intercepts_are_available() {
 fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     let host = host_vmx_capabilities();
     let capabilities = NestedVmxCapabilities::from_host(host);
+    assert_eq!(capabilities.host_procbased_ctls2, host.procbased_ctls2);
+    assert_eq!(capabilities.host_misc, host.misc);
     let pinbased_bits = nested::VMX_LEGACY_PINBASED_DEFAULT1
         | nested::VMX_PIN_EXTERNAL_INTERRUPT_EXITING
         | nested::VMX_PIN_NMI_EXITING
@@ -256,7 +258,8 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     assert_eq!(capabilities.vmx_entry_ctls, legacy_entry_control);
     assert_eq!(
         capabilities.vmx_misc,
-        (host.misc & !(0x1ff_u64 << 16)) | (nested::VMX_CR3_TARGET_COUNT << 16)
+        (host.misc & !((0x1ff_u64 << 16) | (1 << 29)))
+            | (nested::VMX_CR3_TARGET_COUNT << 16)
     );
     assert_eq!(capabilities.vmx_cr0_fixed0, host.cr0_fixed0);
     assert_eq!(capabilities.vmx_cr0_fixed1, host.cr0_fixed1);
@@ -609,7 +612,7 @@ fn cpuid_contract_uses_architectural_bits_and_hypervisor_namespace() {
     assert_eq!(MATRIXHV_STATUS_SIGNATURE_EAX, 0x4d48_5631);
     assert_eq!(MATRIXHV_STATUS_SIGNATURE_EBX.to_le_bytes(), *b"MATR");
     assert_eq!(MATRIXHV_STATUS_SIGNATURE_ECX.to_le_bytes(), *b"IXHV");
-    assert_eq!(MATRIXHV_STATUS_PROTOCOL, 6);
+    assert_eq!(MATRIXHV_STATUS_PROTOCOL, 7);
     assert_eq!(HYPERVISOR_LEAF_START, 0x4000_0000);
     assert_eq!(HYPERV_FEATURES_LEAF, 0x4000_0003);
     assert_eq!(HYPERVISOR_LEAF_END, 0x4fff_ffff);

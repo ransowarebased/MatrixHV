@@ -28,6 +28,22 @@ timer_assembly = timer_assembly.replace(
     "vmwrite rax, r11", "mov [rbx], r11\nmov [rbx + 8], rax\ncmp r11, 0"
 )
 timer_assembly += "\n.Lresident_dispatch_vmwrite_failed:\nud2"
+boot_timer_start = source.index('.Lresident_dispatch_boot_timer:')
+boot_timer_end = source.index('.Lresident_boot_timer_retry_event:', boot_timer_start)
+boot_timer = source[boot_timer_start:boot_timer_end]
+boot_timer = boot_timer.replace("rdtsc", "mov rax, qword ptr [rip + test_visual_tsc]\nmov rdx, rax\nshr rdx, 32")
+boot_timer = boot_timer.replace("vmread r11, rax", "mov r11, [r12 + {test_pin_controls}]\ncmp r12, 0")
+boot_timer = boot_timer.replace("vmwrite rax, r11", "mov [r12 + {test_pin_controls}], r11\ncmp r12, 0")
+timer_assembly += "\n" + boot_timer + """
+.Lresident_boot_timer_retry_event:
+    ret
+.Lresident_diagnostic_snapshot:
+    inc qword ptr [r12 + {test_snapshot_count}]
+    ret
+.Lresident_dispatch_unsupported:
+.Lresident_dispatch_vmread_failed:
+    ud2
+"""
 assembly = (
     source[start:end]
     + source[emit_start:hex_start]
@@ -53,6 +69,7 @@ assembly = (
     .replace(".Lresident_island_fatal_serial", ".Ltest_exception_return")
 )
 assembly += "\njmp .Ltest_exception_return"
+assembly = assembly.replace("rdtsc", "mov rax, qword ptr [rip + test_visual_tsc]\nmov rdx, rax\nshr rdx, 32")
 screen = (project / "src/boot.rs").read_text(encoding="utf-8")
 
 
@@ -61,6 +78,12 @@ def marker_constant(name):
 
 
 wrappers = """
+.data
+.balign 8
+.globl test_visual_tsc
+test_visual_tsc:
+    .quad 1000
+.text
 .Lresident_nested_eptp_sync_host_nmi:
     xor eax, eax
     ret
@@ -223,6 +246,13 @@ matrixhv_resident_island_log_backend:
 (output / "resident-visual.S").write_text(wrappers + assembly, encoding="utf-8")
 timer_wrapper = """
 .text
+.globl test_dispatch_timer
+test_dispatch_timer:
+    push r12
+    mov r12, rcx
+    call .Lresident_dispatch_boot_timer
+    pop r12
+    ret
 .globl test_reload_timer
 test_reload_timer:
     push rbx

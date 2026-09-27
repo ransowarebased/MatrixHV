@@ -20,7 +20,7 @@ end = source.index('.Lresident_nested_host_msr_list_is_mapped:')
 prepare_start = switch_source.index('.Lresident_nested_prepare_ept02:')
 prepare_end = switch_source.index('.Lresident_nested_activate_vmcs02_ept:')
 invept_start = source.index('.Lresident_nested_invalidate_ept12_context:')
-invept_end = source.index('.Lresident_dispatch_invept_all_contexts:', invept_start)
+invept_end = source.index('.Lresident_dispatch_invvpid:', invept_start)
 assembly = (switch_source[prepare_start:prepare_end] + source[start:end] + source[invept_start:invept_end]).strip()
 vmfunc_start = switch_source.index('.Lresident_nested_switch_eptp:')
 vmfunc_end = switch_source.index('.Lresident_nested_prepare_ept02:', vmfunc_start)
@@ -208,7 +208,7 @@ merge_start = source.index('.Lresident_nested_merge_vmcs02_controls:')
 primary_start = source.index('mov rax, {cpu_based_vm_exec_control}', merge_start)
 primary_end = source.index('bt r11, 21', primary_start)
 secondary_start = source.index('mov rax, {secondary_vm_exec_control}', primary_end)
-secondary_end = source.index('xor r11d, r11d', secondary_start)
+secondary_end = source.index('mov rax, {vm_exit_controls}', secondary_start)
 merge_assembly = (source[primary_start:primary_end] + source[secondary_start:secondary_end]).strip()
 merge_assembly = merge_assembly.replace(
     ".Lresident_nested_write_vmcs02_control", ".Ltest_capture_vmcs02_control"
@@ -218,6 +218,18 @@ merge_assembly += (
     "mov qword ptr [r12 + {test_hardware} + rax * 8], r11\nret\n"
 )
 (output / "resident-intercepts.S").write_text(merge_assembly)
+policy_start = source.index('bt dword ptr [r12 + {b_nested_vmcs12_primary_control}], 28', merge_start)
+policy_end = source.index('.Lresident_nested_merge_msr_bitmap_done:', policy_start)
+policy_assembly = source[policy_start:policy_end].replace(
+    '.Lresident_nested_', '.Ltest_msr_policy_'
+)
+policy_assembly += (
+    '\nret\n.Ltest_msr_policy_host_page_is_mapped:\n'
+    'mov eax, dword ptr [r12 + {test_mapped}]\nret\n'
+    '.Ltest_msr_policy_write_vmcs02_control:\n'
+    'mov qword ptr [r12 + {test_selected}], r11\nret\n'
+)
+(output / "resident-msr-policy.S").write_text(policy_assembly)
 subprocess.run(
     ["rustc", "--edition=2024", "--test", str(project / "tests/nested_ept.rs"),
      "-o", str(executable)], check=True, cwd=project,

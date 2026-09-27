@@ -9,7 +9,8 @@ struct InterceptContext {
     l1_secondary: u64,
     vpid: u64,
     merged_secondary: u64,
-    hardware: [u64; 2],
+    xss_bitmap: u64,
+    hardware: [u64; 3],
 }
 
 core::arch::global_asm!(
@@ -23,6 +24,8 @@ core::arch::global_asm!(
     include_str!("../builds/nested-ept-tests/resident-intercepts.S"),
     cpu_based_vm_exec_control = const 0,
     secondary_vm_exec_control = const 1,
+    xss_exiting_bitmap = const 2,
+    b_nested_vmcs12_xss_exiting_bitmap = const std::mem::offset_of!(InterceptContext, xss_bitmap),
     b_nested_vmcs01_primary_controls = const std::mem::offset_of!(InterceptContext, l0_primary),
     b_nested_vmcs12_primary_control = const std::mem::offset_of!(InterceptContext, l1_primary),
     b_nested_vmcs01_secondary_controls = const std::mem::offset_of!(InterceptContext, l0_secondary),
@@ -46,23 +49,24 @@ fn merge_test_intercepts(context: &mut InterceptContext) {
 fn l1_monitor_trap_and_wbinvd_controls_reach_vmcs02_and_can_be_cleared() {
     let mut context = InterceptContext {
         l0_primary: 1 << 28,
-        l1_primary: 1 << 27,
+        l1_primary: (1 << 31) | (1 << 27),
         l0_secondary: 1 << 1,
         l1_secondary: 1 << 6,
         vpid: 0,
         merged_secondary: 0,
-        hardware: [0; 2],
+        xss_bitmap: 0,
+        hardware: [0; 3],
     };
     merge_test_intercepts(&mut context);
     assert_eq!(
         context.hardware,
-        [(1 << 28) | (1 << 27), (1 << 1) | (1 << 6)]
+        [(1 << 31) | (1 << 28) | (1 << 27), (1 << 1) | (1 << 6), 0]
     );
     assert_eq!(context.merged_secondary, context.hardware[1]);
     context.l1_primary = 0;
     context.l1_secondary = 0;
     merge_test_intercepts(&mut context);
-    assert_eq!(context.hardware, [1 << 28, 1 << 1]);
+    assert_eq!(context.hardware, [1 << 28, 1 << 1, 0]);
 }
 
 #[test]
@@ -74,7 +78,8 @@ fn vmfunc_trapping_follows_l1_secondary_control_activation() {
         l1_secondary: 0x2002,
         vpid: 0,
         merged_secondary: 0,
-        hardware: [0; 2],
+        xss_bitmap: 0,
+        hardware: [0; 3],
     };
     merge_test_intercepts(&mut context);
     assert_eq!(context.hardware[1], 0x2002);
@@ -85,6 +90,91 @@ fn vmfunc_trapping_follows_l1_secondary_control_activation() {
     context.l1_secondary = 2;
     merge_test_intercepts(&mut context);
     assert_eq!(context.hardware[1], 2);
+}
+
+#[test]
+fn inactive_secondary_controls_do_not_add_l2_intercepts_or_mbec() {
+    let mut context = InterceptContext {
+        l0_primary: (1 << 31) | (1 << 28),
+        l1_primary: 0,
+        l0_secondary: 2,
+        l1_secondary: 0x5038ce,
+        vpid: 0,
+        merged_secondary: 0,
+        xss_bitmap: u64::MAX,
+        hardware: [0; 3],
+    };
+    merge_test_intercepts(&mut context);
+    assert_eq!(context.hardware[1], 2);
+    assert_eq!(context.hardware[2], 0);
+    context.l1_primary = 1 << 31;
+    merge_test_intercepts(&mut context);
+    assert_eq!(context.hardware[1], 0x5038ce);
+    assert_eq!(context.hardware[2], u64::MAX);
+    context.l1_primary = 0;
+    merge_test_intercepts(&mut context);
+    assert_eq!(context.hardware[1], 2);
+    assert_eq!(context.hardware[2], 0);
+}
+
+#[repr(C)]
+struct MsrPolicyContext {
+    primary: u64,
+    l0: *const u8,
+    l1: *const u8,
+    composed: *mut u8,
+    mapped: u64,
+    selected: *const u8,
+}
+
+core::arch::global_asm!(
+    ".text",
+    ".globl select_test_msr_bitmap",
+    "select_test_msr_bitmap:",
+    "push r12", "push rsi", "push rdi", "mov r12, rcx",
+    "call .Ltest_msr_policy_entry",
+    "pop rdi", "pop rsi", "pop r12", "ret",
+    ".Ltest_msr_policy_entry:",
+    include_str!("../builds/nested-ept-tests/resident-msr-policy.S"),
+    b_nested_vmcs12_primary_control = const std::mem::offset_of!(MsrPolicyContext, primary),
+    b_nested_l0_msr_bitmap = const std::mem::offset_of!(MsrPolicyContext, l0),
+    b_nested_vmcs12_msr_bitmap = const std::mem::offset_of!(MsrPolicyContext, l1),
+    b_nested_composed_msr_bitmap = const std::mem::offset_of!(MsrPolicyContext, composed),
+    nested_msr_bitmap_qword_count = const 512,
+    msr_bitmap = const 0,
+    test_mapped = const std::mem::offset_of!(MsrPolicyContext, mapped),
+    test_selected = const std::mem::offset_of!(MsrPolicyContext, selected),
+);
+
+unsafe extern "win64" {
+    fn select_test_msr_bitmap(context: *mut MsrPolicyContext);
+}
+
+#[test]
+fn disabled_l1_msr_bitmap_intercepts_every_msr_and_tracks_reactivation() {
+    let mut l0 = [0_u8; 4096];
+    let mut l1 = [0_u8; 4096];
+    let mut composed = [0_u8; 4096];
+    l0[16] = 0x12;
+    l1[2048 + 17] = 0x34;
+    let mut context = MsrPolicyContext {
+        primary: 0,
+        l0: l0.as_ptr(),
+        l1: l1.as_ptr(),
+        composed: composed.as_mut_ptr(),
+        mapped: 1,
+        selected: std::ptr::null(),
+    };
+    for primary in [0, 1 << 28, 0] {
+        context.primary = primary;
+        // The production routine accesses only these live arrays and the context.
+        unsafe { select_test_msr_bitmap(&mut context) };
+        assert_eq!(context.selected, composed.as_ptr());
+        for offset in 0..4096 {
+            let expected = if primary == 0 { 0xff } else { l0[offset] | l1[offset] };
+            assert_eq!(composed[offset], expected);
+        }
+    }
 }
 
 #[repr(C)]
@@ -572,6 +662,8 @@ struct Context {
     invalidations: u64,
     native_invept: u64,
     recycles: u64,
+    eviction_cursor: u64,
+    table_evictions: u64,
     ept02: u64,
     pool: u64,
     pool_pages: u64,
@@ -671,6 +763,14 @@ core::arch::global_asm!(
     "call .Lresident_nested_switch_eptp",
     "pop r15", "pop r14", "pop r13", "pop r12",
     "pop rsi", "pop rdi", "pop rbp", "pop rbx", "ret",
+    ".globl invalidate_test_all_ept_contexts",
+    "invalidate_test_all_ept_contexts:",
+    "push rbx", "push rbp", "push rdi", "push rsi",
+    "push r12", "push r13", "push r14", "push r15",
+    "mov r12, rcx", "mov r10, rdx",
+    "call .Lresident_dispatch_invept_all_contexts",
+    "pop r15", "pop r14", "pop r13", "pop r12",
+    "pop rsi", "pop rdi", "pop rbp", "pop rbx", "ret",
     ".globl validate_test_vm_functions",
     "validate_test_vm_functions:",
     "push r12", "mov r12, rcx",
@@ -737,6 +837,8 @@ core::arch::global_asm!(
     b_nested_ept02_table_pool = const std::mem::offset_of!(Context, pool),
     b_nested_ept02_table_pool_pages = const std::mem::offset_of!(Context, pool_pages),
     b_nested_ept02_table_pool_used = const std::mem::offset_of!(Context, pool_used),
+    b_nested_ept02_eviction_cursor = const std::mem::offset_of!(Context, eviction_cursor),
+    b_nested_ept02_table_eviction_count = const std::mem::offset_of!(Context, table_evictions),
     b_nested_ept_composition_count = const std::mem::offset_of!(Context, compositions),
     b_nested_vmcs12_ept_pointer = const std::mem::offset_of!(Context, ept12),
     b_nested_vmcs12_secondary_control = const std::mem::offset_of!(Context, secondary_control),
@@ -762,6 +864,7 @@ unsafe extern "win64" {
     fn revalidate_test_ept(context: *mut Context);
     fn prepare_test_ept(context: *mut Context);
     fn invalidate_test_ept_context(context: *mut Context, ept_pointer: u64);
+    fn invalidate_test_all_ept_contexts(context: *mut Context, descriptor: *const u64) -> u64;
     fn switch_test_eptp(context: *mut Context, function: u64, index: u64) -> u64;
     fn validate_test_vm_functions(context: *mut Context) -> u64;
     fn refresh_test_eptp_list(context: *mut Context);
@@ -1003,6 +1106,23 @@ fn context(arena: &mut Arena, ept12: u64, ept01: u64) -> Context {
         alternate_pool_pages: 16,
         ..Default::default()
     }
+}
+
+#[test]
+fn inactive_l1_ept_does_not_resolve_an_exit_using_stale_tables() {
+    let mut arena = Arena::new();
+    let ept12 = arena.pages(1);
+    let ept01 = arena.pages(1);
+    arena.map(ept12, 0x200000, 0x400000, 21, 0xb7);
+    arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+    let mut state = context(&mut arena, ept12, ept01);
+    state.primary_control = 0;
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+    assert_eq!(state.pool_used, 0);
+    assert_eq!(state.compositions, 0);
+    state.primary_control = 1 << 31;
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    assert!(state.pool_used > 0);
 }
 
 #[test]
@@ -1574,6 +1694,37 @@ fn ept_cache_retains_each_execution_mode_and_invalidates_both_by_root() {
     assert_eq!(leaf(mbec_root, state.gpa).1, 0);
 }
 #[test]
+fn global_invept_ignores_eptp_and_revokes_both_cached_contexts() {
+    for descriptor_eptp in [0, 0x1234, u64::MAX] {
+        let mut arena = Arena::new();
+        let ept12 = arena.pages(1);
+        let ept01 = arena.pages(1);
+        arena.map(ept12, 0x200000, 0x400000, 21, 0x4b7);
+        arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+        let mut state = context(&mut arena, ept12 | 0x1e, ept01);
+        let supervisor_root = state.ept02;
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+        state.secondary_control |= 1 << 22;
+        unsafe { prepare_test_ept(&mut state) };
+        let mbec_root = state.ept02;
+        assert_ne!(supervisor_root, mbec_root);
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+        arena.map(ept12, 0x200000, 0, 21, 0);
+        let invalidations = state.invalidations;
+        let descriptor = [descriptor_eptp, 0];
+        assert_eq!(
+            unsafe { invalidate_test_all_ept_contexts(&mut state, descriptor.as_ptr()) },
+            0,
+            "Global INVEPT rejected ignored EPTP {descriptor_eptp:#x}"
+        );
+        assert_eq!(state.invalidations, invalidations + 2);
+        assert_eq!(state.ept02, mbec_root);
+        assert_eq!(leaf(supervisor_root, state.gpa).1, 0);
+        assert_eq!(leaf(mbec_root, state.gpa).1, 0);
+    }
+}
+
+#[test]
 fn composition_translates_every_ept12_table_and_honors_table_write_protection() {
     let mut arena = Arena::new();
     let tables = [
@@ -1835,6 +1986,54 @@ fn recycles_exhausted_tables_without_reflecting_a_false_violation() {
 }
 
 #[test]
+fn full_pool_recycles_one_leaf_table_and_retains_other_translations() {
+    let mut arena = Arena::new();
+    let ept12 = arena.pages(1);
+    let ept01 = arena.pages(1);
+    for region in 1..=12 {
+        for offset in [0x3000, 0x4000] {
+            let address = region * 0x200000 + offset;
+            arena.map(ept12, address, address, 12, 0x37);
+        }
+        arena.map(ept01, region * 0x200000, region * 0x200000, 21, 0xb7);
+    }
+    let mut state = context(&mut arena, ept12, ept01);
+    state.pool_pages = 6;
+    for region in 1..=4 {
+        for offset in [0x3000, 0x4000] {
+            state.gpa = region * 0x200000 + offset;
+            assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+        }
+    }
+    assert_eq!(state.pool_used, 6);
+    state.gpa = 0xa03000;
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    assert_eq!(leaf(state.ept02, state.gpa), (12, state.gpa | 0x37));
+    let retained = (1..=4).flat_map(|region| [0x3000, 0x4000].map(move |offset| region * 0x200000 + offset))
+        .filter(|address| leaf(state.ept02, *address).1 != 0).count();
+    assert_eq!(retained, 6);
+    assert_eq!(state.recycles, 0);
+    assert_eq!(state.table_evictions, 1);
+    assert_eq!(state.pool_used, 6);
+    assert_eq!(leaf(state.ept02, 0xa04000).1, 0);
+    state.telemetry_active = 0;
+    for region in 6..=12 {
+        state.gpa = region * 0x200000 + 0x3000;
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+        assert_eq!(leaf(state.ept02, state.gpa), (12, state.gpa | 0x37));
+        assert_eq!(leaf(state.ept02, state.gpa + 4096).1, 0);
+        assert_eq!(leaf(state.ept02, (region - 4) * 0x200000 + 0x3000).1, 0);
+        for retained_region in region - 3..region {
+            let address = retained_region * 0x200000 + 0x3000;
+            assert_eq!(leaf(state.ept02, address), (12, address | 0x37));
+        }
+    }
+    assert_eq!(state.pool_used, 6);
+    assert_eq!(state.table_evictions, 1);
+    assert_eq!(state.recycles, 0);
+}
+
+#[test]
 fn replaces_a_cached_large_leaf_after_l1_relaxes_permissions() {
     let mut arena = Arena::new();
     let ept12 = arena.pages(1);
@@ -2008,6 +2207,197 @@ fn revalidation_visits_four_kib_leaves_and_upper_level_revocations() {
         revalidate_test_ept(&mut state);
     }
     assert_eq!(leaf(state.ept02, state.gpa), (12, 0));
+}
+
+#[test]
+fn revalidation_checks_sparse_boundary_slots_and_mbec_only_entries() {
+    let mut arena = Arena::new();
+    let ept12 = arena.pages(1);
+    let ept01 = arena.pages(1);
+    let slots = [0, 1, 7, 8, 63, 64, 255, 256, 510, 511];
+    for slot in slots {
+        let address = 0x200000 + slot * 4096;
+        arena.map(ept12, address, address + 0x200000, 12, 0x37);
+    }
+    arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+    let mut state = context(&mut arena, ept12, ept01);
+    for slot in slots {
+        state.gpa = 0x200000 + slot * 4096;
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+        let entry = *entry_addresses(state.ept02, state.gpa).last().unwrap();
+        // A user-execute-only MBEC entry must still be visited, even without R/W/X.
+        unsafe { (entry as *mut u64).write(0x400) };
+        arena.map(ept12, state.gpa, 0, 12, 0);
+    }
+    unsafe { revalidate_test_ept(&mut state) };
+    for slot in slots {
+        let entry = *entry_addresses(state.ept02, 0x200000 + slot * 4096).last().unwrap();
+        assert_eq!(unsafe { (entry as *const u64).read() }, 0);
+    }
+}
+
+#[test]
+fn dense_revalidation_updates_stale_translations_and_retains_unchanged_mappings() {
+    let mut arena = Arena::new();
+    let ept12 = arena.pages(1);
+    let ept01 = arena.pages(1);
+    arena.map(ept01, 0, 0, 30, 0xb7);
+    for index in 0..24 {
+        let address = 0x200000 + index * 0x200000;
+        arena.map(ept12, address, address + 0x200000, 12, 0x37);
+    }
+    let mut state = context(&mut arena, ept12, ept01);
+    state.pool = arena.pages(32);
+    state.pool_pages = 32;
+    for index in 0..24 {
+        state.gpa = 0x200000 + index * 0x200000;
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    }
+    assert!(state.pool_used >= 24);
+    let pool_used = state.pool_used;
+    let address = state.gpa;
+    arena.map(ept12, address, address + 0x400000, 12, 0x31);
+    unsafe { revalidate_test_ept(&mut state) };
+    assert_eq!(leaf(state.ept02, address), (12, address + 0x400000 + 0x31));
+    for index in 0..23 {
+        let unchanged_address = 0x200000 + index * 0x200000;
+        assert_eq!(
+            leaf(state.ept02, unchanged_address),
+            (12, unchanged_address + 0x200000 + 0x37)
+        );
+    }
+    assert_eq!(state.pool_used, pool_used);
+    assert_eq!(state.native_invept, 1);
+    arena.map(ept12, address, 0, 12, 0);
+    unsafe { revalidate_test_ept(&mut state) };
+    assert_eq!(leaf(state.ept02, address).1, 0);
+}
+
+#[test]
+#[ignore = "Run explicitly to measure the production EPT revalidation assembly"]
+fn benchmark_ept_revalidation() {
+    for leaves_per_table in [1_u64, 16, 512] {
+        let mut arena = Arena::new();
+        let ept12 = arena.pages(1);
+        let ept01 = arena.pages(1);
+        for table in 1..=16 {
+            for slot in 0..leaves_per_table {
+                let address = table * 0x200000 + slot * 4096;
+                arena.map(ept12, address, address + 0x4000000, 12, 0x37);
+            }
+            arena.map(ept01, table * 0x200000 + 0x4000000,
+                      table * 0x200000 + 0x8000000, 21, 0xb7);
+        }
+        let mut state = context(&mut arena, ept12, ept01);
+        state.pool = arena.pages(32);
+        state.pool_pages = 32;
+        state.host_cr3 = arena.host_map();
+        for table in 1..=16 {
+            for slot in 0..leaves_per_table {
+                state.gpa = table * 0x200000 + slot * 4096;
+                assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+            }
+        }
+        let mut timings = Vec::new();
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            for _ in 0..1000 {
+                unsafe { revalidate_test_ept(std::hint::black_box(&mut state)) };
+            }
+            timings.push(start.elapsed().as_nanos() / 1000);
+        }
+        timings.sort_unstable();
+        println!("leaves_per_table={leaves_per_table} table_pages={} median_ns={}",
+                 state.pool_used, timings[3]);
+    }
+}
+
+#[test]
+#[ignore = "Run explicitly to measure INVEPT together with working-set refill"]
+fn benchmark_ept_invalidation_and_refill() {
+    for leaves_per_table in [1_u64, 16, 512] {
+        let mut arena = Arena::new();
+        let ept12 = arena.pages(1);
+        let ept01 = arena.pages(1);
+        arena.map(ept01, 0, 0, 30, 0xb7);
+        let mut addresses = Vec::new();
+        for table in 1..=32 {
+            for slot in 0..leaves_per_table {
+                let address = table * 0x200000 + slot * 4096;
+                arena.map(ept12, address, address + 0x8000000, 12, 0x37);
+                addresses.push(address);
+            }
+        }
+        let mut state = context(&mut arena, ept12, ept01);
+        state.pool = arena.pages(64);
+        state.pool_pages = 64;
+        state.host_cr3 = arena.host_map();
+        for &address in &addresses {
+            state.gpa = address;
+            assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+        }
+        let mut timings = Vec::new();
+        let mut refill_faults = 0;
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            for _ in 0..30 {
+                unsafe { revalidate_test_ept(std::hint::black_box(&mut state)) };
+                for &address in &addresses {
+                    if std::hint::black_box(leaf(state.ept02, address).1) & 7 == 0 {
+                        state.gpa = address;
+                        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+                        refill_faults += 1;
+                    }
+                }
+            }
+            timings.push(start.elapsed().as_nanos() / 30);
+        }
+        timings.sort_unstable();
+        println!(
+            "leaves_per_table={leaves_per_table} median_ns={} refill_faults_per_invept={}",
+            timings[2], refill_faults / 150
+        );
+    }
+}
+
+#[test]
+#[ignore = "Run explicitly to measure full-cache recycling with a reused working set"]
+fn benchmark_ept_pool_recycling() {
+    for leaves_per_table in [1_u64, 16, 512] {
+        let mut arena = Arena::new();
+        let ept12 = arena.pages(1);
+        let ept01 = arena.pages(1);
+        arena.map(ept01, 0, 0, 30, 0xb7);
+        let mut hot = Vec::new();
+        for table in 1..=64 {
+            for slot in 0..if table <= 8 { leaves_per_table } else { 1 } {
+                let address = table * 0x200000 + slot * 4096;
+                arena.map(ept12, address, address, 12, 0x37);
+                if table <= 8 {
+                    hot.push(address);
+                }
+            }
+        }
+        let mut state = context(&mut arena, ept12, ept01);
+        state.pool = arena.pages(18);
+        state.pool_pages = 18;
+        state.host_cr3 = arena.host_map();
+        let start = std::time::Instant::now();
+        let mut faults = 0_u64;
+        for _ in 0..10 {
+            for table in 9..=64 {
+                for address in std::iter::once(table * 0x200000).chain(hot.iter().copied()) {
+                    if leaf(state.ept02, address).1 & 7 == 0 {
+                        state.gpa = address;
+                        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+                        faults += 1;
+                    }
+                }
+            }
+        }
+        println!("leaves_per_table={leaves_per_table} faults={faults} full_resets={} table_evictions={} elapsed_ns={}",
+                 state.recycles, state.table_evictions, start.elapsed().as_nanos());
+    }
 }
 
 #[repr(C)]

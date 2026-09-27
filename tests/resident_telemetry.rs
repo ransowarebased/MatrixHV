@@ -12,7 +12,7 @@ unsafe extern "win64" {
     fn test_diagnostic(context: *mut u64, shared: *mut u64, subleaf: u32, result: *mut u32);
 }
 
-fn diagnostic(context: &mut [u64; 512], shared: &mut [u64; 512], subleaf: u32) -> [u32; 4] {
+fn diagnostic(context: &mut [u64; 1024], shared: &mut [u64; 1024], subleaf: u32) -> [u32; 4] {
     let mut result = [0; 4];
     unsafe {
         test_diagnostic(
@@ -27,7 +27,7 @@ fn diagnostic(context: &mut [u64; 512], shared: &mut [u64; 512], subleaf: u32) -
 
 #[test]
 fn telemetry_queries_do_not_advance_sequence_or_overwrite_last_guest() {
-    let mut context = [0; 512];
+    let mut context = [0; 1024];
     context[offset("b_telemetry_enabled")] = 1;
     context[offset("b_last_reason")] = 10;
     context[offset("b_last_rax")] = 0x4d48_5652;
@@ -43,7 +43,7 @@ fn telemetry_queries_do_not_advance_sequence_or_overwrite_last_guest() {
 
 #[test]
 fn exit_transition_captures_three_states_and_counts_access_bits() {
-    let mut context = [0; 512];
+    let mut context = [0; 1024];
     context[offset("b_telemetry_enabled")] = 1;
     context[offset("b_last_reason")] = 48;
     context[offset("b_last_qualification")] = 7;
@@ -77,7 +77,7 @@ fn exit_transition_captures_three_states_and_counts_access_bits() {
 
 #[test]
 fn expired_lease_disables_capture_and_first_entry_failure_is_sealed() {
-    let mut context = [0; 512];
+    let mut context = [0; 1024];
     context[offset("b_telemetry_enabled")] = 1;
     context[offset("b_watchdog_deadline")] = 99;
     context[offset("b_last_reason")] = 0x8000_0021;
@@ -98,9 +98,9 @@ fn expired_lease_disables_capture_and_first_entry_failure_is_sealed() {
 
 #[test]
 fn remote_cpu_queries_preserve_64_bit_values_and_validate_target() {
-    let mut context = [0; 512];
-    let mut remote = [0u64; 512];
-    let mut shared = [0; 512];
+    let mut context = [0; 1024];
+    let mut remote = [0u64; 1024];
+    let mut shared = [0; 1024];
     shared[offset("event_cpu_contexts") + 1] = remote.as_mut_ptr() as u64;
     remote[offset("b_watchdog_last_reason")] = 0x1122334455667788;
     remote[offset("b_watchdog_last_rip")] = 0x8877665544332211;
@@ -118,10 +118,42 @@ fn remote_cpu_queries_preserve_64_bit_values_and_validate_target() {
 }
 
 #[test]
+fn vmx_capability_queries_distinguish_host_support_from_nested_exposure() {
+    let mut context = [0; 1024];
+    let mut remote = [0u64; 1024];
+    let mut shared = [0; 1024];
+    shared[offset("event_cpu_contexts") + 1] = remote.as_mut_ptr() as u64;
+    remote[offset("b_nested_host_procbased_ctls2")] = (1 << 46) | 0x1234;
+    remote[offset("b_nested_vmx_procbased_ctls2")] = 2 << 32;
+    remote[offset("b_nested_host_misc")] = (1 << 29) | 5;
+    remote[offset("b_nested_vmx_misc")] = 5;
+    std::hint::black_box(&remote);
+    assert_eq!(diagnostic(&mut context, &mut shared, (2 << 16) | 47), [0x1234, 0x4000, 0, 2]);
+    assert_eq!(diagnostic(&mut context, &mut shared, (2 << 16) | 48), [0x20000005, 0, 5, 0]);
+    assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 47), [0; 4]);
+    assert_ne!(diagnostic(&mut context, &mut shared, 34)[0] & (1 << 12), 0);
+}
+
+#[test]
+fn ept_recycling_queries_distinguish_full_resets_from_single_table_evictions() {
+    let mut context = [0; 1024];
+    let mut remote = [0_u64; 1024];
+    let mut shared = [0; 1024];
+    shared[offset("event_cpu_contexts") + 1] = remote.as_mut_ptr() as u64;
+    remote[offset("b_nested_ept02_recycle_count")] = 0x123456789abcdef0;
+    remote[offset("b_nested_ept02_table_eviction_count")] = 0xfedcba9876543210;
+    std::hint::black_box(&remote);
+    assert_eq!(diagnostic(&mut context, &mut shared, (2 << 16) | 49),
+               [0x9abcdef0, 0x12345678, 0x76543210, 0xfedcba98]);
+    assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 49), [0; 4]);
+    assert_ne!(diagnostic(&mut context, &mut shared, 34)[0] & (1 << 13), 0);
+}
+
+#[test]
 fn profiling_reports_remote_msr_operands_and_full_width_handler_ticks() {
-    let mut context = [0; 512];
-    let mut remote = [0_u64; 512];
-    let mut shared = [0; 512];
+    let mut context = [0; 1024];
+    let mut remote = [0_u64; 1024];
+    let mut shared = [0; 1024];
     shared[offset("event_cpu_contexts")] = remote.as_mut_ptr() as u64;
     remote[offset("b_rdmsr_count")] = 0x123456789abcdef0;
     remote[offset("b_wrmsr_count")] = 0x0fedcba987654321;
@@ -142,7 +174,7 @@ fn profiling_reports_remote_msr_operands_and_full_width_handler_ticks() {
 #[test]
 fn opt_in_handler_timing_works_without_a_serial_port() {
     for (reason, category) in [(23, 0), (25, 0), (20, 1), (24, 1), (31, 2), (50, 3)] {
-        let mut context = [0; 512];
+        let mut context = [0; 1024];
         context[offset("b_last_reason")] = reason;
         context[offset("b_nested_exit_started_tsc")] = 25;
         unsafe { test_profile_exit(context.as_mut_ptr()) };
@@ -156,9 +188,55 @@ fn opt_in_handler_timing_works_without_a_serial_port() {
 }
 
 #[test]
+fn exit_histogram_is_monotonic_and_excludes_observer_queries() {
+    let mut context = [0; 1024];
+    context[offset("b_telemetry_enabled")] = 1;
+    let counts = offset("b_nested_exit_reason_counts");
+    for reason in [20, 23, 25, 24, 23, 25, 0x8000_0021, 127, 128] {
+        context[offset("b_last_reason")] = reason;
+        unsafe { test_watchdog_begin(context.as_mut_ptr()) };
+    }
+    assert_eq!(context[counts + 23], 2);
+    assert_eq!(context[counts + 25], 2);
+    assert_eq!(context[counts + 33], 1);
+    assert_eq!(context[counts + 127], 1);
+    assert_eq!(context[counts..counts + 128].iter().sum::<u64>(), 8);
+    context[offset("b_last_reason")] = 10;
+    context[offset("b_last_rax")] = 0x4d48_5652;
+    unsafe { test_watchdog_begin(context.as_mut_ptr()) };
+    assert_eq!(context[counts + 10], 0);
+    context[offset("b_last_reason")] = 23;
+    context[offset("b_telemetry_enabled")] = 0;
+    unsafe { test_watchdog_begin(context.as_mut_ptr()) };
+    assert_eq!(context[counts + 23], 2);
+}
+
+#[test]
+fn remote_histogram_and_vmcs_profile_share_cumulative_counters() {
+    let mut context = [0; 1024];
+    let mut remote = [0_u64; 1024];
+    let mut shared = [0; 1024];
+    shared[offset("event_cpu_contexts")] = remote.as_mut_ptr() as u64;
+    let counts = offset("b_nested_exit_reason_counts");
+    remote[counts + 23] = 0x1122334455667788;
+    remote[counts + 25] = 0x8877665544332211;
+    remote[counts + 127] = u64::MAX;
+    std::hint::black_box(&remote);
+    assert_eq!(diagnostic(&mut context, &mut shared, (1 << 16) | 40),
+               [0x55667788, 0x11223344, 0x44332211, 0x88776655]);
+    assert_eq!(diagnostic(&mut context, &mut shared, (1 << 16) | 0x30b),
+               [0, 0, 0x55667788, 0x11223344]);
+    assert_eq!(diagnostic(&mut context, &mut shared, (1 << 16) | 0x33f),
+               [0, 0, u32::MAX, u32::MAX]);
+    for selector in [0x2ff, 0x340] {
+        assert_eq!(diagnostic(&mut context, &mut shared, selector), [0; 4]);
+    }
+}
+
+#[test]
 fn nested_failure_trace_exposes_each_record_word_pair() {
-    let mut context = [0; 512];
-    let mut shared = [0; 512];
+    let mut context = [0; 1024];
+    let mut shared = [0; 1024];
     context[offset("b_nested_failure_count")] = 1;
     let trace = offset("b_nested_failure_trace");
     context[trace] = 0x1122334455667788;
@@ -182,7 +260,7 @@ fn nested_failure_trace_exposes_each_record_word_pair() {
 
 #[test]
 fn nested_failure_recorder_captures_instruction_context_and_bounds_the_trace() {
-    let mut context = [0; 512];
+    let mut context = [0; 1024];
     let trace = offset("b_nested_failure_trace");
     context[offset("b_telemetry_active")] = 1;
     context[offset("b_nested_failure_count")] = 1;
@@ -207,9 +285,9 @@ fn nested_failure_recorder_captures_instruction_context_and_bounds_the_trace() {
 
 #[test]
 fn watchdog_control_uses_a_15_second_lease_on_the_selected_cpu() {
-    let mut context = [0; 512];
-    let mut remote = [0u64; 512];
-    let mut shared = [0; 512];
+    let mut context = [0; 1024];
+    let mut remote = [0u64; 1024];
+    let mut shared = [0; 1024];
     shared[offset("event_cpu_contexts")] = remote.as_mut_ptr() as u64;
     remote[offset("b_watchdog_tsc_hz")] = 200;
     remote[offset("b_telemetry_enabled")] = 1;
@@ -222,8 +300,8 @@ fn watchdog_control_uses_a_15_second_lease_on_the_selected_cpu() {
 
 #[test]
 fn collection_is_disabled_until_enabled_and_freezes_existing_records() {
-    let mut context = [0; 512];
-    let mut shared = [0; 512];
+    let mut context = [0; 1024];
+    let mut shared = [0; 1024];
     context[offset("b_last_reason")] = 48;
     context[offset("b_last_qualification")] = 7;
     context[offset("b_last_guest_rip")] = 0x1122;
@@ -257,9 +335,9 @@ fn collection_is_disabled_until_enabled_and_freezes_existing_records() {
 
 #[test]
 fn remote_toggle_applies_to_selected_cpu_and_finishes_an_inflight_exit() {
-    let mut context = [0; 512];
-    let mut remote = [0u64; 512];
-    let mut shared = [0; 512];
+    let mut context = [0; 1024];
+    let mut remote = [0u64; 1024];
+    let mut shared = [0; 1024];
     shared[offset("event_cpu_contexts") + 1] = remote.as_mut_ptr() as u64;
     remote[offset("b_last_reason")] = 28;
     remote[offset("b_last_qualification")] = 3;
@@ -285,7 +363,7 @@ fn remote_toggle_applies_to_selected_cpu_and_finishes_an_inflight_exit() {
 
 #[test]
 fn basic_counters_freeze_when_disabled_and_preserve_carry_flag() {
-    let mut context = [0; 512];
+    let mut context = [0; 1024];
     context[offset("b_exit_count")] = 17;
     for active in [0, 1, 0] {
         context[offset("b_telemetry_active")] = active;
@@ -298,8 +376,8 @@ fn basic_counters_freeze_when_disabled_and_preserve_carry_flag() {
 
 #[test]
 fn startup_probe_does_not_enable_user_telemetry() {
-    let mut context = [0; 512];
-    let mut shared = [0; 512];
+    let mut context = [0; 1024];
+    let mut shared = [0; 1024];
     context[offset("b_telemetry_probe_active")] = 1;
     context[offset("b_last_reason")] = 10;
     unsafe {

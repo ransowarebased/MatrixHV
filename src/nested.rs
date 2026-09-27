@@ -115,6 +115,7 @@ pub const VMX_SOFTWARE_INVALIDATION_CAPABILITIES: u64 = VMX_EPT_INVEPT
     | VMX_VPID_INVVPID_ALL_CONTEXTS
     | VMX_VPID_INVVPID_SINGLE_CONTEXT_RETAINING_GLOBALS;
 pub const VMX_CR3_TARGET_COUNT: u64 = 4;
+pub const VMX_MISC_VMWRITE_READ_ONLY_FIELDS: u64 = 1 << 29;
 pub const VMCS12_MAX_ENUM_INDEX: u64 = 22;
 
 pub const CPUID_VMX_BIT: u32 = 1 << 5;
@@ -127,7 +128,7 @@ pub const MATRIXHV_STATUS_LEAF: u32 = 0x4d48_5652;
 pub const MATRIXHV_STATUS_SIGNATURE_EAX: u32 = 0x4d48_5631;
 pub const MATRIXHV_STATUS_SIGNATURE_EBX: u32 = u32::from_le_bytes(*b"MATR");
 pub const MATRIXHV_STATUS_SIGNATURE_ECX: u32 = u32::from_le_bytes(*b"IXHV");
-pub const MATRIXHV_STATUS_PROTOCOL: u32 = 6;
+pub const MATRIXHV_STATUS_PROTOCOL: u32 = 7;
 pub const NESTED_FAILURE_TRACE_CAPACITY: usize = 32;
 pub const NESTED_FAILURE_TRACE_WORD_COUNT: usize = 192;
 const _: () = assert!(NESTED_FAILURE_TRACE_WORD_COUNT == NESTED_FAILURE_TRACE_CAPACITY * 6);
@@ -156,6 +157,8 @@ pub struct HostVmxCapabilities {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NestedVmxCapabilities {
     pub revision_id: u32,
+    pub host_procbased_ctls2: u64,
+    pub host_misc: u64,
     pub feature_control: u64,
     pub vmx_basic: u64,
     pub vmx_pinbased_ctls: u64,
@@ -182,6 +185,8 @@ impl NestedVmxCapabilities {
         let revision_id = host_vmx_basic as u32 & 0x7fff_ffff;
         Self {
             revision_id,
+            host_procbased_ctls2: 0,
+            host_misc: 0,
             feature_control: IA32_FEATURE_CONTROL_LOCKED | IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX,
             vmx_basic: u64::from(revision_id)
                 | (VMX_REGION_SIZE << 32)
@@ -357,7 +362,11 @@ impl NestedVmxCapabilities {
             vmx_procbased_ctls: procbased_ctls,
             vmx_exit_ctls: exit_ctls,
             vmx_entry_ctls: entry_ctls,
-            vmx_misc: (host.misc & !(0x1ff_u64 << 16)) | (VMX_CR3_TARGET_COUNT << 16),
+            host_procbased_ctls2: host.procbased_ctls2,
+            host_misc: host.misc,
+            // VMCS12 rejects writes to exit-information fields regardless of host support.
+            vmx_misc: (host.misc & !((0x1ff_u64 << 16) | VMX_MISC_VMWRITE_READ_ONLY_FIELDS))
+                | (VMX_CR3_TARGET_COUNT << 16),
             vmx_cr0_fixed0: host.cr0_fixed0,
             vmx_cr0_fixed1: host.cr0_fixed1,
             vmx_cr4_fixed0: host.cr4_fixed0,
@@ -1187,6 +1196,8 @@ pub const INVALID_VMCS_POINTER: u64 = u64::MAX;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NestedVmxState {
+    pub host_procbased_ctls2: u64,
+    pub host_misc: u64,
     pub feature_control: u64,
     pub vmx_basic: u64,
     pub vmx_pinbased_ctls: u64,
@@ -1313,6 +1324,8 @@ pub struct NestedVmxState {
     pub host_mapping_cache: [u64; 4],
     pub vmcs02_rare_state_pending: [u64; 2],
     pub ept02_recycle_count: u64,
+    pub ept02_eviction_cursor: u64,
+    pub ept02_table_eviction_count: u64,
     pub failure_trace: [u64; NESTED_FAILURE_TRACE_WORD_COUNT],
     pub eptp_shadow_list: u64,
     pub eptp_native_supported: u64,
@@ -1326,6 +1339,7 @@ pub struct NestedVmxState {
     pub eptp_table_pool: u64,
     pub eptp_table_pages: u64,
     pub eptp_table_used: u64,
+    pub exit_reason_counts: [u64; 128],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1371,6 +1385,8 @@ impl NestedVmxState {
             0
         };
         Self {
+            host_procbased_ctls2: capabilities.host_procbased_ctls2,
+            host_misc: capabilities.host_misc,
             feature_control: capabilities.feature_control,
             vmx_basic: capabilities.vmx_basic,
             vmx_pinbased_ctls: capabilities.vmx_pinbased_ctls,
@@ -1497,6 +1513,8 @@ impl NestedVmxState {
             host_mapping_cache: [0; 4],
             vmcs02_rare_state_pending: [0; 2],
             ept02_recycle_count: 0,
+            ept02_eviction_cursor: 0,
+            ept02_table_eviction_count: 0,
             failure_trace: [0; NESTED_FAILURE_TRACE_WORD_COUNT],
             eptp_shadow_list: 0,
             eptp_native_supported: 0,
@@ -1510,6 +1528,7 @@ impl NestedVmxState {
             eptp_table_pool: 0,
             eptp_table_pages: 0,
             eptp_table_used: 0,
+            exit_reason_counts: [0; 128],
         }
     }
 
