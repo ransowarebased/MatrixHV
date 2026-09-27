@@ -44,6 +44,8 @@ pub const VM_ENTRY_MSR_LOAD_ADDR: u64 = 0x200a;
 pub const TSC_OFFSET: u64 = 0x2010;
 pub const VIRTUAL_APIC_PAGE_ADDR: u64 = 0x2012;
 pub const EPT_POINTER: u64 = 0x201a;
+pub const VM_FUNCTION_CONTROL: u64 = 0x2018;
+pub const EPTP_LIST_ADDRESS: u64 = 0x2024;
 pub const XSS_EXITING_BITMAP: u64 = 0x202c;
 
 pub const PIN_BASED_VM_EXEC_CONTROL: u64 = 0x4000;

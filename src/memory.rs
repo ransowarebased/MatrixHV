@@ -42,6 +42,10 @@ impl ResidentPages {
         constraint: AddressConstraint,
         memory_type: MemoryType,
     ) -> Result<Self, Status> {
+        let byte_len = pages
+            .checked_mul(PAGE_SIZE)
+            .filter(|length| *length != 0 && *length <= isize::MAX as usize)
+            .ok_or(Status::INVALID_PARAMETER)?;
         if crate::hv_core::vt_resident::boot_services_exited() {
             return Err(Status::UNSUPPORTED);
         }
@@ -52,13 +56,28 @@ impl ResidentPages {
         let pointer = boot::allocate_pages(allocate_type, memory_type, pages)
             .map_err(|error| error.status())?;
         unsafe {
-            pointer.as_ptr().write_bytes(0, PAGE_SIZE * pages);
+            pointer.as_ptr().write_bytes(0, byte_len);
         }
         Ok(Self {
             pointer,
             pages,
             release_on_drop: true,
         })
+    }
+
+    pub fn allocate_initialized(
+        pages: usize,
+        constraint: AddressConstraint,
+        initialize: impl FnOnce(&mut [u8]),
+    ) -> Result<Self, Status> {
+        let allocation = Self::allocate(pages, constraint)?;
+        // Only fresh, zeroed pages are borrowed; no address has escaped to
+        // firmware, another CPU, or a hardware page walker at this point.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(allocation.pointer.as_ptr(), allocation.byte_len())
+        };
+        initialize(bytes);
+        Ok(allocation)
     }
 
     pub fn pointer(&self) -> NonNull<u8> {

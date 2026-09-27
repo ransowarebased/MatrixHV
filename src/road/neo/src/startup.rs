@@ -37,7 +37,7 @@ fn install_platform(executable: &Path, listen_address: &str) -> Result<(), Strin
     let installed_executable = install_directory.join("neo.exe");
     copy_for_install(executable, &installed_executable)?;
     let command_line = format!(
-        "\"{}\" --listen {}",
+        "\"{}\" serve --listen {}",
         installed_executable.display(),
         listen_address
     );
@@ -80,7 +80,7 @@ fn spawn_detached(executable: &Path, listen_address: &str) -> Result<(), String>
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     Command::new(executable)
-        .args(["--listen", listen_address])
+        .args(["serve", "--listen", listen_address])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|error| format!("failed to start neo: {error}"))?;
@@ -163,6 +163,13 @@ fn copy_for_install(source: &Path, destination: &Path) -> Result<(), String> {
     let same_path =
         destination.exists() && source.canonicalize().ok() == destination.canonicalize().ok();
     if same_path {
+        return Ok(());
+    }
+    if destination.exists()
+        && std::fs::read(source).ok().is_some_and(|source_bytes| {
+            std::fs::read(destination).ok().as_ref() == Some(&source_bytes)
+        })
+    {
         return Ok(());
     }
     std::fs::copy(source, destination)
@@ -320,4 +327,42 @@ fn update_path(executable: &Path, suffix: &str) -> Result<PathBuf, String> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| "neo executable has an invalid file name".to_string())?;
     Ok(executable.with_file_name(format!("{file_name}.{suffix}")))
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::copy_for_install;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    #[test]
+    fn reinstall_preserves_an_identical_running_binary() {
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .to_path_buf();
+        let directory = project
+            .join("builds/road-startup-tests")
+            .join(std::process::id().to_string());
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.exe");
+        let destination = directory.join("installed.exe");
+        std::fs::write(&source, b"neo test binary").unwrap();
+        copy_for_install(&source, &destination).unwrap();
+        let running = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&destination)
+            .unwrap();
+        copy_for_install(&source, &destination).unwrap();
+        std::fs::write(&source, b"different neo binary").unwrap();
+        assert!(copy_for_install(&source, &destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"neo test binary");
+        drop(running);
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(destination).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    use std::path::PathBuf;
 }

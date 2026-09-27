@@ -702,6 +702,8 @@ const BCTX_NESTED_CURRENT_VMCS: usize = core::mem::offset_of!(ResidentBootContex
     + core::mem::offset_of!(NestedVmxState, current_vmcs);
 const BCTX_NESTED_LAST_OPERAND: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, last_operand);
+const BCTX_NESTED_LAST_VMCS_FIELD: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, last_vmcs_field);
 const BCTX_NESTED_INSTRUCTION_ERROR: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, instruction_error);
 const BCTX_NESTED_VMXON_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
@@ -1545,61 +1547,35 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
     Ok(report)
 }
 
-fn allow_low_msr_passthrough(bitmap: &ResidentPages, index: u32) {
-    debug_assert!(index <= 0x1fff);
+fn allow_low_msr_passthrough(bitmap: &mut [u8], index: u32) {
+    assert!(index <= 0x1fff);
     let byte_index = (index >> 3) as usize;
     let bit_mask = !(1_u8 << (index & 7));
-    unsafe {
-        let read_byte = bitmap.pointer().as_ptr().add(byte_index);
-        read_byte.write(read_byte.read() & bit_mask);
-        let write_byte = bitmap
-            .pointer()
-            .as_ptr()
-            .add(MSR_BITMAP_WRITE_LOW_OFFSET + byte_index);
-        write_byte.write(write_byte.read() & bit_mask);
-    }
+    bitmap[byte_index] &= bit_mask;
+    bitmap[MSR_BITMAP_WRITE_LOW_OFFSET + byte_index] &= bit_mask;
 }
 
-fn allow_low_msr_read_passthrough(bitmap: &ResidentPages, index: u32) {
-    debug_assert!(index <= 0x1fff);
+fn allow_low_msr_read_passthrough(bitmap: &mut [u8], index: u32) {
+    assert!(index <= 0x1fff);
     let byte_index = (index >> 3) as usize;
     let bit_mask = !(1_u8 << (index & 7));
-    unsafe {
-        let read_byte = bitmap.pointer().as_ptr().add(byte_index);
-        read_byte.write(read_byte.read() & bit_mask);
-    }
+    bitmap[byte_index] &= bit_mask;
 }
 
-fn allow_low_msr_write_passthrough(bitmap: &ResidentPages, index: u32) {
-    debug_assert!(index <= 0x1fff);
+fn allow_low_msr_write_passthrough(bitmap: &mut [u8], index: u32) {
+    assert!(index <= 0x1fff);
     let byte_index = (index >> 3) as usize;
     let bit_mask = !(1_u8 << (index & 7));
-    unsafe {
-        let write_byte = bitmap
-            .pointer()
-            .as_ptr()
-            .add(MSR_BITMAP_WRITE_LOW_OFFSET + byte_index);
-        write_byte.write(write_byte.read() & bit_mask);
-    }
+    bitmap[MSR_BITMAP_WRITE_LOW_OFFSET + byte_index] &= bit_mask;
 }
 
-fn allow_high_msr_passthrough(bitmap: &ResidentPages, index: u32) {
-    debug_assert!((0xc000_0000..=0xc000_1fff).contains(&index));
+fn allow_high_msr_passthrough(bitmap: &mut [u8], index: u32) {
+    assert!((0xc000_0000..=0xc000_1fff).contains(&index));
     let relative_index = index - 0xc000_0000;
     let byte_index = (relative_index >> 3) as usize;
     let bit_mask = !(1_u8 << (relative_index & 7));
-    unsafe {
-        let read_byte = bitmap
-            .pointer()
-            .as_ptr()
-            .add(MSR_BITMAP_READ_HIGH_OFFSET + byte_index);
-        read_byte.write(read_byte.read() & bit_mask);
-        let write_byte = bitmap
-            .pointer()
-            .as_ptr()
-            .add(MSR_BITMAP_WRITE_HIGH_OFFSET + byte_index);
-        write_byte.write(write_byte.read() & bit_mask);
-    }
+    bitmap[MSR_BITMAP_READ_HIGH_OFFSET + byte_index] &= bit_mask;
+    bitmap[MSR_BITMAP_WRITE_HIGH_OFFSET + byte_index] &= bit_mask;
 }
 
 fn spec_ctrl_available(leaf7_edx: u32) -> bool {
@@ -1692,6 +1668,13 @@ fn configure_nested_vmcs02(
             configuration.ept_pointer,
         )?;
         vt_controls::enable_resident_vpid(&mut controls, 2)?;
+        if unsafe { arch::read_msr(arch::IA32_VMX_PROCBASED_CTLS2) }
+            & (u64::from(crate::nested::VMX_SECONDARY_ENABLE_VM_FUNCTIONS) << 32)
+            != 0
+        {
+            // Trap VMFUNC so L1 EPTPs are composed through EPT01 before use by L2.
+            vmwrite(VM_FUNCTION_CONTROL, 0)?;
+        }
         vmwrite(EXCEPTION_BITMAP, 0)?;
         configure_resident_msr_switch(configuration.msr_state)?;
         configure_resident_host(
@@ -1838,9 +1821,9 @@ fn seed_nested_vmcs12_core_state(
     set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_ACTIVITY_STATE, 0);
     set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_PENDING_DBG_EXCEPTIONS, 0);
 
-    let sysenter_cs = unsafe { arch::read_msr(arch::IA32_SYSENTER_CS) };
-    let sysenter_esp = unsafe { arch::read_msr(arch::IA32_SYSENTER_ESP) };
-    let sysenter_eip = unsafe { arch::read_msr(arch::IA32_SYSENTER_EIP) };
+    let sysenter_cs = arch::ArchitecturalMsr::SysenterCs.read();
+    let sysenter_esp = arch::ArchitecturalMsr::SysenterEsp.read();
+    let sysenter_eip = arch::ArchitecturalMsr::SysenterEip.read();
     set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_SYSENTER_CS, sysenter_cs);
     set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_SYSENTER_ESP, sysenter_esp);
     set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_SYSENTER_EIP, sysenter_eip);
@@ -1979,10 +1962,56 @@ pub fn run_boot_loader(
     let initial_rflags = arch::read_rflags();
     let code = ResidentCode::allocate(event_context)?;
     let root_segments = arch::capture();
-    let msr_bitmap = ResidentPages::allocate(MSR_BITMAP_PAGES, AddressConstraint::Any)
+    let machine_check_bank_count = unsafe { arch::read_msr(IA32_MCG_CAP_MSR) } as u32 & 0xff;
+    let msr_bitmap =
+        ResidentPages::allocate_initialized(MSR_BITMAP_PAGES, AddressConstraint::Any, |bitmap| {
+            bitmap.fill(0xff);
+            allow_low_msr_passthrough(bitmap, IA32_ARCH_CAPABILITIES_MSR);
+            allow_low_msr_passthrough(bitmap, IA32_SPEC_CTRL_MSR);
+            allow_low_msr_write_passthrough(bitmap, IA32_PRED_CMD_MSR);
+            allow_low_msr_read_passthrough(bitmap, IA32_MCG_CAP_MSR);
+            allow_low_msr_passthrough(bitmap, IA32_MCG_STATUS_MSR);
+            allow_low_msr_passthrough(bitmap, IA32_MCG_CTL_MSR);
+            // Resident CPUs own their physical APIC. Keep TSC synchronization and its
+            // deadline timer in the same clock domain; L1 bitmap intercepts still apply to L2.
+            for index in [IA32_TSC_MSR, IA32_TSC_ADJUST_MSR, IA32_TSC_DEADLINE_MSR] {
+                allow_low_msr_passthrough(bitmap, index);
+            }
+            // L1 owns the local APIC; trapping its accesses only repeats the same MSR
+            // instruction in root mode. VMCS02 still includes every L1 bitmap intercept.
+            for index in IA32_X2APIC_MSR_BASE..=IA32_X2APIC_MSR_END {
+                allow_low_msr_passthrough(bitmap, index);
+            }
+            allow_low_msr_passthrough(bitmap, IA32_XSS_MSR);
+            for bank in 0..machine_check_bank_count {
+                allow_low_msr_passthrough(bitmap, IA32_MC0_CTL2_MSR + bank);
+                allow_low_msr_passthrough(
+                    bitmap,
+                    IA32_MC0_CTL_MSR + bank * MACHINE_CHECK_BANK_MSR_STRIDE,
+                );
+                allow_low_msr_passthrough(
+                    bitmap,
+                    IA32_MC0_STATUS_MSR + bank * MACHINE_CHECK_BANK_MSR_STRIDE,
+                );
+            }
+            allow_low_msr_passthrough(bitmap, IA32_MISC_ENABLE_MSR);
+            allow_low_msr_passthrough(bitmap, arch::IA32_PAT);
+            allow_high_msr_passthrough(bitmap, IA32_STAR_MSR);
+            allow_high_msr_passthrough(bitmap, IA32_LSTAR_MSR);
+            allow_high_msr_passthrough(bitmap, IA32_CSTAR_MSR);
+            allow_high_msr_passthrough(bitmap, IA32_FMASK_MSR);
+            // VM exits save FS/GS bases and VM entries restore them from the guest state.
+            // Let hardware update those fields without introducing an L1-unrequested exit.
+            allow_high_msr_passthrough(bitmap, IA32_FS_BASE_MSR);
+            allow_high_msr_passthrough(bitmap, IA32_GS_BASE_MSR);
+            allow_high_msr_passthrough(bitmap, IA32_KERNEL_GS_BASE_MSR);
+            allow_high_msr_passthrough(bitmap, IA32_TSC_AUX_MSR);
+        })
         .map_err(ResidentProbeError::Allocation)?;
-    let ept_test_page = ResidentPages::allocate(1, AddressConstraint::Any)
-        .map_err(ResidentProbeError::Allocation)?;
+    let ept_test_page = ResidentPages::allocate_initialized(1, AddressConstraint::Any, |bytes| {
+        bytes[..8].copy_from_slice(&0x4550_5454_4553_5431_u64.to_ne_bytes());
+    })
+    .map_err(ResidentProbeError::Allocation)?;
     let zero_page = ResidentPages::allocate(1, AddressConstraint::Any)
         .map_err(ResidentProbeError::Allocation)?;
     let mut host_address_space = HostAddressSpace::reserve().map_err(ResidentProbeError::Paging)?;
@@ -2017,60 +2046,6 @@ pub fn run_boot_loader(
             }
         }
     }
-    unsafe {
-        ept_test_page
-            .pointer()
-            .as_ptr()
-            .cast::<u64>()
-            .write(0x4550_5454_4553_5431);
-    }
-    unsafe {
-        msr_bitmap
-            .pointer()
-            .as_ptr()
-            .write_bytes(0xff, msr_bitmap.byte_len());
-    }
-    allow_low_msr_passthrough(&msr_bitmap, IA32_ARCH_CAPABILITIES_MSR);
-    allow_low_msr_passthrough(&msr_bitmap, IA32_SPEC_CTRL_MSR);
-    allow_low_msr_write_passthrough(&msr_bitmap, IA32_PRED_CMD_MSR);
-    allow_low_msr_read_passthrough(&msr_bitmap, IA32_MCG_CAP_MSR);
-    allow_low_msr_passthrough(&msr_bitmap, IA32_MCG_STATUS_MSR);
-    allow_low_msr_passthrough(&msr_bitmap, IA32_MCG_CTL_MSR);
-    // Resident CPUs own their physical APIC. Keep TSC synchronization and its
-    // deadline timer in the same clock domain; L1 bitmap intercepts still apply to L2.
-    for index in [IA32_TSC_MSR, IA32_TSC_ADJUST_MSR, IA32_TSC_DEADLINE_MSR] {
-        allow_low_msr_passthrough(&msr_bitmap, index);
-    }
-    // L1 owns the local APIC; trapping its accesses only repeats the same MSR
-    // instruction in root mode. VMCS02 still includes every L1 bitmap intercept.
-    for index in IA32_X2APIC_MSR_BASE..=IA32_X2APIC_MSR_END {
-        allow_low_msr_passthrough(&msr_bitmap, index);
-    }
-    allow_low_msr_passthrough(&msr_bitmap, IA32_XSS_MSR);
-    let machine_check_bank_count = unsafe { arch::read_msr(IA32_MCG_CAP_MSR) } as u32 & 0xff;
-    for bank in 0..machine_check_bank_count {
-        allow_low_msr_passthrough(&msr_bitmap, IA32_MC0_CTL2_MSR + bank);
-        allow_low_msr_passthrough(
-            &msr_bitmap,
-            IA32_MC0_CTL_MSR + bank * MACHINE_CHECK_BANK_MSR_STRIDE,
-        );
-        allow_low_msr_passthrough(
-            &msr_bitmap,
-            IA32_MC0_STATUS_MSR + bank * MACHINE_CHECK_BANK_MSR_STRIDE,
-        );
-    }
-    allow_low_msr_passthrough(&msr_bitmap, IA32_MISC_ENABLE_MSR);
-    allow_low_msr_passthrough(&msr_bitmap, arch::IA32_PAT);
-    allow_high_msr_passthrough(&msr_bitmap, IA32_STAR_MSR);
-    allow_high_msr_passthrough(&msr_bitmap, IA32_LSTAR_MSR);
-    allow_high_msr_passthrough(&msr_bitmap, IA32_CSTAR_MSR);
-    allow_high_msr_passthrough(&msr_bitmap, IA32_FMASK_MSR);
-    // VM exits save FS/GS bases and VM entries restore them from the guest state.
-    // Let hardware update those fields without introducing an L1-unrequested exit.
-    allow_high_msr_passthrough(&msr_bitmap, IA32_FS_BASE_MSR);
-    allow_high_msr_passthrough(&msr_bitmap, IA32_GS_BASE_MSR);
-    allow_high_msr_passthrough(&msr_bitmap, IA32_KERNEL_GS_BASE_MSR);
-    allow_high_msr_passthrough(&msr_bitmap, IA32_TSC_AUX_MSR);
 
     crate::boot::screen::stage("resident host paging");
     let host_space = host_address_space
@@ -2252,6 +2227,11 @@ pub fn run_boot_loader(
         alternate_permissions: nested_ept_alternate_composition.permissions,
     });
     nested_state.configure_ept02_table_pools(nested_ept02_table_pools);
+    nested_state.eptp_shadow_list = cpu_resources.nested_eptp_list.physical_address();
+    nested_state.eptp_table_pool = cpu_resources.nested_eptp_tables.physical_address();
+    nested_state.eptp_table_pages = cpu_resources.nested_eptp_tables.pages() as u64;
+    nested_state.eptp_native_supported = u64::from(vt_controls::native_eptp_switching_supported());
+    nested_state.eptp_sync_apic_id = u64::from(arch::apic_id());
     seed_nested_vmcs12_core_state(&mut nested_state.vmcs12, root_segments, l1_cr4);
     seed_nested_vmcs12_backing(&cpu_resources.nested_vmcs12_pages, &nested_state.vmcs12);
 
@@ -2780,6 +2760,12 @@ impl ResidentApLaunch<'_> {
             alternate_permissions: nested_ept_alternate_composition.permissions,
         });
         nested_state.configure_ept02_table_pools(nested_ept02_table_pools);
+        nested_state.eptp_shadow_list = self.resources.nested_eptp_list.physical_address();
+        nested_state.eptp_table_pool = self.resources.nested_eptp_tables.physical_address();
+        nested_state.eptp_table_pages = self.resources.nested_eptp_tables.pages() as u64;
+        nested_state.eptp_native_supported =
+            u64::from(vt_controls::native_eptp_switching_supported());
+        nested_state.eptp_sync_apic_id = u64::from(arch::apic_id());
         seed_nested_vmcs12_core_state(&mut nested_state.vmcs12, segments, l1_cr4);
         seed_nested_vmcs12_backing(&self.resources.nested_vmcs12_pages, &nested_state.vmcs12);
         let context = self
@@ -2855,8 +2841,8 @@ fn configure_resident_host(
     vmwrite(HOST_CR0, arch::read_cr0())?;
     vmwrite(HOST_CR3, host_cr3)?;
     vmwrite(HOST_CR4, arch::read_cr4())?;
-    vmwrite(HOST_IA32_PAT, unsafe { arch::read_msr(arch::IA32_PAT) })?;
-    vmwrite(HOST_IA32_EFER, unsafe { arch::read_msr(arch::IA32_EFER) })?;
+    vmwrite(HOST_IA32_PAT, arch::ArchitecturalMsr::Pat.read())?;
+    vmwrite(HOST_IA32_EFER, arch::ArchitecturalMsr::Efer.read())?;
     vmwrite(HOST_FS_BASE, segments.fs.base)?;
     vmwrite(HOST_GS_BASE, tables.tss)?;
     vmwrite(HOST_TR_BASE, tables.tss)?;
@@ -2864,14 +2850,16 @@ fn configure_resident_host(
     vmwrite(HOST_IDTR_BASE, tables.idt)?;
     vmwrite(
         HOST_SYSENTER_CS,
-        unsafe { arch::read_msr(arch::IA32_SYSENTER_CS) } & 0xffff_ffff,
+        arch::ArchitecturalMsr::SysenterCs.read() & 0xffff_ffff,
     )?;
-    vmwrite(HOST_SYSENTER_ESP, unsafe {
-        arch::read_msr(arch::IA32_SYSENTER_ESP)
-    })?;
-    vmwrite(HOST_SYSENTER_EIP, unsafe {
-        arch::read_msr(arch::IA32_SYSENTER_EIP)
-    })?;
+    vmwrite(
+        HOST_SYSENTER_ESP,
+        arch::ArchitecturalMsr::SysenterEsp.read(),
+    )?;
+    vmwrite(
+        HOST_SYSENTER_EIP,
+        arch::ArchitecturalMsr::SysenterEip.read(),
+    )?;
     Ok(())
 }
 
@@ -2941,6 +2929,7 @@ unsafe extern "C" {
 global_asm!(
     include_str!("../asm/ap_startup.S"),
     include_str!("../asm/ept_cache.S"),
+    include_str!("../asm/eptp_switch.S"),
     include_str!("../asm/resident_island.S"),
     host_rsp = const HOST_RSP,
     host_rip = const HOST_RIP,
@@ -3075,6 +3064,36 @@ global_asm!(
     vmxon_reason = const VMXON_EXIT_REASON,
     vmxoff_reason = const VMXOFF_EXIT_REASON,
     invept_reason = const INVEPT_EXIT_REASON,
+    vmfunc_reason = const crate::nested::VMFUNC_EXIT_REASON,
+    vm_function_control = const VM_FUNCTION_CONTROL,
+    eptp_list_address = const EPTP_LIST_ADDRESS,
+    b_nested_eptp_shadow_list = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, eptp_shadow_list),
+    b_nested_eptp_native_supported = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, eptp_native_supported),
+    b_nested_eptp_native_enabled = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, eptp_native_enabled),
+    b_nested_eptp_sync_ack = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, eptp_sync_ack),
+    b_nested_eptp_sync_safe = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, eptp_sync_safe),
+    b_nested_eptp_sync_nmi = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, eptp_sync_nmi),
+    b_nested_eptp_sync_apic_id = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, eptp_sync_apic_id),
+    b_nested_eptp_admission = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, eptp_admission),
+    b_nested_eptp_write_retry = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, eptp_write_retry),
+    b_nested_eptp_table_pool = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, eptp_table_pool),
+    b_nested_eptp_table_pages = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, eptp_table_pages),
+    b_nested_eptp_table_used = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, eptp_table_used),
+    vmx_vmfunc_msr = const crate::nested::IA32_VMX_VMFUNC_MSR,
+    b_nested_vmcs12_vm_function_control = const BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 118 * 8,
+    b_nested_vmcs12_eptp_list_address = const BCTX_NESTED_VMCS12_EXTENDED_FIELDS + 119 * 8,
     invvpid_reason = const INVVPID_EXIT_REASON,
     cpuid_reason = const CPUID_EXIT_REASON,
     vmcall_reason = const VMCALL_EXIT_REASON,
@@ -3291,6 +3310,7 @@ global_asm!(
     b_nested_vmxon_region = const BCTX_NESTED_VMXON_REGION,
     b_nested_current_vmcs = const BCTX_NESTED_CURRENT_VMCS,
     b_nested_last_operand = const BCTX_NESTED_LAST_OPERAND,
+    b_nested_last_vmcs_field = const BCTX_NESTED_LAST_VMCS_FIELD,
     b_nested_instruction_error = const BCTX_NESTED_INSTRUCTION_ERROR,
     b_nested_vmxon_count = const BCTX_NESTED_VMXON_COUNT,
     b_nested_vmxoff_count = const BCTX_NESTED_VMXOFF_COUNT,
@@ -3429,6 +3449,10 @@ global_asm!(
     b_nested_ept01_pointer = const BCTX_NESTED_EPT01_POINTER,
     b_nested_ept02_recycle_count = const core::mem::offset_of!(ResidentBootContext, nested)
         + core::mem::offset_of!(NestedVmxState, ept02_recycle_count),
+    b_nested_failure_trace = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, failure_trace),
+    nested_failure_trace_capacity = const crate::nested::NESTED_FAILURE_TRACE_CAPACITY,
+    nested_failure_trace_limit = const 0x101 + crate::nested::NESTED_FAILURE_TRACE_CAPACITY * 3,
     b_nested_ept02_invalidation_count = const BCTX_NESTED_EPT02_INVALIDATION_COUNT,
     b_nested_ept_target_gpa = const BCTX_NESTED_EPT_TARGET_GPA,
     b_nested_ept_composition_count = const BCTX_NESTED_EPT_COMPOSITION_COUNT,

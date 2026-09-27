@@ -7,6 +7,7 @@ unsafe extern "win64" {
     fn test_watchdog_begin(context: *mut u64);
     fn test_watchdog_complete(context: *mut u64);
     fn test_counter(context: *mut u64) -> u64;
+    fn test_nested_failure_record(context: *mut u64, kind: u64, code: u64);
     fn test_diagnostic(context: *mut u64, shared: *mut u64, subleaf: u32, result: *mut u32);
 }
 
@@ -113,6 +114,56 @@ fn remote_cpu_queries_preserve_64_bit_values_and_validate_target() {
     );
     assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 8), [0; 4]);
     assert_eq!(diagnostic(&mut context, &mut shared, 36), [2, 0, 0, 0]);
+}
+
+#[test]
+fn nested_failure_trace_exposes_each_record_word_pair() {
+    let mut context = [0; 512];
+    let mut shared = [0; 512];
+    context[offset("b_nested_failure_count")] = 1;
+    let trace = offset("b_nested_failure_trace");
+    context[trace] = 0x1122334455667788;
+    context[trace + 1] = 25;
+    context[trace + 2] = 1;
+    context[trace + 3] = 12;
+    context[trace + 4] = 0x2806;
+    context[trace + 5] = 0x1234;
+    assert_eq!(diagnostic(&mut context, &mut shared, 0x100), [1, 0, 32, 0]);
+    assert_eq!(
+        diagnostic(&mut context, &mut shared, 0x101),
+        [0x55667788, 0x11223344, 25, 0]
+    );
+    assert_eq!(diagnostic(&mut context, &mut shared, 0x102), [1, 0, 12, 0]);
+    assert_eq!(
+        diagnostic(&mut context, &mut shared, 0x103),
+        [0x2806, 0, 0x1234, 0]
+    );
+    assert_eq!(diagnostic(&mut context, &mut shared, 0x104), [0; 4]);
+}
+
+#[test]
+fn nested_failure_recorder_captures_instruction_context_and_bounds_the_trace() {
+    let mut context = [0; 512];
+    let trace = offset("b_nested_failure_trace");
+    context[offset("b_telemetry_active")] = 1;
+    context[offset("b_nested_failure_count")] = 1;
+    context[offset("b_nested_current_vmcs")] = 0x3000;
+    context[offset("b_last_guest_rip")] = 0x140001234;
+    context[offset("b_last_reason")] = 25;
+    context[offset("b_nested_last_vmcs_field")] = 0x2806;
+    context[offset("b_nested_last_operand")] = 0xabc;
+    unsafe { test_nested_failure_record(context.as_mut_ptr(), 1, 12) };
+    assert_eq!(
+        &context[trace..trace + 6],
+        &[0x140001234, 25, 1, 12, 0x2806, 0xabc]
+    );
+    context[offset("b_nested_failure_count")] = 2;
+    context[offset("b_nested_current_vmcs")] = u64::MAX;
+    unsafe { test_nested_failure_record(context.as_mut_ptr(), 1, 7) };
+    assert_eq!(&context[trace + 6..trace + 10], &[0x140001234, 25, 6, 7]);
+    context[offset("b_nested_failure_count")] = 33;
+    unsafe { test_nested_failure_record(context.as_mut_ptr(), 1, 8) };
+    assert_eq!(&context[trace + 6 * 31..trace + 6 * 32], &[0; 6]);
 }
 
 #[test]

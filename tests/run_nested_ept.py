@@ -6,19 +6,69 @@ project = Path(__file__).resolve().parents[1]
 output = project / "builds" / "nested-ept-tests"
 output.mkdir(parents=True, exist_ok=True)
 source = (project / "src/asm/resident_island.S").read_text()
+switch_source = (project / "src/asm/eptp_switch.S").read_text()
+exit_msr_start = source.index('.Lresident_nested_capture_vmcs02_guest_state:')
+exit_msr_end = source.index('lea rsi, [rip + .Lresident_nested_guest_state_table]', exit_msr_start)
+exit_msr_assembly = source[exit_msr_start:exit_msr_end].replace(
+    "vmread r11, rax",
+    "mov r11, qword ptr [r12 + {test_hardware} + rax * 8]\n"
+    "push rax\nmov eax, 1\ntest eax, eax\npop rax",
+)
+(output / "resident-exit-msrs.S").write_text(exit_msr_assembly + "ret\n")
 start = source.index('.Lresident_nested_resolve_ept02_violation:')
 end = source.index('.Lresident_nested_host_msr_list_is_mapped:')
-prepare_start = source.index('.Lresident_nested_prepare_ept02:')
-prepare_end = source.index('.Lresident_nested_activate_vmcs02_ept:')
+prepare_start = switch_source.index('.Lresident_nested_prepare_ept02:')
+prepare_end = switch_source.index('.Lresident_nested_activate_vmcs02_ept:')
 invept_start = source.index('.Lresident_nested_invalidate_ept12_context:')
 invept_end = source.index('.Lresident_dispatch_invept_all_contexts:', invept_start)
-assembly = (source[prepare_start:prepare_end] + source[start:end] + source[invept_start:invept_end]).strip()
+assembly = (switch_source[prepare_start:prepare_end] + source[start:end] + source[invept_start:invept_end]).strip()
+vmfunc_start = switch_source.index('.Lresident_nested_switch_eptp:')
+vmfunc_end = switch_source.index('.Lresident_nested_prepare_ept02:', vmfunc_start)
+address_start = source.index('.Lresident_nested_physical_address_is_valid:')
+address_end = source.index('.Lresident_nested_resolve_ept02_violation:', address_start)
+vmfunc_assembly = (switch_source[vmfunc_start:vmfunc_end] + source[address_start:address_end]).replace(
+    '.Lresident_nested_physical_address_is_valid', '.Ltest_vmfunc_physical_address_is_valid'
+).replace('.Lresident_nested_address_width_is_valid', '.Ltest_vmfunc_address_width_is_valid')
+for suffix in ('invalid', 'valid'):
+    vmfunc_assembly = vmfunc_assembly.replace(
+        '.Lresident_nested_physical_address_' + suffix,
+        '.Ltest_vmfunc_physical_address_' + suffix,
+    )
+assembly += '\n' + vmfunc_assembly
+native_start = switch_source.index('.Lresident_nested_refresh_eptp_list:')
+native_end = switch_source.index('.Lresident_nested_vmfunc:')
+native = switch_source[native_start:native_end]
+native = native.replace('.Lresident_dispatch_vmwrite_failed', '.Lresident_dispatch_vmread_failed')
+native = native.replace(
+    'vmwrite rax, r11',
+    'mov qword ptr [r12 + {test_native_vmcs} + rax * 8], r11\n'
+    'push rax\nmov eax, 1\ntest eax, eax\npop rax',
+).replace(
+    'vmread r10, rax',
+    'mov r10, qword ptr [r12 + {test_native_vmcs} + rax * 8]\n'
+    'push rax\nmov eax, 1\ntest eax, eax\npop rax',
+)
+assembly += '\n' + native
+assembly = assembly.replace(
+    '[rip + .Lresident_eptp_lists_live]', '[r12 + {test_lists_live}]'
+)
+flush_start = switch_source.index('.Lresident_nested_eptp_sync_flush_local:')
+flush_end = switch_source.index('.Lresident_nested_eptp_sync_enter:', flush_start)
+assembly += '\n' + switch_source[flush_start:flush_end]
+assembly += (
+    '\n.Lresident_nested_eptp_sync_acquire:\n'
+    'inc qword ptr [r12 + {test_sync_requests}]\n'
+    'mov rax, qword ptr [r12 + {test_sync_result}]\nret\n'
+    '.Lresident_nested_eptp_sync_end:\n'
+    'inc qword ptr [r12 + {test_sync_releases}]\nret\n'
+    '.Lresident_nested_eptp_sync_poll:\nret\n'
+)
 macro_start = source.index('.macro resident_telemetry_counter ')
 macro_end = source.index('.endm', macro_start) + len('.endm')
 assembly = source[macro_start:macro_end] + "\n" + assembly
 # Execute the production address walks; replace only privileged instructions.
 assert assembly.count("vmread r8, rax") == 1
-assert assembly.count("invept rax, xmmword ptr [rsp]") == 1
+assert assembly.count("invept rax, xmmword ptr [rsp]") == 2
 assembly = assembly.replace(
     "vmread r8, rax",
     "mov r8, qword ptr [r12 + {b_last_guest_physical_address}]\n"
@@ -107,6 +157,11 @@ mapped_start = source.index('.Lresident_nested_host_msr_list_is_mapped:')
 mapped_end = source.index('.Lresident_nested_exit_store_list_is_safe:')
 msr_assembly = (source[msr_start:msr_end] + source[mapped_start:mapped_end]).strip()
 msr_assembly = msr_assembly.replace(
+    'call .Lresident_nested_eptp_before_root_write',
+    'call .Ltest_msr_root_write',
+)
+msr_assembly += '\n.Ltest_msr_root_write:\nret\n'
+msr_assembly = msr_assembly.replace(
     "vmwrite rax, r11",
     "inc qword ptr [r12 + {test_writes}]\n"
     "mov qword ptr [r12 + {test_hardware} + rax * 8], r11\n"
@@ -115,7 +170,7 @@ msr_assembly = msr_assembly.replace(
 msr_assembly += "\n.data\n.balign 8\nmatrixhv_resident_island_msr_switch_count:\n.quad 1\n.text\n"
 (output / "resident-msr-exit.S").write_text(msr_assembly)
 address_start = source.index('.Lresident_nested_physical_address_is_valid:')
-address_end = source.index('.Lresident_nested_prepare_ept02:')
+address_end = source.index('.Lresident_nested_resolve_ept02_violation:', address_start)
 address_assembly = source[address_start:address_end].strip()
 (output / "resident-address.S").write_text(address_assembly)
 snapshot_start = source.index('.Lresident_nested_snapshot_vmcs01_effective_state:')

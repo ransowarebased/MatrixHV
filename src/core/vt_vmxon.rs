@@ -340,8 +340,8 @@ impl InterruptGuard {
             idtr: arch::read_idtr(),
             dr7: arch::read_dr7(),
             debugctl: unsafe { arch::read_msr(arch::IA32_DEBUGCTL) },
-            fs_base: unsafe { arch::read_msr(arch::IA32_FS_BASE) },
-            gs_base: unsafe { arch::read_msr(arch::IA32_GS_BASE) },
+            fs_base: arch::ArchitecturalMsr::FsBase.read(),
+            gs_base: arch::ArchitecturalMsr::GsBase.read(),
         }
     }
 }

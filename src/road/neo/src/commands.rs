@@ -522,6 +522,7 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
             Some("exec") => return Err("exec requires an executable".to_string()),
             Some(command) => return Err(format!("unknown command or extra argument: {command}")),
             None if remote.is_some() => Action::Status,
+            None if cfg!(target_os = "windows") => Action::Install,
             None => Action::Serve,
         }
     };
@@ -552,7 +553,44 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
 }
 
 fn print_usage() {
+    if cfg!(target_os = "windows") {
+        println!(
+            "Launching neo without a command installs automatic startup at Windows sign-in.\nUse serve for a temporary server without startup registration.\n"
+        );
+    }
     println!(
         "neo [serve] [--listen ADDRESS:PORT]\nneo ping | status | install | uninstall\nneo telemetry enable | disable\nneo telemetry | -t [watchdog | eptdiag] [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nneo --remote ADDRESS:PORT [status | ping | telemetry [enable | disable | watchdog | eptdiag] | -t [watchdog | eptdiag] | exec PROGRAM [ARGUMENT ...]]\nneo --remote ADDRESS:PORT --update [--binary PATH]\n\nCounters and basic records start disabled; use telemetry enable/disable to control collection.\nDisabling collection preserves snapshots and stops watchdog capture.\nWatchdog renews a 15-second lease; its interval must not exceed 5000 ms.\nThe remote transport is plaintext and unauthenticated."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, parse_options};
+
+    #[test]
+    fn default_launch_installs_windows_startup() {
+        let options = parse_options(Vec::new()).unwrap().unwrap();
+        if cfg!(target_os = "windows") {
+            assert!(matches!(options.action, Action::Install));
+        } else {
+            assert!(matches!(options.action, Action::Serve));
+        }
+    }
+
+    #[test]
+    fn startup_child_and_remote_client_do_not_reinstall() {
+        let server = parse_options(vec![
+            "serve".to_string(),
+            "--listen".to_string(),
+            "127.0.0.1:4041".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(matches!(server.action, Action::Serve));
+        assert_eq!(server.listen_address, "127.0.0.1:4041");
+        let client = parse_options(vec!["--remote".to_string(), "127.0.0.1:4040".to_string()])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(client.action, Action::Status));
+    }
 }

@@ -11,6 +11,7 @@ assembly_source = (project / "src/asm/resident_island.S").read_text(encoding="ut
 start = assembly_source.index('.Lresident_nested_complete_vmcs02_msr_exit:')
 end = assembly_source.index('.Lresident_nested_activate_vmcs01_msr_entry:', start)
 assembly = assembly_source[start:end].strip()
+assembly += '\n.Lresident_nested_eptp_before_root_write:\nret\n'
 start = assembly_source.index('.Lresident_validate_efer:')
 end = assembly_source.index('.Lresident_guarded_rdmsr:', start)
 assembly += "\n" + assembly_source[start:end].strip()
@@ -102,14 +103,14 @@ test_cache_flush:
     ret
 """
 (output / "resident-cache-flush.S").write_text(".text\n" + cache_flush, encoding="utf-8")
-start = source.index("    allow_low_msr_passthrough(&msr_bitmap, IA32_ARCH_CAPABILITIES_MSR);")
+start = source.index("            allow_low_msr_passthrough(bitmap, IA32_ARCH_CAPABILITIES_MSR);")
 end = source.index("    // L1 owns the local APIC", start)
-bitmap_policy = "fn clock_bitmap() -> ResidentPages {\nlet msr_bitmap = ResidentPages::new();\n"
+bitmap_policy = "fn clock_bitmap() -> ResidentPages {\nlet mut msr_bitmap = ResidentPages::new();\nlet bitmap = &mut msr_bitmap.bytes;\n"
 bitmap_policy += source[start:end] + "\nmsr_bitmap\n}\n"
 start = source.index("fn allow_low_msr_passthrough(")
-end = source.index("fn allow_high_msr_passthrough(", start)
+end = source.index("fn spec_ctrl_available(", start)
 bitmap_policy += source[start:end]
-for name in set(re.findall(r"\b(?:IA32_[A-Z0-9_]+|MSR_BITMAP_WRITE_LOW_OFFSET)\b", bitmap_policy)):
+for name in set(re.findall(r"\b(?:IA32_[A-Z0-9_]+|MSR_BITMAP_(?:WRITE_LOW|READ_HIGH|WRITE_HIGH)_OFFSET)\b", bitmap_policy)):
     bitmap_policy += re.search(rf"const {name}:[^;]+;", source)[0] + "\n"
 start = source.index("fn spec_ctrl_available(")
 end = source.index("\n}", start) + 2

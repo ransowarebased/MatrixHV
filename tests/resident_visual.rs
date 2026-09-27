@@ -33,6 +33,7 @@ struct EventContext {
     host_fault_error_code: u64,
     host_fault_address: u64,
     nmi_pending: u64,
+    sync_nmi: u64,
     nmi_count: u64,
 }
 
@@ -59,6 +60,7 @@ global_asm!(
     event_host_fault_error_code = const core::mem::offset_of!(EventContext, host_fault_error_code),
     event_host_fault_address = const core::mem::offset_of!(EventContext, host_fault_address),
     b_nmi_pending = const core::mem::offset_of!(EventContext, nmi_pending),
+    b_nested_eptp_sync_nmi = const core::mem::offset_of!(EventContext, sync_nmi),
     b_nmi_count = const core::mem::offset_of!(EventContext, nmi_count),
     b_telemetry_enabled = const core::mem::offset_of!(EventContext, telemetry_enabled),
     visual_marker_step_bytes = const MARKER_STEP * 4,
@@ -243,6 +245,7 @@ fn context(pixels: &mut [u32]) -> EventContext {
     EventContext {
         telemetry_enabled: 1,
         nmi_pending: 0,
+        sync_nmi: 0,
         nmi_count: 0,
         diagnostic_halted: 0,
         exit_boot_services_seen: 1,
@@ -347,6 +350,7 @@ fn missing_framebuffer_is_ignored() {
     let event_context = EventContext {
         telemetry_enabled: 1,
         nmi_pending: 0,
+        sync_nmi: 0,
         nmi_count: 0,
         diagnostic_halted: 0,
         exit_boot_services_seen: 1,

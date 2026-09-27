@@ -61,6 +61,9 @@ def marker_constant(name):
 
 
 wrappers = """
+.Lresident_nested_eptp_sync_host_nmi:
+    xor eax, eax
+    ret
 .globl test_claim_diagnostic
 test_claim_diagnostic:
     mov r8, rcx

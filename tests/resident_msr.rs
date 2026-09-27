@@ -1,23 +1,19 @@
 use core::arch::global_asm;
 
 struct ResidentPages {
-    bytes: core::cell::UnsafeCell<[u8; 4096]>,
+    bytes: [u8; 4096],
 }
 
 impl ResidentPages {
     fn new() -> Self {
         Self {
-            bytes: core::cell::UnsafeCell::new([0xff; 4096]),
+            bytes: [0xff; 4096],
         }
-    }
-
-    fn pointer(&self) -> core::ptr::NonNull<u8> {
-        core::ptr::NonNull::new(self.bytes.get().cast()).unwrap()
     }
 
     fn intercepts(&self, index: u32, write: bool) -> bool {
         let offset = (index >> 3) as usize + if write { 2048 } else { 0 };
-        unsafe { (*self.bytes.get())[offset] & (1 << (index & 7)) != 0 }
+        self.bytes[offset] & (1 << (index & 7)) != 0
     }
 }
 
@@ -36,6 +32,51 @@ fn physical_clock_and_deadline_share_native_reads_and_writes() {
         assert!(bitmap.intercepts(index, false));
         assert!(bitmap.intercepts(index, true));
     }
+}
+
+#[test]
+fn bitmap_boundaries_keep_read_write_and_address_ranges_separate() {
+    let mut bitmap = [0xff; 4096];
+    allow_low_msr_read_passthrough(&mut bitmap, 0);
+    allow_low_msr_write_passthrough(&mut bitmap, 0x1fff);
+    allow_high_msr_passthrough(&mut bitmap, 0xc000_0000);
+    allow_high_msr_passthrough(&mut bitmap, 0xc000_1fff);
+    for (offset, byte) in bitmap.into_iter().enumerate() {
+        let expected = match offset {
+            0 | 1024 | 3072 => 0xfe,
+            2047 | 3071 | 4095 => 0x7f,
+            _ => 0xff,
+        };
+        assert_eq!(byte, expected, "unexpected bitmap byte at {offset}");
+    }
+}
+
+#[test]
+fn bitmap_helpers_reject_invalid_registers_and_short_buffers() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let mut bitmap = [0xff; 4096];
+    for index in [0x2000, u32::MAX] {
+        for helper in [
+            allow_low_msr_passthrough,
+            allow_low_msr_read_passthrough,
+            allow_low_msr_write_passthrough,
+        ] {
+            assert!(catch_unwind(AssertUnwindSafe(|| helper(&mut bitmap, index))).is_err());
+            assert_eq!(bitmap, [0xff; 4096]);
+        }
+    }
+    for index in [0, 0xbfff_ffff, 0xc000_2000, u32::MAX] {
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                allow_high_msr_passthrough(&mut bitmap, index);
+            }))
+            .is_err()
+        );
+        assert_eq!(bitmap, [0xff; 4096]);
+    }
+    assert!(catch_unwind(|| allow_low_msr_passthrough(&mut [], 0)).is_err());
+    assert!(catch_unwind(|| allow_high_msr_passthrough(&mut [0xff; 1024], 0xc000_0000)).is_err());
 }
 
 global_asm!(include_str!("resident-cache-flush.S"));

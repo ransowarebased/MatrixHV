@@ -217,6 +217,7 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
         | nested::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
         | nested::VM_EXIT_ACK_INTERRUPT_ON_EXIT
         | nested::VM_EXIT_LOAD_IA32_PAT
+        | nested::VM_EXIT_SAVE_IA32_EFER
         | nested::VM_EXIT_LOAD_IA32_EFER;
     let true_exit_control = control_capabilities(0, legacy_exit_bits);
     let legacy_exit_control =
@@ -244,6 +245,7 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
             | nested::VMX_SECONDARY_UNRESTRICTED_GUEST
             | nested::VMX_SECONDARY_RDRAND_EXITING
             | nested::VMX_SECONDARY_ENABLE_INVPCID
+            | nested::VMX_SECONDARY_ENABLE_VM_FUNCTIONS
             | nested::VMX_SECONDARY_ENABLE_XSAVES
             | nested::VMX_SECONDARY_MODE_BASED_EXECUTE,
     );
@@ -291,8 +293,8 @@ fn host_derived_capabilities_expose_only_the_current_nested_contract() {
     );
     assert_eq!(capabilities.vmx_true_exit_ctls, true_exit_control);
     assert_eq!(
-        (capabilities.vmx_true_exit_ctls >> 32) as u32 & 0x002B_EFFF,
-        0x002B_EFFF
+        (capabilities.vmx_true_exit_ctls >> 32) as u32 & 0x003B_EFFF,
+        0x003B_EFFF
     );
     assert_eq!(capabilities.vmx_true_entry_ctls, ia32e_control);
     assert_eq!(
@@ -313,6 +315,7 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
         & !nested::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
         & !nested::VM_EXIT_ACK_INTERRUPT_ON_EXIT
         & !nested::VM_EXIT_LOAD_IA32_PAT
+        & !nested::VM_EXIT_SAVE_IA32_EFER
         & !nested::VM_EXIT_LOAD_IA32_EFER;
     let entry_supported = u32::MAX
         & !nested::VM_ENTRY_IA32E_MODE_GUEST
@@ -369,6 +372,7 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
                 nested::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
                     | nested::VM_EXIT_ACK_INTERRUPT_ON_EXIT
                     | nested::VM_EXIT_LOAD_IA32_PAT
+                    | nested::VM_EXIT_SAVE_IA32_EFER
                     | nested::VM_EXIT_LOAD_IA32_EFER,
             ),
         0
@@ -388,6 +392,7 @@ fn host_derived_controls_never_invent_unsupported_one_settings() {
                 nested::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
                     | nested::VM_EXIT_ACK_INTERRUPT_ON_EXIT
                     | nested::VM_EXIT_LOAD_IA32_PAT
+                    | nested::VM_EXIT_SAVE_IA32_EFER
                     | nested::VM_EXIT_LOAD_IA32_EFER,
             ),
         0
@@ -560,7 +565,7 @@ fn virtual_vmx_msr_map_covers_the_supported_capability_range() {
     for (msr, value) in expected {
         assert_eq!(capabilities.vmx_msr(msr), Some(value));
     }
-    assert_eq!(capabilities.vmx_msr(0x491), None);
+    assert_eq!(capabilities.vmx_msr(nested::IA32_VMX_VMFUNC_MSR), Some(1));
 }
 
 #[test]
@@ -579,6 +584,23 @@ fn vmcs_enum_is_bounded_by_host_and_vmcs12_field_indices() {
 }
 
 #[test]
+fn vmfunc_requires_host_instruction_support_and_virtual_ept() {
+    let mut host = host_vmx_capabilities();
+    assert_eq!(
+        NestedVmxCapabilities::from_host(host).vmx_msr(0x491),
+        Some(1)
+    );
+    host.procbased_ctls2 &= !(u64::from(nested::VMX_SECONDARY_ENABLE_VM_FUNCTIONS) << 32);
+    assert_eq!(NestedVmxCapabilities::from_host(host).vmx_msr(0x491), None);
+    host = host_vmx_capabilities();
+    host.ept_vpid_cap = 0;
+    let capabilities = NestedVmxCapabilities::from_host(host);
+    assert_eq!(capabilities.vmx_msr(0x491), None);
+    assert_eq!(capabilities.vmx_procbased_ctls2, 0);
+    assert_eq!(nested::VMFUNC_EXIT_REASON, 59);
+}
+
+#[test]
 fn cpuid_contract_uses_architectural_bits_and_hypervisor_namespace() {
     assert_eq!(CPUID_VMX_BIT, 1 << 5);
     assert_eq!(CPUID_OSXSAVE_BIT, 1 << 27);
@@ -587,7 +609,7 @@ fn cpuid_contract_uses_architectural_bits_and_hypervisor_namespace() {
     assert_eq!(MATRIXHV_STATUS_SIGNATURE_EAX, 0x4d48_5631);
     assert_eq!(MATRIXHV_STATUS_SIGNATURE_EBX.to_le_bytes(), *b"MATR");
     assert_eq!(MATRIXHV_STATUS_SIGNATURE_ECX.to_le_bytes(), *b"IXHV");
-    assert_eq!(MATRIXHV_STATUS_PROTOCOL, 4);
+    assert_eq!(MATRIXHV_STATUS_PROTOCOL, 5);
     assert_eq!(HYPERVISOR_LEAF_START, 0x4000_0000);
     assert_eq!(HYPERV_FEATURES_LEAF, 0x4000_0003);
     assert_eq!(HYPERVISOR_LEAF_END, 0x4fff_ffff);
@@ -841,6 +863,10 @@ fn extended_vmcs12_fields_are_dense_unique_and_cover_entry_state() {
     assert_eq!(
         nested::VMCS12_EXTENDED_FIELDS[116].encoding,
         nested::VMCS_FIELD_GUEST_LINEAR_ADDRESS
+    );
+    assert_eq!(
+        nested::VMCS12_EXTENDED_FIELDS[117].encoding,
+        nested::VMCS_FIELD_EXECUTIVE_VMCS_POINTER
     );
     assert!(
         nested::VMCS12_EXTENDED_FIELDS

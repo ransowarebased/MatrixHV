@@ -4,8 +4,10 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MATRIXHV_DIAGNOSTIC_PROTOCOL: u32 = 4;
+const MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL: u32 = 4;
+const MATRIXHV_DIAGNOSTIC_PROTOCOL: u32 = 5;
 const TELEMETRY_CONTROL_CAPABILITY: u32 = 1 << 8;
+const NESTED_FAILURE_TRACE_CAPABILITY: u32 = 1 << 9;
 const PAIR_NAMES: [[&str; 2]; 27] = [
     ["sequence", "phase"],
     ["exits", "handler_returns"],
@@ -188,6 +190,206 @@ fn pair(result: std::arch::x86_64::CpuidResult) -> (u64, u64) {
         u64::from(result.ecx) | (u64::from(result.edx) << 32),
     )
 }
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn nested_vmx_instruction(exit_reason: u64) -> &'static str {
+    match exit_reason & 0xffff {
+        19 => "VMCLEAR",
+        20 => "VMLAUNCH",
+        21 => "VMPTRLD",
+        22 => "VMPTRST",
+        23 => "VMREAD",
+        24 => "VMRESUME",
+        25 => "VMWRITE",
+        26 => "VMXOFF",
+        27 => "VMXON",
+        50 => "INVEPT",
+        53 => "INVVPID",
+        _ => "unknown",
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn nested_vmx_failure_reason(kind: u64, code: u64) -> String {
+    match kind {
+        1 => match code {
+            2 => "VMCLEAR invalid physical address".to_string(),
+            3 => "VMCLEAR points to the VMXON region".to_string(),
+            4 => "VMLAUNCH requires a clear VMCS".to_string(),
+            5 => "VMRESUME requires a launched VMCS".to_string(),
+            7 => "invalid VM-entry control fields".to_string(),
+            8 => "invalid VM-entry host state".to_string(),
+            9 => "VMPTRLD invalid physical address".to_string(),
+            10 => "VMPTRLD points to the VMXON region".to_string(),
+            11 => "VMPTRLD incorrect VMCS revision".to_string(),
+            12 => "unsupported VMCS component".to_string(),
+            13 => "VMWRITE to a read-only VMCS component".to_string(),
+            15 => "VMXON while already in VMX operation".to_string(),
+            26 => "VM entry blocked by MOV SS".to_string(),
+            28 => "invalid INVEPT or INVVPID operand".to_string(),
+            _ => format!("VM-instruction error {code}"),
+        },
+        2 => match code {
+            1 => "no current VMCS".to_string(),
+            2 => "invalid VMXON physical address".to_string(),
+            3 => "incorrect VMXON region revision".to_string(),
+            4 => "hardware VMfailInvalid on L2 entry".to_string(),
+            _ => format!("VMfailInvalid detail {code}"),
+        },
+        3 => format!("page fault with error code {code}"),
+        4 => "VMX instruction unavailable in the current mode".to_string(),
+        5 => "VMX instruction privilege or feature-control violation".to_string(),
+        6 => format!("no current VMCS; attempted VM-instruction error {code}"),
+        _ => format!("unknown failure kind {kind}, detail {code}"),
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn nested_vmx_failure_outcome(kind: u64) -> &'static str {
+    match kind {
+        1 => "VMfailValid",
+        2 | 6 => "VMfailInvalid",
+        3 => "#PF",
+        4 => "#UD",
+        5 => "#GP",
+        _ => "unknown",
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn nested_vmcs_field_details(field: u64) -> Option<(&'static str, Option<&'static str>)> {
+    match field & !1 {
+        0x200c => Some(("executive VMCS pointer", None)),
+        0x2016 => Some((
+            "posted-interrupt descriptor address",
+            Some("process posted interrupts"),
+        )),
+        0x2024 => Some(("EPTP-list address", Some("EPTP switching VM function"))),
+        0x2026 => Some(("VMREAD-bitmap address", Some("VMCS shadowing"))),
+        0x2028 => Some(("VMWRITE-bitmap address", Some("VMCS shadowing"))),
+        0x202a => Some((
+            "virtualization-exception information address",
+            Some("EPT-violation #VE"),
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+mod nested_failure_tests {
+    use super::nested_vmcs_field_details;
+
+    #[test]
+    fn executive_pointer_is_unconditional_and_optional_fields_require_controls() {
+        assert_eq!(
+            nested_vmcs_field_details(0x200c),
+            Some(("executive VMCS pointer", None))
+        );
+        for field in [0x2016, 0x2024, 0x2026, 0x2028, 0x202a] {
+            assert!(nested_vmcs_field_details(field).unwrap().1.is_some());
+        }
+        assert_eq!(
+            nested_vmcs_field_details(0x202b),
+            nested_vmcs_field_details(0x202a)
+        );
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn append_nested_failure_trace(text: &mut String, cpu: u32) {
+    let prefix = format!("cpu.{cpu}");
+    let metadata = diagnostic_cpu(0x100, cpu);
+    let count = u64::from(metadata.eax) | (u64::from(metadata.ebx) << 32);
+    let capacity = metadata.ecx.min(32);
+    writeln!(text, "{prefix}.nested_failure_trace_count={count}").unwrap();
+    writeln!(text, "{prefix}.nested_failure_trace_capacity={capacity}").unwrap();
+    writeln!(
+        text,
+        "{prefix}.nested_failure_trace_truncated={}",
+        u8::from(count > u64::from(capacity))
+    )
+    .unwrap();
+    let mut unsupported_capability_fields = 0;
+    let mut other_failures = 0;
+    for index in 0..count.min(u64::from(capacity)) as u32 {
+        let subleaf = 0x101 + index * 3;
+        let (rip, exit_reason) = pair(diagnostic_cpu(subleaf, cpu));
+        let (kind, code) = pair(diagnostic_cpu(subleaf + 1, cpu));
+        let (vmcs_field, operand) = pair(diagnostic_cpu(subleaf + 2, cpu));
+        let entry = format!("{prefix}.nested_failure.{index}");
+        writeln!(text, "{entry}.rip=0x{rip:x}").unwrap();
+        writeln!(
+            text,
+            "{entry}.instruction={}",
+            nested_vmx_instruction(exit_reason)
+        )
+        .unwrap();
+        writeln!(text, "{entry}.outcome={}", nested_vmx_failure_outcome(kind)).unwrap();
+        writeln!(
+            text,
+            "{entry}.reason={}",
+            nested_vmx_failure_reason(kind, code)
+        )
+        .unwrap();
+        writeln!(text, "{entry}.code={code}").unwrap();
+        if matches!(exit_reason & 0xffff, 23 | 25) {
+            writeln!(text, "{entry}.vmcs_field=0x{vmcs_field:x}").unwrap();
+        }
+        let capability_field = if kind == 1 && code == 12 && matches!(exit_reason & 0xffff, 23 | 25)
+        {
+            nested_vmcs_field_details(vmcs_field).and_then(|(_, required_control)| required_control)
+        } else {
+            None
+        };
+        if let Some((name, required_control)) = nested_vmcs_field_details(vmcs_field) {
+            if matches!(exit_reason & 0xffff, 23 | 25) {
+                writeln!(text, "{entry}.vmcs_field_name={name}").unwrap();
+                if let Some(required_control) = required_control {
+                    writeln!(text, "{entry}.required_control={required_control}").unwrap();
+                }
+            }
+        }
+        if capability_field.is_some() {
+            unsupported_capability_fields += 1;
+            writeln!(text, "{entry}.classification=unsupported_capability_field").unwrap();
+        } else {
+            other_failures += 1;
+            writeln!(text, "{entry}.classification=other_failure").unwrap();
+        }
+        if kind == 3 || matches!(exit_reason & 0xffff, 19 | 21 | 22 | 27) {
+            writeln!(text, "{entry}.operand=0x{operand:x}").unwrap();
+        }
+    }
+    writeln!(
+        text,
+        "{prefix}.nested_failure_trace_unsupported_capability_fields={unsupported_capability_fields}"
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "{prefix}.nested_failure_trace_other_failures={other_failures}"
+    )
+    .unwrap();
+}
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
@@ -200,7 +402,7 @@ fn verify_cpu(cpu: u32) -> Result<(), String> {
     {
         return Err(format!("MatrixHV is not present on logical CPU {cpu}"));
     }
-    if status.edx != MATRIXHV_DIAGNOSTIC_PROTOCOL {
+    if !(MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL..=MATRIXHV_DIAGNOSTIC_PROTOCOL).contains(&status.edx) {
         return Err(format!(
             "unsupported MatrixHV diagnostic protocol {} on logical CPU {cpu}",
             status.edx
@@ -288,6 +490,7 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
     let observer_cpu = affinity.allowed()[0];
     affinity.pin(observer_cpu)?;
     verify_cpu(observer_cpu)?;
+    let protocol = diagnostic(0).edx;
     let registered_mask = pair(diagnostic(36)).0;
     let cpus: Vec<u32> = (0..64)
         .filter(|cpu| registered_mask & (1u64 << cpu) != 0)
@@ -295,8 +498,9 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
     if cpus.is_empty() {
         return Err("MatrixHV reported no registered vCPUs".to_string());
     }
+    let format_version = if protocol >= 5 { 3 } else { 2 };
     let mut text = format!(
-        "format=matrixhv-telemetry-v2\nmode={}\nscope=registered_vcpus\n",
+        "format=matrixhv-telemetry-v{format_version}\nmode={}\nscope=registered_vcpus\n",
         mode.name()
     );
     if mode != Mode::EptDiagnostics {
@@ -349,6 +553,9 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
         }
         writeln!(text, "{prefix}.coherent={}", u8::from(coherent)).unwrap();
         text.push_str(&sample);
+        if protocol >= 5 && mode == Mode::General {
+            append_nested_failure_trace(&mut text, cpu);
+        }
         if cpu == cpus[0] {
             let low = diagnostic(1);
             let high = diagnostic(2);
@@ -406,7 +613,9 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
-    if matrixhv_present && protocol == MATRIXHV_DIAGNOSTIC_PROTOCOL {
+    if matrixhv_present
+        && (MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL..=MATRIXHV_DIAGNOSTIC_PROTOCOL).contains(&protocol)
+    {
         let caps = diagnostic(34);
         let low = diagnostic(1);
         let high = diagnostic(2);
@@ -418,13 +627,18 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
             mask.count_ones().to_string()
         };
         let mut text = format!(
-            "capabilities=0x{:x}\ncapability_names=vcpu_counters,watchdog_sequence_phase,guest_triad,entry_failure_slot,host_exception_slot,ept_diagnostics,watchdog_lease,remote_vcpu_query{}\nlogical_processor_count={count}\n",
+            "capabilities=0x{:x}\ncapability_names=vcpu_counters,watchdog_sequence_phase,guest_triad,entry_failure_slot,host_exception_slot,ept_diagnostics,watchdog_lease,remote_vcpu_query{}{}\nlogical_processor_count={count}\n",
             caps.eax,
             if caps.eax & TELEMETRY_CONTROL_CAPABILITY != 0 {
                 ",telemetry_control"
             } else {
                 ""
-            }
+            },
+            if caps.eax & NESTED_FAILURE_TRACE_CAPABILITY != 0 {
+                ",nested_failure_trace"
+            } else {
+                ""
+            },
         );
         if caps.eax & TELEMETRY_CONTROL_CAPABILITY != 0 {
             writeln!(
@@ -441,6 +655,24 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
 }
 
 #[cfg(target_os = "windows")]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> *mut core::ffi::c_void;
+    fn GetCurrentThread() -> *mut core::ffi::c_void;
+    fn GetProcessAffinityMask(
+        process: *mut core::ffi::c_void,
+        process_mask: *mut usize,
+        system_mask: *mut usize,
+    ) -> i32;
+    fn SetThreadAffinityMask(thread: *mut core::ffi::c_void, mask: usize) -> usize;
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> i32;
+    fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32;
+}
+
+#[cfg(target_os = "windows")]
 struct CpuAffinity {
     thread: *mut core::ffi::c_void,
     allowed: Vec<u32>,
@@ -450,15 +682,6 @@ struct CpuAffinity {
 #[cfg(target_os = "windows")]
 impl CpuAffinity {
     fn current() -> Result<Self, String> {
-        unsafe extern "system" {
-            fn GetCurrentProcess() -> *mut core::ffi::c_void;
-            fn GetCurrentThread() -> *mut core::ffi::c_void;
-            fn GetProcessAffinityMask(
-                process: *mut core::ffi::c_void,
-                process_mask: *mut usize,
-                system_mask: *mut usize,
-            ) -> i32;
-        }
         let mut process_mask = 0usize;
         let mut system_mask = 0usize;
         if unsafe {
@@ -486,9 +709,6 @@ impl CpuAffinity {
     }
 
     fn pin(&mut self, cpu: u32) -> Result<(), String> {
-        unsafe extern "system" {
-            fn SetThreadAffinityMask(thread: *mut core::ffi::c_void, mask: usize) -> usize;
-        }
         let previous = unsafe { SetThreadAffinityMask(self.thread, 1usize << cpu) };
         if previous == 0 {
             return Err(format!(
@@ -504,9 +724,6 @@ impl CpuAffinity {
 #[cfg(target_os = "windows")]
 impl Drop for CpuAffinity {
     fn drop(&mut self) {
-        unsafe extern "system" {
-            fn SetThreadAffinityMask(thread: *mut core::ffi::c_void, mask: usize) -> usize;
-        }
         if let Some(mask) = self.original_mask {
             unsafe { SetThreadAffinityMask(self.thread, mask) };
         }
@@ -522,9 +739,6 @@ struct CpuAffinity {
 #[cfg(target_os = "linux")]
 impl CpuAffinity {
     fn current() -> Result<Self, String> {
-        unsafe extern "C" {
-            fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> i32;
-        }
         let mut original_mask = [0u8; 128];
         if unsafe { sched_getaffinity(0, original_mask.len(), original_mask.as_mut_ptr()) } != 0 {
             return Err(format!(
@@ -555,9 +769,6 @@ impl CpuAffinity {
     }
 
     fn pin(&mut self, cpu: u32) -> Result<(), String> {
-        unsafe extern "C" {
-            fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32;
-        }
         let mut mask = [0u8; 128];
         mask[cpu as usize / 8] = 1 << (cpu % 8);
         if unsafe { sched_setaffinity(0, mask.len(), mask.as_ptr()) } != 0 {
@@ -573,9 +784,6 @@ impl CpuAffinity {
 #[cfg(target_os = "linux")]
 impl Drop for CpuAffinity {
     fn drop(&mut self) {
-        unsafe extern "C" {
-            fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32;
-        }
         unsafe { sched_setaffinity(0, self.original_mask.len(), self.original_mask.as_ptr()) };
     }
 }

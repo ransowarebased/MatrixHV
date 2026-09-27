@@ -248,9 +248,6 @@ impl ProtectionTablePool {
         let entries = unsafe {
             NonNull::new_unchecked(self.pages.pointer().as_ptr().add(page_offset).cast::<u64>())
         };
-        unsafe {
-            entries.as_ptr().write_bytes(0, EPT_ENTRY_COUNT);
-        }
         Ok(TablePage {
             physical_address,
             entries,
@@ -990,9 +987,6 @@ fn allocate_table(pages: &mut Vec<ResidentPages>) -> Result<TablePage, EptError>
     let page = ResidentPages::allocate(1, AddressConstraint::Any).map_err(EptError::Allocation)?;
     let physical_address = page.physical_address();
     let entries = page.pointer().cast::<u64>();
-    unsafe {
-        entries.as_ptr().write_bytes(0, EPT_ENTRY_COUNT);
-    }
     pages.push(page);
     Ok(TablePage {
         physical_address,
@@ -1039,14 +1033,14 @@ fn clone_table_tree(
 }
 
 fn write_entry(table: TablePage, index: usize, value: u64) {
-    debug_assert!(index < EPT_ENTRY_COUNT);
+    assert!(index < EPT_ENTRY_COUNT, "EPT entry index is out of bounds");
     unsafe {
         table.entries.as_ptr().add(index).write(value);
     }
 }
 
 fn read_entry(table: TablePage, index: usize) -> u64 {
-    debug_assert!(index < EPT_ENTRY_COUNT);
+    assert!(index < EPT_ENTRY_COUNT, "EPT entry index is out of bounds");
     unsafe { table.entries.as_ptr().add(index).read() }
 }
 

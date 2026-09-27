@@ -29,24 +29,43 @@ def structure(source, name):
 resident = (project / "src/core/vt_resident.rs").read_text()
 nested = (project / "src/nested.rs").read_text()
 fields = {}
+formats = {}
 offset = 0
 
 
 def append_u64_fields(source, prefix):
     global offset
     for name, kind in re.findall(r"(?:pub )?(\w+): ([^,\n]+),", source):
-        if kind != "u64":
-            break
-        fields[prefix + name] = offset
-        offset += 8
+        if kind in ("u64", "u32"):
+            size = 8 if kind == "u64" else 4
+            offset = (offset + size - 1) // size * size
+            fields[prefix + name] = offset
+            formats[prefix + name] = "<Q" if kind == "u64" else "<I"
+            offset += size
+        elif kind == "WatchdogGuestState":
+            append_u64_fields(structure(resident, kind), prefix + name + ".")
+        elif kind == "NestedVmxState":
+            append_u64_fields(structure(nested, kind), prefix + name + ".")
+        elif kind == "NestedVmcs12State":
+            append_u64_fields(structure(nested, kind), prefix + name + ".")
+        elif (array := re.fullmatch(r"\[(u64|u32); (\w+)\]", kind)):
+            element, length = array.groups()
+            size = 8 if element == "u64" else 4
+            offset = (offset + size - 1) // size * size
+            count = int(length) if length.isdecimal() else int(
+                re.search(r"const " + re.escape(length) + r": usize = (\d+)", nested)[1]
+            )
+            for index in range(count):
+                fields[f"{prefix}{name}.{index}"] = offset
+                formats[f"{prefix}{name}.{index}"] = "<Q" if element == "u64" else "<I"
+                offset += size
+        elif name == "original_gdtr":
+            return
+        else:
+            raise RuntimeError(f"Unsupported resident layout field: {prefix}{name}: {kind}")
 
 
 append_u64_fields(structure(resident, "ResidentBootContext"), "")
-append_u64_fields(structure(nested, "NestedVmxState"), "nested.")
-append_u64_fields(structure(nested, "NestedVmcs12State"), "nested.vmcs12.")
-extended_count = int(re.search(r"const VMCS12_EXTENDED_FIELD_COUNT: usize = (\d+)", nested)[1])
-offset += extended_count * 8 + 8
-append_u64_fields(structure(nested, "NestedVmxState").split("pub vmcs12: NestedVmcs12State,", 1)[1], "nested.")
 reference_serial = os.environ.get("MATRIXHV_REFERENCE_SERIAL")
 serial_path = Path(reference_serial) if reference_serial else output / "serial.log"
 serial = serial_path.read_text(errors="replace")
@@ -99,12 +118,13 @@ try:
                                        "reference_serial": str(serial_path)}
     for address_text in dict.fromkeys(contexts):
         address = int(address_text, 16)
-        size = max(fields.values()) + 8
+        size = max(field_offset + struct.calcsize(formats[name])
+                   for name, field_offset in fields.items())
         ida_dbg.invalidate_dbgmem_contents(address, size)
         data = idc.get_bytes(address, size, True)
         if data is None or len(data) != size:
             raise RuntimeError(f"Cannot read resident context at {address_text}")
-        values = {name: struct.unpack_from("<Q", data, field_offset)[0]
+        values = {name: struct.unpack_from(formats[name], data, field_offset)[0]
                   for name, field_offset in fields.items()}
         (output / f"{sample}-context-{address:x}.bin").write_bytes(data)
         if values["canary_start"] != 0x4856424F4F544331 or values["canary_end"] != 0x4856424F4F544332:
@@ -118,6 +138,27 @@ try:
         values["event.cpu_mask"] = event[7]
         values["event.halted"] = event[8]
         values["event.host_fault_vector"] = event[9]
+        if os.environ.get("MATRIXHV_VMFUNC_PROBE") == "1" and values["processor_number"] == 0:
+            probe_address = values["nested.vmxon_operand"] + 136
+            ida_dbg.invalidate_dbgmem_contents(probe_address, 24)
+            probe_data = idc.get_bytes(probe_address, 24, True)
+            if probe_data is None or len(probe_data) != 24:
+                raise RuntimeError("Cannot read VMFUNC probe results")
+            result["vmfunc_probe"] = {
+                "baseline_exits": struct.unpack_from("<I", probe_data, 0)[0],
+                "switch_loop_exits": struct.unpack_from("<I", probe_data, 8)[0],
+                "completed": struct.unpack_from("<Q", probe_data, 16)[0],
+                "valid_vmfunc_instructions": 2049,
+            }
+            list_address = values["nested.vmcs12.extended_fields.119"]
+            ida_dbg.invalidate_dbgmem_contents(list_address, 4096)
+            list_data = idc.get_bytes(list_address, 4096, True)
+            if list_data is None or len(list_data) != 4096:
+                raise RuntimeError("Cannot read VMFUNC probe EPTP list")
+            result["vmfunc_probe"]["eptp_slots"] = {
+                str(index): struct.unpack_from("<Q", list_data, index * 8)[0]
+                for index in (0, 2, 511)
+            }
         result["contexts"].append({"address": address, "values": values})
         print("CONTEXT", address_text, json.dumps(values))
     (output / f"{sample}-state.json").write_text(json.dumps(result, indent=2))

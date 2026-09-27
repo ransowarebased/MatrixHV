@@ -70,18 +70,20 @@ pub fn configure_host_with_cr3(host_cr3: u64) -> Result<HostStateReport, VmcsErr
     vmwrite(HOST_TR_BASE, segments.tr.base)?;
     vmwrite(HOST_GDTR_BASE, segments.gdtr.base)?;
     vmwrite(HOST_IDTR_BASE, segments.idtr.base)?;
-    vmwrite(HOST_IA32_PAT, unsafe { arch::read_msr(arch::IA32_PAT) })?;
-    vmwrite(HOST_IA32_EFER, unsafe { arch::read_msr(arch::IA32_EFER) })?;
+    vmwrite(HOST_IA32_PAT, arch::ArchitecturalMsr::Pat.read())?;
+    vmwrite(HOST_IA32_EFER, arch::ArchitecturalMsr::Efer.read())?;
     vmwrite(
         HOST_SYSENTER_CS,
-        unsafe { arch::read_msr(arch::IA32_SYSENTER_CS) } & 0xffff_ffff,
+        arch::ArchitecturalMsr::SysenterCs.read() & 0xffff_ffff,
     )?;
-    vmwrite(HOST_SYSENTER_ESP, unsafe {
-        arch::read_msr(arch::IA32_SYSENTER_ESP)
-    })?;
-    vmwrite(HOST_SYSENTER_EIP, unsafe {
-        arch::read_msr(arch::IA32_SYSENTER_EIP)
-    })?;
+    vmwrite(
+        HOST_SYSENTER_ESP,
+        arch::ArchitecturalMsr::SysenterEsp.read(),
+    )?;
+    vmwrite(
+        HOST_SYSENTER_EIP,
+        arch::ArchitecturalMsr::SysenterEip.read(),
+    )?;
 
     Ok(HostStateReport {
         cr3: host_cr3,
@@ -185,18 +187,20 @@ pub fn configure_guest_with_rflags(
     vmwrite(GUEST_IA32_DEBUGCTL, unsafe {
         arch::read_msr(arch::IA32_DEBUGCTL)
     })?;
-    vmwrite(GUEST_IA32_PAT, unsafe { arch::read_msr(arch::IA32_PAT) })?;
-    vmwrite(GUEST_IA32_EFER, unsafe { arch::read_msr(arch::IA32_EFER) })?;
+    vmwrite(GUEST_IA32_PAT, arch::ArchitecturalMsr::Pat.read())?;
+    vmwrite(GUEST_IA32_EFER, arch::ArchitecturalMsr::Efer.read())?;
     vmwrite(
         GUEST_SYSENTER_CS,
-        unsafe { arch::read_msr(arch::IA32_SYSENTER_CS) } & 0xffff_ffff,
+        arch::ArchitecturalMsr::SysenterCs.read() & 0xffff_ffff,
     )?;
-    vmwrite(GUEST_SYSENTER_ESP, unsafe {
-        arch::read_msr(arch::IA32_SYSENTER_ESP)
-    })?;
-    vmwrite(GUEST_SYSENTER_EIP, unsafe {
-        arch::read_msr(arch::IA32_SYSENTER_EIP)
-    })?;
+    vmwrite(
+        GUEST_SYSENTER_ESP,
+        arch::ArchitecturalMsr::SysenterEsp.read(),
+    )?;
+    vmwrite(
+        GUEST_SYSENTER_EIP,
+        arch::ArchitecturalMsr::SysenterEip.read(),
+    )?;
 
     Ok(GuestStateReport {
         cr3: guest_cr3,

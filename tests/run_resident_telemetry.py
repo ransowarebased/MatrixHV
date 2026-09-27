@@ -9,7 +9,9 @@ output.mkdir(parents=True, exist_ok=True)
 source = (project / "src/asm/resident_island.S").read_text(encoding="utf-8")
 start = source.index('.Lresident_dispatch_cpuid_diagnostic:')
 end = source.index('.Lresident_dispatch_cpuid_standard:', start)
-assembly = source[start:end].strip()
+trace_start = source.index('.Lresident_nested_record_failure:')
+trace_end = source.index('.Lresident_dispatch_cpuid:', trace_start)
+assembly = source[trace_start:trace_end] + "\n" + source[start:end]
 macro_start = source.index('.macro resident_telemetry_counter ')
 macro_end = source.index('.endm', macro_start) + len('.endm')
 assembly = source[macro_start:macro_end] + "\n" + assembly
@@ -19,12 +21,16 @@ cursor = 0
 for name in names:
     offsets[name] = cursor
     cursor += 512 if name == "event_cpu_contexts" else (
+        192 * 8 if name == "b_nested_failure_trace" else (
         56 if name in {"b_watchdog_before", "b_watchdog_after", "b_watchdog_resume", "b_entry_failure_guest"} else 8
+        )
     )
 constants = {
     "cpuid_reason": 10, "matrixhv_status_leaf": 0x4D485652,
     "ept_violation_reason": 48, "invept_reason": 50, "preemption_timer_reason": 52,
     "log_serial_sink": 1,
+    "nested_failure_trace_capacity": 32,
+    "nested_failure_trace_limit": 0x161,
     "guest_rip": 0, "guest_rsp": 1, "guest_rflags": 2,
     "guest_cr0": 3, "guest_cr3": 4, "guest_cr4": 5, "guest_efer": 6,
 }
@@ -61,6 +67,15 @@ test_counter:
     resident_telemetry_counter inc, EXIT_COUNT_OFFSET, ACTIVE_OFFSET
     pushfq
     pop rax
+    pop r12
+    ret
+.globl test_nested_failure_record
+test_nested_failure_record:
+    push r12
+    mov r12, rcx
+    mov r10, r8
+    mov r8, rdx
+    call .Lresident_nested_record_failure
     pop r12
     ret
 .globl test_diagnostic

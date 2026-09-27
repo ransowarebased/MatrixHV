@@ -57,6 +57,20 @@ fn allocate_table(pages: &mut Vec<Box<AlignedTable>>) -> Result<TablePage, EptEr
 }
 
 #[test]
+fn table_access_rejects_out_of_bounds_indices_in_every_build_profile() {
+    let mut pages = Vec::new();
+    let table = allocate_table(&mut pages).unwrap();
+    write_entry(table, 0, 0x1234);
+    write_entry(table, EPT_ENTRY_COUNT - 1, 0x5678);
+    for index in [EPT_ENTRY_COUNT, usize::MAX] {
+        assert!(std::panic::catch_unwind(|| read_entry(table, index)).is_err());
+        assert!(std::panic::catch_unwind(|| write_entry(table, index, 0)).is_err());
+    }
+    assert_eq!(read_entry(table, 0), 0x1234);
+    assert_eq!(read_entry(table, EPT_ENTRY_COUNT - 1), 0x5678);
+}
+
+#[test]
 fn relocated_pci_bar_is_uc_without_replacing_ram_or_firmware_bar() {
     assert_eq!(
         [

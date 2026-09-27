@@ -98,6 +98,41 @@ pub const IA32_EFER: u32 = 0xc000_0080;
 pub const IA32_FS_BASE: u32 = 0xc000_0100;
 pub const IA32_GS_BASE: u32 = 0xc000_0101;
 
+// This module runs in the hypervisor's CPL0 environment. Restrict safe reads
+// to architectural state with baseline x86-64 support or a checked CPUID bit.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub enum ArchitecturalMsr {
+    Pat = IA32_PAT,
+    Efer = IA32_EFER,
+    FsBase = IA32_FS_BASE,
+    GsBase = IA32_GS_BASE,
+    SysenterCs = IA32_SYSENTER_CS,
+    SysenterEsp = IA32_SYSENTER_ESP,
+    SysenterEip = IA32_SYSENTER_EIP,
+}
+
+impl ArchitecturalMsr {
+    pub fn read(self) -> u64 {
+        let required_feature = match self {
+            Self::Pat => 1 << 16,
+            Self::SysenterCs | Self::SysenterEsp | Self::SysenterEip => 1 << 11,
+            Self::Efer | Self::FsBase | Self::GsBase => 0,
+        };
+        if required_feature != 0 {
+            assert!(
+                leaf(1).edx & required_feature != 0,
+                "architectural MSR is not supported by this processor"
+            );
+        }
+        // All enum values name read-only accesses to supported architectural state.
+        unsafe { read_msr(self as u32) }
+    }
+}
+
+/// # Safety
+/// The caller must run at CPL0 and verify that this MSR is implemented and
+/// readable on the current processor, including model-specific side effects.
 #[inline]
 pub unsafe fn read_msr(msr: u32) -> u64 {
     let low: u32;
@@ -158,6 +193,16 @@ pub fn leaf_with_subleaf(function: u32, subleaf: u32) -> CpuIdLeaf {
         ecx: result.ecx,
         edx: result.edx,
     }
+}
+
+pub fn apic_id() -> u32 {
+    if leaf(0).eax >= 0xb {
+        let topology = leaf_with_subleaf(0xb, 0);
+        if topology.ebx != 0 {
+            return topology.edx;
+        }
+    }
+    leaf(1).ebx >> 24
 }
 
 // CPU Vendor & Capabilities
@@ -265,8 +310,8 @@ pub fn capture() -> SegmentationState {
         idtr,
     };
 
-    state.fs.base = unsafe { read_msr(IA32_FS_BASE) };
-    state.gs.base = unsafe { read_msr(IA32_GS_BASE) };
+    state.fs.base = ArchitecturalMsr::FsBase.read();
+    state.gs.base = ArchitecturalMsr::GsBase.read();
     state
 }
 

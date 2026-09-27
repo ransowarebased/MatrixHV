@@ -227,6 +227,12 @@ pub(crate) fn enable_resident_vpid(
     Ok(())
 }
 
+pub(crate) fn native_eptp_switching_supported() -> bool {
+    let secondary = unsafe { arch::read_msr(arch::IA32_VMX_PROCBASED_CTLS2) };
+    secondary & (u64::from(crate::nested::VMX_SECONDARY_ENABLE_VM_FUNCTIONS) << 32) != 0
+        && unsafe { arch::read_msr(crate::nested::IA32_VMX_VMFUNC_MSR) } & 1 != 0
+}
+
 fn configure_internal(requested: RequestedControls) -> Result<VmxControls, VmxControlsError> {
     let basic = unsafe { arch::read_msr(arch::IA32_VMX_BASIC) };
     let use_true_controls = basic & IA32_VMX_BASIC_TRUE_CTLS != 0;

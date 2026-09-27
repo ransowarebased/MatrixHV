@@ -33,7 +33,13 @@ core::arch::global_asm!(
 );
 
 unsafe extern "win64" {
-    fn merge_test_intercepts(context: *mut InterceptContext);
+    #[link_name = "merge_test_intercepts"]
+    fn merge_test_intercepts_raw(context: *mut InterceptContext);
+}
+
+fn merge_test_intercepts(context: &mut InterceptContext) {
+    // The trampoline only reads and writes fields of the exclusively borrowed context.
+    unsafe { merge_test_intercepts_raw(context) }
 }
 
 #[test]
@@ -47,7 +53,7 @@ fn l1_monitor_trap_and_wbinvd_controls_reach_vmcs02_and_can_be_cleared() {
         merged_secondary: 0,
         hardware: [0; 2],
     };
-    unsafe { merge_test_intercepts(&mut context) };
+    merge_test_intercepts(&mut context);
     assert_eq!(
         context.hardware,
         [(1 << 28) | (1 << 27), (1 << 1) | (1 << 6)]
@@ -55,8 +61,30 @@ fn l1_monitor_trap_and_wbinvd_controls_reach_vmcs02_and_can_be_cleared() {
     assert_eq!(context.merged_secondary, context.hardware[1]);
     context.l1_primary = 0;
     context.l1_secondary = 0;
-    unsafe { merge_test_intercepts(&mut context) };
+    merge_test_intercepts(&mut context);
     assert_eq!(context.hardware, [1 << 28, 1 << 1]);
+}
+
+#[test]
+fn vmfunc_trapping_follows_l1_secondary_control_activation() {
+    let mut context = InterceptContext {
+        l0_primary: 1 << 31,
+        l1_primary: 1 << 31,
+        l0_secondary: 2,
+        l1_secondary: 0x2002,
+        vpid: 0,
+        merged_secondary: 0,
+        hardware: [0; 2],
+    };
+    merge_test_intercepts(&mut context);
+    assert_eq!(context.hardware[1], 0x2002);
+    context.l1_primary = 0;
+    merge_test_intercepts(&mut context);
+    assert_eq!(context.hardware[1], 2);
+    context.l1_primary = 1 << 31;
+    context.l1_secondary = 2;
+    merge_test_intercepts(&mut context);
+    assert_eq!(context.hardware[1], 2);
 }
 
 #[repr(C)]
@@ -82,7 +110,13 @@ core::arch::global_asm!(
 );
 
 unsafe extern "win64" {
-    fn complete_test_vmx_success(context: *mut SuccessContext);
+    #[link_name = "complete_test_vmx_success"]
+    fn complete_test_vmx_success_raw(context: *mut SuccessContext);
+}
+
+fn complete_test_vmx_success(context: &mut SuccessContext) {
+    // All simulated VMCS accesses stay inside the borrowed context.
+    unsafe { complete_test_vmx_success_raw(context) }
 }
 
 #[test]
@@ -100,9 +134,7 @@ fn vmx_success_clears_status_flags_and_preserves_other_guest_flags() {
                 writes: 0,
                 advances: 0,
             };
-            unsafe {
-                complete_test_vmx_success(&mut state);
-            }
+            complete_test_vmx_success(&mut state);
             assert_eq!(state.rflags, preserved);
             assert_eq!(state.writes, u64::from(status != 0));
             assert_eq!(state.advances, 1);
@@ -127,7 +159,13 @@ core::arch::global_asm!(
 );
 
 unsafe extern "win64" {
-    fn compose_test_msr_bitmap(l0: *const u8, l1: *const u8, output: *mut u8);
+    #[link_name = "compose_test_msr_bitmap"]
+    fn compose_test_msr_bitmap_raw(l0: *const u8, l1: *const u8, output: *mut u8);
+}
+
+fn compose_test_msr_bitmap(l0: &[u8; 4096], l1: &[u8; 4096], output: &mut [u8; 4096]) {
+    // Array sizes cover all 512 qword accesses; the output borrow excludes aliasing.
+    unsafe { compose_test_msr_bitmap_raw(l0.as_ptr(), l1.as_ptr(), output.as_mut_ptr()) }
 }
 
 #[test]
@@ -149,9 +187,7 @@ fn apic_passthrough_keeps_l1_intercepts_and_tracks_bitmap_changes() {
         } else if revision == 2 {
             l1[2048 + 0x808 / 8] |= 1 << (0x808 % 8);
         }
-        unsafe {
-            compose_test_msr_bitmap(l0.as_ptr(), l1.as_ptr(), output.as_mut_ptr());
-        }
+        compose_test_msr_bitmap(&l0, &l1, &mut output);
         for offset in 0..4096 {
             assert_eq!(output[offset], l0[offset] | l1[offset]);
         }
@@ -196,7 +232,13 @@ core::arch::global_asm!(
 );
 
 unsafe extern "win64" {
-    fn snapshot_test_vmcs01(context: *mut SnapshotContext);
+    #[link_name = "snapshot_test_vmcs01"]
+    fn snapshot_test_vmcs01_raw(context: *mut SnapshotContext);
+}
+
+fn snapshot_test_vmcs01(context: &mut SnapshotContext) {
+    // The nine fixed VMCS selectors index the two inline arrays.
+    unsafe { snapshot_test_vmcs01_raw(context) }
 }
 
 #[test]
@@ -216,9 +258,7 @@ fn vmcs01_snapshot_retains_controls_and_refreshes_live_l1_state() {
         ],
         reads: 0,
     };
-    unsafe {
-        snapshot_test_vmcs01(&mut state);
-    }
+    snapshot_test_vmcs01(&mut state);
     assert_eq!(state.values, state.hardware);
     assert_eq!(state.reads, 9);
     let controls = state.values[4..].to_vec();
@@ -227,9 +267,7 @@ fn vmcs01_snapshot_retains_controls_and_refreshes_live_l1_state() {
     state.hardware[1] = 0;
     state.hardware[2] = u64::MAX - 100;
     state.hardware[3] &= !0x200;
-    unsafe {
-        snapshot_test_vmcs01(&mut state);
-    }
+    snapshot_test_vmcs01(&mut state);
     assert_eq!(state.values[..4], state.hardware[..4]);
     assert_eq!(state.values[4..], controls);
     assert_eq!(state.reads, 13);
@@ -251,7 +289,13 @@ core::arch::global_asm!(
 );
 
 unsafe extern "win64" {
-    fn validate_test_address(width: *const u32, address: u64, aligned: u64) -> u64;
+    #[link_name = "validate_test_address"]
+    fn validate_test_address_raw(width: *const u32, address: u64, aligned: u64) -> u64;
+}
+
+fn validate_test_address(width: &u32, address: u64, aligned: u64) -> u64 {
+    // The address is validated as an integer, never dereferenced.
+    unsafe { validate_test_address_raw(width, address, aligned) }
 }
 
 #[test]
@@ -266,14 +310,11 @@ fn physical_address_validation_honors_cached_width_and_alignment() {
             (last_byte + 1, 1, 0),
             (u64::MAX, 0, 0),
         ] {
-            assert_eq!(
-                unsafe { validate_test_address(&width, address, aligned) },
-                valid
-            );
+            assert_eq!(validate_test_address(&width, address, aligned), valid);
         }
     }
-    assert_eq!(unsafe { validate_test_address(&0, 0, 1) }, 0);
-    assert_eq!(unsafe { validate_test_address(&64, u64::MAX, 0) }, 1);
+    assert_eq!(validate_test_address(&0, 0, 1), 0);
+    assert_eq!(validate_test_address(&64, u64::MAX, 0), 1);
 }
 
 #[repr(C)]
@@ -419,8 +460,24 @@ core::arch::global_asm!(
 );
 
 unsafe extern "win64" {
-    fn prepare_test_vpid(context: *mut VpidContext);
-    fn invalidate_test_vpid(context: *mut VpidContext, kind: u64, descriptor: *const u64) -> u64;
+    #[link_name = "prepare_test_vpid"]
+    fn prepare_test_vpid_raw(context: *mut VpidContext);
+    #[link_name = "invalidate_test_vpid"]
+    fn invalidate_test_vpid_raw(
+        context: *mut VpidContext,
+        kind: u64,
+        descriptor: *const u64,
+    ) -> u64;
+}
+
+fn invalidate_test_vpid(context: &mut VpidContext, kind: u64, descriptor: &[u64; 2]) -> u64 {
+    // The descriptor contains both qwords consumed by the validation routine.
+    unsafe { invalidate_test_vpid_raw(context, kind, descriptor.as_ptr()) }
+}
+
+fn prepare_test_vpid(context: &mut VpidContext) {
+    // VPID tags and the packed cache are integers; hardware operations are mocked.
+    unsafe { prepare_test_vpid_raw(context) }
 }
 
 #[test]
@@ -444,23 +501,23 @@ fn vpid_cache_retains_vtl_translations_and_flushes_before_reassigning_a_tag() {
         (2, 3, 4),
     ] {
         state.virtual_tag = tag;
-        unsafe { prepare_test_vpid(&mut state) };
+        prepare_test_vpid(&mut state);
         assert_eq!(state.flushes, expected_flushes);
         assert_eq!(state.selected_tag, selected);
         assert_eq!(state.kind, 1);
         assert_ne!(state.hardware_tag, 1);
     }
     state.secondary = 0;
-    unsafe { prepare_test_vpid(&mut state) };
+    prepare_test_vpid(&mut state);
     assert_eq!(state.last_tag, 0);
     assert_eq!(state.flushes, 6);
     assert_eq!(state.cache, 48 << 32);
     state.secondary = 1 << 5;
-    unsafe { prepare_test_vpid(&mut state) };
+    prepare_test_vpid(&mut state);
     assert_eq!(state.flushes, 7);
     state.hardware_controls = 0;
     state.virtual_tag = 3;
-    unsafe { prepare_test_vpid(&mut state) };
+    prepare_test_vpid(&mut state);
     assert_eq!(state.flushes, 7);
 }
 
@@ -479,10 +536,7 @@ fn invvpid_preserves_l1_and_validates_only_architectural_operand_bits() {
             u64::MAX
         };
         let descriptor = [5, linear];
-        assert_eq!(
-            unsafe { invalidate_test_vpid(&mut state, kind, descriptor.as_ptr()) },
-            0
-        );
+        assert_eq!(invalidate_test_vpid(&mut state, kind, &descriptor), 0);
         assert_eq!(
             (state.kind, state.hardware_tag),
             (1, if kind == 2 { 3 } else { 2 })
@@ -495,26 +549,14 @@ fn invvpid_preserves_l1_and_validates_only_architectural_operand_bits() {
         (2, [1 << 16, 0]),
         (3, [0, 0]),
     ] {
-        assert_eq!(
-            unsafe { invalidate_test_vpid(&mut state, kind, descriptor.as_ptr()) },
-            1
-        );
+        assert_eq!(invalidate_test_vpid(&mut state, kind, &descriptor), 1);
     }
     assert_eq!(state.flushes, 5);
-    assert_eq!(
-        unsafe { invalidate_test_vpid(&mut state, 1, [7, 0].as_ptr()) },
-        0
-    );
+    assert_eq!(invalidate_test_vpid(&mut state, 1, &[7, 0]), 0);
     assert_eq!(state.flushes, 5);
-    assert_eq!(
-        unsafe { invalidate_test_vpid(&mut state, 1, [6, 0].as_ptr()) },
-        0
-    );
+    assert_eq!(invalidate_test_vpid(&mut state, 1, &[6, 0]), 0);
     assert_eq!((state.flushes, state.hardware_tag), (6, 3));
-    assert_eq!(
-        unsafe { invalidate_test_vpid(&mut state, 2, [0, u64::MAX].as_ptr()) },
-        0
-    );
+    assert_eq!(invalidate_test_vpid(&mut state, 2, &[0, u64::MAX]), 0);
     assert_eq!(state.flushes, 8);
 }
 
@@ -548,6 +590,24 @@ struct Context {
     alternate_pool_used: u64,
     alternate_mbec: u64,
     telemetry_active: u64,
+    vm_function_control: u64,
+    eptp_list_address: u64,
+    physical_address_bits: u64,
+    ept_capabilities: u64,
+    shadow_list: u64,
+    native_supported: u64,
+    native_enabled: u64,
+    native_vmcs: [u64; 3],
+    admission: u64,
+    write_retry: u64,
+    sync_result: u64,
+    sync_requests: u64,
+    sync_releases: u64,
+    eptp_pool: u64,
+    eptp_pages: u64,
+    eptp_used: u64,
+    event_context: u64,
+    lists_live: u64,
 }
 
 core::arch::global_asm!(
@@ -602,7 +662,65 @@ core::arch::global_asm!(
     "pop r15", "pop r14", "pop r13", "pop r12",
     "pop rsi", "pop rdi", "pop rbp", "pop rbx",
     "ret",
+    ".globl switch_test_eptp",
+    "switch_test_eptp:",
+    "push rbx", "push rbp", "push rdi", "push rsi",
+    "push r12", "push r13", "push r14", "push r15",
+    "mov r12, rcx", "mov eax, edx", "mov ecx, r8d",
+    "call .Lresident_nested_switch_eptp",
+    "pop r15", "pop r14", "pop r13", "pop r12",
+    "pop rsi", "pop rdi", "pop rbp", "pop rbx", "ret",
+    ".globl validate_test_vm_functions",
+    "validate_test_vm_functions:",
+    "push r12", "mov r12, rcx",
+    "call .Lresident_nested_validate_vm_functions",
+    "pop r12", "ret",
+    ".globl refresh_test_eptp_list",
+    "refresh_test_eptp_list:",
+    "push rbx", "push rbp", "push rdi", "push rsi",
+    "push r12", "push r13", "push r14", "push r15",
+    "mov r12, rcx", "call .Lresident_nested_refresh_eptp_list",
+    "pop r15", "pop r14", "pop r13", "pop r12",
+    "pop rsi", "pop rdi", "pop rbp", "pop rbx", "ret",
+    ".globl capture_test_native_eptp",
+    "capture_test_native_eptp:",
+    "push r12", "mov r12, rcx", "call .Lresident_nested_capture_native_eptp",
+    "pop r12", "ret",
+    ".globl release_test_eptp_sources",
+    "release_test_eptp_sources:",
+    "push rbx", "push rbp", "push rdi", "push rsi",
+    "push r12", "push r13", "push r14", "push r15",
+    "mov r12, rcx", "call .Lresident_nested_eptp_release_sources",
+    "pop r15", "pop r14", "pop r13", "pop r12",
+    "pop rsi", "pop rdi", "pop rbp", "pop rbx", "ret",
+    ".globl root_write_test_eptp",
+    "root_write_test_eptp:",
+    "push r12", "mov r12, rcx",
+    "call .Lresident_nested_eptp_before_root_write",
+    "pop r12", "ret",
     include_str!("../builds/nested-ept-tests/resident-ept.S"),
+    b_event_context = const std::mem::offset_of!(Context, event_context),
+    event_cpu_contexts = const 0,
+    test_lists_live = const std::mem::offset_of!(Context, lists_live),
+    b_nested_eptp_shadow_list = const std::mem::offset_of!(Context, shadow_list),
+    b_nested_eptp_native_supported = const std::mem::offset_of!(Context, native_supported),
+    b_nested_eptp_native_enabled = const std::mem::offset_of!(Context, native_enabled),
+    b_nested_eptp_admission = const std::mem::offset_of!(Context, admission),
+    b_nested_eptp_write_retry = const std::mem::offset_of!(Context, write_retry),
+    test_sync_result = const std::mem::offset_of!(Context, sync_result),
+    test_sync_requests = const std::mem::offset_of!(Context, sync_requests),
+    test_sync_releases = const std::mem::offset_of!(Context, sync_releases),
+    b_nested_eptp_table_pool = const std::mem::offset_of!(Context, eptp_pool),
+    b_nested_eptp_table_pages = const std::mem::offset_of!(Context, eptp_pages),
+    b_nested_eptp_table_used = const std::mem::offset_of!(Context, eptp_used),
+    test_native_vmcs = const std::mem::offset_of!(Context, native_vmcs),
+    vm_function_control = const 0,
+    eptp_list_address = const 1,
+    ept_pointer = const 2,
+    b_nested_vmcs12_vm_function_control = const std::mem::offset_of!(Context, vm_function_control),
+    b_nested_vmcs12_eptp_list_address = const std::mem::offset_of!(Context, eptp_list_address),
+    b_nested_physical_address_bits = const std::mem::offset_of!(Context, physical_address_bits),
+    b_nested_vmx_ept_vpid_cap = const std::mem::offset_of!(Context, ept_capabilities),
     b_expected_host_cr3 = const std::mem::offset_of!(Context, host_cr3),
     b_telemetry_active = const std::mem::offset_of!(Context, telemetry_active),
     b_nested_host_mapping_cache = const std::mem::offset_of!(Context, host_mapping_cache),
@@ -641,16 +759,24 @@ unsafe extern "win64" {
     fn revalidate_test_ept(context: *mut Context);
     fn prepare_test_ept(context: *mut Context);
     fn invalidate_test_ept_context(context: *mut Context, ept_pointer: u64);
+    fn switch_test_eptp(context: *mut Context, function: u64, index: u64) -> u64;
+    fn validate_test_vm_functions(context: *mut Context) -> u64;
+    fn refresh_test_eptp_list(context: *mut Context);
+    fn capture_test_native_eptp(context: *mut Context);
+    fn release_test_eptp_sources(context: *mut Context) -> u64;
+    fn root_write_test_eptp(context: *mut Context);
 }
 
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 struct Arena {
     allocations: Vec<(*mut u8, Layout)>,
+    ept12_mappings: HashMap<u64, u64>,
 }
 impl Arena {
     fn new() -> Self {
         Self {
             allocations: Vec::new(),
+            ept12_mappings: HashMap::new(),
         }
     }
     fn pages(&mut self, count: usize) -> u64 {
@@ -668,6 +794,9 @@ impl Arena {
                 unsafe {
                     (slot as *mut u64).write(target | attributes);
                 }
+                if let Some(&ept01) = self.ept12_mappings.get(&root) {
+                    self.map_ept12_tables(root, ept01, 39);
+                }
                 return;
             }
             let entry = unsafe { (slot as *const u64).read() };
@@ -683,6 +812,22 @@ impl Arena {
             }
         }
         panic!("Invalid leaf size");
+    }
+    fn expose_ept12(&mut self, root: u64, ept01: u64) {
+        self.ept12_mappings.insert(root, ept01);
+        self.map_ept12_tables(root, ept01, 39);
+    }
+    fn map_ept12_tables(&mut self, table: u64, ept01: u64, shift: u32) {
+        self.map(ept01, table, table, 12, 0x37);
+        if shift == 12 {
+            return;
+        }
+        for index in 0..512 {
+            let entry = unsafe { (table as *const u64).add(index).read() };
+            if entry & 0x407 != 0 && entry & 0x80 == 0 {
+                self.map_ept12_tables(entry & ADDRESS_MASK, ept01, shift - 9);
+            }
+        }
     }
     fn host_map(&mut self) -> u64 {
         let root = self.pages(1);
@@ -823,11 +968,18 @@ fn accessed_dirty_does_not_mark_denied_writes_or_change_disabled_flags() {
 }
 
 fn context(arena: &mut Arena, ept12: u64, ept01: u64) -> Context {
+    if ept12 & ADDRESS_MASK != 0 && ept01 != 0 {
+        arena.expose_ept12(ept12 & ADDRESS_MASK, ept01);
+    }
     let ept02 = arena.pages(1);
     let pool = arena.pages(16);
     let alternate_ept02 = arena.pages(1);
     let alternate_pool = arena.pages(16);
+    let eptp_pool = arena.pages(4);
     Context {
+        eptp_pool,
+        eptp_pages: 4,
+        lists_live: 1,
         telemetry_active: 1,
         host_cr3: arena.host_map(),
         gpa: 0x203000,
@@ -867,6 +1019,461 @@ fn disabled_telemetry_keeps_ept_composition_and_invalidation_operational() {
     assert_eq!(state.invalidations, 0);
     assert_eq!(state.native_invept, 0);
     assert!(state.pool_used > 0);
+}
+
+#[test]
+fn vmfunc_switches_remapped_list_entries_and_retains_both_cached_roots() {
+    let mut arena = Arena::new();
+    let first = arena.pages(1) | 0x1e;
+    let second = arena.pages(1) | 0x1e;
+    let ept01 = arena.pages(1);
+    let list = arena.pages(1);
+    arena.map(ept01, 0x9000, list, 12, 0x31);
+    arena.map(first & ADDRESS_MASK, 0x200000, 0x400000, 21, 0xb7);
+    arena.map(second & ADDRESS_MASK, 0x200000, 0x600000, 21, 0xb7);
+    arena.expose_ept12(second & ADDRESS_MASK, ept01);
+    arena.map(ept01, 0x400000, 0x800000, 21, 0xb7);
+    arena.map(ept01, 0x600000, 0xa00000, 21, 0xb7);
+    unsafe {
+        (list as *mut u64).write(first);
+        (list as *mut u64).add(511).write(second);
+    }
+    let mut state = context(&mut arena, first, ept01);
+    state.secondary_control |= 1 << 13;
+    state.vm_function_control = 1;
+    state.eptp_list_address = 0x9000;
+    state.physical_address_bits = 52;
+    let first_root = state.ept02;
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    let first_leaf = leaf(state.ept02, state.gpa);
+    assert_eq!(first_leaf.1 & ADDRESS_MASK, 0x800000);
+    assert_eq!(unsafe { switch_test_eptp(&mut state, 0, 511) }, 1);
+    assert_eq!(state.ept12, second);
+    assert_ne!(state.ept02, first_root);
+    assert_eq!(state.invalidations, 1);
+    let second_root = state.ept02;
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    let second_leaf = leaf(state.ept02, state.gpa);
+    assert_eq!(second_leaf.1 & ADDRESS_MASK, 0xa00000);
+    for _ in 0..8 {
+        assert_eq!(unsafe { switch_test_eptp(&mut state, 0, 0) }, 1);
+        assert_eq!(state.ept02, first_root);
+        assert_eq!(leaf(state.ept02, state.gpa), first_leaf);
+        assert_eq!(unsafe { switch_test_eptp(&mut state, 0, 511) }, 1);
+        assert_eq!(state.ept02, second_root);
+        assert_eq!(leaf(state.ept02, state.gpa), second_leaf);
+    }
+    assert_eq!(state.invalidations, 1);
+    assert_eq!(state.compositions, 2);
+    assert_eq!(unsafe { switch_test_eptp(&mut state, 1 << 32, 1 << 32) }, 1);
+    assert_eq!(state.ept12, first);
+}
+
+#[test]
+fn vmfunc_invalid_requests_preserve_the_active_ept() {
+    let mut arena = Arena::new();
+    let first = arena.pages(1) | 0x1e;
+    let ept01 = arena.pages(1);
+    let list = arena.pages(1);
+    arena.map(ept01, 0x9000, list, 12, 0x31);
+    let mut state = context(&mut arena, first, ept01);
+    state.secondary_control |= 1 << 13;
+    state.vm_function_control = 1;
+    state.eptp_list_address = 0x9000;
+    state.physical_address_bits = 48;
+    let root = state.ept02;
+    for entry in [0, first | 0x80, first | (1 << 48), first ^ 1, first | 0x40] {
+        unsafe { (list as *mut u64).write(entry) };
+        assert_eq!(unsafe { switch_test_eptp(&mut state, 0, 0) }, 0);
+        assert_eq!(state.ept12, first);
+        assert_eq!(state.ept02, root);
+        assert_eq!(state.invalidations, 0);
+    }
+    unsafe { (list as *mut u64).write(first) };
+    for (function, index) in [(1, 0), (63, 0), (0, 512), (0, u32::MAX as u64)] {
+        assert_eq!(unsafe { switch_test_eptp(&mut state, function, index) }, 0);
+    }
+    state.vm_function_control = 0;
+    assert_eq!(unsafe { switch_test_eptp(&mut state, 0, 0) }, 0);
+    state.vm_function_control = 1;
+    state.primary_control = 0;
+    assert_eq!(unsafe { switch_test_eptp(&mut state, 0, 0) }, 0);
+    state.primary_control = 1 << 31;
+    state.secondary_control = 2;
+    assert_eq!(unsafe { switch_test_eptp(&mut state, 0, 0) }, 0);
+    state.secondary_control = 0x2002;
+    arena.map(ept01, 0x9000, list, 12, 0x34);
+    assert_eq!(unsafe { switch_test_eptp(&mut state, 0, 0) }, 0);
+    assert_eq!(state.ept12, first);
+    assert_eq!(state.ept02, root);
+    assert_eq!(state.invalidations, 0);
+}
+
+#[test]
+fn native_eptp_list_publishes_composed_roots_and_recovers_hardware_selection() {
+    let mut arena = Arena::new();
+    let first = arena.pages(1) | 0x1e;
+    let second = arena.pages(1) | 0x1e;
+    let cold = arena.pages(1) | 0x1e;
+    let list = arena.pages(1);
+    let shadow = arena.pages(1);
+    let ept01 = arena.pages(1);
+    arena.map(ept01, 0x9000, list, 12, 0x31);
+    unsafe {
+        (list as *mut u64).write(first);
+        (list as *mut u64).add(1).write(second);
+        (list as *mut u64).add(2).write(cold);
+        (list as *mut u64).add(3).write(u64::MAX);
+        (list as *mut u64).add(511).write(second);
+    }
+    let mut state = context(&mut arena, first, ept01);
+    state.secondary_control = 0x2002;
+    state.vm_function_control = 1;
+    state.eptp_list_address = 0x9000;
+    state.physical_address_bits = 52;
+    state.shadow_list = shadow;
+    state.native_supported = 1;
+    assert_eq!(unsafe { switch_test_eptp(&mut state, 0, 1) }, 1);
+    let second_root = state.ept02;
+    let first_root = state.alternate_ept02;
+    unsafe { refresh_test_eptp_list(&mut state) };
+    assert_eq!(state.native_enabled, 1);
+    assert_eq!(state.native_vmcs[..2], [1, shadow]);
+    let published = unsafe { std::slice::from_raw_parts(shadow as *const u64, 512) };
+    assert_eq!(published[0], first_root);
+    assert_eq!(published[1], second_root);
+    assert_eq!(published[511], second_root);
+    assert!(published[2..511].iter().all(|entry| *entry == 0));
+
+    let old_pool = state.pool;
+    let old_alternate_pool = state.alternate_pool;
+    state.native_vmcs[2] = published[0];
+    unsafe { capture_test_native_eptp(&mut state) };
+    assert_eq!(state.ept12, first);
+    assert_eq!(state.ept02, first_root);
+    assert_eq!(state.pool, old_alternate_pool);
+    assert_eq!(state.alternate_pool, old_pool);
+    state.native_vmcs[2] = published[511];
+    unsafe { capture_test_native_eptp(&mut state) };
+    assert_eq!(state.ept12, second);
+    assert_eq!(state.ept02, second_root);
+    assert_eq!(state.pool, old_pool);
+    assert_eq!(state.invalidations, 1);
+
+    assert_eq!(unsafe { switch_test_eptp(&mut state, 0, 2) }, 1);
+    unsafe { refresh_test_eptp_list(&mut state) };
+    assert_eq!(
+        published[0], 0,
+        "A recycled root must lose its old list aliases"
+    );
+    assert_eq!(published[1], second_root);
+    assert_eq!(published[2], state.ept02);
+    state.vm_function_control = 0;
+    unsafe { refresh_test_eptp_list(&mut state) };
+    assert_eq!(state.native_enabled, 0);
+    assert_eq!(state.native_vmcs[0], 0);
+}
+
+#[test]
+fn native_eptp_list_requires_stable_source_and_matching_execution_mode() {
+    let mut arena = Arena::new();
+    let first = arena.pages(1) | 0x5e;
+    let list = arena.pages(1);
+    let shadow = arena.pages(1);
+    let ept01 = arena.pages(1);
+    arena.map(ept01, 0x9000, list, 12, 0x33);
+    unsafe { (list as *mut u64).write(first) };
+    let mut state = context(&mut arena, first, ept01);
+    state.ept02 |= 0x1e;
+    state.secondary_control = 0x2002;
+    state.vm_function_control = 1;
+    state.eptp_list_address = 0x9000;
+    state.physical_address_bits = 52;
+    state.ept_capabilities = 1 << 21;
+    state.shadow_list = shadow;
+    state.native_supported = 1;
+    unsafe { refresh_test_eptp_list(&mut state) };
+    assert_eq!(state.native_enabled, 0);
+    arena.map(ept01, 0x9000, list, 12, 0x31);
+    unsafe { refresh_test_eptp_list(&mut state) };
+    assert_eq!(state.native_enabled, 1);
+    assert_eq!(unsafe { (shadow as *const u64).read() }, state.ept02 | 0x40);
+    state.native_vmcs[2] = state.ept02 | 0x40;
+    unsafe { capture_test_native_eptp(&mut state) };
+    assert_eq!(state.ept12, first);
+    state.secondary_control |= 1 << 22;
+    unsafe { refresh_test_eptp_list(&mut state) };
+    assert_eq!(unsafe { (shadow as *const u64).read() }, 0);
+    state.native_supported = 0;
+    state.native_vmcs = [0xfeed; 3];
+    unsafe { refresh_test_eptp_list(&mut state) };
+    assert_eq!(state.native_vmcs, [0xfeed; 3]);
+}
+
+#[test]
+fn native_eptp_list_rejects_writable_physical_aliases_at_every_leaf_size() {
+    for shift in [12, 21, 30] {
+        let mut arena = Arena::new();
+        let first = arena.pages(1) | 0x1e;
+        let list = arena.pages(1);
+        let shadow = arena.pages(1);
+        let ept01 = arena.pages(1);
+        let alias = (1_u64 << 39) + (5_u64 << 30);
+        let size = 1_u64 << shift;
+        let target = list & !(size - 1);
+        let large = if shift == 12 { 0 } else { 0x80 };
+        arena.map(ept01, 0x9000, list, 12, 0x31);
+        arena.map(ept01, alias, target, shift, 0x31 | large);
+        unsafe { (list as *mut u64).write(first) };
+        let mut state = context(&mut arena, first, ept01);
+        state.ept02 |= 0x1e;
+        state.secondary_control = 0x2002;
+        state.vm_function_control = 1;
+        state.eptp_list_address = 0x9000;
+        state.physical_address_bits = 52;
+        state.shadow_list = shadow;
+        state.native_supported = 1;
+        unsafe { refresh_test_eptp_list(&mut state) };
+        assert_eq!(state.native_enabled, 1);
+
+        arena.map(ept01, alias, target, shift, 0x33 | large);
+        unsafe { refresh_test_eptp_list(&mut state) };
+        assert_eq!(state.native_enabled, 0, "Writable alias with shift {shift}");
+        assert_eq!(state.native_vmcs[0], 0);
+
+        // A denial at any ancestor removes effective write access to the alias.
+        let entries = entry_addresses(ept01, alias);
+        for &address in &entries[..entries.len() - 1] {
+            unsafe { *(address as *mut u64) &= !2 };
+            unsafe { refresh_test_eptp_list(&mut state) };
+            assert_eq!(state.native_enabled, 1);
+            unsafe { *(address as *mut u64) |= 2 };
+        }
+
+        arena.map(ept01, alias, target ^ size, shift, 0x33 | large);
+        unsafe { refresh_test_eptp_list(&mut state) };
+        assert_eq!(
+            state.native_enabled, 1,
+            "Unrelated writable leaf with shift {shift}"
+        );
+        assert_eq!(unsafe { (shadow as *const u64).read() }, state.ept02);
+    }
+}
+
+#[test]
+fn writable_lists_are_protected_before_publication_and_deoptimized_before_a_write() {
+    const TRACKED: u64 = 1 << 55;
+    for shift in [12, 21, 30] {
+        let mut arena = Arena::new();
+        let first = arena.pages(1) | 0x1e;
+        let list = arena.pages(1);
+        let shadow = arena.pages(1);
+        let ept01 = arena.pages(1);
+        let alias = 1_u64 << 39;
+        let size = 1_u64 << shift;
+        let alias_page = alias + (list & (size - 1));
+        let large = if shift == 12 { 0 } else { 0x80 };
+        arena.map(ept01, 0x9000, list, 12, 0x37);
+        arena.map(ept01, alias, list & !(size - 1), shift, 0x33 | large);
+        arena.map(ept01, 0xa000, list, 12, 0x31);
+        arena.map(first & ADDRESS_MASK, 0x200000, 0x9000, 12, 0x37);
+        unsafe { (list as *mut u64).write(first) };
+        let mut state = context(&mut arena, first, ept01);
+        state.ept02 |= 0x1e;
+        state.secondary_control = 0x2002;
+        state.vm_function_control = 1;
+        state.eptp_list_address = 0x9000;
+        state.physical_address_bits = 52;
+        state.shadow_list = shadow;
+        state.native_supported = 1;
+        state.admission = 1;
+        let original = [leaf(ept01, 0x9000), leaf(ept01, alias), leaf(ept01, 0xa000)];
+
+        // Failed quiescence must leave permissions and native execution unchanged.
+        unsafe { refresh_test_eptp_list(&mut state) };
+        assert_eq!(state.native_enabled, 0);
+        assert_eq!(leaf(ept01, 0x9000), original[0]);
+        assert_eq!(state.sync_releases, 0);
+        state.admission = 1;
+        state.sync_result = 1;
+        unsafe { refresh_test_eptp_list(&mut state) };
+        assert_eq!(state.native_enabled, 1);
+        assert_eq!(state.admission, 0);
+        assert_eq!(state.sync_releases, 1);
+        assert_eq!(leaf(ept01, 0x9000).1, (original[0].1 & !2) | TRACKED);
+        assert_eq!(leaf(ept01, alias_page), (12, list | 0x31 | TRACKED));
+        if shift != 12 {
+            let neighbor = alias_page ^ 4096;
+            let neighbor_leaf = leaf(ept01, neighbor);
+            assert_eq!(neighbor_leaf, (12, (list ^ 4096) | 0x33));
+        }
+        assert_eq!(state.eptp_used, u64::from((shift - 12) / 9));
+        assert_eq!(leaf(ept01, 0xa000), original[2]);
+        assert_eq!(unsafe { (shadow as *const u64).read() }, state.ept02);
+        state.gpa = 0x200000;
+        state.qualification = 2;
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+        assert_eq!(state.write_retry, 1);
+
+        state.sync_result = 0;
+        assert_eq!(unsafe { release_test_eptp_sources(&mut state) }, 0);
+        assert_ne!(leaf(ept01, 0x9000).1 & TRACKED, 0);
+        state.sync_result = 1;
+        assert_eq!(unsafe { release_test_eptp_sources(&mut state) }, 1);
+        assert_eq!(state.native_enabled, 0);
+        assert_eq!(leaf(ept01, 0x9000), original[0]);
+        assert_eq!(leaf(ept01, alias_page), (12, list | 0x33));
+        assert_eq!(leaf(ept01, 0xa000), original[2]);
+        assert!(
+            unsafe { std::slice::from_raw_parts(shadow as *const u64, 512) }
+                .iter()
+                .all(|entry| *entry == 0)
+        );
+        unsafe { refresh_test_eptp_list(&mut state) };
+        assert_eq!(
+            state.native_enabled, 0,
+            "Internal retry must not reprotect the pending store"
+        );
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+        assert_eq!(state.write_retry, 0);
+        assert_eq!(leaf(state.ept02, state.gpa).1 & 2, 2);
+        let used = state.eptp_used;
+        state.admission = 1;
+        unsafe { refresh_test_eptp_list(&mut state) };
+        assert_eq!(state.native_enabled, 1);
+        assert_eq!(
+            state.eptp_used, used,
+            "Readmission reuses permanent split tables"
+        );
+    }
+}
+
+#[test]
+fn protection_pool_exhaustion_restores_earlier_aliases_without_publishing() {
+    for pages in [0, 1] {
+        let mut arena = Arena::new();
+        let first = arena.pages(1) | 0x1e;
+        let list = arena.pages(1);
+        let shadow = arena.pages(1);
+        let ept01 = arena.pages(1);
+        let alias = 1_u64 << 39;
+        let attributes = (1_u64 << 63) | (3 << 52) | 0x3b7;
+        arena.map(ept01, 0x9000, list, 12, 0x37);
+        arena.map(ept01, alias, list & !((1 << 30) - 1), 30, attributes);
+        unsafe { (list as *mut u64).write(first) };
+        let mut state = context(&mut arena, first, ept01);
+        state.ept02 |= 0x1e;
+        state.secondary_control = 0x2002;
+        state.vm_function_control = 1;
+        state.eptp_list_address = 0x9000;
+        state.physical_address_bits = 52;
+        state.shadow_list = shadow;
+        state.native_supported = 1;
+        state.admission = 1;
+        state.sync_result = 1;
+        state.eptp_pages = pages;
+        unsafe { refresh_test_eptp_list(&mut state) };
+        assert_eq!(state.native_enabled, 0);
+        assert_eq!(state.lists_live, 0);
+        assert_eq!(state.eptp_used, pages);
+        assert_eq!(state.sync_releases, 1);
+        assert_eq!(leaf(ept01, 0x9000), (12, list | 0x37));
+        let address = alias + (list & ((1 << 30) - 1));
+        let (shift, entry) = leaf(ept01, address);
+        let mask = (1_u64 << shift) - 1;
+        assert_eq!(entry, (list & !mask) | attributes);
+        assert!(
+            unsafe { std::slice::from_raw_parts(shadow as *const u64, 512) }
+                .iter()
+                .all(|entry| *entry == 0)
+        );
+    }
+}
+
+#[test]
+fn root_writes_retire_readonly_sources_and_tpr_shadow_prevents_publication() {
+    let mut arena = Arena::new();
+    let first = arena.pages(1) | 0x1e;
+    let list = arena.pages(1);
+    let shadow = arena.pages(1);
+    let ept01 = arena.pages(1);
+    arena.map(ept01, 0x9000, list, 12, 0x31);
+    unsafe { (list as *mut u64).write(first) };
+    let mut state = context(&mut arena, first, ept01);
+    state.ept02 |= 0x1e;
+    state.secondary_control = 0x2002;
+    state.vm_function_control = 1;
+    state.eptp_list_address = 0x9000;
+    state.physical_address_bits = 52;
+    state.shadow_list = shadow;
+    state.native_supported = 1;
+    state.lists_live = 0;
+    unsafe { root_write_test_eptp(&mut state) };
+    assert_eq!(state.sync_requests, 0);
+    unsafe { refresh_test_eptp_list(&mut state) };
+    assert_eq!(
+        state.native_enabled, 0,
+        "Initial publication requires quiescence"
+    );
+    state.sync_result = 1;
+    unsafe { refresh_test_eptp_list(&mut state) };
+    assert_eq!(state.native_enabled, 1);
+    assert_eq!(state.lists_live, 1);
+    unsafe { root_write_test_eptp(&mut state) };
+    assert_eq!(state.lists_live, 0);
+    assert_eq!(state.native_enabled, 0);
+    assert_eq!(leaf(ept01, 0x9000), (12, list | 0x31));
+    assert_eq!(unsafe { (shadow as *const u64).read() }, 0);
+    let requests = state.sync_requests;
+    unsafe { root_write_test_eptp(&mut state) };
+    assert_eq!(state.sync_requests, requests);
+
+    let peer = Context {
+        primary_control: 1 << 21,
+        ..Default::default()
+    };
+    let mut peers = [0_u64; 64];
+    peers[63] = &peer as *const Context as u64;
+    state.event_context = peers.as_ptr() as u64;
+    unsafe { refresh_test_eptp_list(&mut state) };
+    assert_eq!(state.native_enabled, 0);
+    unsafe { peers.as_mut_ptr().add(63).write_volatile(0) };
+    unsafe { refresh_test_eptp_list(&mut state) };
+    assert_eq!(state.native_enabled, 1);
+    state.primary_control |= 1 << 21;
+    unsafe { refresh_test_eptp_list(&mut state) };
+    assert_eq!(state.native_enabled, 0);
+}
+
+#[test]
+fn vm_function_entry_validation_checks_reserved_bits_ept_and_list_alignment() {
+    let mut arena = Arena::new();
+    let mut state = context(&mut arena, 0, 0);
+    state.secondary_control = 0x2002;
+    state.physical_address_bits = 48;
+    state.vm_function_control = 1;
+    state.eptp_list_address = 0x9000;
+    assert_eq!(unsafe { validate_test_vm_functions(&mut state) }, 1);
+    for list in [0x9001, 1 << 48, u64::MAX] {
+        state.eptp_list_address = list;
+        assert_eq!(unsafe { validate_test_vm_functions(&mut state) }, 0);
+    }
+    state.eptp_list_address = 0x9000;
+    for function_mask in [2, 3, 1 << 63] {
+        state.vm_function_control = function_mask;
+        assert_eq!(unsafe { validate_test_vm_functions(&mut state) }, 0);
+    }
+    state.vm_function_control = 1;
+    state.secondary_control = 1 << 13;
+    assert_eq!(unsafe { validate_test_vm_functions(&mut state) }, 0);
+    state.vm_function_control = 0;
+    assert_eq!(unsafe { validate_test_vm_functions(&mut state) }, 1);
+    state.vm_function_control = u64::MAX;
+    state.secondary_control = 2;
+    assert_eq!(unsafe { validate_test_vm_functions(&mut state) }, 1);
+    state.primary_control = 0;
+    state.secondary_control = 0x2002;
+    assert_eq!(unsafe { validate_test_vm_functions(&mut state) }, 1);
 }
 
 #[test]
@@ -962,6 +1569,108 @@ fn ept_cache_retains_each_execution_mode_and_invalidates_both_by_root() {
     assert_eq!(leaf(supervisor_root, state.gpa).1, 0);
     assert_eq!(leaf(mbec_root, state.gpa).1, 0);
 }
+#[test]
+fn composition_translates_every_ept12_table_and_honors_table_write_protection() {
+    let mut arena = Arena::new();
+    let tables = [
+        arena.pages(1),
+        arena.pages(1),
+        arena.pages(1),
+        arena.pages(1),
+    ];
+    let table_gpas = [0, 0x101000, 0x102000, 0x103000];
+    let slots = [tables[0], tables[1], tables[2] + 8, tables[3] + 3 * 8];
+    let entries = [
+        table_gpas[1] | 7,
+        table_gpas[2] | 7,
+        table_gpas[3] | 7,
+        0x403037,
+    ];
+    let ept01 = arena.pages(1);
+    for (gpa, hpa) in table_gpas.into_iter().zip(tables) {
+        arena.map(ept01, gpa, hpa, 12, 0x37);
+    }
+    arena.map(ept01, 0x403000, 0x803000, 12, 0x37);
+    for (slot, entry) in slots.into_iter().zip(entries) {
+        unsafe { (slot as *mut u64).write(entry) };
+    }
+    let mut state = context(&mut arena, 0, ept01);
+    state.ept12 = table_gpas[0] | 0x1e;
+    state.cached_ept12 = state.ept12;
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    assert_eq!(leaf(state.ept02, state.gpa), (12, 0x803037));
+
+    arena.map(ept01, 0x405000, 0xa05000, 12, 0x37);
+    unsafe { (slots[3] as *mut u64).write(0x405031) };
+    let eptp = state.ept12;
+    unsafe { invalidate_test_ept_context(&mut state, eptp) };
+    assert_eq!(leaf(state.ept02, state.gpa), (12, 0xa05031));
+    unsafe { (slots[3] as *mut u64).write(entries[3]) };
+
+    for index in 0..4 {
+        // Deny reads through EPT01 even though all host backing pages are mapped.
+        arena.map(ept01, table_gpas[index], tables[index], 12, 0x34);
+        unsafe { discard_test_ept(&mut state) };
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+        assert_eq!(leaf(state.ept02, state.gpa).1, 0);
+        arena.map(ept01, table_gpas[index], tables[index], 12, 0x37);
+    }
+
+    state.ept12 |= 0x40;
+    state.cached_ept12 = state.ept12;
+    for index in 0..4 {
+        for (slot, entry) in slots.into_iter().zip(entries) {
+            unsafe { (slot as *mut u64).write(entry) };
+        }
+        arena.map(ept01, table_gpas[index], tables[index], 12, 0x35);
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+        assert_eq!(
+            unsafe { (slots[index] as *const u64).read() },
+            entries[index]
+        );
+        arena.map(ept01, table_gpas[index], tables[index], 12, 0x37);
+    }
+    for (slot, entry) in slots.into_iter().zip(entries) {
+        unsafe { (slot as *mut u64).write(entry | 0x100) };
+    }
+    arena.map(ept01, table_gpas[3], tables[3], 12, 0x35);
+    // Already-accessed, read-only table pages can be walked without any update.
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    state.qualification = 2;
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+    assert_eq!(unsafe { (slots[3] as *const u64).read() } & 0x200, 0);
+    arena.map(ept01, table_gpas[3], tables[3], 12, 0x37);
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    assert_eq!(unsafe { (slots[3] as *const u64).read() } & 0x300, 0x300);
+
+    // L0's software A/D writes must take the same deoptimization path as a
+    // guest store when an EPT12 table shares the protected list page/range.
+    state.sync_result = 1;
+    for index in 0..4 {
+        for (slot, entry) in slots.into_iter().zip(entries) {
+            unsafe { (slot as *mut u64).write(entry) };
+        }
+        arena.map(
+            ept01,
+            table_gpas[index],
+            tables[index],
+            12,
+            (1 << 55) | 0x35,
+        );
+        state.qualification = 1;
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+        assert_eq!(state.write_retry, 1);
+        assert_eq!(
+            unsafe { (slots[index] as *const u64).read() },
+            entries[index]
+        );
+        assert_eq!(unsafe { release_test_eptp_sources(&mut state) }, 1);
+        assert_eq!(leaf(ept01, table_gpas[index]).1 & ((1 << 55) | 2), 2);
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+        assert_eq!(state.write_retry, 0);
+    }
+}
+
 #[test]
 fn composes_large_leaves_with_remapping_and_restricted_permissions() {
     let mut arena = Arena::new();
@@ -1208,6 +1917,87 @@ fn revalidation_visits_four_kib_leaves_and_upper_level_revocations() {
 }
 
 #[repr(C)]
+struct ExitMsrContext {
+    values: [u64; 117],
+    hardware: [u64; 117],
+    saved_pat: u64,
+    saved_efer: u64,
+    exit_reason: u64,
+    exit_controls: u64,
+    vmx_misc: u64,
+    entry_controls: u64,
+}
+core::arch::global_asm!(
+    ".text",
+    ".globl capture_test_exit_msrs",
+    "capture_test_exit_msrs:",
+    "push r12", "mov r12, rcx",
+    "call .Lresident_nested_capture_vmcs02_guest_state",
+    "pop r12", "ret",
+    include_str!("../builds/nested-ept-tests/resident-exit-msrs.S"),
+    guest_pat = const 25,
+    guest_efer = const 26,
+    test_hardware = const std::mem::offset_of!(ExitMsrContext, hardware),
+    b_nested_l2_saved_pat = const std::mem::offset_of!(ExitMsrContext, saved_pat),
+    b_nested_l2_saved_efer = const std::mem::offset_of!(ExitMsrContext, saved_efer),
+    b_nested_vmcs12_exit_reason = const std::mem::offset_of!(ExitMsrContext, exit_reason),
+    b_nested_vmcs12_vm_exit_controls = const std::mem::offset_of!(ExitMsrContext, exit_controls),
+    b_nested_vmcs12_extended_fields = const std::mem::offset_of!(ExitMsrContext, values),
+    b_nested_vmx_misc = const std::mem::offset_of!(ExitMsrContext, vmx_misc),
+    b_nested_vmcs12_vm_entry_controls = const std::mem::offset_of!(ExitMsrContext, entry_controls),
+);
+unsafe extern "win64" {
+    #[link_name = "capture_test_exit_msrs"]
+    fn capture_test_exit_msrs_raw(context: *mut ExitMsrContext);
+}
+
+fn capture_test_exit_msrs(context: &mut ExitMsrContext) {
+    // Fixed PAT and EFER indices are within both inline arrays.
+    unsafe { capture_test_exit_msrs_raw(context) }
+}
+#[test]
+fn exit_saves_efer_only_when_requested_after_successful_entry() {
+    for save_efer in [false, true] {
+        for entry_failed in [false, true] {
+            for update_entry_mode in [false, true] {
+                let mut state = ExitMsrContext {
+                    values: [0xfeed; 117],
+                    hardware: [0; 117],
+                    saved_pat: 0,
+                    saved_efer: 0,
+                    exit_reason: if entry_failed { 0x80000021 } else { 10 },
+                    exit_controls: if save_efer { 1 << 20 } else { 0 },
+                    vmx_misc: if update_entry_mode { 1 << 5 } else { 0 },
+                    entry_controls: 0,
+                };
+                state.hardware[25] = 0x0007040600070406;
+                state.hardware[26] = 0x500;
+                capture_test_exit_msrs(&mut state);
+                assert_eq!(state.saved_efer, 0x500);
+                assert_eq!(state.saved_pat, state.hardware[25]);
+                assert_eq!(state.values[25], 0xfeed);
+                assert_eq!(
+                    state.values[26],
+                    if save_efer && !entry_failed {
+                        0x500
+                    } else {
+                        0xfeed
+                    }
+                );
+                assert_eq!(
+                    state.entry_controls,
+                    if update_entry_mode && !entry_failed {
+                        1 << 9
+                    } else {
+                        0
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[repr(C)]
 struct GuestContext {
     valid: u64,
     control_valid: [u64; 2],
@@ -1269,10 +2059,48 @@ core::arch::global_asm!(
     nested_guest_state_table_count = const 50,
 );
 unsafe extern "win64" {
-    fn sync_test_guest(context: *mut GuestContext);
-    fn capture_test_guest(context: *mut GuestContext);
-    fn materialize_test_guest(context: *mut GuestContext, field: u64, value: u64, encoding: u64);
-    fn materialize_test_all_guest(context: *mut GuestContext);
+    #[link_name = "sync_test_guest"]
+    fn sync_test_guest_raw(context: *mut GuestContext);
+    #[link_name = "capture_test_guest"]
+    fn capture_test_guest_raw(context: *mut GuestContext);
+    #[link_name = "materialize_test_guest"]
+    fn materialize_test_guest_raw(
+        context: *mut GuestContext,
+        field: u64,
+        value: u64,
+        encoding: u64,
+    );
+    #[link_name = "materialize_test_all_guest"]
+    fn materialize_test_all_guest_raw(context: *mut GuestContext);
+}
+
+fn materialize_test_all_guest(context: &mut GuestContext) {
+    assert_eq!(context.vmcs01, 1);
+    assert_eq!(context.vmcs02, 2);
+    // Deferred fields come from the bounded static table; VMCS identifiers are mocked.
+    unsafe { materialize_test_all_guest_raw(context) }
+}
+
+fn materialize_test_guest(context: &mut GuestContext, field: u64, value: u64, encoding: u64) {
+    assert!(
+        field < context.values.len() as u64,
+        "guest field index is out of bounds"
+    );
+    assert_eq!(context.vmcs01, 1);
+    assert_eq!(context.vmcs02, 2);
+    // The checked field bounds the bitmap and array accesses; VMCS identifiers are mocked.
+    unsafe { materialize_test_guest_raw(context, field, value, encoding) }
+}
+
+fn capture_test_guest(context: &mut GuestContext) {
+    assert_eq!(context.selected_vmcs, 2);
+    // The static guest-field table indexes only the inline context arrays.
+    unsafe { capture_test_guest_raw(context) }
+}
+
+fn sync_test_guest(context: &mut GuestContext) {
+    // The static guest-field table indexes only the inline context arrays.
+    unsafe { sync_test_guest_raw(context) }
 }
 #[test]
 fn guest_sync_retains_hardware_state_and_applies_l1_changes() {
@@ -1290,28 +2118,20 @@ fn guest_sync_retains_hardware_state_and_applies_l1_changes() {
         switches: 0,
         reads: 0,
     };
-    unsafe {
-        sync_test_guest(&mut state);
-    }
+    sync_test_guest(&mut state);
     assert_eq!(state.writes, 50);
     state.values[30] = 0x12345000;
-    unsafe {
-        sync_test_guest(&mut state);
-    }
+    sync_test_guest(&mut state);
     assert_eq!(state.writes, 55);
     assert_eq!(state.hardware[30], 0x12345000);
     state.hardware[30] = 0x87654000;
     state.cache[30] = state.hardware[30];
     state.values[30] = state.hardware[30];
-    unsafe {
-        sync_test_guest(&mut state);
-    }
+    sync_test_guest(&mut state);
     assert_eq!(state.writes, 59);
     assert_eq!(state.hardware[30], 0x87654000);
     state.valid = 0;
-    unsafe {
-        sync_test_guest(&mut state);
-    }
+    sync_test_guest(&mut state);
     assert_eq!(state.writes, 109);
 }
 
@@ -1337,9 +2157,7 @@ fn deferred_guest_state_survives_resume_and_materializes_before_l1_access() {
             || (65..=80).contains(&index)
             || index == 92
     };
-    unsafe {
-        sync_test_guest(&mut state);
-    }
+    sync_test_guest(&mut state);
     let fields: Vec<usize> = state
         .hardware
         .iter()
@@ -1350,9 +2168,7 @@ fn deferred_guest_state_survives_resume_and_materializes_before_l1_access() {
     for &index in &fields {
         state.hardware[index] = 0x10000 + index as u64;
     }
-    unsafe {
-        capture_test_guest(&mut state);
-    }
+    capture_test_guest(&mut state);
     assert_eq!(state.reads, 15);
     let pending = [
         (0xff_u64 << 35) | (0x3ff_u64 << 50),
@@ -1370,23 +2186,17 @@ fn deferred_guest_state_survives_resume_and_materializes_before_l1_access() {
         );
     }
     state.selected_vmcs = 1;
-    unsafe {
-        materialize_test_guest(&mut state, 30, u64::MAX, 0x6802);
-    }
+    materialize_test_guest(&mut state, 30, u64::MAX, 0x6802);
     assert_eq!(state.switches, 0);
     assert_eq!(state.rare_pending, pending);
     state.selected_vmcs = 2;
-    unsafe {
-        sync_test_guest(&mut state);
-    }
+    sync_test_guest(&mut state);
     assert_eq!(state.writes, 54);
     for &index in &fields {
         assert_eq!(state.hardware[index], 0x10000 + index as u64);
     }
     state.selected_vmcs = 1;
-    unsafe {
-        materialize_test_guest(&mut state, 50, 0xfeed_dead_beef, 0x6806);
-    }
+    materialize_test_guest(&mut state, 50, 0xfeed_dead_beef, 0x6806);
     assert_eq!(state.reads, 16);
     assert_eq!(state.switches, 2);
     assert_eq!(state.selected_vmcs, 1);
@@ -1400,28 +2210,22 @@ fn deferred_guest_state_survives_resume_and_materializes_before_l1_access() {
         assert_eq!(state.values[index], expected);
         assert_eq!(state.cache[index], expected);
     }
-    unsafe { materialize_test_guest(&mut state, 50, 0, 0x6806) };
+    materialize_test_guest(&mut state, 50, 0, 0x6806);
     assert_eq!(state.reads, 16);
     assert_eq!(state.switches, 2);
     state.values[50] = 0x87654000;
     state.selected_vmcs = 2;
-    unsafe {
-        sync_test_guest(&mut state);
-    }
+    sync_test_guest(&mut state);
     assert_eq!(state.hardware[50], 0x87654000);
     assert_eq!(state.writes, 59);
     // A VMCS switch or clear must save even fields L1 has not read.
     for &index in &fields {
         state.hardware[index] = 0x20000 + index as u64;
     }
-    unsafe {
-        capture_test_guest(&mut state);
-    }
+    capture_test_guest(&mut state);
     state.selected_vmcs = 1;
-    unsafe {
-        materialize_test_all_guest(&mut state);
-        materialize_test_all_guest(&mut state);
-    }
+    materialize_test_all_guest(&mut state);
+    materialize_test_all_guest(&mut state);
     assert_eq!(state.reads, 66);
     assert_eq!(state.switches, 4);
     assert_eq!(state.selected_vmcs, 1);
@@ -1454,8 +2258,59 @@ core::arch::global_asm!(
     vmcs12_extended_field_count = const 117,
 );
 unsafe extern "win64" {
-    fn sync_test_control(context: *mut GuestContext, field: u64, value: u64);
-    fn lookup_test_field(encoding: u64) -> u64;
+    #[link_name = "sync_test_control"]
+    fn sync_test_control_raw(context: *mut GuestContext, field: u64, value: u64);
+    #[link_name = "lookup_test_field"]
+    fn lookup_test_field_raw(encoding: u64) -> u64;
+}
+
+fn lookup_test_field(encoding: u64) -> u64 {
+    // The assembly rejects reserved bits before indexing its static lookup table.
+    unsafe { lookup_test_field_raw(encoding) }
+}
+
+fn sync_test_control(context: &mut GuestContext, field: u64, value: u64) {
+    assert!(
+        lookup_test_field(field) < context.cache.len() as u64,
+        "unknown VMCS field"
+    );
+    // The validated encoding maps to an in-bounds context array index.
+    unsafe { sync_test_control_raw(context, field, value) }
+}
+
+#[test]
+fn guest_wrappers_reject_invalid_indices_before_entering_assembly() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let mut context = GuestContext {
+        valid: 0,
+        control_valid: [0; 2],
+        values: [0; 117],
+        cache: [0; 117],
+        hardware: [0; 117],
+        writes: 0,
+        rare_pending: [u64::MAX; 2],
+        vmcs01: 1,
+        vmcs02: 2,
+        selected_vmcs: 2,
+        switches: 0,
+        reads: 0,
+    };
+    for field in [117, 128, u64::MAX] {
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                materialize_test_guest(&mut context, field, 0, 0x6806);
+            }))
+            .is_err()
+        );
+    }
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            sync_test_control(&mut context, u64::MAX, 0);
+        }))
+        .is_err()
+    );
+    assert_eq!((context.reads, context.writes, context.switches), (0, 0, 0));
 }
 #[test]
 fn vmcs_lookup_rejects_reserved_bits_and_resolves_every_index() {
@@ -1479,14 +2334,10 @@ fn vmcs_lookup_rejects_reserved_bits_and_resolves_every_index() {
         } else {
             255
         };
-        assert_eq!(
-            unsafe { lookup_test_field(encoding) },
-            expected,
-            "{encoding:#x}"
-        );
+        assert_eq!(lookup_test_field(encoding), expected, "{encoding:#x}");
     }
     for encoding in [0x1_0000_6802, u64::MAX, 0x8000_0000_0000_0000] {
-        assert_eq!(unsafe { lookup_test_field(encoding) }, 255);
+        assert_eq!(lookup_test_field(encoding), 255);
     }
 }
 #[test]
@@ -1505,33 +2356,21 @@ fn control_cache_writes_zero_initially_and_tracks_high_indices() {
         switches: 0,
         reads: 0,
     };
-    unsafe {
-        sync_test_control(&mut state, 0x4000, 0);
-    }
+    sync_test_control(&mut state, 0x4000, 0);
     assert_eq!(state.hardware[1], 0);
     assert_eq!(state.writes, 1);
-    unsafe {
-        sync_test_control(&mut state, 0x4000, 0);
-    }
+    sync_test_control(&mut state, 0x4000, 0);
     assert_eq!(state.writes, 1);
-    unsafe {
-        sync_test_control(&mut state, 0x2012, 0x100000000);
-    }
+    sync_test_control(&mut state, 0x2012, 0x100000000);
     assert_eq!(state.hardware[101], 0x100000000);
     assert_eq!(state.writes, 2);
-    unsafe {
-        sync_test_control(&mut state, 0x2012, 0x100000000);
-    }
+    sync_test_control(&mut state, 0x2012, 0x100000000);
     assert_eq!(state.writes, 2);
-    unsafe {
-        sync_test_control(&mut state, 0x2012, 0x200000000);
-    }
+    sync_test_control(&mut state, 0x2012, 0x200000000);
     assert_eq!(state.hardware[101], 0x200000000);
     assert_eq!(state.writes, 3);
     state.control_valid = [0; 2];
-    unsafe {
-        sync_test_control(&mut state, 0x2012, 0x200000000);
-    }
+    sync_test_control(&mut state, 0x2012, 0x200000000);
     assert_eq!(state.writes, 4);
 }
 

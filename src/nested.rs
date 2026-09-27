@@ -24,6 +24,7 @@ pub const IA32_VMX_TRUE_PINBASED_CTLS_MSR: u32 = 0x48d;
 pub const IA32_VMX_TRUE_PROCBASED_CTLS_MSR: u32 = 0x48e;
 pub const IA32_VMX_TRUE_EXIT_CTLS_MSR: u32 = 0x48f;
 pub const IA32_VMX_TRUE_ENTRY_CTLS_MSR: u32 = 0x490;
+pub const IA32_VMX_VMFUNC_MSR: u32 = 0x491;
 
 pub const VMX_PIN_EXTERNAL_INTERRUPT_EXITING: u32 = 1 << 0;
 pub const VMX_PIN_NMI_EXITING: u32 = 1 << 3;
@@ -31,6 +32,7 @@ pub const VMX_PIN_VIRTUAL_NMIS: u32 = 1 << 5;
 pub const VM_EXIT_ACK_INTERRUPT_ON_EXIT: u32 = 1 << 15;
 pub const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
 pub const VM_EXIT_LOAD_IA32_PAT: u32 = 1 << 19;
+pub const VM_EXIT_SAVE_IA32_EFER: u32 = 1 << 20;
 pub const VM_EXIT_LOAD_IA32_EFER: u32 = 1 << 21;
 pub const VM_ENTRY_IA32E_MODE_GUEST: u32 = 1 << 9;
 pub const VM_ENTRY_LOAD_IA32_PAT: u32 = 1 << 14;
@@ -77,6 +79,7 @@ pub const VMX_SECONDARY_WBINVD_EXITING: u32 = 1 << 6;
 pub const VMX_SECONDARY_UNRESTRICTED_GUEST: u32 = 1 << 7;
 pub const VMX_SECONDARY_RDRAND_EXITING: u32 = 1 << 11;
 pub const VMX_SECONDARY_ENABLE_INVPCID: u32 = 1 << 12;
+pub const VMX_SECONDARY_ENABLE_VM_FUNCTIONS: u32 = 1 << 13;
 pub const VMX_SECONDARY_ENABLE_XSAVES: u32 = 1 << 20;
 pub const VMX_SECONDARY_MODE_BASED_EXECUTE: u32 = 1 << 22;
 pub const VMX_LEGACY_PINBASED_DEFAULT1: u32 = 0x0000_0016;
@@ -124,7 +127,10 @@ pub const MATRIXHV_STATUS_LEAF: u32 = 0x4d48_5652;
 pub const MATRIXHV_STATUS_SIGNATURE_EAX: u32 = 0x4d48_5631;
 pub const MATRIXHV_STATUS_SIGNATURE_EBX: u32 = u32::from_le_bytes(*b"MATR");
 pub const MATRIXHV_STATUS_SIGNATURE_ECX: u32 = u32::from_le_bytes(*b"IXHV");
-pub const MATRIXHV_STATUS_PROTOCOL: u32 = 4;
+pub const MATRIXHV_STATUS_PROTOCOL: u32 = 5;
+pub const NESTED_FAILURE_TRACE_CAPACITY: usize = 32;
+pub const NESTED_FAILURE_TRACE_WORD_COUNT: usize = 192;
+const _: () = assert!(NESTED_FAILURE_TRACE_WORD_COUNT == NESTED_FAILURE_TRACE_CAPACITY * 6);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostVmxCapabilities {
@@ -236,6 +242,7 @@ impl NestedVmxCapabilities {
             | VM_EXIT_HOST_ADDRESS_SPACE_SIZE
             | VM_EXIT_ACK_INTERRUPT_ON_EXIT
             | VM_EXIT_LOAD_IA32_PAT
+            | VM_EXIT_SAVE_IA32_EFER
             | VM_EXIT_LOAD_IA32_EFER;
         let entry_supported = VMX_LEGACY_ENTRY_DEFAULT1
             | VM_ENTRY_IA32E_MODE_GUEST
@@ -277,6 +284,7 @@ impl NestedVmxCapabilities {
                 | secondary_invpcid
                 | secondary_xsaves
                 | secondary_mbec
+                | restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_VM_FUNCTIONS, 0)
                 | (u64::from(VMX_SECONDARY_ENABLE_VPID) << 32)
         } else {
             0
@@ -384,6 +392,14 @@ impl NestedVmxCapabilities {
             IA32_VMX_VMCS_ENUM_MSR => Some(self.vmx_vmcs_enum),
             IA32_VMX_PROCBASED_CTLS2_MSR => Some(self.vmx_procbased_ctls2),
             IA32_VMX_EPT_VPID_CAP_MSR => Some(self.vmx_ept_vpid_cap),
+            IA32_VMX_VMFUNC_MSR
+                if control_may_be_one(
+                    self.vmx_procbased_ctls2,
+                    VMX_SECONDARY_ENABLE_VM_FUNCTIONS,
+                ) =>
+            {
+                Some(1)
+            }
             IA32_VMX_TRUE_PINBASED_CTLS_MSR if self.has_true_controls() => {
                 Some(self.vmx_true_pinbased_ctls)
             }
@@ -449,6 +465,7 @@ pub const VMWRITE_EXIT_REASON: u64 = 25;
 pub const VMXOFF_EXIT_REASON: u64 = 26;
 pub const VMXON_EXIT_REASON: u64 = 27;
 pub const INVEPT_EXIT_REASON: u64 = 50;
+pub const VMFUNC_EXIT_REASON: u64 = 59;
 pub const INVVPID_EXIT_REASON: u64 = 53;
 
 pub const VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR: u32 = 2;
@@ -493,10 +510,13 @@ pub const VMCS_FIELD_MSR_BITMAP: u64 = 0x2004;
 pub const VMCS_FIELD_VM_EXIT_MSR_STORE_ADDR: u64 = 0x2006;
 pub const VMCS_FIELD_VM_EXIT_MSR_LOAD_ADDR: u64 = 0x2008;
 pub const VMCS_FIELD_VM_ENTRY_MSR_LOAD_ADDR: u64 = 0x200a;
+pub const VMCS_FIELD_EXECUTIVE_VMCS_POINTER: u64 = 0x200c;
 pub const VMCS_FIELD_TSC_OFFSET: u64 = 0x2010;
 pub const VMCS_FIELD_VIRTUAL_APIC_PAGE_ADDR: u64 = 0x2012;
 pub const VMCS_FIELD_APIC_ACCESS_ADDR: u64 = 0x2014;
 pub const VMCS_FIELD_EPT_POINTER: u64 = 0x201a;
+pub const VMCS_FIELD_VM_FUNCTION_CONTROL: u64 = 0x2018;
+pub const VMCS_FIELD_EPTP_LIST_ADDRESS: u64 = 0x2024;
 pub const VMCS_FIELD_XSS_EXITING_BITMAP: u64 = 0x202c;
 pub const VMCS_FIELD_VMCS_LINK_POINTER: u64 = 0x2800;
 pub const VMCS_FIELD_GUEST_PHYSICAL_ADDRESS: u64 = 0x2400;
@@ -598,7 +618,7 @@ pub const VMCS_FIELD_HOST_SYSENTER_EIP: u64 = 0x6c12;
 pub const VMCS_FIELD_HOST_RSP: u64 = 0x6c14;
 pub const VMCS_FIELD_HOST_RIP: u64 = 0x6c16;
 
-pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 117;
+pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 120;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Vmcs12ExtendedField {
@@ -1075,6 +1095,18 @@ pub const VMCS12_EXTENDED_FIELDS: [Vmcs12ExtendedField; VMCS12_EXTENDED_FIELD_CO
         encoding: VMCS_FIELD_GUEST_LINEAR_ADDRESS,
         index: 116,
     },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_EXECUTIVE_VMCS_POINTER,
+        index: 117,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_VM_FUNCTION_CONTROL,
+        index: 118,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_EPTP_LIST_ADDRESS,
+        index: 119,
+    },
 ];
 
 #[repr(C)]
@@ -1179,6 +1211,7 @@ pub struct NestedVmxState {
     pub vmxon_region: u64,
     pub current_vmcs: u64,
     pub last_operand: u64,
+    pub last_vmcs_field: u64,
     pub instruction_error: u64,
     pub vmxon_count: u64,
     pub vmxoff_count: u64,
@@ -1280,6 +1313,19 @@ pub struct NestedVmxState {
     pub host_mapping_cache: [u64; 4],
     pub vmcs02_rare_state_pending: [u64; 2],
     pub ept02_recycle_count: u64,
+    pub failure_trace: [u64; NESTED_FAILURE_TRACE_WORD_COUNT],
+    pub eptp_shadow_list: u64,
+    pub eptp_native_supported: u64,
+    pub eptp_native_enabled: u64,
+    pub eptp_sync_ack: u64,
+    pub eptp_sync_safe: u64,
+    pub eptp_sync_nmi: u64,
+    pub eptp_sync_apic_id: u64,
+    pub eptp_admission: u64,
+    pub eptp_write_retry: u64,
+    pub eptp_table_pool: u64,
+    pub eptp_table_pages: u64,
+    pub eptp_table_used: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1349,6 +1395,7 @@ impl NestedVmxState {
             vmxon_region,
             current_vmcs: INVALID_VMCS_POINTER,
             last_operand: 0,
+            last_vmcs_field: 0,
             instruction_error: 0,
             vmxon_count: 0,
             vmxoff_count: 0,
@@ -1450,6 +1497,19 @@ impl NestedVmxState {
             host_mapping_cache: [0; 4],
             vmcs02_rare_state_pending: [0; 2],
             ept02_recycle_count: 0,
+            failure_trace: [0; NESTED_FAILURE_TRACE_WORD_COUNT],
+            eptp_shadow_list: 0,
+            eptp_native_supported: 0,
+            eptp_native_enabled: 0,
+            eptp_sync_ack: 0,
+            eptp_sync_safe: 0,
+            eptp_sync_nmi: 0,
+            eptp_sync_apic_id: 0,
+            eptp_admission: 0,
+            eptp_write_retry: 0,
+            eptp_table_pool: 0,
+            eptp_table_pages: 0,
+            eptp_table_used: 0,
         }
     }
 
