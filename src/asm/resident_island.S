@@ -602,7 +602,10 @@ mov qword ptr [r12 + {b_nested_vmcs12_exit_qualification}], r11
 mov eax, r10d
 and eax, 0xffff
 cmp eax, {ept_violation_reason}
+je .Lresident_nested_l2_capture_guest_physical_address
+cmp eax, {ept_misconfiguration_reason}
 jne .Lresident_nested_l2_guest_physical_address_ready
+.Lresident_nested_l2_capture_guest_physical_address:
 mov r11, qword ptr [r12 + {b_last_guest_physical_address}]
 mov qword ptr [r12 + {b_nested_vmcs12_guest_physical_address}], r11
 .Lresident_nested_l2_guest_physical_address_ready:
@@ -1064,6 +1067,8 @@ jnc .Lresident_nested_ept02_unresolved
 mov r9, qword ptr [r12 + {b_nested_vmcs12_ept_pointer}]
 mov edi, 1
 call .Lresident_nested_translate_ept02
+cmp eax, 2
+je .Lresident_nested_ept02_misconfigured
 test eax, eax
 jz .Lresident_nested_ept02_unresolved
 mov eax, dword ptr [r12 + {b_last_qualification}]
@@ -1170,6 +1175,13 @@ resident_telemetry_counter inc, {b_nested_ept02_recycle_count}, {b_telemetry_act
 // INVEPT retires the old translations before the table pages are reused.
 call .Lresident_nested_invalidate_ept02
 jmp .Lresident_nested_resolve_ept02_violation
+.Lresident_nested_ept02_misconfigured:
+// L1 may deliberately use W=1/R=0 entries to request an EPT-misconfiguration
+// exit. Reflect reason 49 before treating the entry as a table or a mapping.
+mov qword ptr [r12 + {b_last_reason}], {ept_misconfiguration_reason}
+mov qword ptr [r12 + {b_last_qualification}], 0
+xor eax, eax
+ret
 .Lresident_nested_ept02_unresolved:
 mov r10, qword ptr [r12 + {b_last_qualification}]
 and r10, -121
@@ -1184,6 +1196,21 @@ or r10, rax
 mov qword ptr [r12 + {b_last_qualification}], r10
 xor eax, eax
 ret
+.macro resident_nested_ept12_permissions
+mov ecx, dword ptr [r12 + {b_nested_ept02_mbec}]
+shl ecx, 10
+or ecx, 7
+mov eax, r10d
+and eax, ecx
+and r14d, eax
+// Presence belongs to this entry. Accumulated access rights are evaluated
+// only after the walk, so an earlier denial cannot hide a malformed entry.
+test eax, eax
+jz .Lresident_nested_translate_ept02_failed
+and eax, 3
+cmp eax, 2
+je .Lresident_nested_translate_ept02_misconfigured
+.endm
 .Lresident_nested_translate_ept02:
 mov rbp, r9
 xor r14d, r14d
@@ -1203,11 +1230,7 @@ shr rcx, 39
 and ecx, 0x1ff
 lea rsi, [r9 + rcx * 8]
 mov r10, qword ptr [rsi]
-mov eax, r10d
-and eax, r14d
-mov r14d, eax
-test eax, eax
-jz .Lresident_nested_translate_ept02_failed
+resident_nested_ept12_permissions
 call .Lresident_nested_track_ept12_access
 test eax, eax
 jz .Lresident_nested_translate_ept02_failed
@@ -1222,11 +1245,7 @@ shr rcx, 30
 and ecx, 0x1ff
 lea rsi, [r9 + rcx * 8]
 mov r10, qword ptr [rsi]
-mov eax, r10d
-and eax, r14d
-mov r14d, eax
-test eax, eax
-jz .Lresident_nested_translate_ept02_failed
+resident_nested_ept12_permissions
 call .Lresident_nested_track_ept12_access
 test eax, eax
 jz .Lresident_nested_translate_ept02_failed
@@ -1243,11 +1262,7 @@ shr rcx, 21
 and ecx, 0x1ff
 lea rsi, [r9 + rcx * 8]
 mov r10, qword ptr [rsi]
-mov eax, r10d
-and eax, r14d
-mov r14d, eax
-test eax, eax
-jz .Lresident_nested_translate_ept02_failed
+resident_nested_ept12_permissions
 call .Lresident_nested_track_ept12_access
 test eax, eax
 jz .Lresident_nested_translate_ept02_failed
@@ -1264,11 +1279,7 @@ shr rcx, 12
 and ecx, 0x1ff
 lea rsi, [r9 + rcx * 8]
 mov r10, qword ptr [rsi]
-mov eax, r10d
-and eax, r14d
-mov r14d, eax
-test eax, eax
-jz .Lresident_nested_translate_ept02_failed
+resident_nested_ept12_permissions
 call .Lresident_nested_track_ept12_access
 test eax, eax
 jz .Lresident_nested_translate_ept02_failed
@@ -1431,6 +1442,9 @@ and r14d, -3
 .Lresident_nested_translate_ept02_success:
 mov eax, 1
 ret
+.Lresident_nested_translate_ept02_misconfigured:
+mov eax, 2
+ret
 .Lresident_nested_translate_ept02_failed:
 xor eax, eax
 ret
@@ -1554,8 +1568,8 @@ mov qword ptr [rsp + 32], rdi
 mov r9, qword ptr [r12 + {b_nested_ept12_pointer}]
 xor edi, edi
 call .Lresident_nested_translate_ept02
-test eax, eax
-jz .Lresident_nested_revalidate_ept02_remove
+cmp eax, 1
+jne .Lresident_nested_revalidate_ept02_remove
 cmp qword ptr [rsp + 16], 12
 je .Lresident_nested_revalidate_ept02_small_leaf
 cmp qword ptr [rsp + 16], 21
@@ -3990,6 +4004,9 @@ mov dword ptr [r12 + {b_nested_vmcs02_vpid_cache}], 0
 mov qword ptr [r12 + {b_nested_vmcs02_last_vpid}], 0
 mov qword ptr [r12 + {b_nested_current_vmcs}], -1
 mov qword ptr [r12 + {b_nested_instruction_error}], 0
+// Synchronous UART output here stalls L1's preemption-disabled VMX entry path.
+cmp qword ptr [r12 + {b_telemetry_probe_active}], 0
+je .Lresident_nested_succeed
 lea rsi, [rip + .Lnested_vmxon_message]
 mov r9d, {nested_vmxon_message_len}
 call .Lresident_serial_write
@@ -4032,6 +4049,8 @@ mov qword ptr [r12 + {b_nested_active}], 0
 mov qword ptr [r12 + {b_nested_current_vmcs}], -1
 mov qword ptr [r12 + {b_nested_instruction_error}], 0
 mov qword ptr [r12 + {b_nested_probe_complete}], 1
+cmp qword ptr [r12 + {b_telemetry_probe_active}], 0
+je .Lresident_nested_succeed
 lea rsi, [rip + .Lnested_vmxoff_message]
 mov r9d, {nested_vmxoff_message_len}
 call .Lresident_serial_write
@@ -4301,6 +4320,10 @@ cmp ecx, 36
 je .Lresident_dispatch_cpuid_registered_cpus
 cmp ecx, 37
 je .Lresident_dispatch_cpuid_telemetry_state
+cmp ecx, 38
+jb .Lresident_dispatch_cpuid_diagnostic_zero
+cmp ecx, 46
+jbe .Lresident_dispatch_cpuid_profile_pair
 cmp ecx, 0x100
 je .Lresident_dispatch_cpuid_nested_failure_count
 cmp ecx, 0x101
@@ -4319,6 +4342,11 @@ jmp .Lresident_dispatch_cpuid_diagnostic_zero
 .Lresident_dispatch_cpuid_diagnostic_pair:
 sub ecx, 4
 lea r9, [rip + .Lresident_diagnostic_pair_offsets]
+jmp .Lresident_dispatch_cpuid_pair_load
+.Lresident_dispatch_cpuid_profile_pair:
+sub ecx, 38
+lea r9, [rip + .Lresident_profile_pair_offsets]
+.Lresident_dispatch_cpuid_pair_load:
 mov r10d, dword ptr [r9 + rcx * 8]
 mov edx, dword ptr [r9 + rcx * 8 + 4]
 mov rax, qword ptr [r8 + r10]
@@ -4398,7 +4426,7 @@ mov rbx, rax
 shr rbx, 32
 jmp .Lresident_dispatch_cpuid_diagnostic_store
 .Lresident_dispatch_cpuid_capabilities:
-mov eax, 0x3ff
+mov eax, 0x7ff
 mov ebx, dword ptr [r8 + {b_processor_number}]
 mov rcx, qword ptr [r8 + {b_watchdog_deadline}]
 test rcx, rcx
@@ -4409,7 +4437,7 @@ or rax, rdx
 cmp rax, rcx
 setb cl
 movzx ecx, cl
-mov eax, 0x3ff
+mov eax, 0x7ff
 xor edx, edx
 jmp .Lresident_dispatch_cpuid_diagnostic_store
 .Lresident_dispatch_cpuid_capabilities_inactive:
@@ -4491,6 +4519,16 @@ jmp .Lresident_dispatch_cpuid_advance
 .long {b_entry_failure_guest} + 8, {b_entry_failure_guest} + 16
 .long {b_entry_failure_guest} + 24, {b_entry_failure_guest} + 32
 .long {b_entry_failure_guest} + 40, {b_entry_failure_guest} + 48
+.Lresident_profile_pair_offsets:
+.long {b_rdmsr_count}, {b_wrmsr_count}
+.long {b_cpuid_count}, {b_nested_invvpid_count}
+.long {b_nested_vmread_count}, {b_nested_vmwrite_count}
+.long {b_nested_vmlaunch_count}, {b_nested_vmresume_count}
+.long {b_last_normal_reason}, {b_last_rcx}
+.long {b_nested_exit_handler_cycles}, {b_nested_exit_handler_cycles} + 8
+.long {b_nested_exit_handler_cycles} + 16, {b_nested_exit_handler_cycles} + 24
+.long {b_last_normal_rip}, {b_watchdog_tsc_hz}
+.long {b_nested_ept02_table_pool_used}, {b_nested_ept02_cached_table_pool_used}
 .Lresident_telemetry_begin:
 // Latch counters for the entire exit so remote toggles cannot leave the sequence odd.
 mov rax, qword ptr [r12 + {b_telemetry_enabled}]
@@ -4504,8 +4542,6 @@ mov qword ptr [r12 + {b_telemetry_active}], 0
 .Lresident_telemetry_profile:
 cmp qword ptr [r12 + {b_telemetry_active}], 0
 je .Lresident_telemetry_begin_done
-test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}
-jz .Lresident_telemetry_begin_done
 lfence
 rdtsc
 shl rdx, 32
@@ -5497,8 +5533,6 @@ jmp .Lresident_dispatch_halt
 .Lresident_profile_exit_handler:
 cmp qword ptr [r12 + {b_telemetry_active}], 0
 je .Lresident_profile_exit_handler_done
-test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}
-jz .Lresident_profile_exit_handler_done
 mov ecx, 2
 mov r11d, dword ptr [r12 + {b_last_reason}]
 cmp r11d, {vmread_reason}
@@ -5572,6 +5606,11 @@ jmp .Lresident_dispatch_halt_loop
 .Lresident_visual_callback:
 test byte ptr [rip + matrixhv_resident_island_log_backend], {log_framebuffer_sink}
 jz .Lresident_visual_callback_disabled
+mov rax, qword ptr [r12 + {b_event_context}]
+test rax, rax
+jz .Lresident_visual_callback_disabled
+cmp qword ptr [rax + {event_ebs_seen}], 0
+jne .Lresident_visual_callback_disabled
 push r15
 mov r15, rsp
 and rsp, -16
@@ -5891,7 +5930,7 @@ jmp 1b
 .globl matrixhv_resident_ebs_callback
 matrixhv_resident_ebs_callback:
 // Keep the notification independent of protocols, locks, and display MMIO.
-// Resident exits render through the saved physical framebuffer aperture.
+// The OS owns the display after this transition; the saved aperture is retired.
 mov qword ptr [rdx + {event_ebs_seen}], 1
 ret
 .globl matrixhv_resident_va_callback
@@ -5908,6 +5947,8 @@ ret
 .Lresident_paint_stage:
 test byte ptr [rip + matrixhv_resident_island_log_backend], {log_framebuffer_sink}
 jz .Lresident_paint_stage_done
+cmp qword ptr [r8 + {event_ebs_seen}], 0
+jne .Lresident_paint_stage_done
 lea eax, [rcx - 1]
 cmp eax, 28
 ja .Lresident_paint_stage_done
@@ -6142,7 +6183,7 @@ jz .Lresident_diagnostic_emit_serial
 test r8, r8
 jz .Lresident_diagnostic_emit_serial
 cmp qword ptr [r8 + {event_ebs_seen}], 0
-je .Lresident_diagnostic_emit_serial
+jne .Lresident_diagnostic_emit_serial
 call .Lresident_paint_hex
 .Lresident_diagnostic_emit_serial:
 pop rcx
@@ -6188,6 +6229,8 @@ ret
 .Lresident_paint_hex:
 test byte ptr [rip + matrixhv_resident_island_log_backend], {log_framebuffer_sink}
 jz .Lresident_paint_hex_done
+cmp qword ptr [r8 + {event_ebs_seen}], 0
+jne .Lresident_paint_hex_done
 cmp ecx, {visual_hex_last_row}
 ja .Lresident_paint_hex_done
 cmp qword ptr [r8 + {event_visual_base}], 0

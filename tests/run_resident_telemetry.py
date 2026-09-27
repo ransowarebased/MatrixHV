@@ -12,6 +12,9 @@ end = source.index('.Lresident_dispatch_cpuid_standard:', start)
 trace_start = source.index('.Lresident_nested_record_failure:')
 trace_end = source.index('.Lresident_dispatch_cpuid:', trace_start)
 assembly = source[trace_start:trace_end] + "\n" + source[start:end]
+profile_start = source.index('.Lresident_profile_exit_handler:')
+profile_end = source.index('.Lresident_dispatch_halt:', profile_start)
+assembly += "\n" + source[profile_start:profile_end]
 macro_start = source.index('.macro resident_telemetry_counter ')
 macro_end = source.index('.endm', macro_start) + len('.endm')
 assembly = source[macro_start:macro_end] + "\n" + assembly
@@ -22,12 +25,14 @@ for name in names:
     offsets[name] = cursor
     cursor += 512 if name == "event_cpu_contexts" else (
         192 * 8 if name == "b_nested_failure_trace" else (
-        56 if name in {"b_watchdog_before", "b_watchdog_after", "b_watchdog_resume", "b_entry_failure_guest"} else 8
+        56 if name in {"b_watchdog_before", "b_watchdog_after", "b_watchdog_resume", "b_entry_failure_guest"}
+        else 32 if name == "b_nested_exit_handler_cycles" else 8
         )
     )
 constants = {
     "cpuid_reason": 10, "matrixhv_status_leaf": 0x4D485652,
     "ept_violation_reason": 48, "invept_reason": 50, "preemption_timer_reason": 52,
+    "vmread_reason": 23, "vmwrite_reason": 25, "vmlaunch_reason": 20, "vmresume_reason": 24,
     "log_serial_sink": 1,
     "nested_failure_trace_capacity": 32,
     "nested_failure_trace_limit": 0x161,
@@ -67,6 +72,13 @@ test_counter:
     resident_telemetry_counter inc, EXIT_COUNT_OFFSET, ACTIVE_OFFSET
     pushfq
     pop rax
+    pop r12
+    ret
+.globl test_profile_exit
+test_profile_exit:
+    push r12
+    mov r12, rcx
+    call .Lresident_profile_exit_handler
     pop r12
     ret
 .globl test_nested_failure_record

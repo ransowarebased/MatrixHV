@@ -2,6 +2,7 @@ use alloc::vec::Vec;
 
 use core::arch::global_asm;
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 
 use uefi::Status;
@@ -683,27 +684,71 @@ fn resources_alias(
         .any(|left_address| right_addresses.contains(left_address))
 }
 
-pub(crate) fn launch(
+struct ApBatchEntry {
     processor_number: usize,
-    launch: &mut ResidentApLaunch<'_>,
-) -> Result<(), ResidentProbeError> {
+    launch: *mut c_void,
+}
+
+struct ApBatchContext {
+    mp: *const MpServices,
+    entries: *const ApBatchEntry,
+    entry_count: usize,
+    callback_failed: AtomicBool,
+}
+
+pub(crate) fn launch_all(launches: &mut [ResidentApLaunch<'_>]) -> Result<(), ResidentProbeError> {
+    if launches.is_empty() {
+        return Ok(());
+    }
     let handle = boot::get_handle_for_protocol::<MpServices>()
         .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
     let mp = boot::open_protocol_exclusive::<MpServices>(handle)
         .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
-    mp.startup_this_ap(
-        processor_number,
+    let entries: Vec<_> = launches
+        .iter_mut()
+        .map(|launch| ApBatchEntry {
+            processor_number: launch.processor_number,
+            launch: (launch as *mut ResidentApLaunch<'_>).cast(),
+        })
+        .collect();
+    let context = ApBatchContext {
+        mp: &*mp,
+        entries: entries.as_ptr(),
+        entry_count: entries.len(),
+        callback_failed: AtomicBool::new(false),
+    };
+    // The blocking call keeps each AP's distinct launch resources alive until all callbacks end.
+    mp.startup_all_aps(
+        false,
         callback,
-        (launch as *mut ResidentApLaunch<'_>).cast(),
+        (&context as *const ApBatchContext).cast_mut().cast(),
         None,
         Some(Duration::from_secs(10)),
     )
-    .map_err(|error| ResidentProbeError::Allocation(error.status()))
+    .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
+    if context.callback_failed.load(Ordering::Acquire) {
+        return Err(ResidentProbeError::Allocation(Status::DEVICE_ERROR));
+    }
+    Ok(())
 }
 
 extern "efiapi" fn callback(argument: *mut c_void) {
+    let context = unsafe { &*argument.cast::<ApBatchContext>() };
+    let mp = unsafe { &*context.mp };
+    let Ok(processor_number) = mp.who_am_i() else {
+        context.callback_failed.store(true, Ordering::Release);
+        return;
+    };
+    let entries = unsafe { core::slice::from_raw_parts(context.entries, context.entry_count) };
+    let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.processor_number == processor_number)
+    else {
+        context.callback_failed.store(true, Ordering::Release);
+        return;
+    };
     unsafe {
-        matrixhv_ap_launch_asm(argument);
+        matrixhv_ap_launch_asm(entry.launch);
     }
 }
 

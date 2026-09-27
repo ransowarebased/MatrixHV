@@ -45,6 +45,17 @@ fn one_neo_binary_serves_remote_status_and_ping() {
     assert!(status_text.contains("binary_fingerprint="));
     assert!(status_text.contains("capabilities="));
     assert!(status_text.contains("logical_processor_count="));
+    let protocol = status_text.lines()
+        .find_map(|line| line.strip_prefix("matrixhv_protocol="))
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    let supports_telemetry = status_text.contains("matrixhv_present=true\n")
+        && (4..=6).contains(&protocol);
+    let telemetry_format = if protocol >= 5 {
+        "format=matrixhv-telemetry-v3"
+    } else {
+        "format=matrixhv-telemetry-v2"
+    };
 
     let ping = Command::new(executable)
         .args(["--remote", &address.to_string(), "ping"])
@@ -77,14 +88,12 @@ fn one_neo_binary_serves_remote_status_and_ping() {
         .args(["--remote", &address.to_string(), "telemetry"])
         .output()
         .unwrap();
-    if status_text.contains("matrixhv_present=true\n")
-        && status_text.contains("matrixhv_protocol=4\n")
-    {
+    if supports_telemetry {
         assert!(telemetry.status.success());
         assert!(
             String::from_utf8(telemetry.stdout)
                 .unwrap()
-                .contains("format=matrixhv-telemetry-v2")
+                .contains(telemetry_format)
         );
     } else {
         assert!(!telemetry.status.success());
@@ -100,9 +109,7 @@ fn one_neo_binary_serves_remote_status_and_ping() {
                 .args(["--remote", &address.to_string(), command, mode])
                 .output()
                 .unwrap();
-            if status_text.contains("matrixhv_present=true\n")
-                && status_text.contains("matrixhv_protocol=4\n")
-            {
+            if supports_telemetry {
                 if mode == "watchdog" && status_text.contains("telemetry_enabled=0\n") {
                     assert!(!output.status.success());
                     assert!(
@@ -137,7 +144,7 @@ fn one_neo_binary_serves_remote_status_and_ping() {
         if status_text.contains("telemetry_control=true\n") {
             assert!(output.status.success());
             let text = String::from_utf8(output.stdout).unwrap();
-            assert!(text.contains("format=matrixhv-telemetry-v2"));
+            assert!(text.contains(telemetry_format));
             assert!(text.contains(&format!(
                 ".telemetry_enabled={}\n",
                 u8::from(control == "enable")

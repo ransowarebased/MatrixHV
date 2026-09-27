@@ -5,9 +5,21 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL: u32 = 4;
-const MATRIXHV_DIAGNOSTIC_PROTOCOL: u32 = 5;
+const MATRIXHV_DIAGNOSTIC_PROTOCOL: u32 = 6;
 const TELEMETRY_CONTROL_CAPABILITY: u32 = 1 << 8;
 const NESTED_FAILURE_TRACE_CAPABILITY: u32 = 1 << 9;
+const EXIT_PROFILE_CAPABILITY: u32 = 1 << 10;
+const PROFILE_PAIR_NAMES: [[&str; 2]; 9] = [
+    ["rdmsr", "wrmsr"],
+    ["cpuid", "nested_invvpid_instructions"],
+    ["nested_vmread", "nested_vmwrite"],
+    ["nested_vmlaunch", "nested_vmresume"],
+    ["last_normal_exit_reason", "last_guest_rcx"],
+    ["handler_cycles.vmcs", "handler_cycles.nested_entry"],
+    ["handler_cycles.other", "handler_cycles.invept"],
+    ["last_normal_guest_rip", "profile_tsc_hz"],
+    ["ept02_table_pages", "cached_ept02_table_pages"],
+];
 const PAIR_NAMES: [[&str; 2]; 27] = [
     ["sequence", "phase"],
     ["exits", "handler_returns"],
@@ -539,6 +551,13 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
                     writeln!(sample, "{prefix}.{}={second}", names[1]).unwrap();
                 }
             }
+            if caps.eax & EXIT_PROFILE_CAPABILITY != 0 && mode == Mode::General {
+                for (index, names) in PROFILE_PAIR_NAMES.iter().enumerate() {
+                    let (first, second) = pair(diagnostic_cpu(index as u32 + 38, cpu));
+                    writeln!(sample, "{prefix}.{}={first}", names[0]).unwrap();
+                    writeln!(sample, "{prefix}.{}={second}", names[1]).unwrap();
+                }
+            }
             if mode != Mode::EptDiagnostics {
                 let nested = diagnostic_cpu(31, cpu);
                 writeln!(sample, "{prefix}.nested_active={}", nested.eax).unwrap();
@@ -627,7 +646,7 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
             mask.count_ones().to_string()
         };
         let mut text = format!(
-            "capabilities=0x{:x}\ncapability_names=vcpu_counters,watchdog_sequence_phase,guest_triad,entry_failure_slot,host_exception_slot,ept_diagnostics,watchdog_lease,remote_vcpu_query{}{}\nlogical_processor_count={count}\n",
+            "capabilities=0x{:x}\ncapability_names=vcpu_counters,watchdog_sequence_phase,guest_triad,entry_failure_slot,host_exception_slot,ept_diagnostics,watchdog_lease,remote_vcpu_query{}{}{}\nlogical_processor_count={count}\n",
             caps.eax,
             if caps.eax & TELEMETRY_CONTROL_CAPABILITY != 0 {
                 ",telemetry_control"
@@ -636,6 +655,11 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
             },
             if caps.eax & NESTED_FAILURE_TRACE_CAPABILITY != 0 {
                 ",nested_failure_trace"
+            } else {
+                ""
+            },
+            if caps.eax & EXIT_PROFILE_CAPABILITY != 0 {
+                ",exit_profile"
             } else {
                 ""
             },

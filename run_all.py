@@ -21,12 +21,9 @@ def run_commands(commands, project):
 
 
 def main():
-    project = Path(__file__).resolve().parents[1]
+    project = Path(__file__).resolve().parent
     tests = project / "tests"
-    runners = sorted(
-        path for path in tests.rglob("run_*.py")
-        if path != Path(__file__).resolve()
-    )
+    runners = sorted(tests.rglob("run_*.py"))
     covered = {path.with_name(path.stem.removeprefix("run_") + ".rs") for path in runners}
     # The EPT cache runner also builds the high-address mapping harness.
     if tests / "run_ept_cache.py" in runners:

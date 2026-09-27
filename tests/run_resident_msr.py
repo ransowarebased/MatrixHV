@@ -103,7 +103,27 @@ test_cache_flush:
     ret
 """
 (output / "resident-cache-flush.S").write_text(".text\n" + cache_flush, encoding="utf-8")
-start = source.index("            allow_low_msr_passthrough(bitmap, IA32_ARCH_CAPABILITIES_MSR);")
+start = assembly_source.index('.Lresident_nested_merge_msr_bitmap_loop:')
+end = assembly_source.index('.Lresident_nested_intercept_unmapped_msr_bitmap:', start)
+bitmap_merge = assembly_source[start:end]
+bitmap_merge += """
+.Lresident_nested_use_composed_msr_bitmap:
+    ret
+.globl test_merge_msr_bitmaps
+test_merge_msr_bitmaps:
+    push rsi
+    push rdi
+    mov rsi, rcx
+    mov rdi, rdx
+    mov rdx, r8
+    mov ecx, 512
+    call .Lresident_nested_merge_msr_bitmap_loop
+    pop rdi
+    pop rsi
+    ret
+"""
+(output / "resident-msr-bitmap.S").write_text(".text\n" + bitmap_merge, encoding="utf-8")
+start = source.index("            allow_native_msr_reads(bitmap);")
 end = source.index("    // L1 owns the local APIC", start)
 bitmap_policy = "fn clock_bitmap() -> ResidentPages {\nlet mut msr_bitmap = ResidentPages::new();\nlet bitmap = &mut msr_bitmap.bytes;\n"
 bitmap_policy += source[start:end] + "\nmsr_bitmap\n}\n"

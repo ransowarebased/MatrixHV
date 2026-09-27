@@ -609,7 +609,7 @@ fn cpuid_contract_uses_architectural_bits_and_hypervisor_namespace() {
     assert_eq!(MATRIXHV_STATUS_SIGNATURE_EAX, 0x4d48_5631);
     assert_eq!(MATRIXHV_STATUS_SIGNATURE_EBX.to_le_bytes(), *b"MATR");
     assert_eq!(MATRIXHV_STATUS_SIGNATURE_ECX.to_le_bytes(), *b"IXHV");
-    assert_eq!(MATRIXHV_STATUS_PROTOCOL, 5);
+    assert_eq!(MATRIXHV_STATUS_PROTOCOL, 6);
     assert_eq!(HYPERVISOR_LEAF_START, 0x4000_0000);
     assert_eq!(HYPERV_FEATURES_LEAF, 0x4000_0003);
     assert_eq!(HYPERVISOR_LEAF_END, 0x4fff_ffff);

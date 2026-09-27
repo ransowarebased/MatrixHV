@@ -12,7 +12,9 @@ impl ResidentPages {
     }
 
     fn intercepts(&self, index: u32, write: bool) -> bool {
-        let offset = (index >> 3) as usize + if write { 2048 } else { 0 };
+        let offset = ((index & 0x1fff) >> 3) as usize
+            + if index >= 0xc000_0000 { 1024 } else { 0 }
+            + if write { 2048 } else { 0 };
         self.bytes[offset] & (1 << (index & 7)) != 0
     }
 }
@@ -28,10 +30,109 @@ fn physical_clock_and_deadline_share_native_reads_and_writes() {
             );
         }
     }
-    for index in [0xfe, 0x200, 0x201, 0x250, 0x2ff, 0x480] {
-        assert!(bitmap.intercepts(index, false));
+    for index in [0xfe, 0x200, 0x201, 0x250, 0x2ff] {
+        assert!(!bitmap.intercepts(index, false));
         assert!(bitmap.intercepts(index, true));
     }
+    assert!(bitmap.intercepts(0x480, false));
+    assert!(bitmap.intercepts(0x480, true));
+}
+
+#[test]
+fn sysenter_state_does_not_generate_unsolicited_l1_exits() {
+    let bitmap = clock_bitmap();
+    for index in [0x174, 0x175, 0x176] {
+        for write in [false, true] {
+            assert!(
+                !bitmap.intercepts(index, write),
+                "VMCS-backed SYSENTER MSR {index:#x}, write={write} must not create an unsolicited L1 exit"
+            );
+        }
+    }
+    for index in [0x173, 0x177, 0x480] {
+        assert_eq!(bitmap.intercepts(index, false), index == 0x480);
+        assert!(bitmap.intercepts(index, true));
+    }
+}
+
+global_asm!(include_str!("resident-msr-bitmap.S"));
+
+unsafe extern "C" {
+    fn test_merge_msr_bitmaps(l0: *const u8, composed: *mut u8, l1: *const u8);
+}
+
+#[test]
+fn sysenter_intercepts_follow_l1_read_and_write_policy() {
+    let l0 = clock_bitmap();
+    for index in [0x174_u32, 0x175, 0x176] {
+        for requested in 0..4 {
+            let mut l1 = [0_u8; 4096];
+            for write in [false, true] {
+                let offset = (index >> 3) as usize + if write { 2048 } else { 0 };
+                if requested & (1 << u32::from(write)) != 0 {
+                    l1[offset] |= 1 << (index & 7);
+                }
+            }
+            let mut composed = ResidentPages::new();
+            unsafe {
+                test_merge_msr_bitmaps(l0.bytes.as_ptr(), composed.bytes.as_mut_ptr(), l1.as_ptr());
+            }
+            for write in [false, true] {
+                assert_eq!(
+                    composed.intercepts(index, write),
+                    requested & (1 << u32::from(write)) != 0,
+                    "SYSENTER MSR {index:#x}, write={write}, requested={requested}"
+                );
+            }
+            for other in [0x173, 0x177, 0x480] {
+                assert_eq!(composed.intercepts(other, false), other == 0x480);
+                assert!(composed.intercepts(other, true));
+            }
+        }
+    }
+}
+
+#[test]
+fn only_virtualized_msr_reads_require_a_resident_exit() {
+    let bitmap = clock_bitmap();
+    for base in [0, 0xc000_0000] {
+        for index in base..base + 0x2000 {
+            let virtualized = index == 0x3a || (0x480..=0x49f).contains(&index)
+                || index == 0xc000_0080;
+            assert_eq!(bitmap.intercepts(index, false), virtualized, "MSR {index:#x}");
+        }
+    }
+}
+
+#[test]
+fn native_read_policy_preserves_every_l1_intercept() {
+    let l0 = clock_bitmap();
+    for pattern in [0, 0x55, 0xaa, 0xff] {
+        let l1 = [pattern; 4096];
+        let mut composed = ResidentPages::new();
+        unsafe { test_merge_msr_bitmaps(l0.bytes.as_ptr(), composed.bytes.as_mut_ptr(), l1.as_ptr()) };
+        for base in [0, 0xc000_0000] {
+            for index in base..base + 0x2000 {
+                for write in [false, true] {
+                    let requested = pattern & (1 << (index & 7)) != 0;
+                    assert_eq!(composed.intercepts(index, write),
+                               requested || l0.intercepts(index, write),
+                               "MSR {index:#x}, write={write}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_read_policy_never_changes_write_intercepts() {
+    let mut bitmap = [0_u8; 4096];
+    for (index, byte) in bitmap.iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(73);
+    }
+    let before = bitmap;
+    allow_native_msr_reads(&mut bitmap);
+    assert_eq!(&bitmap[2048..], &before[2048..]);
 }
 
 #[test]

@@ -567,6 +567,7 @@ struct Context {
     host_mapping_cache: [u64; 4],
     gpa: u64,
     qualification: u64,
+    exit_reason: u64,
     ept01: u64,
     invalidations: u64,
     native_invept: u64,
@@ -726,6 +727,8 @@ core::arch::global_asm!(
     b_nested_host_mapping_cache = const std::mem::offset_of!(Context, host_mapping_cache),
     b_last_guest_physical_address = const std::mem::offset_of!(Context, gpa),
     b_last_qualification = const std::mem::offset_of!(Context, qualification),
+    b_last_reason = const std::mem::offset_of!(Context, exit_reason),
+    ept_misconfiguration_reason = const 49,
     b_nested_ept01_pointer = const std::mem::offset_of!(Context, ept01),
     b_nested_ept02_invalidation_count = const std::mem::offset_of!(Context, invalidations),
     b_invept_exits = const std::mem::offset_of!(Context, native_invept),
@@ -984,6 +987,7 @@ fn context(arena: &mut Arena, ept12: u64, ept01: u64) -> Context {
         host_cr3: arena.host_map(),
         gpa: 0x203000,
         qualification: 1,
+        exit_reason: 48,
         ept01,
         ept12,
         ept02,
@@ -1682,6 +1686,96 @@ fn composes_large_leaves_with_remapping_and_restricted_permissions() {
     assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
     assert_eq!(leaf(state.ept02, state.gpa), (21, 0x6000b5));
     assert_eq!(state.pool_used, 2);
+}
+
+#[test]
+fn vmware_shadow_markers_raise_misconfiguration_at_every_ept_level() {
+    for mbec in [false, true] {
+        for ad in [false, true] {
+            for level in 0..4 {
+                let mut arena = Arena::new();
+                let ept12 = arena.pages(1);
+                let ept01 = arena.pages(1);
+                let zero_page = arena.pages(1);
+                arena.map(ept12, 0x203000, 0x403000, 12, 0x37);
+                arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+                arena.map(ept01, 0, zero_page, 12, 0x37);
+                let mut state = context(&mut arena, ept12 | if ad { 0x40 } else { 0 }, ept01);
+                state.mbec = u64::from(mbec);
+                state.qualification = 0x681;
+                let slot = entry_addresses(ept12, state.gpa)[level] as *mut u64;
+                // VMware VNPTClearShadowEntry uses W=1/R=0 to request exit 49.
+                let marker = if mbec { 0x476 } else { 0x76 };
+                unsafe { slot.write(marker) };
+                assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+                assert_eq!(state.exit_reason, 49, "level={level}, mbec={mbec}, ad={ad}");
+                assert_eq!(state.gpa, 0x203000);
+                assert_eq!(state.compositions, 0);
+                assert_eq!(unsafe { slot.read() }, marker);
+                assert_eq!(leaf(state.ept02, state.gpa).1, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn write_without_read_is_invalid_even_for_writes_and_instruction_fetches() {
+    for access in [1, 2, 4] {
+        for permissions in [2, 6] {
+            let mut arena = Arena::new();
+            let ept12 = arena.pages(1);
+            let ept01 = arena.pages(1);
+            arena.map(ept12, 0x200000, 0x400000, 21, 0xb0 | permissions);
+            arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+            let mut state = context(&mut arena, ept12, ept01);
+            state.qualification = access;
+            assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+            assert_eq!(state.exit_reason, 49);
+            assert_eq!(state.compositions, 0);
+        }
+    }
+}
+
+#[test]
+fn misconfiguration_precedes_accumulated_permission_denial() {
+    let mut arena = Arena::new();
+    let ept12 = arena.pages(1);
+    let ept01 = arena.pages(1);
+    arena.map(ept12, 0x203000, 0x403000, 12, 0x36);
+    arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+    let mut state = context(&mut arena, ept12, ept01);
+    let slots = entry_addresses(ept12, state.gpa);
+    unsafe {
+        *(slots[0] as *mut u64) &= !3;
+        *(slots[1] as *mut u64) &= !6;
+    }
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+    assert_eq!(state.exit_reason, 49);
+    assert_eq!(state.compositions, 0);
+
+    // A nonpresent entry ends the walk before a malformed descendant.
+    state.exit_reason = 48;
+    state.qualification = 1;
+    unsafe { *(slots[0] as *mut u64) &= !0x407 };
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+    assert_eq!(state.exit_reason, 48);
+}
+
+#[test]
+fn invept_removes_misconfigured_leaves_without_synthesizing_an_exit() {
+    let mut arena = Arena::new();
+    let ept12 = arena.pages(1);
+    let ept01 = arena.pages(1);
+    arena.map(ept12, 0x200000, 0x400000, 21, 0xb7);
+    arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+    let mut state = context(&mut arena, ept12, ept01);
+    assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+    let slots = entry_addresses(ept12, state.gpa);
+    unsafe { *(*slots.last().unwrap() as *mut u64) &= !1 };
+    state.exit_reason = 50;
+    unsafe { revalidate_test_ept(&mut state) };
+    assert_eq!(state.exit_reason, 50);
+    assert_eq!(leaf(state.ept02, state.gpa).1, 0);
 }
 #[test]
 fn preserves_four_kib_l0_remaps_inside_a_large_l1_leaf() {

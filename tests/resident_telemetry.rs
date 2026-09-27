@@ -7,6 +7,7 @@ unsafe extern "win64" {
     fn test_watchdog_begin(context: *mut u64);
     fn test_watchdog_complete(context: *mut u64);
     fn test_counter(context: *mut u64) -> u64;
+    fn test_profile_exit(context: *mut u64);
     fn test_nested_failure_record(context: *mut u64, kind: u64, code: u64);
     fn test_diagnostic(context: *mut u64, shared: *mut u64, subleaf: u32, result: *mut u32);
 }
@@ -114,6 +115,44 @@ fn remote_cpu_queries_preserve_64_bit_values_and_validate_target() {
     );
     assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 8), [0; 4]);
     assert_eq!(diagnostic(&mut context, &mut shared, 36), [2, 0, 0, 0]);
+}
+
+#[test]
+fn profiling_reports_remote_msr_operands_and_full_width_handler_ticks() {
+    let mut context = [0; 512];
+    let mut remote = [0_u64; 512];
+    let mut shared = [0; 512];
+    shared[offset("event_cpu_contexts")] = remote.as_mut_ptr() as u64;
+    remote[offset("b_rdmsr_count")] = 0x123456789abcdef0;
+    remote[offset("b_wrmsr_count")] = 0x0fedcba987654321;
+    remote[offset("b_last_normal_reason")] = 31;
+    remote[offset("b_last_rcx")] = 0xc0000080;
+    remote[offset("b_nested_exit_handler_cycles") + 3] = 0xfedcba9876543210;
+    std::hint::black_box(&remote);
+    assert_eq!(diagnostic(&mut context, &mut shared, (1 << 16) | 38),
+               [0x9abcdef0, 0x12345678, 0x87654321, 0x0fedcba9]);
+    assert_eq!(diagnostic(&mut context, &mut shared, (1 << 16) | 42),
+               [31, 0, 0xc0000080, 0]);
+    assert_eq!(diagnostic(&mut context, &mut shared, (1 << 16) | 44),
+               [0, 0, 0x76543210, 0xfedcba98]);
+    assert_eq!(diagnostic(&mut context, &mut shared, 47), [0; 4]);
+    assert_eq!(diagnostic(&mut context, &mut shared, 34)[0] & 0x400, 0x400);
+}
+
+#[test]
+fn opt_in_handler_timing_works_without_a_serial_port() {
+    for (reason, category) in [(23, 0), (25, 0), (20, 1), (24, 1), (31, 2), (50, 3)] {
+        let mut context = [0; 512];
+        context[offset("b_last_reason")] = reason;
+        context[offset("b_nested_exit_started_tsc")] = 25;
+        unsafe { test_profile_exit(context.as_mut_ptr()) };
+        assert_eq!(&context[offset("b_nested_exit_handler_cycles")..][..4], &[0; 4]);
+        context[offset("b_telemetry_active")] = 1;
+        unsafe { test_profile_exit(context.as_mut_ptr()) };
+        let mut expected = [0; 4];
+        expected[category] = 75;
+        assert_eq!(&context[offset("b_nested_exit_handler_cycles")..][..4], &expected);
+    }
 }
 
 #[test]

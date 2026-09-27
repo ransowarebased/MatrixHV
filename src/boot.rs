@@ -757,148 +757,152 @@ pub fn run() -> Result<(), Status> {
     ));
     runtime::phase("uefi.memory_map.ok");
 
-    screen::stage("VMXON proof");
-    runtime::phase("vmx.vmxon.start");
-    match hv_core::vt_vmxon::probe_vmxon() {
-        Ok(report) => {
-            log::info!(
-                "VMXON probe succeeded: revision={:#x}, region_size={}, region_pa={:#x}, cr0={:#x}->{:#x}, cr4={:#x}->{:#x}",
-                report.revision_id,
-                report.region_size,
-                report.region_physical_address,
-                report.original_cr0,
-                report.vmx_cr0,
-                report.original_cr4,
-                report.vmx_cr4
-            );
-            runtime::info(format_args!(
-                "vmxon revision={:#x} region_size={} region_pa={:#x} cr0={:#x}->{:#x} cr4={:#x}->{:#x}",
-                report.revision_id,
-                report.region_size,
-                report.region_physical_address,
-                report.original_cr0,
-                report.vmx_cr0,
-                report.original_cr4,
-                report.vmx_cr4
-            ));
-            runtime::phase("vmx.vmxon.ok");
+    if current().vmx_test {
+        screen::stage("VMXON proof");
+        runtime::phase("vmx.vmxon.start");
+        match hv_core::vt_vmxon::probe_vmxon() {
+            Ok(report) => {
+                log::info!(
+                    "VMXON probe succeeded: revision={:#x}, region_size={}, region_pa={:#x}, cr0={:#x}->{:#x}, cr4={:#x}->{:#x}",
+                    report.revision_id,
+                    report.region_size,
+                    report.region_physical_address,
+                    report.original_cr0,
+                    report.vmx_cr0,
+                    report.original_cr4,
+                    report.vmx_cr4
+                );
+                runtime::info(format_args!(
+                    "vmxon revision={:#x} region_size={} region_pa={:#x} cr0={:#x}->{:#x} cr4={:#x}->{:#x}",
+                    report.revision_id,
+                    report.region_size,
+                    report.region_physical_address,
+                    report.original_cr0,
+                    report.vmx_cr0,
+                    report.original_cr4,
+                    report.vmx_cr4
+                ));
+                runtime::phase("vmx.vmxon.ok");
+            }
+            Err(error) => {
+                log::error!("VMXON probe failed: {error:?}");
+                runtime::error(format_args!("vmxon error={error:?}"));
+                runtime::phase("vmx.vmxon.failed");
+                screen::error(format_args!("VMXON proof: {error:?}"));
+                return Err(Status::DEVICE_ERROR);
+            }
         }
-        Err(error) => {
-            log::error!("VMXON probe failed: {error:?}");
-            runtime::error(format_args!("vmxon error={error:?}"));
-            runtime::phase("vmx.vmxon.failed");
-            screen::error(format_args!("VMXON proof: {error:?}"));
-            return Err(Status::DEVICE_ERROR);
-        }
-    }
 
-    screen::stage("VMCS proof");
-    runtime::phase("vmx.vmcs.start");
-    match hv_core::vmcs::probe_vmcs() {
-        Ok(report) => {
-            runtime::info(format_args!(
-                "vmcs revision={:#x} region_pa={:#x} current_pa={:#x} instruction_error={} vmxon_pa={:#x}",
-                report.revision_id,
-                report.region_physical_address,
-                report.current_vmcs_physical_address,
-                report.instruction_error,
-                report.vmxon.region_physical_address
-            ));
-            runtime::phase("vmx.vmcs.ok");
+        screen::stage("VMCS proof");
+        runtime::phase("vmx.vmcs.start");
+        match hv_core::vmcs::probe_vmcs() {
+            Ok(report) => {
+                runtime::info(format_args!(
+                    "vmcs revision={:#x} region_pa={:#x} current_pa={:#x} instruction_error={} vmxon_pa={:#x}",
+                    report.revision_id,
+                    report.region_physical_address,
+                    report.current_vmcs_physical_address,
+                    report.instruction_error,
+                    report.vmxon.region_physical_address
+                ));
+                runtime::phase("vmx.vmcs.ok");
+            }
+            Err(error) => {
+                log::error!("VMCS probe failed: {error:?}");
+                runtime::error(format_args!("vmcs error={error:?}"));
+                runtime::phase("vmx.vmcs.failed");
+                screen::error(format_args!("VMCS proof: {error:?}"));
+                return Err(Status::DEVICE_ERROR);
+            }
         }
-        Err(error) => {
-            log::error!("VMCS probe failed: {error:?}");
-            runtime::error(format_args!("vmcs error={error:?}"));
-            runtime::phase("vmx.vmcs.failed");
-            screen::error(format_args!("VMCS proof: {error:?}"));
-            return Err(Status::DEVICE_ERROR);
-        }
-    }
 
-    screen::stage("VMLAUNCH proof");
-    runtime::phase("vmx.vmlaunch_probe.start");
-    match hv_core::vt_entry::probe_vmlaunch() {
-        Ok(report) => {
-            runtime::info(format_args!(
-                "vmlaunch proof vmcs_pa={:#x} exit_reason={:#x} qualification={:#x} instruction_len={} guest_rip_after_exit={:#x}",
-                report.vmcs_physical_address,
-                report.exit_reason,
-                report.exit_qualification,
-                report.exit_instruction_length,
-                report.guest_rip_after_exit
-            ));
-            runtime::info(format_args!(
-                "vmlaunch proof vmxon_pa={:#x} host_cs={:#x} host_tr={:#x} guest_cs={:#x} guest_tr={:#x} controls primary={:#x} exit={:#x} entry={:#x}",
-                report.vmxon.region_physical_address,
-                report.host.cs_selector,
-                report.host.tr_selector,
-                report.guest.cs_selector,
-                report.guest.tr_selector,
-                report.controls.primary_processor_based,
-                report.controls.vm_exit,
-                report.controls.vm_entry
-            ));
-            runtime::phase("vmx.vmlaunch_probe.ok");
+        screen::stage("VMLAUNCH proof");
+        runtime::phase("vmx.vmlaunch_probe.start");
+        match hv_core::vt_entry::probe_vmlaunch() {
+            Ok(report) => {
+                runtime::info(format_args!(
+                    "vmlaunch proof vmcs_pa={:#x} exit_reason={:#x} qualification={:#x} instruction_len={} guest_rip_after_exit={:#x}",
+                    report.vmcs_physical_address,
+                    report.exit_reason,
+                    report.exit_qualification,
+                    report.exit_instruction_length,
+                    report.guest_rip_after_exit
+                ));
+                runtime::info(format_args!(
+                    "vmlaunch proof vmxon_pa={:#x} host_cs={:#x} host_tr={:#x} guest_cs={:#x} guest_tr={:#x} controls primary={:#x} exit={:#x} entry={:#x}",
+                    report.vmxon.region_physical_address,
+                    report.host.cs_selector,
+                    report.host.tr_selector,
+                    report.guest.cs_selector,
+                    report.guest.tr_selector,
+                    report.controls.primary_processor_based,
+                    report.controls.vm_exit,
+                    report.controls.vm_entry
+                ));
+                runtime::phase("vmx.vmlaunch_probe.ok");
+            }
+            Err(error) => {
+                log::error!("VMLAUNCH probe failed: {error:?}");
+                runtime::error(format_args!("vmlaunch error={error:?}"));
+                runtime::phase("vmx.vmlaunch_probe.failed");
+                screen::error(format_args!("VMLAUNCH proof: {error:?}"));
+                return Err(Status::DEVICE_ERROR);
+            }
         }
-        Err(error) => {
-            log::error!("VMLAUNCH probe failed: {error:?}");
-            runtime::error(format_args!("vmlaunch error={error:?}"));
-            runtime::phase("vmx.vmlaunch_probe.failed");
-            screen::error(format_args!("VMLAUNCH proof: {error:?}"));
-            return Err(Status::DEVICE_ERROR);
-        }
-    }
 
-    screen::stage("VM-exit dispatcher proof");
-    runtime::phase("vmx.dispatch_probe.start");
-    match hv_core::vt_entry::probe_vmexit_dispatcher() {
-        Ok(report) => {
-            let diagnostics = report.diagnostics;
-            runtime::info(format_args!(
-                "dispatcher proof vmcs_pa={:#x} exits={} cpuid={} vmcall={} resumes={} failure={} cpuid_input={:#x}/{:#x} cpuid_rip={:#x}/{:#x} vmcall_rip={:#x}/{:#x}",
-                report.vmcs_physical_address,
-                diagnostics.exit_count,
-                diagnostics.cpuid_count,
-                diagnostics.vmcall_count,
-                diagnostics.resume_count,
-                diagnostics.failure_code,
-                diagnostics.cpuid_leaf,
-                diagnostics.cpuid_subleaf,
-                diagnostics.cpuid_rip,
-                report.cpuid_rip_expected,
-                diagnostics.vmcall_rip,
-                report.vmcall_rip_expected
-            ));
-            runtime::info(format_args!(
-                "dispatcher guest-state cpuid eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} final eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} rsp={:#x}/{:#x}",
-                diagnostics.cpuid_eax,
-                diagnostics.cpuid_ebx,
-                diagnostics.cpuid_ecx,
-                diagnostics.cpuid_edx,
-                diagnostics.final_eax,
-                diagnostics.final_ebx,
-                diagnostics.final_ecx,
-                diagnostics.final_edx,
-                diagnostics.final_rsp,
-                report.guest.rsp
-            ));
-            runtime::info(format_args!(
-                "dispatcher host/guest vmxon_pa={:#x} host_tr={:#x} guest_rip={:#x} primary={:#x} secondary={:#x}",
-                report.vmxon.region_physical_address,
-                report.host.tr_selector,
-                report.guest.rip,
-                report.controls.primary_processor_based,
-                report.controls.secondary_processor_based
-            ));
-            runtime::phase("vmx.dispatch_probe.ok");
+        screen::stage("VM-exit dispatcher proof");
+        runtime::phase("vmx.dispatch_probe.start");
+        match hv_core::vt_entry::probe_vmexit_dispatcher() {
+            Ok(report) => {
+                let diagnostics = report.diagnostics;
+                runtime::info(format_args!(
+                    "dispatcher proof vmcs_pa={:#x} exits={} cpuid={} vmcall={} resumes={} failure={} cpuid_input={:#x}/{:#x} cpuid_rip={:#x}/{:#x} vmcall_rip={:#x}/{:#x}",
+                    report.vmcs_physical_address,
+                    diagnostics.exit_count,
+                    diagnostics.cpuid_count,
+                    diagnostics.vmcall_count,
+                    diagnostics.resume_count,
+                    diagnostics.failure_code,
+                    diagnostics.cpuid_leaf,
+                    diagnostics.cpuid_subleaf,
+                    diagnostics.cpuid_rip,
+                    report.cpuid_rip_expected,
+                    diagnostics.vmcall_rip,
+                    report.vmcall_rip_expected
+                ));
+                runtime::info(format_args!(
+                    "dispatcher guest-state cpuid eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} final eax={:#x} ebx={:#x} ecx={:#x} edx={:#x} rsp={:#x}/{:#x}",
+                    diagnostics.cpuid_eax,
+                    diagnostics.cpuid_ebx,
+                    diagnostics.cpuid_ecx,
+                    diagnostics.cpuid_edx,
+                    diagnostics.final_eax,
+                    diagnostics.final_ebx,
+                    diagnostics.final_ecx,
+                    diagnostics.final_edx,
+                    diagnostics.final_rsp,
+                    report.guest.rsp
+                ));
+                runtime::info(format_args!(
+                    "dispatcher host/guest vmxon_pa={:#x} host_tr={:#x} guest_rip={:#x} primary={:#x} secondary={:#x}",
+                    report.vmxon.region_physical_address,
+                    report.host.tr_selector,
+                    report.guest.rip,
+                    report.controls.primary_processor_based,
+                    report.controls.secondary_processor_based
+                ));
+                runtime::phase("vmx.dispatch_probe.ok");
+            }
+            Err(error) => {
+                log::error!("VM-exit dispatcher probe failed: {error:?}");
+                runtime::error(format_args!("dispatcher error={error:?}"));
+                runtime::phase("vmx.dispatch_probe.failed");
+                screen::error(format_args!("VM-exit dispatcher: {error:?}"));
+                return Err(Status::DEVICE_ERROR);
+            }
         }
-        Err(error) => {
-            log::error!("VM-exit dispatcher probe failed: {error:?}");
-            runtime::error(format_args!("dispatcher error={error:?}"));
-            runtime::phase("vmx.dispatch_probe.failed");
-            screen::error(format_args!("VM-exit dispatcher: {error:?}"));
-            return Err(Status::DEVICE_ERROR);
-        }
+    } else {
+        runtime::phase("vmx.preboot_probes.skipped");
     }
 
     screen::stage("resident host proof");
@@ -939,74 +943,80 @@ pub fn run() -> Result<(), Status> {
         }
     }
 
-    screen::stage("guest UEFI loader proof");
-    guest::reset_report();
-    runtime::phase("vmx.real_boot_vcpu.start");
-    let vcpu_report = match guest::run(guest::entry_address()) {
-        Ok(report) => report,
-        Err(error) => {
-            log::error!("Persistent boot vCPU failed: {error:?}");
-            runtime::error(format_args!("real_boot_vcpu error={error:?}"));
-            runtime::phase("vmx.real_boot_vcpu.failed");
-            screen::error(format_args!("guest UEFI loader: {error:?}"));
-            return Err(guest::status_from_error(&error));
-        }
+    let vcpu_proof = if current().vmx_test {
+        screen::stage("guest UEFI loader proof");
+        guest::reset_report();
+        runtime::phase("vmx.real_boot_vcpu.start");
+        let vcpu_report = match guest::run(guest::entry_address()) {
+            Ok(report) => report,
+            Err(error) => {
+                log::error!("Persistent boot vCPU failed: {error:?}");
+                runtime::error(format_args!("real_boot_vcpu error={error:?}"));
+                runtime::phase("vmx.real_boot_vcpu.failed");
+                screen::error(format_args!("guest UEFI loader: {error:?}"));
+                return Err(guest::status_from_error(&error));
+            }
+        };
+        let vcpu_diagnostics = vcpu_report.diagnostics;
+        let boot_stage = guest::report();
+        screen::message(format_args!(
+            "guest result={} flags={:#x} status={:#x} handles={}",
+            guest::result_name(vcpu_report.result),
+            boot_stage.flags,
+            boot_stage.status,
+            boot_stage.handle_count
+        ));
+        runtime::info(format_args!(
+            "real_boot_vcpu result={:#x} result_name={} exits={} cpuid={} rdmsr={} wrmsr={} vmcall={} resumes={} failure={} guest_rsp={:#x}/{:#x} guest_rflags={:#x} initial_rflags={:#x}",
+            vcpu_report.result,
+            guest::result_name(vcpu_report.result),
+            vcpu_diagnostics.exit_count,
+            vcpu_diagnostics.cpuid_count,
+            vcpu_diagnostics.rdmsr_count,
+            vcpu_diagnostics.wrmsr_count,
+            vcpu_diagnostics.vmcall_count,
+            vcpu_diagnostics.resume_count,
+            vcpu_diagnostics.failure_code,
+            vcpu_diagnostics.final_rsp,
+            vcpu_report.guest.rsp,
+            vcpu_report.guest.rflags,
+            vcpu_report.initial_rflags
+        ));
+        runtime::info(format_args!(
+            "real_boot_vcpu firmware_report magic={:#x} version={} flags={:#x} status={:#x} handles={} required={}",
+            boot_stage.magic,
+            boot_stage.version,
+            boot_stage.flags,
+            boot_stage.status,
+            boot_stage.handle_count,
+            boot_stage.required_count
+        ));
+        runtime::info(format_args!(
+            "real_boot_vcpu vmcs_pa={:#x} vmxon_pa={:#x} host_tr={:#x} primary={:#x} secondary={:#x}",
+            vcpu_report.vmcs_physical_address,
+            vcpu_report.vmxon.region_physical_address,
+            vcpu_report.host.tr_selector,
+            vcpu_report.controls.primary_processor_based,
+            vcpu_report.controls.secondary_processor_based
+        ));
+        runtime::info(format_args!(
+            "real_boot_vcpu address_space source_cr3={:#x} guest_initial_cr3={:#x} host_cr3={:#x} observed_host_cr3={:#x}/{:#x} last_guest_cr3={:#x} host_pt_arena={:#x}/{} host_pt_used={}",
+            vcpu_report.host_address_space.source_cr3,
+            vcpu_report.guest.cr3,
+            vcpu_report.host.cr3,
+            vcpu_diagnostics.first_host_cr3,
+            vcpu_diagnostics.last_host_cr3,
+            vcpu_diagnostics.last_guest_cr3,
+            vcpu_report.host_address_space.arena_physical_address,
+            vcpu_report.host_address_space.arena_pages,
+            vcpu_report.host_address_space.table_pages
+        ));
+        runtime::phase("vmx.host_address_space.ok");
+        Some((vcpu_report, boot_stage))
+    } else {
+        runtime::phase("vmx.real_boot_vcpu.skipped");
+        None
     };
-    let vcpu_diagnostics = vcpu_report.diagnostics;
-    let boot_stage = guest::report();
-    screen::message(format_args!(
-        "guest result={} flags={:#x} status={:#x} handles={}",
-        guest::result_name(vcpu_report.result),
-        boot_stage.flags,
-        boot_stage.status,
-        boot_stage.handle_count
-    ));
-    runtime::info(format_args!(
-        "real_boot_vcpu result={:#x} result_name={} exits={} cpuid={} rdmsr={} wrmsr={} vmcall={} resumes={} failure={} guest_rsp={:#x}/{:#x} guest_rflags={:#x} initial_rflags={:#x}",
-        vcpu_report.result,
-        guest::result_name(vcpu_report.result),
-        vcpu_diagnostics.exit_count,
-        vcpu_diagnostics.cpuid_count,
-        vcpu_diagnostics.rdmsr_count,
-        vcpu_diagnostics.wrmsr_count,
-        vcpu_diagnostics.vmcall_count,
-        vcpu_diagnostics.resume_count,
-        vcpu_diagnostics.failure_code,
-        vcpu_diagnostics.final_rsp,
-        vcpu_report.guest.rsp,
-        vcpu_report.guest.rflags,
-        vcpu_report.initial_rflags
-    ));
-    runtime::info(format_args!(
-        "real_boot_vcpu firmware_report magic={:#x} version={} flags={:#x} status={:#x} handles={} required={}",
-        boot_stage.magic,
-        boot_stage.version,
-        boot_stage.flags,
-        boot_stage.status,
-        boot_stage.handle_count,
-        boot_stage.required_count
-    ));
-    runtime::info(format_args!(
-        "real_boot_vcpu vmcs_pa={:#x} vmxon_pa={:#x} host_tr={:#x} primary={:#x} secondary={:#x}",
-        vcpu_report.vmcs_physical_address,
-        vcpu_report.vmxon.region_physical_address,
-        vcpu_report.host.tr_selector,
-        vcpu_report.controls.primary_processor_based,
-        vcpu_report.controls.secondary_processor_based
-    ));
-    runtime::info(format_args!(
-        "real_boot_vcpu address_space source_cr3={:#x} guest_initial_cr3={:#x} host_cr3={:#x} observed_host_cr3={:#x}/{:#x} last_guest_cr3={:#x} host_pt_arena={:#x}/{} host_pt_used={}",
-        vcpu_report.host_address_space.source_cr3,
-        vcpu_report.guest.cr3,
-        vcpu_report.host.cr3,
-        vcpu_diagnostics.first_host_cr3,
-        vcpu_diagnostics.last_host_cr3,
-        vcpu_diagnostics.last_guest_cr3,
-        vcpu_report.host_address_space.arena_physical_address,
-        vcpu_report.host_address_space.arena_pages,
-        vcpu_report.host_address_space.table_pages
-    ));
-    runtime::phase("vmx.host_address_space.ok");
 
     screen::stage("root UEFI target lookup");
     let root_handle_count = simple_file_system_count()?;
@@ -1041,27 +1051,29 @@ pub fn run() -> Result<(), Status> {
             }
         }
     };
-    runtime::info(format_args!(
-        "real_boot_vcpu crosscheck guest_handles={} root_handles={} root_boot_target_present={}",
-        boot_stage.handle_count, root_handle_count, root_boot_target_present
-    ));
-    if vcpu_report.result != guest::BOOT_STAGE_TARGET_IMAGE_LOAD_OK
-        || !guest::proof_complete(boot_stage)
-        || usize::try_from(boot_stage.handle_count).ok() != Some(root_handle_count)
-        || !root_boot_target_present
-    {
-        runtime::phase("vmx.real_boot_vcpu.crosscheck_failed");
-        screen::error(format_args!(
-            "guest crosscheck result={} flags={:#x} guest_handles={} root_handles={} target={}",
-            guest::result_name(vcpu_report.result),
-            boot_stage.flags,
-            boot_stage.handle_count,
-            root_handle_count,
-            root_boot_target_present
+    if let Some((vcpu_report, boot_stage)) = vcpu_proof {
+        runtime::info(format_args!(
+            "real_boot_vcpu crosscheck guest_handles={} root_handles={} root_boot_target_present={}",
+            boot_stage.handle_count, root_handle_count, root_boot_target_present
         ));
-        return Err(Status::DEVICE_ERROR);
+        if vcpu_report.result != guest::BOOT_STAGE_TARGET_IMAGE_LOAD_OK
+            || !guest::proof_complete(boot_stage)
+            || usize::try_from(boot_stage.handle_count).ok() != Some(root_handle_count)
+            || !root_boot_target_present
+        {
+            runtime::phase("vmx.real_boot_vcpu.crosscheck_failed");
+            screen::error(format_args!(
+                "guest crosscheck result={} flags={:#x} guest_handles={} root_handles={} target={}",
+                guest::result_name(vcpu_report.result),
+                boot_stage.flags,
+                boot_stage.handle_count,
+                root_handle_count,
+                root_boot_target_present
+            ));
+            return Err(Status::DEVICE_ERROR);
+        }
+        runtime::phase("vmx.real_boot_vcpu.ok");
     }
-    runtime::phase("vmx.real_boot_vcpu.ok");
 
     screen::stage("resident event setup");
     runtime::phase("vmx.residency_events.arm.start");

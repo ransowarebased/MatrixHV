@@ -71,6 +71,7 @@ const RDMSR_EXIT_REASON: u64 = 31;
 const WRMSR_EXIT_REASON: u64 = 32;
 const XSETBV_EXIT_REASON: u64 = 55;
 const EPT_VIOLATION_EXIT_REASON: u64 = 48;
+const EPT_MISCONFIGURATION_EXIT_REASON: u64 = 49;
 const VMX_PREEMPTION_TIMER_EXIT_REASON: u64 = 52;
 const VM_ENTRY_FAILURE_MSR_LOADING_EXIT_REASON: u64 = 34;
 const EPT_TEST_READ_ACCESS: u64 = 1;
@@ -1578,6 +1579,18 @@ fn allow_high_msr_passthrough(bitmap: &mut [u8], index: u32) {
     bitmap[MSR_BITMAP_WRITE_HIGH_OFFSET + byte_index] &= bit_mask;
 }
 
+fn allow_native_msr_reads(bitmap: &mut [u8]) {
+    // Unmodified reads already reach guarded RDMSR in the resident handler.
+    // Avoid that round trip; L1's read intercepts are still ORed into VMCS02.
+    // Feature control, VMX capabilities and EFER retain the virtualized view.
+    bitmap[..MSR_BITMAP_WRITE_LOW_OFFSET].fill(0);
+    bitmap[(IA32_FEATURE_CONTROL_MSR >> 3) as usize] |=
+        1 << (IA32_FEATURE_CONTROL_MSR & 7);
+    bitmap[0x480 / 8..0x4a0 / 8].fill(0xff);
+    let efer_byte = MSR_BITMAP_READ_HIGH_OFFSET + ((IA32_EFER_MSR & 0x1fff) >> 3) as usize;
+    bitmap[efer_byte] |= 1 << (IA32_EFER_MSR & 7);
+}
+
 fn spec_ctrl_available(leaf7_edx: u32) -> bool {
     leaf7_edx & ((1 << 26) | (1 << 27) | (1 << 31)) != 0
 }
@@ -1693,9 +1706,14 @@ fn configure_nested_vmcs02(
         Ok(())
     })();
 
+    // VMPTRLD of VMCS01 leaves VMCS02 active; flush it before BSP executes VMXOFF.
+    let clear = unsafe { vmcs::vmclear(configuration.vmcs02_region) };
     let restore = unsafe { vmcs::vmptrld(configuration.vmcs01_region) };
     if restore != VmxInstructionResult::Succeeded {
         return Err(ResidentProbeError::Vmcs(VmcsError::Vmptrld(restore)));
+    }
+    if clear != VmxInstructionResult::Succeeded {
+        return Err(ResidentProbeError::Vmclear(clear));
     }
     configure_result
 }
@@ -1966,12 +1984,18 @@ pub fn run_boot_loader(
     let msr_bitmap =
         ResidentPages::allocate_initialized(MSR_BITMAP_PAGES, AddressConstraint::Any, |bitmap| {
             bitmap.fill(0xff);
+            allow_native_msr_reads(bitmap);
             allow_low_msr_passthrough(bitmap, IA32_ARCH_CAPABILITIES_MSR);
             allow_low_msr_passthrough(bitmap, IA32_SPEC_CTRL_MSR);
             allow_low_msr_write_passthrough(bitmap, IA32_PRED_CMD_MSR);
             allow_low_msr_read_passthrough(bitmap, IA32_MCG_CAP_MSR);
             allow_low_msr_passthrough(bitmap, IA32_MCG_STATUS_MSR);
             allow_low_msr_passthrough(bitmap, IA32_MCG_CTL_MSR);
+            // VMCS guest state saves and restores SYSENTER MSRs. Intercepting them
+            // here would reflect exits that L1's MSR bitmap explicitly disabled.
+            allow_low_msr_passthrough(bitmap, IA32_SYSENTER_CS_MSR);
+            allow_low_msr_passthrough(bitmap, IA32_SYSENTER_ESP_MSR);
+            allow_low_msr_passthrough(bitmap, IA32_SYSENTER_EIP_MSR);
             // Resident CPUs own their physical APIC. Keep TSC synchronization and its
             // deadline timer in the same clock domain; L1 bitmap intercepts still apply to L2.
             for index in [IA32_TSC_MSR, IA32_TSC_ADJUST_MSR, IA32_TSC_DEADLINE_MSR] {
@@ -2286,16 +2310,16 @@ pub fn run_boot_loader(
     })?;
 
     // Firmware MP services run with the BSP's original CRs, tables, and IF.
-    // VMCLEAR retains the prepared fields while relinquishing CPU ownership.
+    // Both VMCS regions must be inactive before this temporary VMXOFF.
     let clear = unsafe { vmcs::vmclear(vmcs_physical_address) };
     drop(session);
     if clear != VmxInstructionResult::Succeeded {
         return Err(ResidentProbeError::Vmclear(clear));
     }
     crate::boot::screen::stage("resident AP launch");
-    for (processor_number, resources) in &mut ap_resources {
-        crate::boot::screen::message(format_args!("resident AP {} starting", processor_number));
-        let mut launch = ResidentApLaunch {
+    let mut launches = ap_resources
+        .iter_mut()
+        .map(|(processor_number, resources)| ResidentApLaunch {
             resources,
             host_cr3: host_space.host_cr3,
             event_context,
@@ -2303,8 +2327,15 @@ pub fn run_boot_loader(
             msr_bitmap: msr_bitmap.physical_address(),
             dispatch_entry: code.dispatch_entry,
             processor_number: *processor_number,
-        };
-        let result = crate::smp::launch(*processor_number, &mut launch);
+        })
+        .collect::<alloc::vec::Vec<_>>();
+    crate::boot::screen::message(format_args!("resident APs starting={}", launches.len()));
+    if let Err(error) = crate::smp::launch_all(&mut launches) {
+        crate::boot::screen::error(format_args!("resident AP batch failed: {error:?}"));
+        resident_startup_halt();
+    }
+    drop(launches);
+    for (processor_number, resources) in &mut ap_resources {
         let ap_context = resources
             .context_pages
             .pointer()
@@ -2313,10 +2344,9 @@ pub fn run_boot_loader(
         let started = unsafe { core::ptr::addr_of!((*ap_context).ap_started).read_volatile() };
         let nested = unsafe { core::ptr::addr_of!((*ap_context).nested).read_volatile() };
         crate::runtime::info(format_args!(
-            "smp resident processor={} started={} status={:?} vmxon={:#x} vmcs={:#x} host_stack={:#x} context={:#x} host_cr3={:#x} ept={:#x}",
+            "smp resident processor={} started={} vmxon={:#x} vmcs={:#x} host_stack={:#x} context={:#x} host_cr3={:#x} ept={:#x}",
             processor_number,
             started,
-            result,
             resources.vmxon_region.physical_address(),
             resources.vmcs_region.physical_address(),
             resources.host_stack.physical_address(),
@@ -2367,8 +2397,7 @@ pub fn run_boot_loader(
             nested.l2_last_exit_rip,
             nested.l2_last_exit_rsp
         ));
-        if result.is_err()
-            || started != 1
+        if started != 1
             || nested.vmxon_count != 2
             || nested.vmxoff_count != 1
             || nested.active != 0
@@ -2447,7 +2476,7 @@ pub fn run_boot_loader(
             || nested.vmcs12.extended_fields[16] != nested.ept12_pointer
         {
             crate::boot::screen::error(format_args!(
-                "resident AP {} failed: status={result:?} started={started} complete={} vmx_failures={}",
+                "resident AP {} failed: started={started} complete={} vmx_failures={}",
                 processor_number, nested.probe_complete, nested.failure_count
             ));
             resident_startup_halt();
@@ -2515,7 +2544,7 @@ pub fn run_boot_loader(
         first_high_bar.1
     ));
     crate::boot::screen::message(format_args!(
-        "runtime diagnostics use the saved framebuffer aperture without UEFI services"
+        "runtime diagnostics retain counters and serial output; framebuffer writes stop at ExitBootServices"
     ));
     crate::boot::screen::message(format_args!(
         "mark rows: first reason bits, VMRESUME error bits, first eight exits"
@@ -2654,7 +2683,7 @@ pub(crate) struct ResidentApLaunch<'a> {
     ept_pointer: u64,
     msr_bitmap: u64,
     dispatch_entry: u64,
-    processor_number: usize,
+    pub(crate) processor_number: usize,
 }
 
 impl ResidentApLaunch<'_> {
@@ -3052,6 +3081,7 @@ global_asm!(
     event_magic = const EVENT_CONTEXT_MAGIC,
     event_canary = const EVENT_CONTEXT_CANARY,
     ept_violation_reason = const EPT_VIOLATION_EXIT_REASON,
+    ept_misconfiguration_reason = const EPT_MISCONFIGURATION_EXIT_REASON,
     vm_entry_failure_msr_loading_reason = const VM_ENTRY_FAILURE_MSR_LOADING_EXIT_REASON,
     ept_test_read_access = const EPT_TEST_READ_ACCESS,
     vmclear_reason = const VMCLEAR_EXIT_REASON,
