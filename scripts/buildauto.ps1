@@ -56,6 +56,9 @@ if ($null -eq $RustcCommand) {
 New-Item -ItemType Directory -Path $CargoTargetRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $HostCargoTargetRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $BootRoot -Force | Out-Null
+if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+    & (Join-Path $PSScriptRoot 'make_config.ps1') -OutputPath $ConfigPath | Out-Null
+}
 
 $CargoArguments = @(
     'build',

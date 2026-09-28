@@ -7,8 +7,9 @@ output = project / "builds" / "config-tests"
 output.mkdir(parents=True, exist_ok=True)
 source = (project / "src/boot.rs").read_text(encoding="utf-8")
 start = source.index("pub const CONFIG_HEADER:")
-end = source.index("\nmod boot_order {", start)
-parser = source[start:end]
+end = source.index("\n#[derive(Clone, Copy, Debug, Eq, PartialEq)]\npub enum ConfigLoadError", start)
+parser = source[start:source.index("const CONFIG_FILE_PATH", start)]
+parser += source[source.index("static CPUID_PRESENCE", start):end]
 cases = (project / "tests/config.rs").read_text(encoding="utf-8")
 harness = output / "harness.rs"
 harness.write_text(

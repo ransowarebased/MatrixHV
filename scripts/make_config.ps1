@@ -26,9 +26,9 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 }
 $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 
-$CurrentCpuidPresence = $true
+$CurrentCpuidPresence = $false
 $CurrentLogger = $true
-$CurrentVtNested = $false
+$CurrentVtNested = $true
 $CurrentVmxTest = $false
 if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
     foreach ($Line in Get-Content -LiteralPath $OutputPath) {

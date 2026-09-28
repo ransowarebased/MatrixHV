@@ -196,6 +196,12 @@ pub fn leaf_with_subleaf(function: u32, subleaf: u32) -> CpuIdLeaf {
 }
 
 pub fn apic_id() -> u32 {
+    if leaf(0).eax >= 0x1f {
+        let topology = leaf_with_subleaf(0x1f, 0);
+        if topology.ebx != 0 {
+            return topology.edx;
+        }
+    }
     if leaf(0).eax >= 0xb {
         let topology = leaf_with_subleaf(0xb, 0);
         if topology.ebx != 0 {

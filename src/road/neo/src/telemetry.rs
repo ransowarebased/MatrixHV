@@ -12,6 +12,8 @@ const EXIT_PROFILE_CAPABILITY: u32 = 1 << 10;
 const EXIT_REASON_COUNTS_CAPABILITY: u32 = 1 << 11;
 const VMX_HARDWARE_CAPABILITY: u32 = 1 << 12;
 const EPT_RECYCLING_CAPABILITY: u32 = 1 << 13;
+const CONTROL_STAGE_CAPABILITY: u32 = 1 << 14;
+const CONTROL_NATIVE_SNAPSHOT_CAPABILITY: u32 = 1 << 15;
 const PROFILE_PAIR_NAMES: [[&str; 2]; 9] = [
     ["rdmsr", "wrmsr"],
     ["cpuid", "nested_invvpid_instructions"],
@@ -109,6 +111,345 @@ pub struct CaptureOptions {
     pub output: Option<PathBuf>,
 }
 
+pub struct ControlTraceOptions {
+    pub cpu: u32,
+    pub seconds: u64,
+    pub output: PathBuf,
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+const NATIVE_SNAPSHOT_FIELDS: [&str; 26] = [
+    "stage",
+    "rip",
+    "rsp",
+    "rflags",
+    "cr0",
+    "cr3",
+    "cr4",
+    "caller_rsp",
+    "stack_limit",
+    "stack_base",
+    "rax",
+    "rcx",
+    "rdx",
+    "rbx",
+    "rbp",
+    "rsi",
+    "rdi",
+    "r8",
+    "r9",
+    "r10",
+    "r11",
+    "r12",
+    "r13",
+    "r14",
+    "r15",
+    "tsc",
+];
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[derive(Clone, Copy, Debug)]
+struct NativeSnapshotLayout {
+    snapshot_bytes: usize,
+    stack_offset: usize,
+    stack_bytes: usize,
+    capacity: u64,
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+impl NativeSnapshotLayout {
+    fn from_cpuid(result: std::arch::x86_64::CpuidResult) -> Result<Self, String> {
+        let layout = Self {
+            snapshot_bytes: result.eax as usize,
+            stack_offset: result.ebx as usize,
+            stack_bytes: result.ecx as usize,
+            capacity: u64::from(result.edx),
+        };
+        let pairs = layout.snapshot_bytes / 16;
+        let leaf_limit = 0x4000u64 + layout.capacity * pairs as u64;
+        if layout.stack_offset != NATIVE_SNAPSHOT_FIELDS.len() * 8
+            || layout.stack_bytes == 0
+            || layout.stack_bytes > 65536
+            || layout.snapshot_bytes != layout.stack_offset + layout.stack_bytes
+            || layout.snapshot_bytes % 16 != 0
+            || layout.capacity == 0
+            || leaf_limit > 0x10000
+        {
+            return Err(format!(
+                "unsupported native snapshot layout: bytes={}, stack_offset={}, stack_bytes={}, capacity={}",
+                layout.snapshot_bytes, layout.stack_offset, layout.stack_bytes, layout.capacity
+            ));
+        }
+        Ok(layout)
+    }
+
+    fn published(
+        self,
+        query: &mut impl FnMut(u32) -> std::arch::x86_64::CpuidResult,
+    ) -> Result<(u64, u64), String> {
+        let published = pair(query(51));
+        if published.0 > self.capacity {
+            return Err(format!(
+                "native snapshot count {} exceeds capacity {}",
+                published.0, self.capacity
+            ));
+        }
+        Ok(published)
+    }
+
+    fn read_frame(
+        self,
+        frame_index: u64,
+        sequence: u64,
+        query: &mut impl FnMut(u32) -> std::arch::x86_64::CpuidResult,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let before = self.published(query)?;
+        if before.1 != sequence || frame_index >= before.0 {
+            return Ok(None);
+        }
+        let first_leaf = 0x4000 + frame_index as u32 * (self.snapshot_bytes / 16) as u32;
+        let mut bytes = vec![0; self.snapshot_bytes];
+        for (index, chunk) in bytes.chunks_exact_mut(16).enumerate() {
+            let result = query(first_leaf + index as u32);
+            for (word, value) in chunk
+                .chunks_exact_mut(4)
+                .zip([result.eax, result.ebx, result.ecx, result.edx])
+            {
+                word.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        // Published frames are immutable until the next activation resets the count.
+        // Recheck both the header and publication state before accepting the stack.
+        for (index, chunk) in bytes[..self.stack_offset].chunks_exact(16).enumerate() {
+            let result = query(first_leaf + index as u32);
+            for (word, value) in chunk
+                .chunks_exact(4)
+                .zip([result.eax, result.ebx, result.ecx, result.edx])
+            {
+                if word != value.to_le_bytes() {
+                    return Ok(None);
+                }
+            }
+        }
+        let after = self.published(query)?;
+        if after.1 != sequence || after.0 < before.0 {
+            return Ok(None);
+        }
+        let fields = native_snapshot_fields(&bytes);
+        if fields[0] == 0
+            || fields[1] == 0
+            || fields[9].checked_sub(fields[8]) != Some(self.stack_bytes as u64)
+            || !(fields[8]..=fields[9]).contains(&fields[2])
+        {
+            return Err(format!(
+                "invalid native snapshot header at frame {frame_index}"
+            ));
+        }
+        Ok(Some(bytes))
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn native_snapshot_fields(bytes: &[u8]) -> [u64; NATIVE_SNAPSHOT_FIELDS.len()] {
+    std::array::from_fn(|index| {
+        u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap())
+    })
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn save_native_frame(
+    trace_path: &std::path::Path,
+    trace: &mut std::fs::File,
+    cpu: u32,
+    sequence: u64,
+    frame_index: u64,
+    layout: NativeSnapshotLayout,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let mut frame_name = trace_path
+        .file_name()
+        .ok_or_else(|| "control trace output requires a file name".to_string())?
+        .to_os_string();
+    frame_name.push(format!(
+        ".cpu{cpu}.seq{sequence:016x}.frame{frame_index:02}.bin"
+    ));
+    let frame_path = trace_path.with_file_name(frame_name);
+    let mut frame_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&frame_path)
+        .map_err(|error| format!("failed to create {}: {error}", frame_path.display()))?;
+    frame_file
+        .write_all(bytes)
+        .and_then(|()| frame_file.sync_all())
+        .map_err(|error| format!("failed to persist {}: {error}", frame_path.display()))?;
+    let fields = native_snapshot_fields(bytes);
+    let mut record = format!(
+        "native_frame_index={frame_index}\nnative_control_sequence=0x{sequence:016x}\nnative_frame_file={}\nnative_frame_bytes={}\nnative_stack_offset={}\nnative_stack_bytes={}\nnative_stack_scope=runtime_resident_allocation\nnative_rip_kind=checkpoint_return_address\nnative_stage_name={}\n",
+        frame_path.display(),
+        layout.snapshot_bytes,
+        layout.stack_offset,
+        layout.stack_bytes,
+        control_stage_name(fields[0]),
+    );
+    for (name, value) in NATIVE_SNAPSHOT_FIELDS.iter().zip(fields) {
+        writeln!(record, "native_{name}=0x{value:016x}").unwrap();
+    }
+    record.push_str("native_frame_complete=true\n\n");
+    trace
+        .write_all(record.as_bytes())
+        .and_then(|()| trace.sync_data())
+        .map_err(|error| format!("failed to write {}: {error}", trace_path.display()))
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub fn capture_control(options: ControlTraceOptions) -> Result<(), String> {
+    if options.cpu >= 64 || !(1..=3600).contains(&options.seconds) {
+        return Err("invalid control trace CPU or duration".into());
+    }
+    let mut affinity = CpuAffinity::current()?;
+    let observer_cpu = affinity
+        .allowed()
+        .iter()
+        .copied()
+        .find(|cpu| *cpu != options.cpu && *cpu < 64)
+        .ok_or_else(|| {
+            "control trace requires an observer CPU different from the target".to_string()
+        })?;
+    affinity.pin(observer_cpu)?;
+    verify_cpu(observer_cpu)?;
+    let capabilities = diagnostic_cpu(34, options.cpu).eax;
+    if capabilities & CONTROL_STAGE_CAPABILITY == 0 {
+        return Err("MatrixHV does not support control stage tracing on the target CPU".into());
+    }
+    let native_layout = if capabilities & CONTROL_NATIVE_SNAPSHOT_CAPABILITY != 0 {
+        Some(NativeSnapshotLayout::from_cpuid(diagnostic_cpu(
+            52,
+            options.cpu,
+        ))?)
+    } else {
+        None
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&options.output)
+        .map_err(|error| format!("failed to create {}: {error}", options.output.display()))?;
+    writeln!(
+        file,
+        "format=matrixhv-control-trace-v2\nobserver_cpu={observer_cpu}\ntarget_cpu={}\npolling=continuous\nnative_capture_supported={}\nnative_snapshot_encoding=little_endian_u64_header_and_raw_stack\n",
+        options.cpu,
+        native_layout.is_some(),
+    )
+    .and_then(|()| file.sync_all())
+    .map_err(|error| format!("failed to write {}: {error}", options.output.display()))?;
+    let deadline = Instant::now() + Duration::from_secs(options.seconds);
+    let mut previous = None;
+    let mut previous_native = None;
+    let mut native_sequence = None;
+    let mut next_native_frame = 0;
+    let mut next_heartbeat = Instant::now();
+    loop {
+        let state = pair(diagnostic_cpu(50, options.cpu));
+        let mut query = |subleaf| diagnostic_cpu(subleaf, options.cpu);
+        let published = native_layout
+            .map(|layout| layout.published(&mut query))
+            .transpose()?;
+        if let (Some(layout), Some((count, sequence))) = (native_layout, published) {
+            if native_sequence != Some(sequence) {
+                native_sequence = Some(sequence);
+                next_native_frame = 0;
+            }
+            // Off uses the same control sequence slot and clears the native stage.
+            // Its retained bytes must not be relabeled as a new activation.
+            if state.0 != 0 {
+                while next_native_frame < count {
+                    let Some(bytes) = layout.read_frame(next_native_frame, sequence, &mut query)?
+                    else {
+                        break;
+                    };
+                    save_native_frame(
+                        &options.output,
+                        &mut file,
+                        options.cpu,
+                        sequence,
+                        next_native_frame,
+                        layout,
+                        &bytes,
+                    )?;
+                    next_native_frame += 1;
+                }
+            }
+        }
+        let now = Instant::now();
+        if previous != Some(state) || previous_native != published || now >= next_heartbeat {
+            let (exits, handler_returns) = pair(diagnostic_cpu(5, options.cpu));
+            let resume_failures = pair(diagnostic_cpu(6, options.cpu)).0;
+            let (last_exit_reason, last_guest_rip) = pair(diagnostic_cpu(8, options.cpu));
+            let (entry_failure_state, entry_failure_exit) = pair(diagnostic_cpu(9, options.cpu));
+            let (control_failure_reason, control_failure_qualification) =
+                pair(diagnostic_cpu(53, options.cpu));
+            let (fault_vector, fault_error) = pair(diagnostic(32));
+            let (fault_rip, fault_address) = pair(diagnostic(33));
+            let sample_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
+                .as_millis();
+            writeln!(
+                file,
+                "sample_unix_ms={sample_time}\ncontrol_stage={}\ncontrol_stage_name={}\ncontrol_phase={}\ncontrol_failure_reason=0x{control_failure_reason:016x}\ncontrol_failure_qualification=0x{control_failure_qualification:016x}\nexits={exits}\nhandler_returns={handler_returns}\nresume_failures={resume_failures}\nlast_exit_reason={last_exit_reason}\nlast_guest_rip=0x{last_guest_rip:x}\nentry_failure_state={entry_failure_state}\nentry_failure_exit={entry_failure_exit}\nfault_vector={fault_vector}\nfault_error={fault_error}\nfault_rip=0x{fault_rip:x}\nfault_address=0x{fault_address:x}\n",
+                state.0,
+                control_stage_name(state.0),
+                state.1
+            )
+            .and_then(|()| {
+                if let Some((count, sequence)) = published {
+                    writeln!(
+                        file,
+                        "native_published_count={count}\nnative_control_sequence=0x{sequence:016x}\nnative_saved_count={next_native_frame}\n"
+                    )?;
+                }
+                Ok(())
+            })
+            .and_then(|()| file.sync_data())
+            .map_err(|error| format!("failed to write {}: {error}", options.output.display()))?;
+            previous = Some(state);
+            previous_native = published;
+            next_heartbeat = now + Duration::from_millis(100);
+        }
+        if now >= deadline {
+            return Ok(());
+        }
+        std::hint::spin_loop();
+    }
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+pub fn capture_control(_options: ControlTraceOptions) -> Result<(), String> {
+    Err("MatrixHV control tracing requires x86-64 Windows or Linux".into())
+}
+
 pub fn capture(
     options: CaptureOptions,
     mut request: impl FnMut(Mode, Control) -> Result<String, String>,
@@ -204,6 +545,36 @@ fn pair(result: std::arch::x86_64::CpuidResult) -> (u64, u64) {
         u64::from(result.eax) | (u64::from(result.ebx) << 32),
         u64::from(result.ecx) | (u64::from(result.edx) << 32),
     )
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn control_stage_name(stage: u64) -> &'static str {
+    match stage {
+        0 => "idle",
+        1 => "requested",
+        2 => "preflight_complete",
+        3 => "vmxe_enabled",
+        4 => "vmxon_complete",
+        5 => "vmcs_loaded",
+        6 => "host_fields_restored",
+        7 => "guest_fields_written",
+        8 => "invalidation_complete",
+        9 => "guest_entered",
+        10 => "vmcs_cleared",
+        11 => "before_invept",
+        12 => "before_invvpid",
+        128 => "preflight_failed",
+        129 => "vmx_busy",
+        130 => "vmxon_failed",
+        131 => "root_setup_failed",
+        132 => "invalidation_failed",
+        133 => "vm_entry_failed",
+        134 => "vmcs_preservation_failed",
+        _ => "unknown",
+    }
 }
 
 #[cfg(all(
@@ -540,6 +911,24 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
             writeln!(sample, "{prefix}.processor_number={}", caps.ebx).unwrap();
             writeln!(sample, "{prefix}.capabilities=0x{:x}", caps.eax).unwrap();
             writeln!(sample, "{prefix}.watchdog_active={}", caps.ecx).unwrap();
+            if caps.eax & CONTROL_STAGE_CAPABILITY != 0 {
+                let (stage, phase) = pair(diagnostic_cpu(50, cpu));
+                writeln!(sample, "{prefix}.control_stage={stage}").unwrap();
+                writeln!(
+                    sample,
+                    "{prefix}.control_stage_name={}",
+                    control_stage_name(stage)
+                )
+                .unwrap();
+                writeln!(sample, "{prefix}.control_phase={phase}").unwrap();
+                let (reason, qualification) = pair(diagnostic_cpu(53, cpu));
+                writeln!(sample, "{prefix}.control_failure_reason=0x{reason:016x}").unwrap();
+                writeln!(
+                    sample,
+                    "{prefix}.control_failure_qualification=0x{qualification:016x}"
+                )
+                .unwrap();
+            }
             if caps.eax & TELEMETRY_CONTROL_CAPABILITY != 0 {
                 writeln!(
                     sample,
@@ -561,12 +950,16 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
                 }
             }
             if caps.eax & EXIT_PROFILE_CAPABILITY != 0 && mode == Mode::General {
-                writeln!(sample, "{prefix}.vmcs_instruction_counter_scope={}",
+                writeln!(
+                    sample,
+                    "{prefix}.vmcs_instruction_counter_scope={}",
                     if caps.eax & EXIT_REASON_COUNTS_CAPABILITY != 0 {
                         "vcpu_cumulative"
                     } else {
                         "current_vmcs_snapshot"
-                    }).unwrap();
+                    }
+                )
+                .unwrap();
                 for (index, names) in PROFILE_PAIR_NAMES.iter().enumerate() {
                     let (first, second) = pair(diagnostic_cpu(index as u32 + 38, cpu));
                     writeln!(sample, "{prefix}.{}={first}", names[0]).unwrap();
@@ -576,7 +969,11 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
             if caps.eax & EPT_RECYCLING_CAPABILITY != 0 && mode != Mode::Watchdog {
                 let (resets, table_evictions) = pair(diagnostic_cpu(49, cpu));
                 writeln!(sample, "{prefix}.nested_ept02_full_recycles={resets}").unwrap();
-                writeln!(sample, "{prefix}.nested_ept02_table_evictions={table_evictions}").unwrap();
+                writeln!(
+                    sample,
+                    "{prefix}.nested_ept02_table_evictions={table_evictions}"
+                )
+                .unwrap();
             }
             if caps.eax & EXIT_REASON_COUNTS_CAPABILITY != 0 && mode == Mode::General {
                 for index in 0..64 {
@@ -601,7 +998,9 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
         text.push_str(&sample);
         if protocol >= 5 && mode == Mode::General {
             append_nested_failure_trace(
-                &mut text, cpu, diagnostic_cpu(34, cpu).eax & VMX_HARDWARE_CAPABILITY != 0,
+                &mut text,
+                cpu,
+                diagnostic_cpu(34, cpu).eax & VMX_HARDWARE_CAPABILITY != 0,
             );
         }
         if cpu == cpus[0] {
@@ -675,7 +1074,7 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
             mask.count_ones().to_string()
         };
         let mut text = format!(
-            "capabilities=0x{:x}\ncapability_names=vcpu_counters,watchdog_sequence_phase,guest_triad,entry_failure_slot,host_exception_slot,ept_diagnostics,watchdog_lease,remote_vcpu_query{}{}{}{}{}{}\nlogical_processor_count={count}\n",
+            "capabilities=0x{:x}\ncapability_names=vcpu_counters,watchdog_sequence_phase,guest_triad,entry_failure_slot,host_exception_slot,ept_diagnostics,watchdog_lease,remote_vcpu_query{}{}{}{}{}{}{}{}\nlogical_processor_count={count}\n",
             caps.eax,
             if caps.eax & TELEMETRY_CONTROL_CAPABILITY != 0 {
                 ",telemetry_control"
@@ -707,6 +1106,16 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
             } else {
                 ""
             },
+            if caps.eax & CONTROL_STAGE_CAPABILITY != 0 {
+                ",control_stage_trace"
+            } else {
+                ""
+            },
+            if caps.eax & CONTROL_NATIVE_SNAPSHOT_CAPABILITY != 0 {
+                ",control_native_context_stack"
+            } else {
+                ""
+            },
         );
         if caps.eax & TELEMETRY_CONTROL_CAPABILITY != 0 {
             writeln!(
@@ -719,7 +1128,12 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
         if caps.eax & VMX_HARDWARE_CAPABILITY != 0 {
             let (host_secondary, nested_secondary) = pair(diagnostic(47));
             let (host_misc, nested_misc) = pair(diagnostic(48));
-            text.push_str(&format_vmx_support(host_secondary, nested_secondary, host_misc, nested_misc));
+            text.push_str(&format_vmx_support(
+                host_secondary,
+                nested_secondary,
+                host_misc,
+                nested_misc,
+            ));
         } else {
             text.push_str("vmcs_shadowing_host_supported=unknown\nvmcs_shadowing_query=requires_updated_matrixhv\n");
         }
@@ -729,7 +1143,12 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
     "capabilities=none\nlogical_processor_count=unavailable\nvmcs_shadowing_host_supported=unknown\nvmcs_shadowing_query=requires_matrixhv_msr_telemetry\n".to_string()
 }
 
-fn format_vmx_support(host_secondary: u64, nested_secondary: u64, host_misc: u64, nested_misc: u64) -> String {
+fn format_vmx_support(
+    host_secondary: u64,
+    nested_secondary: u64,
+    host_misc: u64,
+    nested_misc: u64,
+) -> String {
     format!(
         "vmx_capability_source=matrixhv_root_msr_snapshot\nvmx_host_secondary_controls=0x{host_secondary:x}\nvmx_nested_secondary_controls=0x{nested_secondary:x}\nvmcs_shadowing_host_supported={}\nvmcs_shadowing_nested_exposed={}\nvmx_host_vmwrite_read_only_supported={}\nvmx_nested_vmwrite_read_only_supported={}\n",
         host_secondary & (1 << 46) != 0,
@@ -887,3 +1306,11 @@ impl Drop for CpuAffinity {
         unsafe { sched_setaffinity(0, self.original_mask.len(), self.original_mask.as_ptr()) };
     }
 }
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "../../../../tests/neo_control_trace.rs"]
+mod control_trace_tests;

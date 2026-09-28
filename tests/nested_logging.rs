@@ -52,17 +52,13 @@ fn explicit_startup_probe_retains_serial_lifecycle_evidence() {
 }
 
 #[test]
-fn firmware_display_is_writable_only_before_exit_boot_services() {
+fn firmware_display_is_writable_only_during_the_post_ebs_window() {
     for hexadecimal in [0, 1] {
-        let mut framebuffer = vec![0x55aa55aa_u32; 512 * 128];
-        let mut event = [0, framebuffer.as_mut_ptr() as u64, 512 * 4];
-        unsafe { test_resident_display(event.as_ptr(), hexadecimal) };
-        assert!(framebuffer.iter().any(|&pixel| pixel != 0x55aa55aa));
-
-        framebuffer.fill(0x55aa55aa);
-        event[0] = 1;
-        unsafe { test_resident_display(event.as_ptr(), hexadecimal) };
-        assert!(framebuffer.iter().all(|&pixel| pixel == 0x55aa55aa),
-                "Diagnostic rendering must not modify the OS-owned framebuffer");
+        for (ebs_seen, deadline, writable) in [(0, u64::MAX, false), (1, 1001, true), (1, 1000, false)] {
+            let mut framebuffer = vec![0x55aa55aa_u32; 512 * 128];
+            let event = [ebs_seen, framebuffer.as_mut_ptr() as u64, 512 * 4, deadline];
+            unsafe { test_resident_display(event.as_ptr(), hexadecimal) };
+            assert_eq!(framebuffer.iter().any(|&pixel| pixel != 0x55aa55aa), writable);
+        }
     }
 }

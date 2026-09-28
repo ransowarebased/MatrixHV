@@ -150,6 +150,43 @@ fn ept_recycling_queries_distinguish_full_resets_from_single_table_evictions() {
 }
 
 #[test]
+fn remote_control_stage_remains_visible_when_target_cpu_is_native() {
+    let mut context = [0; 1024];
+    let mut remote = [0_u64; 1024];
+    let mut shared = [0; 1024];
+    shared[offset("event_cpu_contexts") + 1] = remote.as_mut_ptr() as u64;
+    remote[offset("b_processor_number")] = 1;
+    std::hint::black_box(&remote);
+    let stage = offset("event_control_cpu_states") + 8;
+    shared[stage] = 0x1122334455667788;
+    shared[stage + 1] = 0x8877665544332211;
+    assert_eq!(
+        diagnostic(&mut context, &mut shared, (2 << 16) | 50),
+        [0x55667788, 0x11223344, 0x44332211, 0x88776655]
+    );
+    assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 50), [0; 4]);
+    assert_ne!(diagnostic(&mut context, &mut shared, 34)[0] & (1 << 14), 0);
+}
+
+#[test]
+fn remote_control_failure_reports_the_complete_entry_reason_and_qualification() {
+    let mut context = [0; 1024];
+    let mut remote = [0_u64; 1024];
+    let mut shared = [0; 1024];
+    shared[offset("event_cpu_contexts") + 1] = remote.as_mut_ptr() as u64;
+    remote[offset("b_processor_number")] = 1;
+    std::hint::black_box(&remote);
+    let state = offset("event_control_cpu_states") + 8;
+    shared[state + 2] = 0x80000021;
+    shared[state + 3] = 0x1122334455667788;
+    assert_eq!(
+        diagnostic(&mut context, &mut shared, (2 << 16) | 53),
+        [0x80000021, 0, 0x55667788, 0x11223344]
+    );
+    assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 53), [0; 4]);
+}
+
+#[test]
 fn profiling_reports_remote_msr_operands_and_full_width_handler_ticks() {
     let mut context = [0; 1024];
     let mut remote = [0_u64; 1024];

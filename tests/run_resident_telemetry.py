@@ -23,7 +23,7 @@ offsets = {}
 cursor = 0
 for name in names:
     offsets[name] = cursor
-    cursor += 1024 if name == "b_nested_exit_reason_counts" else 512 if name == "event_cpu_contexts" else (
+    cursor += 4096 if name == "event_control_cpu_states" else 1024 if name == "b_nested_exit_reason_counts" else 512 if name == "event_cpu_contexts" else (
         192 * 8 if name == "b_nested_failure_trace" else (
         56 if name in {"b_watchdog_before", "b_watchdog_after", "b_watchdog_resume", "b_entry_failure_guest"}
         else 32 if name == "b_nested_exit_handler_cycles" else 8
@@ -38,6 +38,14 @@ constants = {
     "nested_failure_trace_limit": 0x161,
     "guest_rip": 0, "guest_rsp": 1, "guest_rflags": 2,
     "guest_cr0": 3, "guest_cr3": 4, "guest_cr4": 5, "guest_efer": 6,
+    "control_cpu_state_size": 64, "control_cpu_stage": 0, "control_cpu_phase": 8,
+    "control_cpu_on_failure_reason": 16, "control_cpu_on_failure_qualification": 24,
+    "control_cpu_native_snapshot_count": 32, "control_cpu_sequence": 40,
+    "control_cpu_native_storage_physical": 48,
+    "native_snapshot_size": 80, "native_snapshot_stack": 16,
+    "native_stack_bytes": 64, "native_snapshot_capacity": 24,
+    "native_snapshot_pairs": 5, "native_snapshot_leaf_limit": 0x4000 + 24 * 5,
+    "native_snapshots_offset": 64,
 }
 assembly = re.sub(r"\{([a-z0-9_]+)\}", lambda match: str(
     (offsets if match[1] in offsets else constants)[match[1]]

@@ -188,6 +188,68 @@ const STATE_RIP_LEN: usize = b" rip=0x".len();
 const STATE_NEWLINE_LEN: usize = b"\r\n".len();
 const NESTED_VMXON_MESSAGE_LEN: usize = b"[MATRIXHV][NESTED] VMXON cpu=0x".len();
 const NESTED_VMXOFF_MESSAGE_LEN: usize = b"[MATRIXHV][NESTED] VMXOFF cpu=0x".len();
+const CONTROL_MAGIC: u64 = 0x4d41_5452_4958_4354;
+const CONTROL_VERSION: u32 = 3;
+const CONTROL_PROBE_OPERATION: u32 = 3;
+const CONTROL_PROBE_VMCALL: u64 = 0x4d41_5452_4958_5042;
+const CONTROL_PROBE_RESULT: u64 = 0x4d41_5452_4958_4f4b;
+const CONTROL_OFF_PREPARE_VMCALL: u64 = 0x4d41_5452_4958_4f50;
+const CONTROL_OFF_PREPARED_RESULT: u64 = 0x4d41_5452_4958_5052;
+const CONTROL_OFF_COMMIT_VMCALL: u64 = 0x4d41_5452_4958_4f43;
+const CONTROL_NATIVE_STACK_BYTES: usize = PAGE_SIZE * 4;
+const CONTROL_NATIVE_SNAPSHOT_CAPACITY: usize = 24;
+
+#[repr(C)]
+struct ControlRequest {
+    magic: u64,
+    version: u32,
+    operation: u32,
+    sequence: u64,
+    expected_apic_id: u32,
+    reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ControlStatus {
+    magic: u64,
+    version: u32,
+    capabilities: u32,
+    current_apic_id: u32,
+    processor_count: u32,
+    expected_mask: u64,
+    active_mask: u64,
+    stopped_mask: u64,
+    failed_mask: u64,
+    exit_boot_services_seen: u64,
+    virtual_address_change_seen: u64,
+    virtual_address_error: u64,
+    completion_sequence: u64,
+    apic_ids: [u32; 64],
+    probe_snapshot: ControlProbeSnapshot,
+}
+
+impl Default for ControlStatus {
+    fn default() -> Self {
+        Self {
+            magic: 0,
+            version: 0,
+            capabilities: 0,
+            current_apic_id: 0,
+            processor_count: 0,
+            expected_mask: 0,
+            active_mask: 0,
+            stopped_mask: 0,
+            failed_mask: 0,
+            exit_boot_services_seen: 0,
+            virtual_address_change_seen: 0,
+            virtual_address_error: 0,
+            completion_sequence: 0,
+            apic_ids: [0; 64],
+            probe_snapshot: ControlProbeSnapshot::default(),
+        }
+    }
+}
 const NESTED_POINTER_MESSAGE_LEN: usize = b" pointer=0x".len();
 const NESTED_FAILURE_MESSAGE_LEN: usize = b"[MATRIXHV][NESTED] PROBE_FAILED".len();
 const NESTED_VMCS12_MESSAGE_LEN: usize = b"[MATRIXHV][NESTED] VMCS12 cpu=0x".len();
@@ -338,6 +400,112 @@ struct ResidentEventContext {
     watchdog_tsc_hz: u64,
     cpu_contexts: [u64; 64],
     visual_deadline_tsc: u64,
+    control_expected_mask: AtomicU64,
+    control_active_mask: AtomicU64,
+    control_stopped_mask: AtomicU64,
+    control_failed_mask: AtomicU64,
+    control_processor_count: u64,
+    control_va_error: u64,
+    control_completion_sequences: [AtomicU64; 64],
+    control_rearm_mask: AtomicU64,
+    runtime_get_variable: u64,
+    runtime_set_variable: u64,
+    runtime_context: u64,
+    control_apic_ids: [u32; 64],
+    control_probe_states: [ControlProbeSnapshot; 64],
+    control_cpu_states: [ControlCpuState; 64],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ControlCpuState {
+    vmxon_region: u64,
+    vmcs_region: u64,
+    current_vmcs: u64,
+    host_fields: [u64; 22],
+    pin_based_controls: u64,
+    exit_msr_load_count: u64,
+    native_cr4: u64,
+    on_original_cr4: u64,
+    guest_dr7: u64,
+    guest_gdtr_limit: u64,
+    guest_idtr_limit: u64,
+    sequence: u64,
+    phase: u64,
+    stage: u64,
+    native_storage_physical: u64,
+    native_storage_runtime: u64,
+    native_caller_rsp: u64,
+    native_snapshot_count: u64,
+    on_native_cr0: u64,
+    on_native_cr3: u64,
+    on_native_dr7: u64,
+    on_native_msrs: [u64; 9],
+    on_failure_reason: u64,
+    on_failure_qualification: u64,
+}
+
+#[repr(C, align(16))]
+struct ControlNativeSnapshot {
+    stage: u64,
+    rip: u64,
+    rsp: u64,
+    rflags: u64,
+    cr0: u64,
+    cr3: u64,
+    cr4: u64,
+    caller_rsp: u64,
+    stack_limit: u64,
+    stack_base: u64,
+    gprs: [u64; 15],
+    tsc: u64,
+    stack: [u8; CONTROL_NATIVE_STACK_BYTES],
+}
+
+#[repr(C, align(4096))]
+struct ControlNativeStorage {
+    stack: [u8; CONTROL_NATIVE_STACK_BYTES],
+    recovery_pml4: [u64; PAGE_SIZE / size_of::<u64>()],
+    snapshots: [ControlNativeSnapshot; CONTROL_NATIVE_SNAPSHOT_CAPACITY],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ControlProbeSnapshot {
+    sequence: u64,
+    guest_rip: u64,
+    guest_rsp: u64,
+    guest_rflags: u64,
+    guest_cr0: u64,
+    guest_cr3: u64,
+    guest_cr4: u64,
+    guest_efer: u64,
+    guest_pat: u64,
+    guest_gdtr_base: u64,
+    guest_gdtr_limit: u64,
+    guest_idtr_base: u64,
+    guest_idtr_limit: u64,
+    guest_cs_selector: u64,
+    guest_ss_selector: u64,
+    guest_tr_selector: u64,
+    guest_tr_access: u64,
+    guest_fs_base: u64,
+    guest_gs_base: u64,
+    guest_interruptibility: u64,
+    idt_vectoring: u64,
+    vm_entry_intr_info: u64,
+    runtime_get_variable: u64,
+    runtime_set_variable: u64,
+    runtime_context: u64,
+    guest_es_selector: u64,
+    guest_ds_selector: u64,
+    guest_fs_selector: u64,
+    guest_gs_selector: u64,
+    guest_ldtr_selector: u64,
+    guest_dr7: u64,
+    guest_cr4_read_shadow: u64,
+    guest_tr_base: u64,
+    guest_tr_limit: u64,
 }
 
 #[repr(C, align(16))]
@@ -1109,6 +1277,14 @@ struct ResidentCode {
     exit_boot_services_callback: u64,
     virtual_address_change_callback: u64,
     dispatch_entry: u64,
+    get_variable_bridge: u64,
+    set_variable_bridge: u64,
+    original_get_variable_slot: u64,
+    original_set_variable_slot: u64,
+    convert_pointer_slot: u64,
+    bridge_context_slot: u64,
+    runtime_get_variable_slot: u64,
+    runtime_set_variable_slot: u64,
 }
 
 impl ResidentCode {
@@ -1127,6 +1303,18 @@ impl ResidentCode {
         let virtual_address_change_callback =
             core::ptr::addr_of!(matrixhv_resident_va_callback) as u64;
         let dispatch_entry = core::ptr::addr_of!(matrixhv_resident_dispatch_entry) as u64;
+        let get_variable_bridge = core::ptr::addr_of!(matrixhv_resident_get_variable) as u64;
+        let set_variable_bridge = core::ptr::addr_of!(matrixhv_resident_set_variable) as u64;
+        let original_get_variable_slot =
+            core::ptr::addr_of!(matrixhv_resident_original_get_variable) as u64;
+        let original_set_variable_slot =
+            core::ptr::addr_of!(matrixhv_resident_original_set_variable) as u64;
+        let convert_pointer_slot = core::ptr::addr_of!(matrixhv_resident_convert_pointer) as u64;
+        let bridge_context_slot = core::ptr::addr_of!(matrixhv_resident_bridge_context) as u64;
+        let runtime_get_variable_slot =
+            core::ptr::addr_of!(matrixhv_resident_runtime_get_variable) as u64;
+        let runtime_set_variable_slot =
+            core::ptr::addr_of!(matrixhv_resident_runtime_set_variable) as u64;
         let end = core::ptr::addr_of!(matrixhv_resident_island_end) as u64;
         if entry < start
             || fatal < start
@@ -1139,6 +1327,14 @@ impl ResidentCode {
             || exit_boot_services_callback < start
             || virtual_address_change_callback < start
             || dispatch_entry < start
+            || get_variable_bridge < start
+            || set_variable_bridge < start
+            || original_get_variable_slot < start
+            || original_set_variable_slot < start
+            || convert_pointer_slot < start
+            || bridge_context_slot < start
+            || runtime_get_variable_slot < start
+            || runtime_set_variable_slot < start
             || end <= start
             || entry >= end
             || fatal >= end
@@ -1151,6 +1347,14 @@ impl ResidentCode {
             || exit_boot_services_callback >= end
             || virtual_address_change_callback >= end
             || dispatch_entry >= end
+            || get_variable_bridge >= end
+            || set_variable_bridge >= end
+            || original_get_variable_slot + 8 > end
+            || original_set_variable_slot + 8 > end
+            || convert_pointer_slot + 8 > end
+            || bridge_context_slot + 8 > end
+            || runtime_get_variable_slot + 8 > end
+            || runtime_set_variable_slot + 8 > end
         {
             return Err(ResidentProbeError::InvalidCodeLayout);
         }
@@ -1199,6 +1403,14 @@ impl ResidentCode {
             exit_boot_services_callback: base + (exit_boot_services_callback - start),
             virtual_address_change_callback: base + (virtual_address_change_callback - start),
             dispatch_entry: base + (dispatch_entry - start),
+            get_variable_bridge: base + (get_variable_bridge - start),
+            set_variable_bridge: base + (set_variable_bridge - start),
+            original_get_variable_slot: base + (original_get_variable_slot - start),
+            original_set_variable_slot: base + (original_set_variable_slot - start),
+            convert_pointer_slot: base + (convert_pointer_slot - start),
+            bridge_context_slot: base + (bridge_context_slot - start),
+            runtime_get_variable_slot: base + (runtime_get_variable_slot - start),
+            runtime_set_variable_slot: base + (runtime_set_variable_slot - start),
             pages,
         })
     }
@@ -1470,9 +1682,18 @@ pub(crate) fn boot_services_exited() -> bool {
 
 pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError> {
     let mut code = ResidentCode::allocate(0)?;
-    let mut context_pages =
-        ResidentPages::allocate_typed(1, AddressConstraint::Any, RESIDENT_EVENT_MEMORY_TYPE)
-            .map_err(ResidentProbeError::Allocation)?;
+    let mut native_storage_pages = ResidentPages::allocate_typed(
+        (size_of::<ControlNativeStorage>() * 64).div_ceil(PAGE_SIZE),
+        AddressConstraint::Any,
+        RESIDENT_EVENT_MEMORY_TYPE,
+    )
+    .map_err(ResidentProbeError::Allocation)?;
+    let mut context_pages = ResidentPages::allocate_typed(
+        size_of::<ResidentEventContext>().div_ceil(PAGE_SIZE),
+        AddressConstraint::Any,
+        RESIDENT_EVENT_MEMORY_TYPE,
+    )
+    .map_err(ResidentProbeError::Allocation)?;
     let context = context_pages
         .pointer()
         .as_ptr()
@@ -1502,7 +1723,27 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
             watchdog_tsc_hz: 0,
             cpu_contexts: [0; 64],
             visual_deadline_tsc: 0,
+            control_expected_mask: AtomicU64::new(0),
+            control_active_mask: AtomicU64::new(0),
+            control_stopped_mask: AtomicU64::new(0),
+            control_failed_mask: AtomicU64::new(0),
+            control_processor_count: 0,
+            control_va_error: 0,
+            control_completion_sequences: core::array::from_fn(|_| AtomicU64::new(0)),
+            control_rearm_mask: AtomicU64::new(0),
+            runtime_get_variable: 0,
+            runtime_set_variable: 0,
+            runtime_context: 0,
+            control_apic_ids: [u32::MAX; 64],
+            control_probe_states: [ControlProbeSnapshot::default(); 64],
+            control_cpu_states: [ControlCpuState::default(); 64],
         });
+        for (index, state) in (*context).control_cpu_states.iter_mut().enumerate() {
+            let address = native_storage_pages.physical_address()
+                + (index * size_of::<ControlNativeStorage>()) as u64;
+            state.native_storage_physical = address;
+            state.native_storage_runtime = address;
+        }
     }
     let serial_lock_address = context_pages.physical_address() + EVENT_CTX_SERIAL_LOCK as u64;
     let notify_context = NonNull::new(context.cast::<c_void>())
@@ -1547,11 +1788,108 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
         exit_boot_services_event: ebs_event.as_ptr() as usize as u64,
         virtual_address_change_event: va_event.as_ptr() as usize as u64,
     };
+    if let Err(status) = install_control_bridge(&code, context) {
+        let _ = boot::close_event(va_event);
+        let _ = boot::close_event(ebs_event);
+        return Err(ResidentProbeError::EventRegistration(status));
+    }
     code.pages.preserve();
     context_pages.preserve();
+    native_storage_pages.preserve();
     EVENT_CONTEXT_ADDRESS.store(report.context_physical_address, Ordering::Release);
     crate::runtime::install_shared_lock(serial_lock_address);
     Ok(report)
+}
+
+fn install_control_bridge(
+    code: &ResidentCode,
+    context: *mut ResidentEventContext,
+) -> Result<(), Status> {
+    let table = uefi::table::system_table_raw().ok_or(Status::NOT_READY)?;
+    let system = unsafe { table.as_ref() };
+    let runtime = unsafe { system.runtime_services.as_mut() }.ok_or(Status::NOT_READY)?;
+    if (runtime.header.size as usize) < size_of::<uefi_raw::table::runtime::RuntimeServices>()
+        || runtime.header.size as usize > PAGE_SIZE
+    {
+        return Err(Status::INCOMPATIBLE_VERSION);
+    }
+    let original_get = runtime.get_variable;
+    let original_set = runtime.set_variable;
+    let original_crc = runtime.header.crc;
+    unsafe {
+        (code.original_get_variable_slot as *mut u64).write(original_get as usize as u64);
+        (code.original_set_variable_slot as *mut u64).write(original_set as usize as u64);
+        (code.convert_pointer_slot as *mut u64).write(runtime.convert_pointer as usize as u64);
+        (code.bridge_context_slot as *mut u64).write(context as u64);
+        (code.runtime_get_variable_slot as *mut u64).write(code.get_variable_bridge);
+        (code.runtime_set_variable_slot as *mut u64).write(code.set_variable_bridge);
+        runtime.get_variable = core::mem::transmute::<
+            usize,
+            unsafe extern "efiapi" fn(
+                *const uefi_raw::Char16,
+                *const uefi_raw::Guid,
+                *mut uefi_raw::table::runtime::VariableAttributes,
+                *mut usize,
+                *mut u8,
+            ) -> uefi_raw::Status,
+        >(code.get_variable_bridge as usize);
+        runtime.set_variable = core::mem::transmute::<
+            usize,
+            unsafe extern "efiapi" fn(
+                *const uefi_raw::Char16,
+                *const uefi_raw::Guid,
+                uefi_raw::table::runtime::VariableAttributes,
+                usize,
+                *const u8,
+            ) -> uefi_raw::Status,
+        >(code.set_variable_bridge as usize);
+    }
+    runtime.header.crc = 0;
+    let table_bytes = unsafe {
+        core::slice::from_raw_parts(
+            (runtime as *const uefi_raw::table::runtime::RuntimeServices).cast::<u8>(),
+            runtime.header.size as usize,
+        )
+    };
+    let result = boot::calculate_crc32(table_bytes)
+        .map_err(|error| error.status())
+        .and_then(|crc| {
+            runtime.header.crc = crc;
+            verify_control_bridge(runtime)
+        });
+    if result.is_err() {
+        runtime.get_variable = original_get;
+        runtime.set_variable = original_set;
+        runtime.header.crc = original_crc;
+    }
+    result
+}
+
+fn verify_control_bridge(
+    runtime: &uefi_raw::table::runtime::RuntimeServices,
+) -> Result<(), Status> {
+    const GUID: uefi_raw::Guid = uefi_raw::guid!("a830e824-19a4-42c4-9178-81ee63c135cc");
+    let mut value = ControlStatus::default();
+    let mut value_size = size_of::<ControlStatus>();
+    let mut attributes = uefi_raw::table::runtime::VariableAttributes::empty();
+    let result = unsafe {
+        (runtime.get_variable)(
+            uefi::cstr16!("MatrixHVControl").as_ptr().cast(),
+            &GUID,
+            &mut attributes,
+            &mut value_size,
+            (&mut value as *mut ControlStatus).cast(),
+        )
+    };
+    if result != Status::SUCCESS
+        || value_size != size_of::<ControlStatus>()
+        || attributes.bits() != 7
+        || value.magic != CONTROL_MAGIC
+        || value.version != CONTROL_VERSION
+    {
+        return Err(Status::DEVICE_ERROR);
+    }
+    Ok(())
 }
 
 fn allow_low_msr_passthrough(bitmap: &mut [u8], index: u32) {
@@ -1590,8 +1928,7 @@ fn allow_native_msr_reads(bitmap: &mut [u8]) {
     // Avoid that round trip; L1's read intercepts are still ORed into VMCS02.
     // Feature control, VMX capabilities and EFER retain the virtualized view.
     bitmap[..MSR_BITMAP_WRITE_LOW_OFFSET].fill(0);
-    bitmap[(IA32_FEATURE_CONTROL_MSR >> 3) as usize] |=
-        1 << (IA32_FEATURE_CONTROL_MSR & 7);
+    bitmap[(IA32_FEATURE_CONTROL_MSR >> 3) as usize] |= 1 << (IA32_FEATURE_CONTROL_MSR & 7);
     bitmap[0x480 / 8..0x4a0 / 8].fill(0xff);
     let efer_byte = MSR_BITMAP_READ_HIGH_OFFSET + ((IA32_EFER_MSR & 0x1fff) >> 3) as usize;
     bitmap[efer_byte] |= 1 << (IA32_EFER_MSR & 7);
@@ -2053,6 +2390,9 @@ pub fn run_boot_loader(
         code.exception_stubs,
     )?;
     let topology = crate::smp::enumerate().map_err(ResidentProbeError::Allocation)?;
+    if topology.total_processors > 64 || topology.bsp_processor != 0 {
+        return Err(ResidentProbeError::Allocation(Status::UNSUPPORTED));
+    }
     let mut ap_resources = alloc::vec::Vec::new();
     {
         let handle = boot::get_handle_for_protocol::<uefi::proto::pi::mp::MpServices>()
@@ -2285,6 +2625,9 @@ pub fn run_boot_loader(
         let shared = event_context as *mut ResidentEventContext;
         (*shared).watchdog_tsc_hz = watchdog_tsc_hz;
         (*shared).cpu_contexts[0] = context as u64;
+        (*shared).control_apic_ids[0] = arch::apic_id();
+        (*shared).control_cpu_states[0].vmxon_region = session.report().region_physical_address;
+        (*shared).control_cpu_states[0].vmcs_region = vmcs_physical_address;
         (*context).cache_ept_pointer = ept.ept_pointer();
         ((cpu_resources.host_tables.tss + 112) as *mut u64).write(context as u64);
         (*context).diagnostic_timer_rate = diagnostic_timer_rate;
@@ -2571,6 +2914,21 @@ pub fn run_boot_loader(
     crate::boot::screen::message(format_args!(
         "hex right A RDMSR B WRMSR C L2 entries D nested failures E nested error F expired"
     ));
+    let mut expected_mask = 1_u64;
+    for (processor_number, _) in &ap_resources {
+        expected_mask |= 1_u64 << processor_number;
+    }
+    let control_context = unsafe { &*(event_context as *const ResidentEventContext) };
+    control_context
+        .control_expected_mask
+        .store(expected_mask, Ordering::Release);
+    control_context
+        .control_active_mask
+        .store(expected_mask, Ordering::Release);
+    unsafe {
+        (*(event_context as *mut ResidentEventContext)).control_processor_count =
+            u64::from(expected_mask.count_ones());
+    }
     crate::boot::screen::message(format_args!(
         "BSP boot timer available={} interval TSC={:#x} rate={} samples=60",
         diagnostic_interval_tsc != 0,
@@ -2833,6 +3191,14 @@ impl ResidentApLaunch<'_> {
             if self.processor_number < 64 {
                 (*(self.event_context as *mut ResidentEventContext)).cpu_contexts
                     [self.processor_number] = context as u64;
+                (*(self.event_context as *mut ResidentEventContext)).control_apic_ids
+                    [self.processor_number] = arch::apic_id();
+                (*(self.event_context as *mut ResidentEventContext)).control_cpu_states
+                    [self.processor_number]
+                    .vmxon_region = session.report().region_physical_address;
+                (*(self.event_context as *mut ResidentEventContext)).control_cpu_states
+                    [self.processor_number]
+                    .vmcs_region = vmcs;
             }
             ((self.resources.host_tables.tss + 112) as *mut u64).write(context as u64);
             (host_rsp as *mut u64).write(context as u64);
@@ -2958,6 +3324,14 @@ unsafe extern "C" {
     static matrixhv_resident_ebs_callback: u8;
     static matrixhv_resident_va_callback: u8;
     static matrixhv_resident_dispatch_entry: u8;
+    static matrixhv_resident_get_variable: u8;
+    static matrixhv_resident_set_variable: u8;
+    static matrixhv_resident_original_get_variable: u8;
+    static matrixhv_resident_original_set_variable: u8;
+    static matrixhv_resident_convert_pointer: u8;
+    static matrixhv_resident_bridge_context: u8;
+    static matrixhv_resident_runtime_get_variable: u8;
+    static matrixhv_resident_runtime_set_variable: u8;
     static matrixhv_resident_island_end: u8;
 }
 
@@ -2968,6 +3342,26 @@ global_asm!(
     include_str!("../asm/resident_island.S"),
     host_rsp = const HOST_RSP,
     host_rip = const HOST_RIP,
+    host_es_selector = const HOST_ES_SELECTOR,
+    host_cs_selector = const HOST_CS_SELECTOR,
+    host_ss_selector = const HOST_SS_SELECTOR,
+    host_ds_selector = const HOST_DS_SELECTOR,
+    host_fs_selector = const HOST_FS_SELECTOR,
+    host_gs_selector = const HOST_GS_SELECTOR,
+    host_tr_selector = const HOST_TR_SELECTOR,
+    host_cr0 = const HOST_CR0,
+    host_cr3 = const HOST_CR3,
+    host_cr4 = const HOST_CR4,
+    host_pat = const HOST_IA32_PAT,
+    host_efer = const HOST_IA32_EFER,
+    host_fs_base = const HOST_FS_BASE,
+    host_gs_base = const HOST_GS_BASE,
+    host_tr_base = const HOST_TR_BASE,
+    host_gdtr_base = const HOST_GDTR_BASE,
+    host_idtr_base = const HOST_IDTR_BASE,
+    host_sysenter_cs = const HOST_SYSENTER_CS,
+    host_sysenter_esp = const HOST_SYSENTER_ESP,
+    host_sysenter_eip = const HOST_SYSENTER_EIP,
     b_root_rsp = const BCTX_ROOT_RSP,
     b_return_rip = const BCTX_RETURN_RIP,
     b_gdtr = const BCTX_ORIGINAL_GDTR,
@@ -3602,6 +3996,132 @@ global_asm!(
     event_failed_exit_reason = const core::mem::offset_of!(ResidentEventContext, failed_exit_reason),
     event_failed_qualification = const core::mem::offset_of!(ResidentEventContext, failed_qualification),
     event_failed_stop_result = const core::mem::offset_of!(ResidentEventContext, failed_stop_result),
+    event_control_expected_mask = const core::mem::offset_of!(ResidentEventContext, control_expected_mask),
+    event_control_active_mask = const core::mem::offset_of!(ResidentEventContext, control_active_mask),
+    event_control_stopped_mask = const core::mem::offset_of!(ResidentEventContext, control_stopped_mask),
+    event_control_failed_mask = const core::mem::offset_of!(ResidentEventContext, control_failed_mask),
+    event_control_processor_count = const core::mem::offset_of!(ResidentEventContext, control_processor_count),
+    event_control_va_error = const core::mem::offset_of!(ResidentEventContext, control_va_error),
+    event_control_completion_sequences = const core::mem::offset_of!(ResidentEventContext, control_completion_sequences),
+    event_control_rearm_mask = const core::mem::offset_of!(ResidentEventContext, control_rearm_mask),
+    event_runtime_get_variable = const core::mem::offset_of!(ResidentEventContext, runtime_get_variable),
+    event_runtime_set_variable = const core::mem::offset_of!(ResidentEventContext, runtime_set_variable),
+    event_runtime_context = const core::mem::offset_of!(ResidentEventContext, runtime_context),
+    event_control_apic_ids = const core::mem::offset_of!(ResidentEventContext, control_apic_ids),
+    event_control_probe_states = const core::mem::offset_of!(ResidentEventContext, control_probe_states),
+    event_control_cpu_states = const core::mem::offset_of!(ResidentEventContext, control_cpu_states),
+    control_cpu_state_size = const size_of::<ControlCpuState>(),
+    control_cpu_vmxon_region = const core::mem::offset_of!(ControlCpuState, vmxon_region),
+    control_cpu_vmcs_region = const core::mem::offset_of!(ControlCpuState, vmcs_region),
+    control_cpu_current_vmcs = const core::mem::offset_of!(ControlCpuState, current_vmcs),
+    control_cpu_host_fields = const core::mem::offset_of!(ControlCpuState, host_fields),
+    control_cpu_pin_based_controls = const core::mem::offset_of!(ControlCpuState, pin_based_controls),
+    control_cpu_exit_msr_load_count = const core::mem::offset_of!(ControlCpuState, exit_msr_load_count),
+    control_cpu_native_cr4 = const core::mem::offset_of!(ControlCpuState, native_cr4),
+    control_cpu_on_original_cr4 = const core::mem::offset_of!(ControlCpuState, on_original_cr4),
+    control_cpu_guest_dr7 = const core::mem::offset_of!(ControlCpuState, guest_dr7),
+    control_cpu_guest_gdtr_limit = const core::mem::offset_of!(ControlCpuState, guest_gdtr_limit),
+    control_cpu_guest_idtr_limit = const core::mem::offset_of!(ControlCpuState, guest_idtr_limit),
+    control_cpu_sequence = const core::mem::offset_of!(ControlCpuState, sequence),
+    control_cpu_phase = const core::mem::offset_of!(ControlCpuState, phase),
+    control_cpu_stage = const core::mem::offset_of!(ControlCpuState, stage),
+    control_cpu_native_storage_physical = const core::mem::offset_of!(ControlCpuState, native_storage_physical),
+    control_cpu_native_storage_runtime = const core::mem::offset_of!(ControlCpuState, native_storage_runtime),
+    control_cpu_native_caller_rsp = const core::mem::offset_of!(ControlCpuState, native_caller_rsp),
+    control_cpu_native_snapshot_count = const core::mem::offset_of!(ControlCpuState, native_snapshot_count),
+    control_cpu_on_native_cr0 = const core::mem::offset_of!(ControlCpuState, on_native_cr0),
+    control_cpu_on_native_cr3 = const core::mem::offset_of!(ControlCpuState, on_native_cr3),
+    control_cpu_on_native_dr7 = const core::mem::offset_of!(ControlCpuState, on_native_dr7),
+    control_cpu_on_native_msrs = const core::mem::offset_of!(ControlCpuState, on_native_msrs),
+    control_cpu_on_failure_reason = const core::mem::offset_of!(ControlCpuState, on_failure_reason),
+    control_cpu_on_failure_qualification = const core::mem::offset_of!(ControlCpuState, on_failure_qualification),
+    native_stack_bytes = const CONTROL_NATIVE_STACK_BYTES,
+    native_recovery_pml4 = const core::mem::offset_of!(ControlNativeStorage, recovery_pml4),
+    native_snapshots_offset = const core::mem::offset_of!(ControlNativeStorage, snapshots),
+    native_snapshot_size = const size_of::<ControlNativeSnapshot>(),
+    native_snapshot_pairs = const size_of::<ControlNativeSnapshot>() / 16,
+    native_snapshot_capacity = const CONTROL_NATIVE_SNAPSHOT_CAPACITY,
+    native_snapshot_leaf_limit = const 0x4000 + CONTROL_NATIVE_SNAPSHOT_CAPACITY * (size_of::<ControlNativeSnapshot>() / 16),
+    native_snapshot_stage = const core::mem::offset_of!(ControlNativeSnapshot, stage),
+    native_snapshot_rip = const core::mem::offset_of!(ControlNativeSnapshot, rip),
+    native_snapshot_rsp = const core::mem::offset_of!(ControlNativeSnapshot, rsp),
+    native_snapshot_rflags = const core::mem::offset_of!(ControlNativeSnapshot, rflags),
+    native_snapshot_cr0 = const core::mem::offset_of!(ControlNativeSnapshot, cr0),
+    native_snapshot_cr3 = const core::mem::offset_of!(ControlNativeSnapshot, cr3),
+    native_snapshot_cr4 = const core::mem::offset_of!(ControlNativeSnapshot, cr4),
+    native_snapshot_caller_rsp = const core::mem::offset_of!(ControlNativeSnapshot, caller_rsp),
+    native_snapshot_stack_limit = const core::mem::offset_of!(ControlNativeSnapshot, stack_limit),
+    native_snapshot_stack_base = const core::mem::offset_of!(ControlNativeSnapshot, stack_base),
+    native_snapshot_gprs = const core::mem::offset_of!(ControlNativeSnapshot, gprs),
+    native_snapshot_tsc = const core::mem::offset_of!(ControlNativeSnapshot, tsc),
+    native_snapshot_stack = const core::mem::offset_of!(ControlNativeSnapshot, stack),
+    probe_state_size = const size_of::<ControlProbeSnapshot>(),
+    probe_state_qwords = const size_of::<ControlProbeSnapshot>() / size_of::<u64>(),
+    probe_sequence = const core::mem::offset_of!(ControlProbeSnapshot, sequence),
+    probe_guest_rip = const core::mem::offset_of!(ControlProbeSnapshot, guest_rip),
+    probe_guest_rsp = const core::mem::offset_of!(ControlProbeSnapshot, guest_rsp),
+    probe_guest_rflags = const core::mem::offset_of!(ControlProbeSnapshot, guest_rflags),
+    probe_guest_cr0 = const core::mem::offset_of!(ControlProbeSnapshot, guest_cr0),
+    probe_guest_cr3 = const core::mem::offset_of!(ControlProbeSnapshot, guest_cr3),
+    probe_guest_cr4 = const core::mem::offset_of!(ControlProbeSnapshot, guest_cr4),
+    probe_guest_efer = const core::mem::offset_of!(ControlProbeSnapshot, guest_efer),
+    probe_guest_pat = const core::mem::offset_of!(ControlProbeSnapshot, guest_pat),
+    probe_guest_gdtr_base = const core::mem::offset_of!(ControlProbeSnapshot, guest_gdtr_base),
+    probe_guest_gdtr_limit = const core::mem::offset_of!(ControlProbeSnapshot, guest_gdtr_limit),
+    probe_guest_idtr_base = const core::mem::offset_of!(ControlProbeSnapshot, guest_idtr_base),
+    probe_guest_idtr_limit = const core::mem::offset_of!(ControlProbeSnapshot, guest_idtr_limit),
+    probe_guest_cs_selector = const core::mem::offset_of!(ControlProbeSnapshot, guest_cs_selector),
+    probe_guest_ss_selector = const core::mem::offset_of!(ControlProbeSnapshot, guest_ss_selector),
+    probe_guest_tr_selector = const core::mem::offset_of!(ControlProbeSnapshot, guest_tr_selector),
+    probe_guest_tr_access = const core::mem::offset_of!(ControlProbeSnapshot, guest_tr_access),
+    probe_guest_fs_base = const core::mem::offset_of!(ControlProbeSnapshot, guest_fs_base),
+    probe_guest_gs_base = const core::mem::offset_of!(ControlProbeSnapshot, guest_gs_base),
+    probe_guest_interruptibility = const core::mem::offset_of!(ControlProbeSnapshot, guest_interruptibility),
+    probe_idt_vectoring = const core::mem::offset_of!(ControlProbeSnapshot, idt_vectoring),
+    probe_vm_entry_intr_info = const core::mem::offset_of!(ControlProbeSnapshot, vm_entry_intr_info),
+    probe_runtime_get_variable = const core::mem::offset_of!(ControlProbeSnapshot, runtime_get_variable),
+    probe_runtime_set_variable = const core::mem::offset_of!(ControlProbeSnapshot, runtime_set_variable),
+    probe_runtime_context = const core::mem::offset_of!(ControlProbeSnapshot, runtime_context),
+    probe_guest_es_selector = const core::mem::offset_of!(ControlProbeSnapshot, guest_es_selector),
+    probe_guest_ds_selector = const core::mem::offset_of!(ControlProbeSnapshot, guest_ds_selector),
+    probe_guest_fs_selector = const core::mem::offset_of!(ControlProbeSnapshot, guest_fs_selector),
+    probe_guest_gs_selector = const core::mem::offset_of!(ControlProbeSnapshot, guest_gs_selector),
+    probe_guest_ldtr_selector = const core::mem::offset_of!(ControlProbeSnapshot, guest_ldtr_selector),
+    probe_guest_dr7 = const core::mem::offset_of!(ControlProbeSnapshot, guest_dr7),
+    probe_guest_cr4_read_shadow = const core::mem::offset_of!(ControlProbeSnapshot, guest_cr4_read_shadow),
+    probe_guest_tr_base = const core::mem::offset_of!(ControlProbeSnapshot, guest_tr_base),
+    probe_guest_tr_limit = const core::mem::offset_of!(ControlProbeSnapshot, guest_tr_limit),
+    bridge_magic = const CONTROL_MAGIC,
+    bridge_version = const CONTROL_VERSION,
+    bridge_status_size = const size_of::<ControlStatus>(),
+    bridge_status_magic = const core::mem::offset_of!(ControlStatus, magic),
+    bridge_status_version = const core::mem::offset_of!(ControlStatus, version),
+    bridge_status_capabilities = const core::mem::offset_of!(ControlStatus, capabilities),
+    bridge_status_apic_id = const core::mem::offset_of!(ControlStatus, current_apic_id),
+    bridge_status_processor_count = const core::mem::offset_of!(ControlStatus, processor_count),
+    bridge_status_expected_mask = const core::mem::offset_of!(ControlStatus, expected_mask),
+    bridge_status_active_mask = const core::mem::offset_of!(ControlStatus, active_mask),
+    bridge_status_stopped_mask = const core::mem::offset_of!(ControlStatus, stopped_mask),
+    bridge_status_failed_mask = const core::mem::offset_of!(ControlStatus, failed_mask),
+    bridge_status_ebs_seen = const core::mem::offset_of!(ControlStatus, exit_boot_services_seen),
+    bridge_status_va_seen = const core::mem::offset_of!(ControlStatus, virtual_address_change_seen),
+    bridge_status_va_error = const core::mem::offset_of!(ControlStatus, virtual_address_error),
+    bridge_status_completion_sequence = const core::mem::offset_of!(ControlStatus, completion_sequence),
+    bridge_status_apic_ids = const core::mem::offset_of!(ControlStatus, apic_ids),
+    bridge_status_probe_snapshot = const core::mem::offset_of!(ControlStatus, probe_snapshot),
+    bridge_request_size = const size_of::<ControlRequest>(),
+    bridge_request_magic = const core::mem::offset_of!(ControlRequest, magic),
+    bridge_request_version = const core::mem::offset_of!(ControlRequest, version),
+    bridge_request_operation = const core::mem::offset_of!(ControlRequest, operation),
+    bridge_request_sequence = const core::mem::offset_of!(ControlRequest, sequence),
+    bridge_request_apic_id = const core::mem::offset_of!(ControlRequest, expected_apic_id),
+    bridge_request_reserved = const core::mem::offset_of!(ControlRequest, reserved),
+    bridge_probe_operation = const CONTROL_PROBE_OPERATION,
+    bridge_probe_vmcall = const CONTROL_PROBE_VMCALL,
+    bridge_probe_result = const CONTROL_PROBE_RESULT,
+    bridge_off_prepare_vmcall = const CONTROL_OFF_PREPARE_VMCALL,
+    bridge_off_prepared_result = const CONTROL_OFF_PREPARED_RESULT,
+    bridge_off_commit_vmcall = const CONTROL_OFF_COMMIT_VMCALL,
     visual_marker_step_bytes = const crate::boot::screen::RESIDENT_MARKER_STEP * 4,
     visual_marker_row_step = const crate::boot::screen::RESIDENT_MARKER_ROW_STEP,
     visual_marker_side = const crate::boot::screen::RESIDENT_MARKER_SIZE,

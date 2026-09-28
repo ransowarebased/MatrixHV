@@ -116,14 +116,16 @@ mapping = "fn offset(name: &str) -> usize { match name {\n"
 mapping += "\n".join(f'"{name}" => {value // 8},' for name, value in offsets.items())
 mapping += '\n_ => panic!("unknown lifecycle field {name}"),\n} }\n'
 (output / "offsets.rs").write_text(mapping, encoding="utf-8")
-display_start = source.index(".Lresident_paint_stage:")
+display_start = source.index(".Lresident_framebuffer_active:")
 display_end = source.index(".Lresident_paint_byte:", display_start)
 hex_start = source.index(".Lresident_paint_hex:")
 hex_end = source.index(".Lresident_diagnostic_name_offsets:", hex_start)
 display = source[display_start:display_end] + source[hex_start:hex_end]
+display = display.replace("rdtsc", "mov eax, 1000\nxor edx, edx")
 display_constants = {
     "log_framebuffer_sink": 2, "event_ebs_seen": 0,
     "event_visual_base": 8, "event_visual_stride_bytes": 16,
+    "event_visual_deadline": 24,
     "visual_marker_row_step": 16, "visual_marker_step_bytes": 64,
     "visual_marker_side": 8, "visual_hex_last_row": 35,
     "visual_hex_column_step_bytes": 640, "visual_hex_row_step": 12,
@@ -134,6 +136,7 @@ display += """
 .text
 .globl test_resident_display
 test_resident_display:
+    mov byte ptr [rip + matrixhv_resident_island_log_backend], 2
     mov r8, rcx
     mov ecx, 1
     test edx, edx

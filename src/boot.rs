@@ -23,21 +23,17 @@ use crate::runtime;
 use crate::smp;
 
 pub const CONFIG_HEADER: &str = "MATRIXHV_CONFIG_V2";
-pub const DEFAULT_FILE_TEXT: &str =
-    "MATRIXHV_CONFIG_V2\ncpuidpresence=true\nlogger=true\nVtNested=false\nVmxTest=false\n";
 pub const CPUIDPRESENCE_KEY: &str = "cpuidpresence";
 pub const LOGGER_KEY: &str = "logger";
 pub const VT_NESTED_KEY: &str = "VtNested";
 pub const VMX_TEST_KEY: &str = "VmxTest";
 
-#[cfg(not(test))]
-const EMBEDDED_CONFIG: &[u8] = include_bytes!("../builds/MatrixConfig.bin");
-#[cfg(test)]
-const EMBEDDED_CONFIG: &[u8] = DEFAULT_FILE_TEXT.as_bytes();
+const CONFIG_FILE_PATH: &CStr16 = cstr16!(r"\MatrixConfig.bin");
+const CONFIG_FILE_MAX_BYTES: usize = 4096;
 
-static CPUID_PRESENCE: AtomicBool = AtomicBool::new(true);
+static CPUID_PRESENCE: AtomicBool = AtomicBool::new(false);
 static LOGGER: AtomicBool = AtomicBool::new(true);
-static VT_NESTED: AtomicBool = AtomicBool::new(false);
+static VT_NESTED: AtomicBool = AtomicBool::new(true);
 static VMX_TEST: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,9 +47,9 @@ pub struct MatrixConfig {
 impl Default for MatrixConfig {
     fn default() -> Self {
         Self {
-            cpuid_presence: true,
+            cpuid_presence: false,
             logger: true,
-            vt_nested: false,
+            vt_nested: true,
             vmx_test: false,
         }
     }
@@ -61,6 +57,7 @@ impl Default for MatrixConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParseError {
+    MissingHeader,
     InvalidEncoding,
     InvalidLine,
     InvalidBoolean,
@@ -71,10 +68,15 @@ pub enum ParseError {
 pub fn parse(bytes: &[u8]) -> Result<MatrixConfig, ParseError> {
     let text = str::from_utf8(bytes).map_err(|_| ParseError::InvalidEncoding)?;
     let mut config = MatrixConfig::default();
+    let mut has_header = false;
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') || line == CONFIG_HEADER {
+        if line == CONFIG_HEADER {
+            has_header = true;
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
@@ -89,6 +91,9 @@ pub fn parse(bytes: &[u8]) -> Result<MatrixConfig, ParseError> {
         }
     }
 
+    if !has_header {
+        return Err(ParseError::MissingHeader);
+    }
     if config.vmx_test && !config.vt_nested {
         return Err(ParseError::VmxTestRequiresVtNested);
     }
@@ -106,13 +111,6 @@ fn parse_bool(value: &str) -> Result<bool, ParseError> {
     }
 }
 
-pub fn load_embedded() -> Result<MatrixConfig, ParseError> {
-    if EMBEDDED_CONFIG.is_empty() {
-        return parse(DEFAULT_FILE_TEXT.as_bytes());
-    }
-    parse(EMBEDDED_CONFIG)
-}
-
 pub fn apply(config: MatrixConfig) {
     CPUID_PRESENCE.store(config.cpuid_presence, Ordering::Relaxed);
     LOGGER.store(config.logger, Ordering::Relaxed);
@@ -127,6 +125,65 @@ pub fn current() -> MatrixConfig {
         vt_nested: VT_NESTED.load(Ordering::Relaxed),
         vmx_test: VMX_TEST.load(Ordering::Relaxed),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigLoadError {
+    Firmware(Status),
+    MissingImageDevice,
+    NotRegularFile,
+    TooLarge,
+    Parse(ParseError),
+}
+
+pub fn load_from_boot_volume() -> Result<MatrixConfig, ConfigLoadError> {
+    let params = OpenProtocolParams {
+        handle: boot::image_handle(),
+        agent: boot::image_handle(),
+        controller: None,
+    };
+    let loaded_image =
+        unsafe { boot::open_protocol::<LoadedImage>(params, OpenProtocolAttributes::GetProtocol) }
+            .map_err(|error| ConfigLoadError::Firmware(error.status()))?;
+    let device_handle = loaded_image
+        .device()
+        .ok_or(ConfigLoadError::MissingImageDevice)?;
+    drop(loaded_image);
+
+    let params = OpenProtocolParams {
+        handle: device_handle,
+        agent: boot::image_handle(),
+        controller: None,
+    };
+    let mut file_system = unsafe {
+        boot::open_protocol::<SimpleFileSystem>(params, OpenProtocolAttributes::GetProtocol)
+    }
+    .map_err(|error| ConfigLoadError::Firmware(error.status()))?;
+    let mut root = file_system
+        .open_volume()
+        .map_err(|error| ConfigLoadError::Firmware(error.status()))?;
+    let file = root
+        .open(CONFIG_FILE_PATH, FileMode::Read, FileAttribute::empty())
+        .map_err(|error| ConfigLoadError::Firmware(error.status()))?;
+    let mut file = file
+        .into_regular_file()
+        .ok_or(ConfigLoadError::NotRegularFile)?;
+
+    let mut bytes = [0u8; CONFIG_FILE_MAX_BYTES + 1];
+    let mut length = 0;
+    loop {
+        let read = file
+            .read(&mut bytes[length..])
+            .map_err(|error| ConfigLoadError::Firmware(error.status()))?;
+        length += read;
+        if read == 0 || length == bytes.len() {
+            break;
+        }
+    }
+    if length > CONFIG_FILE_MAX_BYTES {
+        return Err(ConfigLoadError::TooLarge);
+    }
+    parse(&bytes[..length]).map_err(ConfigLoadError::Parse)
 }
 
 mod boot_order {

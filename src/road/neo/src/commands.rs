@@ -1,7 +1,7 @@
 use crate::server::protocol::{Request, RequestKind, Response, read_response, write_request};
 use crate::server::{self, DEFAULT_LISTEN_ADDRESS, ServerExit};
-use crate::{startup, telemetry};
-use std::io::{self, Write};
+use crate::{matrix, startup, telemetry};
+use std::io::{self, BufRead, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::thread;
@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
 enum Action {
+    Matrix(matrix::Command),
     Serve,
     Ping,
     Status,
@@ -17,6 +18,7 @@ enum Action {
     Update(Option<PathBuf>),
     Telemetry(telemetry::CaptureOptions),
     TelemetryControl(telemetry::Control),
+    TelemetryControlTrace(telemetry::ControlTraceOptions),
     Install,
     Uninstall,
     ApplyUpdate(PathBuf),
@@ -52,6 +54,17 @@ pub fn run(arguments: Vec<String>) -> Result<i32, String> {
 
 fn run_local(action: Action, listen_address: &str) -> Result<i32, String> {
     match action {
+        Action::Matrix(command) => {
+            if command == matrix::Command::On
+                && !confirm_matrix_on(&mut io::stdin().lock(), &mut io::stdout().lock())
+                    .map_err(|error| format!("failed to confirm MatrixHV activation: {error}"))?
+            {
+                println!("MatrixHV activation cancelled.");
+                return Ok(0);
+            }
+            print!("{}", matrix::execute(command)?);
+            Ok(0)
+        }
         Action::Serve => {
             match server::serve(listen_address, startup::prepare, telemetry::request_text)? {
                 ServerExit::Update => startup::activate(listen_address)?,
@@ -79,6 +92,10 @@ fn run_local(action: Action, listen_address: &str) -> Result<i32, String> {
             );
             Ok(0)
         }
+        Action::TelemetryControlTrace(options) => {
+            telemetry::capture_control(options)?;
+            Ok(0)
+        }
         Action::Install => {
             startup::install(listen_address)?;
             Ok(0)
@@ -93,6 +110,26 @@ fn run_local(action: Action, listen_address: &str) -> Result<i32, String> {
         }
         Action::Exec(_) | Action::Update(_) => {
             Err("the command requires --remote ADDRESS:PORT".to_string())
+        }
+    }
+}
+
+fn confirm_matrix_on(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<bool> {
+    writeln!(
+        output,
+        "WARNING: Turning MatrixHV ON can crash running emulators or virtual machines.\nClose them before continuing."
+    )?;
+    loop {
+        write!(output, "Turn MatrixHV ON? [Y/N] (default N): ")?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            return Ok(false);
+        }
+        match answer.trim() {
+            answer if answer.eq_ignore_ascii_case("y") => return Ok(true),
+            answer if answer.is_empty() || answer.eq_ignore_ascii_case("n") => return Ok(false),
+            _ => writeln!(output, "Enter Y or N.")?,
         }
     }
 }
@@ -206,11 +243,18 @@ fn run_remote(remote: &str, timeout: Duration, action: Action) -> Result<i32, St
             print!("{}", response.message);
             Ok(0)
         }
-        Action::Serve | Action::Install | Action::Uninstall | Action::ApplyUpdate(_) => {
-            Err("the command cannot be used with --remote".to_string())
-        }
+        Action::Matrix(_)
+        | Action::TelemetryControlTrace(_)
+        | Action::Serve
+        | Action::Install
+        | Action::Uninstall
+        | Action::ApplyUpdate(_) => Err("the command cannot be used with --remote".to_string()),
     }
 }
+
+#[cfg(test)]
+#[path = "../../../../tests/neo_matrix_confirmation.rs"]
+mod matrix_confirmation_tests;
 
 fn transact(remote: &str, timeout: Duration, request: Request) -> Result<Response, String> {
     let addresses: Vec<_> = remote
@@ -365,6 +409,7 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
     let mut seconds = None;
     let mut interval_ms = None;
     let mut output = None;
+    let mut selected_cpu = None;
     let mut positional = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
@@ -455,6 +500,21 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
                         .ok_or_else(|| "--output requires a path".to_string())?,
                 ));
             }
+            "--cpu" => {
+                index += 1;
+                if selected_cpu.is_some() {
+                    return Err("--cpu may be specified only once".to_string());
+                }
+                let cpu: u32 = arguments
+                    .get(index)
+                    .ok_or_else(|| "--cpu requires a processor index".to_string())?
+                    .parse()
+                    .map_err(|_| "--cpu must be a processor index".to_string())?;
+                if cpu >= 64 {
+                    return Err("--cpu must be in 0..64".to_string());
+                }
+                selected_cpu = Some(cpu);
+            }
             "--help" | "-h" => {
                 print_usage();
                 return Ok(None);
@@ -486,11 +546,38 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
         Action::Update(binary)
     } else {
         match positional.first().map(String::as_str) {
+            Some("matrix") if positional.len() == 2 => {
+                Action::Matrix(match positional[1].as_str() {
+                    "on" => matrix::Command::On,
+                    "off" => selected_cpu
+                        .map(matrix::Command::OffProcessor)
+                        .unwrap_or(matrix::Command::Off),
+                    "status" => matrix::Command::Status,
+                    value => return Err(format!("unknown matrix command: {value}")),
+                })
+            }
+            Some("matrix") => return Err("matrix requires on, off, or status".to_string()),
             Some("serve") if positional.len() == 1 => Action::Serve,
             Some("ping") if positional.len() == 1 => Action::Ping,
             Some("status") if positional.len() == 1 => Action::Status,
             Some("install") if positional.len() == 1 => Action::Install,
             Some("uninstall") if positional.len() == 1 => Action::Uninstall,
+            Some("telemetry") if positional.len() == 2 && positional[1] == "control" => {
+                if interval_ms.is_some() {
+                    return Err(
+                        "control tracing polls continuously and does not accept --interval-ms"
+                            .into(),
+                    );
+                }
+                Action::TelemetryControlTrace(telemetry::ControlTraceOptions {
+                    cpu: selected_cpu
+                        .ok_or_else(|| "control tracing requires --cpu".to_string())?,
+                    seconds: seconds.unwrap_or(60),
+                    output: output
+                        .clone()
+                        .ok_or_else(|| "control tracing requires --output".to_string())?,
+                })
+            }
             Some("telemetry")
                 if positional.len() == 2
                     && matches!(positional[1].as_str(), "enable" | "disable") =>
@@ -526,11 +613,29 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
             None => Action::Serve,
         }
     };
-    if !matches!(&action, Action::Telemetry(_)) && telemetry_options_given {
+    if !matches!(
+        &action,
+        Action::Telemetry(_) | Action::TelemetryControlTrace(_)
+    ) && telemetry_options_given
+    {
         return Err("telemetry options require the telemetry command".to_string());
+    }
+    if selected_cpu.is_some()
+        && !matches!(
+            &action,
+            Action::Matrix(matrix::Command::OffProcessor(_)) | Action::TelemetryControlTrace(_)
+        )
+    {
+        return Err("--cpu requires matrix off or telemetry control".to_string());
     }
     if remote.is_some() && (listen_given || cleanup_path.is_some()) {
         return Err("--listen and --cleanup require local server mode".to_string());
+    }
+    if remote.is_some() && matches!(&action, Action::Matrix(_)) {
+        return Err("matrix commands require the local Windows runtime bridge".to_string());
+    }
+    if remote.is_some() && matches!(&action, Action::TelemetryControlTrace(_)) {
+        return Err("control tracing requires a local observer CPU".to_string());
     }
     if remote.is_none() && timeout_given {
         return Err("--timeout requires --remote".to_string());
@@ -559,13 +664,14 @@ fn print_usage() {
         );
     }
     println!(
-        "neo [serve] [--listen ADDRESS:PORT]\nneo ping | status | install | uninstall\nneo telemetry enable | disable\nneo telemetry | -t [watchdog | eptdiag] [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nneo --remote ADDRESS:PORT [status | ping | telemetry [enable | disable | watchdog | eptdiag] | -t [watchdog | eptdiag] | exec PROGRAM [ARGUMENT ...]]\nneo --remote ADDRESS:PORT --update [--binary PATH]\n\nCounters and basic records start disabled; use telemetry enable/disable to control collection.\nDisabling collection preserves snapshots and stops watchdog capture.\nWatchdog renews a 15-second lease; its interval must not exceed 5000 ms.\nThe remote transport is plaintext and unauthenticated."
+        "neo [serve] [--listen ADDRESS:PORT]\nneo ping | status | install | uninstall\nneo matrix on | off [--cpu INDEX] | status\nneo telemetry enable | disable\nneo telemetry control --cpu INDEX --output FILE [--seconds 1..3600]\nneo telemetry | -t [watchdog | eptdiag] [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nneo --remote ADDRESS:PORT [status | ping | telemetry [enable | disable | watchdog | eptdiag] | -t [watchdog | eptdiag] | exec PROGRAM [ARGUMENT ...]]\nneo --remote ADDRESS:PORT --update [--binary PATH]\n\nCounters and basic records start disabled; use telemetry enable/disable to control collection.\nDisabling collection preserves snapshots and stops watchdog capture.\nWatchdog renews a 15-second lease; its interval must not exceed 5000 ms.\nControl tracing selects a separate observer CPU and saves native context/stack .bin files beside FILE when supported by the EFI.\nThe remote transport is plaintext and unauthenticated."
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Action, parse_options};
+    use crate::matrix::Command;
 
     #[test]
     fn default_launch_installs_windows_startup() {
@@ -592,5 +698,81 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(client.action, Action::Status));
+    }
+
+    #[test]
+    fn matrix_commands_require_an_explicit_local_operation() {
+        for (word, expected) in [
+            ("on", Command::On),
+            ("off", Command::Off),
+            ("status", Command::Status),
+        ] {
+            let options = parse_options(vec!["matrix".into(), word.into()])
+                .unwrap()
+                .unwrap();
+            assert!(matches!(options.action, Action::Matrix(command) if command == expected));
+        }
+        assert!(parse_options(vec!["matrix".into()]).is_err());
+        assert!(parse_options(vec!["matrix".into(), "toggle".into()]).is_err());
+        let one_cpu = parse_options(vec![
+            "matrix".into(),
+            "off".into(),
+            "--cpu".into(),
+            "0".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            one_cpu.action,
+            Action::Matrix(Command::OffProcessor(0))
+        ));
+        assert!(
+            parse_options(vec![
+                "matrix".into(),
+                "on".into(),
+                "--cpu".into(),
+                "0".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_options(vec![
+                "matrix".into(),
+                "off".into(),
+                "--cpu".into(),
+                "64".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_options(vec![
+                "--remote".into(),
+                "127.0.0.1:4040".into(),
+                "matrix".into(),
+                "off".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn control_trace_requires_a_local_target_and_output_file() {
+        let arguments = vec![
+            "telemetry".into(),
+            "control".into(),
+            "--cpu".into(),
+            "0".into(),
+            "--output".into(),
+            "control.txt".into(),
+        ];
+        let options = parse_options(arguments.clone()).unwrap().unwrap();
+        assert!(matches!(
+            options.action,
+            Action::TelemetryControlTrace(trace) if trace.cpu == 0 && trace.seconds == 60
+        ));
+        assert!(parse_options(arguments[..4].to_vec()).is_err());
+        let mut remote = vec!["--remote".into(), "127.0.0.1:4040".into()];
+        remote.extend(arguments);
+        assert!(parse_options(remote).is_err());
     }
 }

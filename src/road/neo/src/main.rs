@@ -1,4 +1,5 @@
 mod commands;
+mod matrix;
 mod server;
 mod startup;
 mod telemetry;

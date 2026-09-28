@@ -7,6 +7,8 @@ param(
 
     [string]$BootBinary,
 
+    [string]$ConfigPath,
+
     [string]$ImagePath,
 
     [string]$NeoSource,
@@ -270,6 +272,9 @@ $ConfigurationName = $Configuration.ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($BootBinary)) {
     $BootBinary = Join-Path $BuildRoot "$ConfigurationName\EFI\BOOT\BOOTX64.EFI"
 }
+if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+    $ConfigPath = Join-Path $BuildRoot "$ConfigurationName\MatrixConfig.bin"
+}
 if ([string]::IsNullOrWhiteSpace($ImagePath)) {
     $ImagePath = Join-Path $BuildRoot "$ConfigurationName\MatrixHV.img"
 }
@@ -281,6 +286,7 @@ if ([string]::IsNullOrWhiteSpace($WindowsNeoSource)) {
 }
 
 $BootBinary = [System.IO.Path]::GetFullPath($BootBinary)
+$ConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
 $ImagePath = [System.IO.Path]::GetFullPath($ImagePath)
 $NeoSource = [System.IO.Path]::GetFullPath($NeoSource)
 $WindowsNeoSource = [System.IO.Path]::GetFullPath($WindowsNeoSource)
@@ -291,6 +297,9 @@ if (-not $ImagePath.StartsWith($BuildRootPrefix, [System.StringComparison]::Ordi
 if (-not (Test-Path -LiteralPath $BootBinary -PathType Leaf)) {
     throw "UEFI boot binary not found: $BootBinary"
 }
+if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+    throw "MatrixHV configuration not found: $ConfigPath"
+}
 if (-not (Test-Path -LiteralPath $NeoSource -PathType Leaf)) {
     throw "Linux neo binary not found: $NeoSource"
 }
@@ -299,6 +308,7 @@ if (-not (Test-Path -LiteralPath $WindowsNeoSource -PathType Leaf)) {
 }
 
 $ImageFiles = New-Object 'System.Collections.Generic.List[object]'
+$ImageFiles.Add((New-ImageFileDescriptor -Directory 'ROOT' -Name 'MatrixConfig.bin' -ShortName 'MATRIX~1BIN' -LongName 'MatrixConfig.bin' -SourcePath $ConfigPath))
 $ImageFiles.Add((New-ImageFileDescriptor -Directory 'ROOT' -Name 'neo' -ShortName 'NEO        ' -LongName $null -SourcePath $NeoSource))
 $ImageFiles.Add((New-ImageFileDescriptor -Directory 'ROOT' -Name 'neo.exe' -ShortName 'NEO     EXE' -LongName $null -SourcePath $WindowsNeoSource))
 $ImageFiles.Add((New-ImageFileDescriptor -Directory 'BOOT' -Name 'BOOTX64.EFI' -ShortName 'BOOTX64 EFI' -LongName $null -SourcePath $BootBinary))

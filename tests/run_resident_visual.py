@@ -8,7 +8,9 @@ output = project / "builds" / "resident-visual-tests"
 output.mkdir(parents=True, exist_ok=True)
 source = (project / "src/asm/resident_island.S").read_text(encoding="utf-8")
 start = source.index('.globl matrixhv_resident_ebs_callback')
-end = source.index('.Lresident_serial_state:', start)
+callback_end = source.index('.globl matrixhv_resident_get_variable', start)
+paint_start = source.index('.Lresident_claim_diagnostic:', callback_end)
+end = source.index('.Lresident_serial_state:', paint_start)
 hex_start = source.index('.Lresident_paint_hex:', end)
 hex_end = source.index('.Lresident_serial_write:', hex_start)
 emit_start = source.index('.Lresident_diagnostic_emit_value:', end)
@@ -45,7 +47,8 @@ timer_assembly += "\n" + boot_timer + """
     ud2
 """
 assembly = (
-    source[start:end]
+    source[start:callback_end]
+    + source[paint_start:end]
     + source[emit_start:hex_start]
     + source[hex_start:hex_end]
     + source[hex_end:serial_char_start]
@@ -85,6 +88,9 @@ test_visual_tsc:
     .quad 1000
 .text
 .Lresident_nested_eptp_sync_host_nmi:
+    xor eax, eax
+    ret
+.Ltest_convert_pointer:
     xor eax, eax
     ret
 .globl test_claim_diagnostic
@@ -234,6 +240,18 @@ test_exception_frame:
 .balign 8
 matrixhv_resident_island_event_context:
     .quad 0
+matrixhv_resident_original_get_variable:
+    .quad 0
+matrixhv_resident_original_set_variable:
+    .quad 0
+matrixhv_resident_runtime_get_variable:
+    .quad 0
+matrixhv_resident_runtime_set_variable:
+    .quad 0
+matrixhv_resident_bridge_context:
+    .quad 0
+matrixhv_resident_convert_pointer:
+    .quad .Ltest_convert_pointer
 matrixhv_resident_island_log_backend:
     .byte 2
 .balign 8
