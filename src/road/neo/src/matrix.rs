@@ -9,9 +9,13 @@ pub enum Command {
 #[cfg(target_os = "windows")]
 mod windows {
     use super::Command;
+    use crate::server::protocol::{RequestKind, Response, read_response, write_response};
     use std::ffi::c_void;
+    use std::io::{Read, Write};
     use std::mem::size_of;
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::os::windows::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
 
     const CONTROL_MAGIC: u64 = 0x4d41_5452_4958_4354;
     const CONTROL_VERSION: u32 = 3;
@@ -21,6 +25,7 @@ mod windows {
     const TOKEN_QUERY: u32 = 0x08;
     const SE_PRIVILEGE_ENABLED: u32 = 0x02;
     const ERROR_NOT_ALL_ASSIGNED: u32 = 1300;
+    const ERROR_CANCELLED: u32 = 1223;
     const WAIT_OBJECT_0: u32 = 0;
     const WAIT_ABANDONED: u32 = 0x80;
     const CONTROL_LOCK_WAIT_MS: u32 = 30_000;
@@ -220,6 +225,25 @@ mod windows {
     }
 
     #[repr(C)]
+    struct ShellExecuteInfo {
+        size: u32,
+        mask: u32,
+        window: *mut c_void,
+        verb: *const u16,
+        file: *const u16,
+        parameters: *const u16,
+        directory: *const u16,
+        show: i32,
+        instance: *mut c_void,
+        id_list: *mut c_void,
+        class: *const u16,
+        class_key: *mut c_void,
+        hot_key: u32,
+        icon_or_monitor: *mut c_void,
+        process: *mut c_void,
+    }
+
+    #[repr(C)]
     struct ControlRequest {
         magic: u64,
         version: u32,
@@ -249,6 +273,8 @@ mod windows {
         fn close_handle(handle: *mut c_void) -> i32;
         #[link_name = "GetLastError"]
         fn get_last_error() -> u32;
+        #[link_name = "GetExitCodeProcess"]
+        fn get_exit_code_process(process: *mut c_void, exit_code: *mut u32) -> i32;
         #[link_name = "CreateMutexW"]
         fn create_mutex_w(
             attributes: *mut c_void,
@@ -274,6 +300,31 @@ mod windows {
             value: *const c_void,
             size: u32,
             attributes: u32,
+        ) -> i32;
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        #[link_name = "ShellExecuteExW"]
+        fn shell_execute_ex_w(info: *mut ShellExecuteInfo) -> i32;
+    }
+
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        #[link_name = "CoInitializeEx"]
+        fn co_initialize_ex(reserved: *mut c_void, flags: u32) -> i32;
+        #[link_name = "CoUninitialize"]
+        fn co_uninitialize();
+    }
+
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        #[link_name = "BCryptGenRandom"]
+        fn bcrypt_gen_random(
+            algorithm: *mut c_void,
+            buffer: *mut u8,
+            length: u32,
+            flags: u32,
         ) -> i32;
     }
 
@@ -307,7 +358,7 @@ mod windows {
         })
     }
 
-    fn enable_firmware_privilege() -> Result<(), String> {
+    fn enable_firmware_privilege() -> Result<bool, String> {
         let mut token = std::ptr::null_mut();
         if unsafe {
             open_process_token(
@@ -347,15 +398,159 @@ mod windows {
                 return Err(win32_error("AdjustTokenPrivileges"));
             }
             if unsafe { get_last_error() } == ERROR_NOT_ALL_ASSIGNED {
-                return Err(
-                    "Windows requires SeSystemEnvironmentPrivilege for UEFI runtime variables; run neo from an elevated console"
-                        .into(),
-                );
+                return Ok(false);
             }
-            Ok(())
+            Ok(true)
         })();
         unsafe { close_handle(token) };
         result
+    }
+
+    fn elevated_arguments(command: Command, port: u16, nonce: u128) -> String {
+        let command = match command {
+            Command::On => "on".to_string(),
+            Command::Off => "off".to_string(),
+            Command::OffProcessor(index) => format!("off --cpu {index}"),
+            Command::Status => "status".to_string(),
+        };
+        format!("--runtime-elevated {port} {nonce} matrix {command}")
+    }
+
+    fn receive_elevated_result(
+        listener: &TcpListener,
+        process: *mut c_void,
+        nonce: [u8; 16],
+    ) -> Result<Response, String> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for the elevated helper to connect".into());
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .map_err(|error| error.to_string())?;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .map_err(|error| error.to_string())?;
+                    let mut received_nonce = [0_u8; 16];
+                    if stream.read_exact(&mut received_nonce).is_err() || received_nonce != nonce {
+                        continue;
+                    }
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(300)))
+                        .map_err(|error| error.to_string())?;
+                    let (request_id, response) = read_response(&mut stream)
+                        .map_err(|error| format!("failed to read the UAC result: {error}"))?;
+                    if request_id != 0 || response.request_kind != RequestKind::Status {
+                        return Err("invalid UAC result frame".into());
+                    }
+                    return Ok(response);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(format!("failed to accept the UAC result: {error}")),
+            }
+            if unsafe { wait_for_single_object(process, 0) } == WAIT_OBJECT_0 {
+                return Err("the elevated helper exited without returning a result".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn run_elevated(command: Command) -> Result<String, String> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| format!("failed to bind the UAC result channel: {error}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+        let mut nonce_bytes = [0_u8; 16];
+        let random_status =
+            unsafe { bcrypt_gen_random(std::ptr::null_mut(), nonce_bytes.as_mut_ptr(), 16, 0x02) };
+        if random_status < 0 {
+            return Err(format!(
+                "BCryptGenRandom failed with NTSTATUS {random_status:#x}"
+            ));
+        }
+        let nonce = u128::from_le_bytes(nonce_bytes);
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("failed to resolve the neo executable: {error}"))?;
+        let file: Vec<u16> = executable
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let parameters = wide(&elevated_arguments(command, port, nonce));
+        let verb = wide("runas");
+        let mut info: ShellExecuteInfo = unsafe { std::mem::zeroed() };
+        info.size = size_of::<ShellExecuteInfo>() as u32;
+        // The hidden helper returns its result over a one-shot loopback channel.
+        // It never accepts commands over this channel.
+        info.mask = 0x40 | 0x100 | 0x400 | 0x8000;
+        info.verb = verb.as_ptr();
+        info.file = file.as_ptr();
+        info.parameters = parameters.as_ptr();
+        info.show = 0;
+        let initialized = unsafe { co_initialize_ex(std::ptr::null_mut(), 0x02 | 0x04) };
+        let launched = unsafe { shell_execute_ex_w(&mut info) };
+        let launch_error = unsafe { get_last_error() };
+        if initialized >= 0 {
+            unsafe { co_uninitialize() };
+        }
+        if launched == 0 {
+            return Err(if launch_error == ERROR_CANCELLED {
+                "UAC elevation cancelled; MatrixHV command was not executed".into()
+            } else {
+                format!("ShellExecuteExW elevation failed with Win32 error {launch_error}")
+            });
+        }
+        if info.process.is_null() {
+            return Err("UAC elevation did not return a process handle".into());
+        }
+        let result = (|| {
+            let response = receive_elevated_result(&listener, info.process, nonce_bytes)?;
+            if unsafe { wait_for_single_object(info.process, u32::MAX) } != WAIT_OBJECT_0 {
+                return Err(win32_error("WaitForSingleObject"));
+            }
+            let mut exit_code = 0;
+            if unsafe { get_exit_code_process(info.process, &mut exit_code) } == 0 {
+                return Err(win32_error("GetExitCodeProcess"));
+            }
+            if !response.success {
+                return Err(response.message);
+            }
+            if exit_code != 0 {
+                return Err(format!(
+                    "elevated MatrixHV command failed with exit code {exit_code}"
+                ));
+            }
+            Ok(response.message)
+        })();
+        unsafe { close_handle(info.process) };
+        result
+    }
+
+    pub(super) fn execute_helper(command: Command, port: u16, nonce: u128) -> Result<i32, String> {
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+            .map_err(|error| format!("failed to connect the UAC result channel: {error}"))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(300)))
+            .map_err(|error| error.to_string())?;
+        stream
+            .write_all(&nonce.to_le_bytes())
+            .map_err(|error| error.to_string())?;
+        let (response, exit_code) = match execute(command, false) {
+            Ok(text) => (Response::success(RequestKind::Status, text), 0),
+            Err(error) => (Response::failure(RequestKind::Status, error), 1),
+        };
+        write_response(&mut stream, 0, &response)
+            .map_err(|error| format!("failed to return the UAC result: {error}"))?;
+        Ok(exit_code)
     }
 
     fn read_status() -> Result<ControlStatus, String> {
@@ -704,8 +899,13 @@ mod windows {
         })
     }
 
-    pub(super) fn execute(command: Command) -> Result<String, String> {
-        enable_firmware_privilege()?;
+    pub(super) fn execute(command: Command, allow_elevation: bool) -> Result<String, String> {
+        if !enable_firmware_privilege()? {
+            if allow_elevation {
+                return run_elevated(command);
+            }
+            return Err("The elevated token does not have SeSystemEnvironmentPrivilege for UEFI runtime variables".into());
+        }
         let _control_mutex = ControlMutex::acquire()?;
         let status = read_status()?;
         if command == Command::Status {
@@ -829,16 +1029,29 @@ mod windows {
             final_status.stopped_mask
         ))
     }
+
+    #[cfg(test)]
+    mod elevation_tests {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../tests/neo_elevation.rs"
+        ));
+    }
 }
 
 pub fn execute(command: Command) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
-        windows::execute(command)
+        windows::execute(command, true)
     }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = command;
         Err("MatrixHV runtime control requires Windows".into())
     }
+}
+
+#[cfg(target_os = "windows")]
+pub fn execute_elevated(command: Command, port: u16, nonce: u128) -> Result<i32, String> {
+    windows::execute_helper(command, port, nonce)
 }

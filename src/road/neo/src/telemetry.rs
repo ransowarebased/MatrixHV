@@ -7,7 +7,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL: u32 = 4;
 const MATRIXHV_DIAGNOSTIC_PROTOCOL: u32 = 7;
 const TELEMETRY_CONTROL_CAPABILITY: u32 = 1 << 8;
-const NESTED_FAILURE_TRACE_CAPABILITY: u32 = 1 << 9;
 const EXIT_PROFILE_CAPABILITY: u32 = 1 << 10;
 const EXIT_REASON_COUNTS_CAPABILITY: u32 = 1 << 11;
 const VMX_HARDWARE_CAPABILITY: u32 = 1 << 12;
@@ -1073,49 +1072,10 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
         } else {
             mask.count_ones().to_string()
         };
+        let format_version = if protocol >= 5 { 3 } else { 2 };
         let mut text = format!(
-            "capabilities=0x{:x}\ncapability_names=vcpu_counters,watchdog_sequence_phase,guest_triad,entry_failure_slot,host_exception_slot,ept_diagnostics,watchdog_lease,remote_vcpu_query{}{}{}{}{}{}{}{}\nlogical_processor_count={count}\n",
+            "capabilities=0x{:x}\n[TELEMETRY v{format_version}]\nlogical_processor_count={count}\n",
             caps.eax,
-            if caps.eax & TELEMETRY_CONTROL_CAPABILITY != 0 {
-                ",telemetry_control"
-            } else {
-                ""
-            },
-            if caps.eax & NESTED_FAILURE_TRACE_CAPABILITY != 0 {
-                ",nested_failure_trace"
-            } else {
-                ""
-            },
-            if caps.eax & EXIT_PROFILE_CAPABILITY != 0 {
-                ",exit_profile"
-            } else {
-                ""
-            },
-            if caps.eax & EXIT_REASON_COUNTS_CAPABILITY != 0 {
-                ",exit_reason_counts"
-            } else {
-                ""
-            },
-            if caps.eax & VMX_HARDWARE_CAPABILITY != 0 {
-                ",vmx_hardware"
-            } else {
-                ""
-            },
-            if caps.eax & EPT_RECYCLING_CAPABILITY != 0 {
-                ",ept_recycling"
-            } else {
-                ""
-            },
-            if caps.eax & CONTROL_STAGE_CAPABILITY != 0 {
-                ",control_stage_trace"
-            } else {
-                ""
-            },
-            if caps.eax & CONTROL_NATIVE_SNAPSHOT_CAPABILITY != 0 {
-                ",control_native_context_stack"
-            } else {
-                ""
-            },
         );
         if caps.eax & TELEMETRY_CONTROL_CAPABILITY != 0 {
             writeln!(

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
 enum Action {
+    Shell,
     Matrix(matrix::Command),
     Serve,
     Ping,
@@ -52,8 +53,40 @@ pub fn run(arguments: Vec<String>) -> Result<i32, String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+pub fn run_elevated_matrix(mut arguments: Vec<String>) -> Result<i32, String> {
+    if arguments.len() < 4 {
+        return Err("the elevated helper requires a result channel and a MatrixHV command".into());
+    }
+    let port: u16 = arguments[0]
+        .parse()
+        .map_err(|_| "invalid UAC result channel port".to_string())?;
+    if port == 0 {
+        return Err("the UAC result channel port must be nonzero".into());
+    }
+    let nonce: u128 = arguments[1]
+        .parse()
+        .map_err(|_| "invalid UAC result channel nonce".to_string())?;
+    arguments.drain(..2);
+    let command = parse_elevated_matrix(arguments)?;
+    matrix::execute_elevated(command, port, nonce)
+}
+
+#[cfg(target_os = "windows")]
+fn parse_elevated_matrix(arguments: Vec<String>) -> Result<matrix::Command, String> {
+    let options = parse_options(arguments)?
+        .ok_or_else(|| "the elevated helper requires a MatrixHV command".to_string())?;
+    match options.action {
+        Action::Matrix(command) if options.remote.is_none() && options.cleanup_path.is_none() => {
+            Ok(command)
+        }
+        _ => Err("the elevated helper only accepts local MatrixHV commands".into()),
+    }
+}
+
 fn run_local(action: Action, listen_address: &str) -> Result<i32, String> {
     match action {
+        Action::Shell => startup::run_shell(),
         Action::Matrix(command) => {
             if command == matrix::Command::On
                 && !confirm_matrix_on(&mut io::stdin().lock(), &mut io::stdout().lock())
@@ -243,7 +276,8 @@ fn run_remote(remote: &str, timeout: Duration, action: Action) -> Result<i32, St
             print!("{}", response.message);
             Ok(0)
         }
-        Action::Matrix(_)
+        Action::Shell
+        | Action::Matrix(_)
         | Action::TelemetryControlTrace(_)
         | Action::Serve
         | Action::Install
@@ -558,6 +592,7 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
             }
             Some("matrix") => return Err("matrix requires on, off, or status".to_string()),
             Some("serve") if positional.len() == 1 => Action::Serve,
+            Some("shell") if positional.len() == 1 => Action::Shell,
             Some("ping") if positional.len() == 1 => Action::Ping,
             Some("status") if positional.len() == 1 => Action::Status,
             Some("install") if positional.len() == 1 => Action::Install,
@@ -609,7 +644,7 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
             Some("exec") => return Err("exec requires an executable".to_string()),
             Some(command) => return Err(format!("unknown command or extra argument: {command}")),
             None if remote.is_some() => Action::Status,
-            None if cfg!(target_os = "windows") => Action::Install,
+            None if cfg!(target_os = "windows") => Action::Shell,
             None => Action::Serve,
         }
     };
@@ -633,6 +668,9 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
     }
     if remote.is_some() && matches!(&action, Action::Matrix(_)) {
         return Err("matrix commands require the local Windows runtime bridge".to_string());
+    }
+    if remote.is_some() && matches!(&action, Action::Shell) {
+        return Err("the interactive shell requires local execution".to_string());
     }
     if remote.is_some() && matches!(&action, Action::TelemetryControlTrace(_)) {
         return Err("control tracing requires a local observer CPU".to_string());
@@ -660,11 +698,11 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
 fn print_usage() {
     if cfg!(target_os = "windows") {
         println!(
-            "Launching neo without a command installs automatic startup at Windows sign-in.\nUse serve for a temporary server without startup registration.\n"
+            "Launching neo without a command opens the Matrix interactive shell.\nUse install to register automatic startup at Windows sign-in.\n"
         );
     }
     println!(
-        "neo [serve] [--listen ADDRESS:PORT]\nneo ping | status | install | uninstall\nneo matrix on | off [--cpu INDEX] | status\nneo telemetry enable | disable\nneo telemetry control --cpu INDEX --output FILE [--seconds 1..3600]\nneo telemetry | -t [watchdog | eptdiag] [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nneo --remote ADDRESS:PORT [status | ping | telemetry [enable | disable | watchdog | eptdiag] | -t [watchdog | eptdiag] | exec PROGRAM [ARGUMENT ...]]\nneo --remote ADDRESS:PORT --update [--binary PATH]\n\nCounters and basic records start disabled; use telemetry enable/disable to control collection.\nDisabling collection preserves snapshots and stops watchdog capture.\nWatchdog renews a 15-second lease; its interval must not exceed 5000 ms.\nControl tracing selects a separate observer CPU and saves native context/stack .bin files beside FILE when supported by the EFI.\nThe remote transport is plaintext and unauthenticated."
+        "neo shell\nneo serve [--listen ADDRESS:PORT]\nneo ping | status | install | uninstall\nneo matrix on | off [--cpu INDEX] | status\nneo telemetry enable | disable\nneo telemetry control --cpu INDEX --output FILE [--seconds 1..3600]\nneo telemetry | -t [watchdog | eptdiag] [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nneo --remote ADDRESS:PORT [status | ping | telemetry [enable | disable | watchdog | eptdiag] | -t [watchdog | eptdiag] | exec PROGRAM [ARGUMENT ...]]\nneo --remote ADDRESS:PORT --update [--binary PATH]\n\nCounters and basic records start disabled; use telemetry enable/disable to control collection.\nDisabling collection preserves snapshots and stops watchdog capture.\nWatchdog renews a 15-second lease; its interval must not exceed 5000 ms.\nControl tracing selects a separate observer CPU and saves native context/stack .bin files beside FILE when supported by the EFI.\nThe remote transport is plaintext and unauthenticated."
     );
 }
 
@@ -674,10 +712,10 @@ mod tests {
     use crate::matrix::Command;
 
     #[test]
-    fn default_launch_installs_windows_startup() {
+    fn default_launch_opens_windows_shell() {
         let options = parse_options(Vec::new()).unwrap().unwrap();
         if cfg!(target_os = "windows") {
-            assert!(matches!(options.action, Action::Install));
+            assert!(matches!(options.action, Action::Shell));
         } else {
             assert!(matches!(options.action, Action::Serve));
         }
