@@ -120,7 +120,7 @@ pub struct ControlTraceOptions {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-const NATIVE_SNAPSHOT_FIELDS: [&str; 26] = [
+pub(crate) const NATIVE_SNAPSHOT_FIELDS: [&str; 26] = [
     "stage",
     "rip",
     "rsp",
@@ -154,11 +154,11 @@ const NATIVE_SNAPSHOT_FIELDS: [&str; 26] = [
     any(target_os = "windows", target_os = "linux")
 ))]
 #[derive(Clone, Copy, Debug)]
-struct NativeSnapshotLayout {
-    snapshot_bytes: usize,
-    stack_offset: usize,
-    stack_bytes: usize,
-    capacity: u64,
+pub(crate) struct NativeSnapshotLayout {
+    pub(crate) snapshot_bytes: usize,
+    pub(crate) stack_offset: usize,
+    pub(crate) stack_bytes: usize,
+    pub(crate) capacity: u64,
 }
 
 #[cfg(all(
@@ -166,7 +166,7 @@ struct NativeSnapshotLayout {
     any(target_os = "windows", target_os = "linux")
 ))]
 impl NativeSnapshotLayout {
-    fn from_cpuid(result: std::arch::x86_64::CpuidResult) -> Result<Self, String> {
+    pub(crate) fn from_cpuid(result: std::arch::x86_64::CpuidResult) -> Result<Self, String> {
         let layout = Self {
             snapshot_bytes: result.eax as usize,
             stack_offset: result.ebx as usize,
@@ -205,7 +205,7 @@ impl NativeSnapshotLayout {
         Ok(published)
     }
 
-    fn read_frame(
+    pub(crate) fn read_frame(
         self,
         frame_index: u64,
         sequence: u64,
@@ -261,7 +261,7 @@ impl NativeSnapshotLayout {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn native_snapshot_fields(bytes: &[u8]) -> [u64; NATIVE_SNAPSHOT_FIELDS.len()] {
+pub(crate) fn native_snapshot_fields(bytes: &[u8]) -> [u64; NATIVE_SNAPSHOT_FIELDS.len()] {
     std::array::from_fn(|index| {
         u64::from_le_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap())
     })
@@ -271,7 +271,7 @@ fn native_snapshot_fields(bytes: &[u8]) -> [u64; NATIVE_SNAPSHOT_FIELDS.len()] {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn save_native_frame(
+pub(crate) fn save_native_frame(
     trace_path: &std::path::Path,
     trace: &mut std::fs::File,
     cpu: u32,
@@ -550,7 +550,7 @@ fn pair(result: std::arch::x86_64::CpuidResult) -> (u64, u64) {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn control_stage_name(stage: u64) -> &'static str {
+pub(crate) fn control_stage_name(stage: u64) -> &'static str {
     match stage {
         0 => "idle",
         1 => "requested",
@@ -1266,11 +1266,3 @@ impl Drop for CpuAffinity {
         unsafe { sched_setaffinity(0, self.original_mask.len(), self.original_mask.as_ptr()) };
     }
 }
-
-#[cfg(all(
-    test,
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-#[path = "../../../../tests/neo_control_trace.rs"]
-mod control_trace_tests;

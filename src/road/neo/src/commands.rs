@@ -147,7 +147,10 @@ fn run_local(action: Action, listen_address: &str) -> Result<i32, String> {
     }
 }
 
-fn confirm_matrix_on(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<bool> {
+pub(crate) fn confirm_matrix_on(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> io::Result<bool> {
     writeln!(
         output,
         "WARNING: Turning MatrixHV ON can crash running emulators or virtual machines.\nClose them before continuing."
@@ -285,10 +288,6 @@ fn run_remote(remote: &str, timeout: Duration, action: Action) -> Result<i32, St
         | Action::ApplyUpdate(_) => Err("the command cannot be used with --remote".to_string()),
     }
 }
-
-#[cfg(test)]
-#[path = "../../../../tests/neo_matrix_confirmation.rs"]
-mod matrix_confirmation_tests;
 
 fn transact(remote: &str, timeout: Duration, request: Request) -> Result<Response, String> {
     let addresses: Vec<_> = remote

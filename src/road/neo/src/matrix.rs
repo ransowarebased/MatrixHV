@@ -7,7 +7,7 @@ pub enum Command {
 }
 
 #[cfg(target_os = "windows")]
-mod windows {
+pub(crate) mod windows {
     use super::Command;
     use crate::server::protocol::{RequestKind, Response, read_response, write_response};
     use std::ffi::c_void;
@@ -225,13 +225,13 @@ mod windows {
     }
 
     #[repr(C)]
-    struct ShellExecuteInfo {
+    pub(crate) struct ShellExecuteInfo {
         size: u32,
         mask: u32,
         window: *mut c_void,
         verb: *const u16,
         file: *const u16,
-        parameters: *const u16,
+        pub(crate) parameters: *const u16,
         directory: *const u16,
         show: i32,
         instance: *mut c_void,
@@ -240,7 +240,7 @@ mod windows {
         class_key: *mut c_void,
         hot_key: u32,
         icon_or_monitor: *mut c_void,
-        process: *mut c_void,
+        pub(crate) process: *mut c_void,
     }
 
     #[repr(C)]
@@ -256,7 +256,7 @@ mod windows {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         #[link_name = "GetCurrentProcess"]
-        fn get_current_process() -> *mut c_void;
+        pub(crate) fn get_current_process() -> *mut c_void;
         #[link_name = "GetCurrentThread"]
         fn get_current_thread() -> *mut c_void;
         #[link_name = "GetActiveProcessorGroupCount"]
@@ -406,7 +406,7 @@ mod windows {
         result
     }
 
-    fn elevated_arguments(command: Command, port: u16, nonce: u128) -> String {
+    pub(crate) fn elevated_arguments(command: Command, port: u16, nonce: u128) -> String {
         let command = match command {
             Command::On => "on".to_string(),
             Command::Off => "off".to_string(),
@@ -416,7 +416,7 @@ mod windows {
         format!("--runtime-elevated {port} {nonce} matrix {command}")
     }
 
-    fn receive_elevated_result(
+    pub(crate) fn receive_elevated_result(
         listener: &TcpListener,
         process: *mut c_void,
         nonce: [u8; 16],
@@ -1028,14 +1028,6 @@ mod windows {
             final_status.active_mask,
             final_status.stopped_mask
         ))
-    }
-
-    #[cfg(test)]
-    mod elevation_tests {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../tests/neo_elevation.rs"
-        ));
     }
 }
 

@@ -45,12 +45,13 @@ fn one_neo_binary_serves_remote_status_and_ping() {
     assert!(status_text.contains("binary_fingerprint="));
     assert!(status_text.contains("capabilities="));
     assert!(status_text.contains("logical_processor_count="));
-    let protocol = status_text.lines()
+    let protocol = status_text
+        .lines()
         .find_map(|line| line.strip_prefix("matrixhv_protocol="))
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(0);
-    let supports_telemetry = status_text.contains("matrixhv_present=true\n")
-        && (4..=7).contains(&protocol);
+    let supports_telemetry =
+        status_text.contains("matrixhv_present=true\n") && (4..=7).contains(&protocol);
     let telemetry_format = if protocol >= 5 {
         "format=matrixhv-telemetry-v3"
     } else {

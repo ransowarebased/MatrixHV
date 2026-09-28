@@ -22,3 +22,7 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../../../tests/neo_tests.rs"]
+mod tests;
