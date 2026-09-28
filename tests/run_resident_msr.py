@@ -3,11 +3,14 @@ import re
 import subprocess
 
 
+from resident_assembly import read_resident_assembly
+
+
 project = Path(__file__).resolve().parents[1]
 output = project / "builds" / "resident-msr-tests"
 output.mkdir(parents=True, exist_ok=True)
 source = (project / "src/core/vt_resident.rs").read_text(encoding="utf-8")
-assembly_source = (project / "src/asm/resident_island.S").read_text(encoding="utf-8")
+assembly_source = read_resident_assembly(project)
 start = assembly_source.index('.Lresident_nested_complete_vmcs02_msr_exit:')
 end = assembly_source.index('.Lresident_nested_activate_vmcs01_msr_entry:', start)
 assembly = assembly_source[start:end].strip()

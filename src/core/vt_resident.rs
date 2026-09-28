@@ -3339,6 +3339,7 @@ global_asm!(
     include_str!("../asm/ap_startup.S"),
     include_str!("../asm/ept_cache.S"),
     include_str!("../asm/eptp_switch.S"),
+    include_str!("../asm/nested.S"),
     include_str!("../asm/resident_island.S"),
     host_rsp = const HOST_RSP,
     host_rip = const HOST_RIP,

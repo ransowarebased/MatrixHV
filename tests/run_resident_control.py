@@ -3,10 +3,13 @@ import re
 import subprocess
 
 
+from resident_assembly import read_resident_assembly
+
+
 project = Path(__file__).resolve().parents[1]
 output = project / "builds" / "resident-control-tests"
 output.mkdir(parents=True, exist_ok=True)
-source = (project / "src/asm/resident_island.S").read_text(encoding="utf-8")
+source = read_resident_assembly(project)
 
 
 def section(start, end):

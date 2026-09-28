@@ -2,10 +2,13 @@ from pathlib import Path
 import subprocess
 
 
+from resident_assembly import read_resident_assembly
+
+
 project = Path(__file__).resolve().parents[1]
 output = project / "builds" / "nested-ept-tests"
 output.mkdir(parents=True, exist_ok=True)
-source = (project / "src/asm/resident_island.S").read_text()
+source = read_resident_assembly(project)
 switch_source = (project / "src/asm/eptp_switch.S").read_text()
 exit_msr_start = source.index('.Lresident_nested_capture_vmcs02_guest_state:')
 exit_msr_end = source.index('lea rsi, [rip + .Lresident_nested_guest_state_table]', exit_msr_start)

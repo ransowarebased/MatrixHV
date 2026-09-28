@@ -3,10 +3,13 @@ import re
 import subprocess
 
 
+from resident_assembly import read_resident_assembly
+
+
 project = Path(__file__).resolve().parents[1]
 output = project / "builds" / "resident-visual-tests"
 output.mkdir(parents=True, exist_ok=True)
-source = (project / "src/asm/resident_island.S").read_text(encoding="utf-8")
+source = read_resident_assembly(project)
 start = source.index('.globl matrixhv_resident_ebs_callback')
 callback_end = source.index('.globl matrixhv_resident_get_variable', start)
 paint_start = source.index('.Lresident_claim_diagnostic:', callback_end)

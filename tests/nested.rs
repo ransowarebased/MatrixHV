@@ -818,7 +818,7 @@ fn supported_vmcs12_fields_match_intel_encodings() {
 
 #[test]
 fn resident_vmcs12_lookup_matches_the_canonical_field_table() {
-    let source = include_str!("../src/asm/resident_island.S");
+    let source = include_str!("../src/asm/nested.S");
     let table = source
         .split(".Lresident_vmcs12_field_index_table:")
         .nth(1)

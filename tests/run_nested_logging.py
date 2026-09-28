@@ -6,10 +6,13 @@ import re
 import subprocess
 
 
+from resident_assembly import read_resident_assembly
+
+
 project = Path(__file__).resolve().parents[1]
 output = project / "builds" / "nested-logging-tests"
 output.mkdir(parents=True, exist_ok=True)
-source = (project / "src/asm/resident_island.S").read_text(encoding="utf-8")
+source = read_resident_assembly(project)
 start = source.index(".Lresident_dispatch_vmxon:")
 end = source.index(".Lresident_nested_vmfail_with_error:", start)
 success = source.index(".Lresident_nested_succeed:", end)

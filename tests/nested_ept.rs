@@ -2798,7 +2798,7 @@ fn guest_wrappers_reject_invalid_indices_before_entering_assembly() {
 }
 #[test]
 fn vmcs_lookup_rejects_reserved_bits_and_resolves_every_index() {
-    let source = include_str!("../src/asm/resident_island.S");
+    let source = include_str!("../src/asm/nested.S");
     let table = source
         .split(".Lresident_vmcs12_field_index_table:")
         .nth(1)
