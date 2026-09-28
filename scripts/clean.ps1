@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
 param()
@@ -6,9 +6,8 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$BuildRoot = Join-Path $ProjectRoot 'builds'
-$ExpectedBuildRoot = $BuildRoot
+$BuildRoot = [System.IO.Path]::GetFullPath('D:\Projetos\MatrixHV\builds')
+$ExpectedBuildRoot = [System.IO.Path]::GetFullPath('D:\Projetos\MatrixHV\builds')
 
 if (-not $BuildRoot.Equals($ExpectedBuildRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing to clean unexpected build root: $BuildRoot"
@@ -26,4 +25,3 @@ else {
         Write-Host "Created build root: $BuildRoot"
     }
 }
-

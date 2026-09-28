@@ -1,185 +1,202 @@
-﻿# MatrixHV: Intel VT-x Pre-Boot Hypervisor
+# MatrixHV
 
-[![Rust](https://img.shields.io/badge/rust-nightly-orange.svg)](https://www.rust-lang.org/)
-[![Target](https://img.shields.io/badge/target-x86__64--unknown--uefi-blue.svg)](https://uefi.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64%20(VBS%2FHVCI)-brightgreen.svg)]()
+MatrixHV is an experimental Intel VT-x pre-boot hypervisor written in Rust for
+`x86_64-unknown-uefi`. It starts as a UEFI application, prepares a resident VMX
+environment on the bootstrap and application processors, and chainloads an EFI
+boot target under virtualization.
 
-MatrixHV is a modern, bare-metal Intel VT-x Type-1 / pre-boot hypervisor written in idiomatic Rust targeting x86_64-unknown-uefi.
+**Nested virtualization is under development.** The repository implements a
+subset of nested VMX and includes host tests for that subset. It does not establish
+complete Hyper-V, VBS, HVCI, VMware, or KVM compatibility, production readiness,
+or freedom from crashes. Passing host tests does not validate an operating-system
+boot or a nested hypervisor workload.
 
-MatrixHV initializes directly from UEFI firmware during early boot, virtualizes all available physical CPU cores (Bootstrap Processor and Application Processors) before the operating system kernel starts, and seamlessly transitions execution into the Windows Boot Manager (ootmgfw.efi / winload.efi) under continuous hardware-assisted virtualization.
+## Implementation status
 
----
+| Area | Present in the implementation | Validation limits |
+| --- | --- | --- |
+| UEFI boot | Configuration loading; Intel VMX checks; loader discovery for VeraCrypt, Ubuntu shim/GRUB, and Windows Boot Manager | Loader discovery does not prove compatibility with every firmware or OS configuration. |
+| Resident virtualization | BSP/AP setup, per-CPU resources, host paging, EPT, runtime callbacks, and VM-exit handling | Stability must be checked on the actual processor, firmware, and guest workload. |
+| Nested VMX | VMXON/VMXOFF, VMCLEAR, VMPTRLD/VMPTRST, VMREAD/VMWRITE, VMLAUNCH/VMRESUME, and VMCS12 state | This is a restricted VMX contract, not the complete Intel VMX feature set. |
+| Nested execution | VMCS02 preparation, L2 state synchronization, exit reflection to L1, and MSR-list/bitmap composition | These mechanisms do not by themselves establish end-to-end L1 hypervisor compatibility. |
+| Nested translation | EPT12/EPT01 composition into EPT02, cached roots, VPID handling, INVEPT/INVVPID, and EPTP-switch paths | Availability depends on the virtual capability contract and underlying hardware. |
+| Diagnostics and control | Serial/framebuffer diagnostics, opt-in telemetry, and the ROAD `neo` host agent | Runtime activation and deactivation require separate live-system verification. |
 
-## Key Features
+Here, **L0** is MatrixHV, **L1** is the hypervisor running inside its guest, and
+**L2** is a guest launched by L1. The capability masks in [src/nested.rs](src/nested.rs)
+define the advertised nested contract. Unsupported features must not be inferred
+from the presence of a related instruction handler or a successful startup probe.
 
-### 1. Bare-Metal UEFI Pre-Boot Virtualization
-- **Firmware Integration**: Native UEFI application (BOOTX64.EFI) that sets up hypervisor memory regions, page tables, and VMX data structures using UEFI boot services before exit.
-- **Multiprocessor Support (SMP)**: Discovers and initializes all APs (Application Processors) via INIT-SIPI-SIPI inter-processor interrupts, creating isolated per-CPU state structures (ResidentCpuResources).
-- **Seamless Boot Chaining**: Hands off execution to the standard Windows OS loader while keeping the processor in VMX root operation.
+The code contains caches and selective MSR passthrough intended to reduce work in
+VM-exit paths. This README makes no quantified performance, undetectability, or
+BSOD-prevention claims.
 
-### 2. High-Performance EPT (Extended Page Tables)
-- **Identity-Mapped EPT**: Hardware-assisted Second Level Address Translation (SLAT) managing guest physical memory access.
-- **Stealth & Page Concealment**: Capability to conceal hypervisor code, runtime stacks, MSR bitmaps, and page tables from guest operating systems and security agents.
-- **Zero-Page Fault Interception**: Configurable read/write/execute permissions and fine-grained violation dispatch.
+## Requirements
 
-### 3. Nested Virtualization (Nested VMX for L1 & L2)
-- **Full Hyper-V & VBS Compatibility**: Tested and validated with Windows 10/11 Virtualization-Based Security (VBS, Device Guard Status 2) and Hypervisor-Enforced Code Integrity (HVCI Service Status 2).
-- **Dual Hardware VPID Retention**: Retains dedicated VPID tags for VTL0 (Standard Windows) and VTL1 (Secure Kernel) contexts, avoiding global TLB invalidations on virtual trust level transitions and preventing DPC watchdog timeouts (BSOD 0x133).
-- **Fast VMCS12 Emulation**: 1024-byte direct index lookup table for VMCS field accesses, accelerating guest mread and mwrite operations.
-- **Dual EPT02 Caching Pools**: Prevents repeated deep EPT page walks when switching between host and nested guest execution.
+- An Intel x86-64 processor exposing VMX and the capabilities required by the
+  configured execution path, including EPT. AMD SVM is not implemented.
+- x64 UEFI firmware. Loading an unsigned development EFI requires a firmware
+  policy that permits it; this repository does not provide a signing workflow.
+- Rust **stable**, as selected by [rust-toolchain.toml](rust-toolchain.toml), and
+  the `x86_64-unknown-uefi` target.
+- For the Windows build scripts and host tests: PowerShell 5.1 or newer, Python 3,
+  and the MSVC linker tools used by Rust's Windows host target.
+- The full packaging pipeline also builds `neo` for
+  `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-musl`; those targets and their
+  linker support must be available.
 
-### 4. Zero-Cost MSR Passthrough & Exit Optimization
-- **Hardware-Managed Contexts**: Passthrough enabled for performance-critical MSRs (IA32_FS_BASE, IA32_GS_BASE, IA32_KERNEL_GS_BASE, IA32_TSC_AUX), eliminating thousands of VM-exits per second on Windows thread swaps.
-- **Adaptive Tracing**: Intelligent throttling of serial debug output to ensure fast boot times.
+For a VM-based test, the outer hypervisor must expose Intel VMX/EPT to MatrixHV.
+Run boot and activation experiments on a disposable test system with recoverable
+boot media. `neo matrix on` already asks for confirmation because activation can
+crash running emulators or virtual machines.
 
-### 5. Automated Host Test Harness
-- **Unit Test Assembly Runner**: Extracts core assembly routines (EPT resolution, VMCS sync, VPID caching, MSR lists) and executes them directly under standard Windows user mode with mocks, eliminating the need to boot a full virtual machine for basic verification.
+## Build
 
----
+Build only the UEFI executable from the repository root:
 
-## Repository Layout
+```powershell
+rustup target add x86_64-unknown-uefi
+cargo build --release --target x86_64-unknown-uefi
+```
 
-`	ext
-.
-├── .cargo/                 # Cargo target configuration and flags
-├── asm/                    # Low-level 16-bit / 32-bit AP startup assembly
-├── scripts/                # Automated PowerShell build, image, and packaging scripts
-│   ├── buildauto.ps1       # One-click build and image generation pipeline
-│   ├── build_debug.ps1     # Builds debug UEFI binary
-│   ├── build_release.ps1   # Builds optimized release UEFI binary
-│   ├── clean.ps1           # Cleans build artifacts and caches
-│   ├── make_config.ps1     # Generates embedded binary configuration
-│   ├── make_image.ps1      # Creates FAT32 bootable GPT/MBR disk images
-│   └── package.ps1         # Packages release archives
-├── src/
-│   ├── main.rs             # UEFI entry point and boot coordinator
-│   ├── arch/               # Architecture-specific x86_64 primitives (registers, segmentation)
-│   ├── boot/               # UEFI memory-map parser, config loader, and firmware services
-│   ├── core/               # Core VMX engine (controls, VMCS, EPT, exits, resident loop)
-│   ├── guest/              # Guest firmware probe and vCPU bootstrap orchestration
-│   ├── memory/             # Paging, resident pools, and physical memory allocation
-│   ├── nested/             # Nested VMX emulation (capabilities, VMCS12, state machines)
-│   ├── road/               # Remote control, telemetry protocol, and agent interface
-│   ├── runtime/            # Low-level UART 16550 serial logger and diagnostics
-│   └── smp/                # Topology discovery, AP startup, and per-CPU state
-├── tests/
-│   ├── nested.rs           # Architectural capability and encoding tests
-│   ├── nested_ept.rs       # Standalone host-runnable resident assembly test harness
-│   └── run_nested_ept.py   # Test extractor and runner
-├── Cargo.toml              # Project dependencies and workspace definition
-├── rust-toolchain.toml     # Pinned Rust toolchain (nightly)
-└── LICENSE                 # MIT License
-`
+The Cargo configuration places it at
+`builds/.cargo-target/x86_64-unknown-uefi/release/MatrixHV.efi`.
+`build.rs` creates `builds/MatrixConfig.bin` when it is missing or empty and
+preserves an existing nonempty configuration.
 
----
+To build and stage MatrixHV and both `neo` binaries without generating a disk
+image or archive:
 
-## Prerequisites
+```powershell
+rustup target add x86_64-pc-windows-msvc x86_64-unknown-linux-musl
+.\scripts\build_release.ps1 -SkipImage -SkipPackage
+```
 
-1. **Rust Toolchain**:
-   - Rust Nightly with the x86_64-unknown-uefi target installed:
-     `powershell
-     rustup default nightly
-     rustup target add x86_64-unknown-uefi
-     rustup component add rust-src llvm-tools-preview
-     `
-2. **PowerShell 5.1+ or 7+** (on Windows).
-3. **Python 3.10+** (optional, required for running host assembly tests).
-4. **Hardware Requirements**:
-   - Intel Core / Xeon processor with Intel VT-x (VMX), EPT, and Unrestricted Guest support.
+For the complete image and archive pipeline:
 
----
-
-## Building
-
-### Quick Build (Debug / Release)
-
-To compile MatrixHV for UEFI:
-
-`powershell
-# Build release UEFI binary
+```powershell
 .\scripts\build_release.ps1
+```
 
-# Or build debug UEFI binary
-.\scripts\build_debug.ps1
-`
+The PowerShell pipeline currently uses the fixed output root
+`D:\Projetos\MatrixHV\builds`. Review the scripts before using another checkout
+location. Release outputs include `builds/release/MatrixHV.efi`, the removable-media
+loader at `builds/release/EFI/BOOT/BOOTX64.EFI`, `neo.exe`, `neo`, and, when requested,
+`MatrixHV.img`. Generated artifacts remain ignored by Git.
 
-The resulting binary will be placed under:
-- uilds/release/MatrixHV.efi (or uilds/debug/MatrixHV.efi)
+The image contains the MatrixHV bootloader and configuration; it does not install
+an operating system. VeraCrypt and VMX-test EFI payloads are optional external
+inputs to the image scripts.
 
-### Creating a Bootable Disk Image
+## Configuration
 
-To generate a bootable FAT32 raw disk image (MatrixHV.img) ready for VMware or QEMU:
+`MatrixConfig.bin` is a UTF-8 text file despite its extension. MatrixHV reads it
+from `\MatrixConfig.bin` on the volume that loaded its EFI application:
 
-`powershell
-.\scripts\buildauto.ps1 -Configuration Release
-`
+```text
+MATRIXHV_CONFIG_V2
+cpuidpresence=false
+logger=true
+VtNested=true
+VmxTest=false
+```
 
-This script will:
-1. Compile the UEFI binary using Cargo.
-2. Build the embedded binary configuration (MatrixConfig.bin).
-3. Construct a virtual FAT32 UEFI boot disk containing \EFI\BOOT\BOOTX64.EFI.
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `cpuidpresence` | `false` | Controls the guest CPUID hypervisor-presence policy; this is not an undetectability guarantee. |
+| `logger` | `true` | Enables runtime logging. |
+| `VtNested` | `true` | Enables exposure of the restricted nested VMX contract. |
+| `VmxTest` | `false` | Selects the external VMX-test boot path; requires `VtNested=true` and the test payload. |
 
----
+Use the configuration generator to update the build copy:
 
-## Testing & Quality Assurance
+```powershell
+.\scripts\make_config.ps1 -VtNested false -VmxTest false
+```
 
-### 1. Running Host-Side Unit Tests
+Changing the build copy does not update an already-created boot disk. Stage or
+regenerate the media so its root contains the intended configuration.
 
-MatrixHV includes high-coverage host tests that validate VMX capability derivations, bitmasks, and field encodings:
+## Tests and validation
 
-`powershell
-cargo test --test nested
-`
+Run the local Python runners and standalone Rust tests on the Windows development
+host:
 
-### 2. Running Resident Assembly Mock Tests
+```powershell
+python run_alltest.py
+```
 
-To test the low-level resident assembly routines (EPT walks, VPID invalidation, VMCS field indexer) directly on your host machine without virtual machines:
+The runner discovers suites under `tests/`, compiles the host harnesses with
+`rustc`, and writes generated test binaries and assembly under `builds/`.
+It does not boot a VM or run the external nested compatibility suite.
 
-`powershell
-python tests\run_nested_ept.py
-`
+For focused nested assembly checks:
 
-### 3. Clippy & Linter Validation
+```powershell
+python tests/run_nested_ept.py
+python tests/run_nested_logging.py
+python tests/run_eptp_sync.py
+```
 
-To ensure standard compliance without warnings:
+Host assembly tests replace privileged operations with controlled stubs. They
+check instruction handling, state transitions, translation, invalidation, and
+failure paths without exercising the full processor/firmware/OS interaction.
 
-`powershell
-cargo fmt -- --check
-cargo check --target x86_64-unknown-uefi
-cargo clippy --target x86_64-unknown-uefi -- -D warnings
-`
+External validation tools are separate:
 
----
+- `tests/kvm_unit_nested.py` builds and checks selected cases from a pinned
+  upstream `kvm-unit-tests` revision. Its presence is not evidence of a passing run.
+- `tests/collect_boot_state.py` collects runtime state through an external
+  debugger setup.
+- `tests/nested_runtime.py` checks collected guest snapshots.
 
-## Testing in a Virtual Machine
+A compatibility result should identify the tested commit, CPU, firmware or outer
+hypervisor, guest OS, nested workload, enabled features, and observed failures or
+skips. Build success, mocked host tests, an OS logo, and a startup probe are
+different levels of evidence.
 
-### VMware Workstation / ESXi
-1. Create a Windows 10/11 x64 virtual machine.
-2. Enable **Virtualize Intel VT-x/EPT or AMD-V/RVI** in VM Settings -> Processors.
-3. Configure the VM to boot from UEFI.
-4. Attach the generated MatrixHV.img or replace the EFI bootloader on the virtual disk with MatrixHV.efi renamed as BOOTX64.EFI.
-5. Add a serial port connected to a named pipe or file to view resident diagnostics and telemetry in real time.
+## Repository layout
 
-### QEMU / OVMF
-`powershell
-qemu-system-x86_64 -enable-kvm -cpu host -m 4G -bios path/to/OVMF.fd -drive format=raw,file=builds/release/MatrixHV.img -serial stdio
-`
+| Path | Responsibility |
+| --- | --- |
+| `src/main.rs` | UEFI entry point and initial configuration/logging |
+| `src/boot.rs` | Configuration parsing, firmware integration, and boot-target selection |
+| `src/arch.rs` | x86-64 registers, CPUID/MSR access, and segmentation |
+| `src/core/` | VMCS, VMX lifecycle, controls, EPT, guest state, and resident runtime |
+| `src/core/vt_resident.rs` | Resident resources, initialization, and assembly integration |
+| `src/asm/resident_island.S` | Resident dispatcher, common handlers, and runtime bridges |
+| `src/asm/nested.S` | Nested handlers, L2 reflection, VMCS12 tables, and messages |
+| `src/asm/eptp_switch.S` | Nested EPTP switching and synchronization |
+| `src/asm/ept_cache.S` | Resident EPT cache-type updates |
+| `src/asm/ap_startup.S`, `ap_launch.S`, `guest_boot.S` | Processor startup and guest boot assembly |
+| `src/nested.rs` | Nested capability contract, VMCS12 definitions, and per-vCPU state |
+| `src/memory.rs`, `src/smp.rs`, `src/guest.rs` | Memory, processor resources, and guest orchestration |
+| `src/runtime.rs` | Logging and runtime diagnostics |
+| `src/road/neo/` | Windows/Linux control, telemetry, and remote agent |
+| `scripts/` | Configuration, builds, disk images, and packaging |
+| `tests/` | Host harnesses and external validation tools |
 
----
+The macros in `nested.S` expand at explicit points inside the copied resident
+island. Separating the source files keeps the handlers and their RIP-relative
+data in the same resident code region.
 
-## Contributing
+## ROAD / neo
 
-Contributions, issues, and feature requests are welcome!
+`neo` provides an interactive console, MatrixHV status/control, telemetry capture,
+and a remote agent. Basic local commands include:
 
-1. Fork the repository.
-2. Create a feature branch: git checkout -b feature/my-new-feature.
-3. Commit your changes: git commit -m "feat(vt_core): add new feature".
-4. Push to the branch: git push origin feature/my-new-feature.
-5. Open a Pull Request.
+```powershell
+neo.exe matrix status
+neo.exe telemetry enable
+neo.exe -t --seconds 10
+neo.exe telemetry disable
+```
 
----
+Telemetry collection starts disabled. Remote serving is optional; its transport
+is plaintext and unauthenticated. When needed for testing, bind explicitly to a
+trusted interface, for example `neo.exe serve --listen 127.0.0.1:4040`.
+Run `neo.exe --help` for the current command syntax.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+MatrixHV is distributed under the [MIT License](LICENSE).

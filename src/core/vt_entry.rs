@@ -4,16 +4,15 @@ use core::ptr::NonNull;
 use uefi::boot::{self, AllocateType};
 use uefi::mem::memory_map::MemoryType;
 
+use super::vmcs::{
+    self, EXIT_QUALIFICATION, GUEST_RIP, GUEST_RSP, HOST_RIP, HOST_RSP, VM_EXIT_INSTRUCTION_LEN,
+    VM_EXIT_REASON, VM_INSTRUCTION_ERROR, VmcsError, VmcsRegion,
+};
 use super::vt_controls::{self, VmxControls, VmxControlsError};
 use super::vt_exits::{self, DispatchDiagnostics, VmRunContext};
 use super::vt_state::{self, GuestStateReport, HostStateReport};
-use super::vt_vmcs::{self, VmcsError, VmcsRegion};
-use super::vt_vmcs_fields::{
-    EXIT_QUALIFICATION, GUEST_RIP, GUEST_RSP, HOST_RIP, HOST_RSP, VM_EXIT_INSTRUCTION_LEN,
-    VM_EXIT_REASON, VM_INSTRUCTION_ERROR,
-};
 use super::vt_vmxon::{self, VmxInstructionResult, VmxonError, VmxonReport};
-use crate::boot::logger;
+use crate::runtime;
 
 const PAGE_SIZE: usize = 4096;
 const HOST_EXIT_STACK_PAGES: usize = 4;
@@ -240,24 +239,24 @@ fn run_vmlaunch_probe(
             .map_err(VmlaunchError::Vmxon)?;
     let vmxon_report = session.report();
 
-    logger::phase("vmx.vmlaunch.vmclear.start");
-    let clear_result = unsafe { vt_vmcs::vmclear(vmcs_physical_address) };
+    runtime::phase("vmx.vmlaunch.vmclear.start");
+    let clear_result = unsafe { vmcs::vmclear(vmcs_physical_address) };
     if clear_result != VmxInstructionResult::Succeeded {
         drop(session);
         return Err(VmlaunchError::Vmcs(VmcsError::Vmclear(clear_result)));
     }
-    logger::phase("vmx.vmlaunch.vmclear.ok");
+    runtime::phase("vmx.vmlaunch.vmclear.ok");
 
-    logger::phase("vmx.vmlaunch.vmptrld.start");
-    let load_result = unsafe { vt_vmcs::vmptrld(vmcs_physical_address) };
+    runtime::phase("vmx.vmlaunch.vmptrld.start");
+    let load_result = unsafe { vmcs::vmptrld(vmcs_physical_address) };
     if load_result != VmxInstructionResult::Succeeded {
         drop(session);
         return Err(VmlaunchError::Vmcs(VmcsError::Vmptrld(load_result)));
     }
-    logger::phase("vmx.vmlaunch.vmptrld.ok");
+    runtime::phase("vmx.vmlaunch.vmptrld.ok");
 
     let controls = vt_controls::configure()?;
-    logger::info(format_args!(
+    runtime::info(format_args!(
         "vmlaunch controls pin={:#x} primary={:#x} secondary={:#x} exit={:#x} entry={:#x}",
         controls.pin_based,
         controls.primary_processor_based,
@@ -265,10 +264,10 @@ fn run_vmlaunch_probe(
         controls.vm_exit,
         controls.vm_entry
     ));
-    logger::phase("vmx.vmlaunch.controls.ok");
+    runtime::phase("vmx.vmlaunch.controls.ok");
 
     let host = vt_state::configure_host()?;
-    logger::info(format_args!(
+    runtime::info(format_args!(
         "vmlaunch host cs={:#x} ss={:#x} tr={:#x} tr_base={:#x} gdtr={:#x} idtr={:#x}",
         host.cs_selector,
         host.ss_selector,
@@ -277,28 +276,28 @@ fn run_vmlaunch_probe(
         host.gdtr_base,
         host.idtr_base
     ));
-    logger::phase("vmx.vmlaunch.host_state.ok");
+    runtime::phase("vmx.vmlaunch.host_state.ok");
 
     let guest_rip = guest_probe_address();
     let guest = vt_state::configure_guest(guest_rip, resources.guest_stack.top())?;
-    logger::info(format_args!(
+    runtime::info(format_args!(
         "vmlaunch guest rip={:#x} rsp={:#x} rflags={:#x} cs={:#x} ss={:#x} tr={:#x}",
         guest.rip, guest.rsp, guest.rflags, guest.cs_selector, guest.ss_selector, guest.tr_selector
     ));
-    logger::phase("vmx.vmlaunch.guest_state.ok");
+    runtime::phase("vmx.vmlaunch.guest_state.ok");
 
-    logger::phase("vmx.vmlaunch.start");
+    runtime::phase("vmx.vmlaunch.start");
     let raw_path = unsafe { matrixhv_vmlaunch_probe_asm() };
-    logger::phase("vmx.vmlaunch.returned_to_host");
+    runtime::phase("vmx.vmlaunch.returned_to_host");
 
-    let exit_reason = vt_vmcs::vmread(VM_EXIT_REASON).unwrap_or(0) as u32;
+    let exit_reason = vmcs::vmread(VM_EXIT_REASON).unwrap_or(0) as u32;
     let basic_exit_reason = vt_exits::basic_reason(exit_reason);
-    let exit_qualification = vt_vmcs::vmread(EXIT_QUALIFICATION).unwrap_or(0);
-    let instruction_length = vt_vmcs::vmread(VM_EXIT_INSTRUCTION_LEN).unwrap_or(0);
-    let vm_instruction_error = vt_vmcs::vmread(VM_INSTRUCTION_ERROR).unwrap_or(u64::MAX);
-    let guest_rip_after_exit = vt_vmcs::vmread(GUEST_RIP).unwrap_or(0);
+    let exit_qualification = vmcs::vmread(EXIT_QUALIFICATION).unwrap_or(0);
+    let instruction_length = vmcs::vmread(VM_EXIT_INSTRUCTION_LEN).unwrap_or(0);
+    let vm_instruction_error = vmcs::vmread(VM_INSTRUCTION_ERROR).unwrap_or(u64::MAX);
+    let guest_rip_after_exit = vmcs::vmread(GUEST_RIP).unwrap_or(0);
 
-    logger::info(format_args!(
+    runtime::info(format_args!(
         "vmlaunch raw_path={} exit_reason={:#x} exit_name={} basic_reason={} qualification={:#x} instruction_len={} vm_instruction_error={} vm_instruction_error_name={} guest_rip={:#x}",
         raw_path,
         exit_reason,
@@ -307,7 +306,7 @@ fn run_vmlaunch_probe(
         exit_qualification,
         instruction_length,
         vm_instruction_error,
-        vt_vmcs::instruction_error_name(vm_instruction_error),
+        vmcs::instruction_error_name(vm_instruction_error),
         guest_rip_after_exit
     ));
 
@@ -344,13 +343,13 @@ fn run_vmlaunch_probe(
         _ => Err(VmlaunchError::VmFailInvalid),
     };
 
-    logger::phase("vmx.vmlaunch.final_vmclear.start");
-    let final_clear = unsafe { vt_vmcs::vmclear(vmcs_physical_address) };
+    runtime::phase("vmx.vmlaunch.final_vmclear.start");
+    let final_clear = unsafe { vmcs::vmclear(vmcs_physical_address) };
     if final_clear == VmxInstructionResult::Succeeded {
-        logger::phase("vmx.vmlaunch.final_vmclear.ok");
+        runtime::phase("vmx.vmlaunch.final_vmclear.ok");
     }
     drop(session);
-    logger::phase("vmx.vmlaunch.vmxoff_restored");
+    runtime::phase("vmx.vmlaunch.vmxoff_restored");
 
     if final_clear != VmxInstructionResult::Succeeded {
         return Err(VmlaunchError::CleanupVmclear(final_clear));
@@ -373,24 +372,24 @@ pub fn probe_vmexit_dispatcher() -> Result<VmexitLoopReport, VmexitLoopError> {
     let session = vt_vmxon::enter_vmx_root().map_err(VmexitLoopError::Vmxon)?;
     let vmxon_report = session.report();
 
-    logger::phase("vmx.dispatch_probe.vmclear.start");
-    let clear_result = unsafe { vt_vmcs::vmclear(vmcs_physical_address) };
+    runtime::phase("vmx.dispatch_probe.vmclear.start");
+    let clear_result = unsafe { vmcs::vmclear(vmcs_physical_address) };
     if clear_result != VmxInstructionResult::Succeeded {
         drop(session);
         return Err(VmexitLoopError::Vmcs(VmcsError::Vmclear(clear_result)));
     }
-    logger::phase("vmx.dispatch_probe.vmclear.ok");
+    runtime::phase("vmx.dispatch_probe.vmclear.ok");
 
-    logger::phase("vmx.dispatch_probe.vmptrld.start");
-    let load_result = unsafe { vt_vmcs::vmptrld(vmcs_physical_address) };
+    runtime::phase("vmx.dispatch_probe.vmptrld.start");
+    let load_result = unsafe { vmcs::vmptrld(vmcs_physical_address) };
     if load_result != VmxInstructionResult::Succeeded {
         drop(session);
         return Err(VmexitLoopError::Vmcs(VmcsError::Vmptrld(load_result)));
     }
-    logger::phase("vmx.dispatch_probe.vmptrld.ok");
+    runtime::phase("vmx.dispatch_probe.vmptrld.ok");
 
     let controls = vt_controls::configure()?;
-    logger::info(format_args!(
+    runtime::info(format_args!(
         "dispatch controls pin={:#x} primary={:#x} secondary={:#x} exit={:#x} entry={:#x}",
         controls.pin_based,
         controls.primary_processor_based,
@@ -398,34 +397,34 @@ pub fn probe_vmexit_dispatcher() -> Result<VmexitLoopReport, VmexitLoopError> {
         controls.vm_exit,
         controls.vm_entry
     ));
-    logger::phase("vmx.dispatch_probe.controls.ok");
+    runtime::phase("vmx.dispatch_probe.controls.ok");
 
     let host = vt_state::configure_host()?;
-    logger::phase("vmx.dispatch_probe.host_state.ok");
+    runtime::phase("vmx.dispatch_probe.host_state.ok");
 
     let guest_rip = dispatch_guest_address();
     let guest = vt_state::configure_guest(guest_rip, guest_stack.top())?;
-    logger::info(format_args!(
+    runtime::info(format_args!(
         "dispatch guest rip={:#x} rsp={:#x} cpuid_rip={:#x} vmcall_rip={:#x}",
         guest.rip,
         guest.rsp,
         dispatch_guest_cpuid_address(),
         dispatch_guest_vmcall_address()
     ));
-    logger::phase("vmx.dispatch_probe.guest_state.ok");
+    runtime::phase("vmx.dispatch_probe.guest_state.ok");
 
     vt_exits::reset_diagnostics();
-    logger::phase("vmx.dispatch_probe.launch.start");
+    runtime::phase("vmx.dispatch_probe.launch.start");
     let raw_path = unsafe { matrixhv_dispatch_run_asm(&mut run_context, host_exit_rsp) };
-    logger::phase("vmx.dispatch_probe.returned_to_host");
+    runtime::phase("vmx.dispatch_probe.returned_to_host");
 
-    let vm_instruction_error = vt_vmcs::vmread(VM_INSTRUCTION_ERROR).unwrap_or(u64::MAX);
+    let vm_instruction_error = vmcs::vmread(VM_INSTRUCTION_ERROR).unwrap_or(u64::MAX);
     let diagnostics = vt_exits::diagnostics();
-    logger::info(format_args!(
+    runtime::info(format_args!(
         "dispatch return path={} vm_instruction_error={} vm_instruction_error_name={} exits={} cpuid={} vmcall={} resumes={} failure={} failure_name={}",
         raw_path,
         vm_instruction_error,
-        vt_vmcs::instruction_error_name(vm_instruction_error),
+        vmcs::instruction_error_name(vm_instruction_error),
         diagnostics.exit_count,
         diagnostics.cpuid_count,
         diagnostics.vmcall_count,
@@ -446,13 +445,13 @@ pub fn probe_vmexit_dispatcher() -> Result<VmexitLoopReport, VmexitLoopError> {
     };
     let result = validate_dispatch_run(raw_path, vm_instruction_error, report);
 
-    logger::phase("vmx.dispatch_probe.final_vmclear.start");
-    let final_clear = unsafe { vt_vmcs::vmclear(vmcs_physical_address) };
+    runtime::phase("vmx.dispatch_probe.final_vmclear.start");
+    let final_clear = unsafe { vmcs::vmclear(vmcs_physical_address) };
     if final_clear == VmxInstructionResult::Succeeded {
-        logger::phase("vmx.dispatch_probe.final_vmclear.ok");
+        runtime::phase("vmx.dispatch_probe.final_vmclear.ok");
     }
     drop(session);
-    logger::phase("vmx.dispatch_probe.vmxoff_restored");
+    runtime::phase("vmx.dispatch_probe.vmxoff_restored");
 
     if final_clear != VmxInstructionResult::Succeeded {
         return Err(VmexitLoopError::CleanupVmclear(final_clear));

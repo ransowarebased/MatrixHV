@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 
 [CmdletBinding()]
 param(
@@ -18,7 +18,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$BuildRoot = Join-Path $ProjectRoot 'builds'
+$BuildRoot = 'D:\Projetos\MatrixHV\builds'
 $TargetTriple = 'x86_64-unknown-uefi'
 $BinaryName = 'MatrixHV'
 $ManifestPath = Join-Path $ProjectRoot 'Cargo.toml'
@@ -56,6 +56,9 @@ if ($null -eq $RustcCommand) {
 New-Item -ItemType Directory -Path $CargoTargetRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $HostCargoTargetRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $BootRoot -Force | Out-Null
+if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+    & (Join-Path $PSScriptRoot 'make_config.ps1') -OutputPath $ConfigPath | Out-Null
+}
 
 $CargoArguments = @(
     'build',
@@ -99,7 +102,6 @@ $RoadWindowsArguments = @(
     '--manifest-path', $RoadManifestPath,
     '--target', $WindowsTargetTriple,
     '--target-dir', $HostCargoTargetRoot,
-    '--bin', 'control',
     '--bin', 'neo'
 )
 $RoadLinuxArguments = @(
@@ -114,7 +116,7 @@ if ($Configuration -eq 'Release') {
     $RoadLinuxArguments += '--release'
 }
 
-Write-Host "Building ROAD controller and Windows agent ($Configuration)..."
+Write-Host "Building ROAD Windows agent ($Configuration)..."
 & $CargoCommand.Source @RoadWindowsArguments
 if ($LASTEXITCODE -ne 0) {
     throw "ROAD Windows build failed with exit code $LASTEXITCODE."
@@ -143,11 +145,9 @@ finally {
     }
 }
 
-$BuiltControl = Join-Path $HostCargoTargetRoot "$WindowsTargetTriple\$CargoProfile\control.exe"
 $BuiltWindowsNeo = Join-Path $HostCargoTargetRoot "$WindowsTargetTriple\$CargoProfile\neo.exe"
 $BuiltLinuxNeo = Join-Path $HostCargoTargetRoot "$LinuxTargetTriple\$CargoProfile\neo"
 $RoadArtifacts = @(
-    @{ Source = $BuiltControl; Destination = (Join-Path $OutputRoot 'control.exe') },
     @{ Source = $BuiltWindowsNeo; Destination = (Join-Path $OutputRoot 'neo.exe') },
     @{ Source = $BuiltLinuxNeo; Destination = (Join-Path $OutputRoot 'neo') }
 )
