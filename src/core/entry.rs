@@ -8,10 +8,10 @@ use super::vmcs::{
     self, EXIT_QUALIFICATION, GUEST_RIP, GUEST_RSP, HOST_RIP, HOST_RSP, VM_EXIT_INSTRUCTION_LEN,
     VM_EXIT_REASON, VM_INSTRUCTION_ERROR, VmcsError, VmcsRegion,
 };
-use super::vt_controls::{self, VmxControls, VmxControlsError};
-use super::vt_exits::{self, DispatchDiagnostics, VmRunContext};
-use super::vt_state::{self, GuestStateReport, HostStateReport};
-use super::vt_vmxon::{self, VmxInstructionResult, VmxonError, VmxonReport};
+use super::controls::{self, VmxControls, VmxControlsError};
+use super::exits::{self, DispatchDiagnostics, VmRunContext};
+use super::state::{self, GuestStateReport, HostStateReport};
+use super::vmxon::{self, VmxInstructionResult, VmxonError, VmxonReport};
 use crate::runtime;
 
 const PAGE_SIZE: usize = 4096;
@@ -181,7 +181,7 @@ impl Drop for HostExitStack {
 }
 
 pub(crate) struct VmlaunchProbeResources {
-    vmxon_region: vt_vmxon::VmxonRegion,
+    vmxon_region: vmxon::VmxonRegion,
     vmcs_region: VmcsRegion,
     guest_stack: ProbeStack,
 }
@@ -195,11 +195,11 @@ pub(crate) struct VmlaunchProbeResourceAddresses {
 
 impl VmlaunchProbeResources {
     pub(crate) fn allocate() -> Result<Self, VmlaunchError> {
-        let vmx_basic = vt_vmxon::vmx_basic();
+        let vmx_basic = vmxon::vmx_basic();
         let vmxon_region =
-            vt_vmxon::VmxonRegion::allocate(vmx_basic).map_err(VmlaunchError::Vmxon)?;
+            vmxon::VmxonRegion::allocate(vmx_basic).map_err(VmlaunchError::Vmxon)?;
         let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
-        vmcs_region.write_revision_id(vt_vmxon::revision_id(vmx_basic));
+        vmcs_region.write_revision_id(vmxon::revision_id(vmx_basic));
         let guest_stack = ProbeStack::allocate()?;
         Ok(Self {
             vmxon_region,
@@ -229,13 +229,13 @@ pub fn probe_vmlaunch() -> Result<VmlaunchReport, VmlaunchError> {
 fn run_vmlaunch_probe(
     resources: &mut VmlaunchProbeResources,
 ) -> Result<VmlaunchReport, VmlaunchError> {
-    let vmx_basic = vt_vmxon::vmx_basic();
-    let revision_id = vt_vmxon::revision_id(vmx_basic);
+    let vmx_basic = vmxon::vmx_basic();
+    let revision_id = vmxon::revision_id(vmx_basic);
     resources.vmcs_region.write_revision_id(revision_id);
     let vmcs_physical_address = resources.vmcs_region.physical_address();
 
     let session =
-        vt_vmxon::enter_vmx_root_with_borrowed_region(vmx_basic, &mut resources.vmxon_region)
+        vmxon::enter_vmx_root_with_borrowed_region(vmx_basic, &mut resources.vmxon_region)
             .map_err(VmlaunchError::Vmxon)?;
     let vmxon_report = session.report();
 
@@ -255,7 +255,7 @@ fn run_vmlaunch_probe(
     }
     runtime::phase("vmx.vmlaunch.vmptrld.ok");
 
-    let controls = vt_controls::configure()?;
+    let controls = controls::configure()?;
     runtime::info(format_args!(
         "vmlaunch controls pin={:#x} primary={:#x} secondary={:#x} exit={:#x} entry={:#x}",
         controls.pin_based,
@@ -266,7 +266,7 @@ fn run_vmlaunch_probe(
     ));
     runtime::phase("vmx.vmlaunch.controls.ok");
 
-    let host = vt_state::configure_host()?;
+    let host = state::configure_host()?;
     runtime::info(format_args!(
         "vmlaunch host cs={:#x} ss={:#x} tr={:#x} tr_base={:#x} gdtr={:#x} idtr={:#x}",
         host.cs_selector,
@@ -279,7 +279,7 @@ fn run_vmlaunch_probe(
     runtime::phase("vmx.vmlaunch.host_state.ok");
 
     let guest_rip = guest_probe_address();
-    let guest = vt_state::configure_guest(guest_rip, resources.guest_stack.top())?;
+    let guest = state::configure_guest(guest_rip, resources.guest_stack.top())?;
     runtime::info(format_args!(
         "vmlaunch guest rip={:#x} rsp={:#x} rflags={:#x} cs={:#x} ss={:#x} tr={:#x}",
         guest.rip, guest.rsp, guest.rflags, guest.cs_selector, guest.ss_selector, guest.tr_selector
@@ -291,7 +291,7 @@ fn run_vmlaunch_probe(
     runtime::phase("vmx.vmlaunch.returned_to_host");
 
     let exit_reason = vmcs::vmread(VM_EXIT_REASON).unwrap_or(0) as u32;
-    let basic_exit_reason = vt_exits::basic_reason(exit_reason);
+    let basic_exit_reason = exits::basic_reason(exit_reason);
     let exit_qualification = vmcs::vmread(EXIT_QUALIFICATION).unwrap_or(0);
     let instruction_length = vmcs::vmread(VM_EXIT_INSTRUCTION_LEN).unwrap_or(0);
     let vm_instruction_error = vmcs::vmread(VM_INSTRUCTION_ERROR).unwrap_or(u64::MAX);
@@ -301,7 +301,7 @@ fn run_vmlaunch_probe(
         "vmlaunch raw_path={} exit_reason={:#x} exit_name={} basic_reason={} qualification={:#x} instruction_len={} vm_instruction_error={} vm_instruction_error_name={} guest_rip={:#x}",
         raw_path,
         exit_reason,
-        vt_exits::reason_name(exit_reason),
+        exits::reason_name(exit_reason),
         basic_exit_reason,
         exit_qualification,
         instruction_length,
@@ -311,11 +311,11 @@ fn run_vmlaunch_probe(
     ));
 
     let launch_result = match raw_path {
-        0 if vt_exits::is_vm_entry_failure(exit_reason) => Err(VmlaunchError::VmEntryFailure {
+        0 if exits::is_vm_entry_failure(exit_reason) => Err(VmlaunchError::VmEntryFailure {
             exit_reason,
             qualification: exit_qualification,
         }),
-        0 if basic_exit_reason != vt_exits::VMCALL => {
+        0 if basic_exit_reason != exits::VMCALL => {
             Err(VmlaunchError::UnexpectedExit(basic_exit_reason))
         }
         0 if instruction_length != 3 => Err(VmlaunchError::UnexpectedInstructionLength(
@@ -359,8 +359,8 @@ fn run_vmlaunch_probe(
 }
 
 pub fn probe_vmexit_dispatcher() -> Result<VmexitLoopReport, VmexitLoopError> {
-    let vmx_basic = vt_vmxon::vmx_basic();
-    let revision_id = vt_vmxon::revision_id(vmx_basic);
+    let vmx_basic = vmxon::vmx_basic();
+    let revision_id = vmxon::revision_id(vmx_basic);
     let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
     vmcs_region.write_revision_id(revision_id);
     let vmcs_physical_address = vmcs_region.physical_address();
@@ -369,7 +369,7 @@ pub fn probe_vmexit_dispatcher() -> Result<VmexitLoopReport, VmexitLoopError> {
     let mut run_context = VmRunContext::default();
     let host_exit_rsp = host_exit_stack.prepare(&mut run_context);
 
-    let session = vt_vmxon::enter_vmx_root().map_err(VmexitLoopError::Vmxon)?;
+    let session = vmxon::enter_vmx_root().map_err(VmexitLoopError::Vmxon)?;
     let vmxon_report = session.report();
 
     runtime::phase("vmx.dispatch_probe.vmclear.start");
@@ -388,7 +388,7 @@ pub fn probe_vmexit_dispatcher() -> Result<VmexitLoopReport, VmexitLoopError> {
     }
     runtime::phase("vmx.dispatch_probe.vmptrld.ok");
 
-    let controls = vt_controls::configure()?;
+    let controls = controls::configure()?;
     runtime::info(format_args!(
         "dispatch controls pin={:#x} primary={:#x} secondary={:#x} exit={:#x} entry={:#x}",
         controls.pin_based,
@@ -399,11 +399,11 @@ pub fn probe_vmexit_dispatcher() -> Result<VmexitLoopReport, VmexitLoopError> {
     ));
     runtime::phase("vmx.dispatch_probe.controls.ok");
 
-    let host = vt_state::configure_host()?;
+    let host = state::configure_host()?;
     runtime::phase("vmx.dispatch_probe.host_state.ok");
 
     let guest_rip = dispatch_guest_address();
-    let guest = vt_state::configure_guest(guest_rip, guest_stack.top())?;
+    let guest = state::configure_guest(guest_rip, guest_stack.top())?;
     runtime::info(format_args!(
         "dispatch guest rip={:#x} rsp={:#x} cpuid_rip={:#x} vmcall_rip={:#x}",
         guest.rip,
@@ -413,13 +413,13 @@ pub fn probe_vmexit_dispatcher() -> Result<VmexitLoopReport, VmexitLoopError> {
     ));
     runtime::phase("vmx.dispatch_probe.guest_state.ok");
 
-    vt_exits::reset_diagnostics();
+    exits::reset_diagnostics();
     runtime::phase("vmx.dispatch_probe.launch.start");
     let raw_path = unsafe { matrixhv_dispatch_run_asm(&mut run_context, host_exit_rsp) };
     runtime::phase("vmx.dispatch_probe.returned_to_host");
 
     let vm_instruction_error = vmcs::vmread(VM_INSTRUCTION_ERROR).unwrap_or(u64::MAX);
-    let diagnostics = vt_exits::diagnostics();
+    let diagnostics = exits::diagnostics();
     runtime::info(format_args!(
         "dispatch return path={} vm_instruction_error={} vm_instruction_error_name={} exits={} cpuid={} vmcall={} resumes={} failure={} failure_name={}",
         raw_path,
@@ -430,7 +430,7 @@ pub fn probe_vmexit_dispatcher() -> Result<VmexitLoopReport, VmexitLoopError> {
         diagnostics.vmcall_count,
         diagnostics.resume_count,
         diagnostics.failure_code,
-        vt_exits::failure_name(diagnostics.failure_code)
+        exits::failure_name(diagnostics.failure_code)
     ));
 
     let report = VmexitLoopReport {

@@ -367,7 +367,7 @@ jz .Lresident_visual_first_exit_done
 mov qword ptr [r12 + {b_visual_first_exit_seen}], 1
 .Lresident_visual_first_exit_done:
 cmp qword ptr [r12 + {b_nested_l2_active}], 1
-je .Lresident_nested_l2_reflect
+je .Lresident_nested_l2_route
 cmp qword ptr [r12 + {b_nested_vmcs01_msr_entry_composed}], 0
 je .Lresident_dispatch_vmcs01_msr_entry_ready
 mov rax, {vm_entry_msr_load_addr}
@@ -631,6 +631,10 @@ je .Lresident_dispatch_cpuid_advance
 mov qword ptr [r12 + {b_cpuid_hypervisor_eax}], 0
 jmp .Lresident_dispatch_cpuid_advance
 .Lresident_dispatch_cpuid_hypervisor_present:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+jne .Lresident_dispatch_cpuid_evmcs
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+jne .Lresident_dispatch_cpuid_evmcs
 mov r10d, dword ptr [rsp + 0]
 cmp qword ptr [r12 + {b_telemetry_active}], 0
 je .Lresident_dispatch_cpuid_hypervisor_recorded
@@ -640,6 +644,55 @@ cmp r8d, {hyperv_features_leaf}
 jne .Lresident_dispatch_cpuid_advance
 and dword ptr [rsp + 0], {hyperv_guest_idle_access_mask}
 and dword ptr [rsp + 16], {hyperv_guest_idle_feature_mask}
+jmp .Lresident_dispatch_cpuid_advance
+.Lresident_dispatch_cpuid_evmcs:
+mov qword ptr [rsp + 0], 0
+mov qword ptr [rsp + 24], 0
+mov qword ptr [rsp + 8], 0
+mov qword ptr [rsp + 16], 0
+cmp r8d, 0x40000000
+je .Lresident_dispatch_cpuid_evmcs_vendor
+cmp r8d, 0x40000001
+je .Lresident_dispatch_cpuid_evmcs_interface
+cmp r8d, 0x40000003
+je .Lresident_dispatch_cpuid_evmcs_features
+cmp r8d, 0x40000004
+je .Lresident_dispatch_cpuid_evmcs_recommendation
+cmp r8d, 0x4000000a
+je .Lresident_dispatch_cpuid_evmcs_version
+jmp .Lresident_dispatch_cpuid_advance
+.Lresident_dispatch_cpuid_evmcs_vendor:
+mov qword ptr [rsp + 0], 0x4000000a
+mov qword ptr [rsp + 24], 0x7263694d
+mov qword ptr [rsp + 8], 0x666f736f
+mov qword ptr [rsp + 16], 0x76482074
+jmp .Lresident_dispatch_cpuid_advance
+.Lresident_dispatch_cpuid_evmcs_interface:
+mov qword ptr [rsp + 0], 0x31237648
+jmp .Lresident_dispatch_cpuid_advance
+.Lresident_dispatch_cpuid_evmcs_features:
+mov qword ptr [rsp + 0], 0x60
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_cpuid_time_features
+// VP Assist Page access is required before L1 can enable enlightened VM entries.
+or qword ptr [rsp + 0], 0x10
+.Lresident_dispatch_cpuid_time_features:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+je .Lresident_dispatch_cpuid_advance
+or qword ptr [rsp + 0], 0x202
+jmp .Lresident_dispatch_cpuid_advance
+.Lresident_dispatch_cpuid_evmcs_recommendation:
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_cpuid_evmcs_spinlocks
+mov qword ptr [rsp + 0], 0x4000
+.Lresident_dispatch_cpuid_evmcs_spinlocks:
+mov r10d, -1
+mov qword ptr [rsp + 24], r10
+jmp .Lresident_dispatch_cpuid_advance
+.Lresident_dispatch_cpuid_evmcs_version:
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_cpuid_advance
+mov qword ptr [rsp + 0], 0x101
 jmp .Lresident_dispatch_cpuid_advance
 .Lresident_dispatch_cpuid_matrixhv:
 resident_telemetry_counter inc, {b_cpuid_hypervisor_count}, {b_telemetry_active}
@@ -1234,12 +1287,31 @@ je .Lresident_dispatch_cpuid_advance
 mov qword ptr [r12 + {b_cpuid_leaf1_ecx}], r10
 .Lresident_dispatch_cpuid_advance:
 call .Lresident_advance_guest_rip
+cmp qword ptr [r12 + {b_nested_l2_active}], 1
+je .Lresident_nested_l2_resume_ept
 jmp .Lresident_dispatch_resume
 .Lresident_dispatch_rdmsr:
 resident_telemetry_counter inc, {b_rdmsr_count}, {b_telemetry_active}
 call .Lresident_msr_privilege
 jc .Lresident_dispatch_inject_gp
 mov ecx, dword ptr [rsp + 8]
+cmp ecx, {hyperv_reference_count_msr}
+je .Lresident_dispatch_rdmsr_reference_count
+cmp ecx, {hyperv_reference_tsc_msr}
+je .Lresident_dispatch_rdmsr_reference_tsc
+cmp ecx, {hyperv_guest_os_id_msr}
+je .Lresident_dispatch_rdmsr_guest_os_id
+cmp ecx, {hyperv_hypercall_msr}
+je .Lresident_dispatch_rdmsr_hypercall
+cmp ecx, {hyperv_vp_index_msr}
+je .Lresident_dispatch_rdmsr_vp_index
+cmp ecx, {hyperv_vp_assist_msr}
+je .Lresident_dispatch_rdmsr_vp_assist
+cmp ecx, 0x40000070
+jb .Lresident_dispatch_rdmsr_apic_checked
+cmp ecx, 0x40000072
+jbe .Lresident_dispatch_rdmsr_hyperv_apic
+.Lresident_dispatch_rdmsr_apic_checked:
 cmp ecx, {platform_id_msr}
 je .Lresident_dispatch_rdmsr_passthrough
 cmp ecx, {apic_base_msr}
@@ -1346,6 +1418,8 @@ cmp ecx, {sysenter_esp_msr}
 je .Lresident_dispatch_rdmsr_sysenter_esp
 cmp ecx, {sysenter_eip_msr}
 je .Lresident_dispatch_rdmsr_sysenter_eip
+cmp ecx, 0x1d9
+je .Lresident_dispatch_rdmsr_debugctl
 cmp ecx, {efer_msr}
 je .Lresident_dispatch_rdmsr_efer
 cmp ecx, {gs_base_msr}
@@ -1475,6 +1549,115 @@ mov eax, r11d
 mov qword ptr [rsp + 16], rax
 call .Lresident_advance_guest_rip
 jmp .Lresident_dispatch_resume
+.Lresident_dispatch_rdmsr_vp_assist:
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_rdmsr_passthrough
+mov r11, qword ptr [r12 + {b_nested_vp_assist_msr}]
+jmp .Lresident_dispatch_rdmsr_nested_value
+.Lresident_dispatch_rdmsr_hyperv_apic:
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_rdmsr_passthrough
+cmp ecx, 0x40000070
+je .Lresident_dispatch_inject_gp
+call .Lresident_hyperv_apic_address
+jc .Lresident_dispatch_inject_gp
+test r8, r8
+jnz .Lresident_dispatch_rdmsr_hyperv_apic_mmio
+cmp r9d, 0x300
+jne .Lresident_dispatch_rdmsr_passthrough
+call .Lresident_guarded_rdmsr
+jc .Lresident_dispatch_inject_gp
+mov r11d, eax
+shl edx, 24
+shl rdx, 32
+or r11, rdx
+jmp .Lresident_dispatch_rdmsr_nested_value
+.Lresident_dispatch_rdmsr_hyperv_apic_mmio:
+mov r11d, dword ptr [r8 + r9]
+cmp r9d, 0x300
+jne .Lresident_dispatch_rdmsr_nested_value
+mov eax, dword ptr [r8 + 0x310]
+and eax, 0xff000000
+shl rax, 32
+or r11, rax
+jmp .Lresident_dispatch_rdmsr_nested_value
+// L1 owns the local APIC. Translate the synthetic registers to its native
+// x2APIC MSRs or xAPIC MMIO registers without depending on an outer Hyper-V.
+.Lresident_hyperv_apic_address:
+mov r9d, 0xb0
+cmp ecx, 0x40000070
+je .Lresident_hyperv_apic_register_ready
+mov r9d, 0x300
+cmp ecx, 0x40000071
+je .Lresident_hyperv_apic_register_ready
+mov r9d, 0x80
+.Lresident_hyperv_apic_register_ready:
+mov ecx, {apic_base_msr}
+rdmsr
+test eax, 0x800
+jz .Lresident_hyperv_apic_disabled
+test eax, 0x400
+jz .Lresident_hyperv_apic_mmio
+xor r8d, r8d
+mov ecx, r9d
+shr ecx, 4
+add ecx, 0x800
+clc
+ret
+.Lresident_hyperv_apic_mmio:
+shl rdx, 32
+or rax, rdx
+and rax, -4096
+mov r8, rax
+clc
+ret
+.Lresident_hyperv_apic_disabled:
+stc
+ret
+.Lresident_dispatch_rdmsr_guest_os_id:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+jne .Lresident_dispatch_rdmsr_guest_os_id_value
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_rdmsr_passthrough
+.Lresident_dispatch_rdmsr_guest_os_id_value:
+mov r9, qword ptr [r12 + {b_event_context}]
+mov r11, qword ptr [r9 + {event_hyperv_guest_os_id}]
+jmp .Lresident_dispatch_rdmsr_nested_value
+.Lresident_dispatch_rdmsr_hypercall:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+jne .Lresident_dispatch_rdmsr_hypercall_value
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_rdmsr_passthrough
+.Lresident_dispatch_rdmsr_hypercall_value:
+mov r9, qword ptr [r12 + {b_event_context}]
+mov r11, qword ptr [r9 + {event_hyperv_hypercall_msr}]
+jmp .Lresident_dispatch_rdmsr_nested_value
+.Lresident_dispatch_rdmsr_vp_index:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+jne .Lresident_dispatch_rdmsr_vp_index_value
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_rdmsr_passthrough
+.Lresident_dispatch_rdmsr_vp_index_value:
+mov r11, qword ptr [r12 + {b_processor_number}]
+jmp .Lresident_dispatch_rdmsr_nested_value
+.Lresident_dispatch_rdmsr_reference_count:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+je .Lresident_dispatch_rdmsr_passthrough
+mov r9, qword ptr [r12 + {b_event_context}]
+lfence
+rdtsc
+shl rdx, 32
+or rax, rdx
+mul qword ptr [r9 + {event_hyperv_tsc_scale}]
+mov r11, rdx
+add r11, qword ptr [r9 + {event_hyperv_tsc_offset}]
+jmp .Lresident_dispatch_rdmsr_nested_value
+.Lresident_dispatch_rdmsr_reference_tsc:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+je .Lresident_dispatch_rdmsr_passthrough
+mov r9, qword ptr [r12 + {b_event_context}]
+mov r11, qword ptr [r9 + {event_hyperv_reference_tsc_msr}]
+jmp .Lresident_dispatch_rdmsr_nested_value
 .Lresident_dispatch_rdmsr_zero:
 xor r11d, r11d
 jmp .Lresident_dispatch_rdmsr_nested_value
@@ -1515,6 +1698,9 @@ mov eax, r11d
 mov qword ptr [rsp + 16], rax
 call .Lresident_advance_guest_rip
 jmp .Lresident_dispatch_resume
+.Lresident_dispatch_rdmsr_debugctl:
+mov eax, {guest_ia32_debugctl}
+jmp .Lresident_dispatch_rdmsr_vmcs_value
 .Lresident_dispatch_rdmsr_efer:
 mov rax, {guest_efer}
 vmread r11, rax
@@ -1544,6 +1730,21 @@ resident_telemetry_counter inc, {b_wrmsr_count}, {b_telemetry_active}
 call .Lresident_msr_privilege
 jc .Lresident_dispatch_inject_gp
 mov ecx, dword ptr [rsp + 8]
+cmp ecx, {hyperv_reference_count_msr}
+je .Lresident_dispatch_wrmsr_reference_count
+cmp ecx, {hyperv_reference_tsc_msr}
+je .Lresident_dispatch_wrmsr_reference_tsc
+cmp ecx, {hyperv_guest_os_id_msr}
+je .Lresident_dispatch_wrmsr_guest_os_id
+cmp ecx, {hyperv_hypercall_msr}
+je .Lresident_dispatch_wrmsr_hypercall
+cmp ecx, {hyperv_vp_assist_msr}
+je .Lresident_dispatch_wrmsr_vp_assist
+cmp ecx, 0x40000070
+jb .Lresident_dispatch_wrmsr_apic_checked
+cmp ecx, 0x40000072
+jbe .Lresident_dispatch_wrmsr_hyperv_apic
+.Lresident_dispatch_wrmsr_apic_checked:
 cmp ecx, {apic_base_msr}
 je .Lresident_dispatch_wrmsr_passthrough
 cmp ecx, {xss_msr}
@@ -1617,6 +1818,8 @@ jb .Lresident_dispatch_wrmsr_not_vmx
 cmp ecx, 0x49f
 jbe .Lresident_dispatch_inject_gp
 .Lresident_dispatch_wrmsr_not_vmx:
+cmp ecx, 0x1d9
+je .Lresident_dispatch_wrmsr_debugctl
 cmp ecx, {efer_msr}
 jne .Lresident_dispatch_wrmsr_passthrough
 mov eax, dword ptr [rsp + 0]
@@ -1645,6 +1848,32 @@ mov qword ptr [r12 + {b_last_efer_write}], r11
 .Lresident_efer_write_recorded:
 call .Lresident_advance_guest_rip
 jmp .Lresident_dispatch_resume
+.Lresident_dispatch_wrmsr_debugctl:
+// Validate model-specific DEBUGCTL bits without retaining the guest value in root.
+call .Lresident_guarded_rdmsr
+jc .Lresident_dispatch_inject_gp
+push rdx
+push rax
+mov eax, dword ptr [rsp + 16]
+mov edx, dword ptr [rsp + 32]
+call .Lresident_guarded_wrmsr
+jc .Lresident_dispatch_wrmsr_debugctl_invalid
+pop rax
+pop rdx
+call .Lresident_guarded_wrmsr
+jc .Lresident_dispatch_halt
+mov r11d, dword ptr [rsp]
+mov r10d, dword ptr [rsp + 16]
+shl r10, 32
+or r11, r10
+mov eax, {guest_ia32_debugctl}
+vmwrite rax, r11
+jna .Lresident_dispatch_vmwrite_failed
+call .Lresident_advance_guest_rip
+jmp .Lresident_dispatch_resume
+.Lresident_dispatch_wrmsr_debugctl_invalid:
+add rsp, 16
+jmp .Lresident_dispatch_inject_gp
 .Lresident_dispatch_wrmsr_fs_base:
 mov r10, {guest_fs_base}
 jmp .Lresident_dispatch_wrmsr_vmcs_value
@@ -1706,6 +1935,302 @@ call .Lresident_guarded_wrmsr
 jc .Lresident_dispatch_inject_gp
 call .Lresident_advance_guest_rip
 jmp .Lresident_dispatch_resume
+.Lresident_dispatch_wrmsr_vp_assist:
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_wrmsr_passthrough
+mov r11d, dword ptr [rsp + 0]
+mov r10d, dword ptr [rsp + 16]
+shl r10, 32
+or r11, r10
+test r11, 0xffe
+jnz .Lresident_dispatch_inject_gp
+test r11b, 1
+jz .Lresident_dispatch_wrmsr_vp_assist_store
+and r11, -4096
+test r11, r11
+jz .Lresident_dispatch_inject_gp
+call .Lresident_nested_physical_address_is_valid
+test eax, eax
+jz .Lresident_dispatch_inject_gp
+call .Lresident_hyperv_reference_page_is_writable
+test eax, eax
+jz .Lresident_dispatch_inject_gp
+// Never offer lazy EOI before root maintains the assist-page handshake.
+// Preserve the nested fields on repeated writes to the same VP Assist page.
+mov dword ptr [r11], 0
+.Lresident_dispatch_wrmsr_vp_assist_store:
+mov r11d, dword ptr [rsp + 0]
+mov r10d, dword ptr [rsp + 16]
+shl r10, 32
+or r11, r10
+mov qword ptr [r12 + {b_nested_vp_assist_msr}], r11
+call .Lresident_advance_guest_rip
+jmp .Lresident_dispatch_resume
+.Lresident_dispatch_wrmsr_hyperv_apic:
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_wrmsr_passthrough
+cmp ecx, 0x40000071
+je .Lresident_dispatch_wrmsr_hyperv_apic_valid
+cmp dword ptr [rsp + 16], 0
+jne .Lresident_dispatch_inject_gp
+cmp ecx, 0x40000070
+jne .Lresident_dispatch_wrmsr_hyperv_tpr
+cmp dword ptr [rsp], 0
+jne .Lresident_dispatch_inject_gp
+jmp .Lresident_dispatch_wrmsr_hyperv_apic_valid
+.Lresident_dispatch_wrmsr_hyperv_tpr:
+test dword ptr [rsp], -256
+jnz .Lresident_dispatch_inject_gp
+.Lresident_dispatch_wrmsr_hyperv_apic_valid:
+call .Lresident_hyperv_apic_address
+jc .Lresident_dispatch_inject_gp
+test r8, r8
+jnz .Lresident_dispatch_wrmsr_hyperv_apic_mmio
+cmp r9d, 0x300
+jne .Lresident_dispatch_wrmsr_passthrough
+mov eax, dword ptr [rsp + 0]
+mov edx, dword ptr [rsp + 16]
+shr edx, 24
+cmp edx, 0xff
+jne .Lresident_dispatch_wrmsr_hyperv_icr_native
+mov edx, -1
+.Lresident_dispatch_wrmsr_hyperv_icr_native:
+call .Lresident_guarded_wrmsr
+jc .Lresident_dispatch_inject_gp
+call .Lresident_advance_guest_rip
+jmp .Lresident_dispatch_resume
+.Lresident_dispatch_wrmsr_hyperv_apic_mmio:
+mov eax, dword ptr [rsp + 0]
+cmp r9d, 0x300
+jne .Lresident_dispatch_wrmsr_hyperv_apic_low
+mov edx, dword ptr [rsp + 16]
+mov dword ptr [r8 + 0x310], edx
+.Lresident_dispatch_wrmsr_hyperv_apic_low:
+mov dword ptr [r8 + r9], eax
+call .Lresident_advance_guest_rip
+jmp .Lresident_dispatch_resume
+.Lresident_dispatch_wrmsr_guest_os_id:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+jne .Lresident_dispatch_wrmsr_guest_os_id_value
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_wrmsr_passthrough
+.Lresident_dispatch_wrmsr_guest_os_id_value:
+mov r11d, dword ptr [rsp + 0]
+mov r10d, dword ptr [rsp + 16]
+shl r10, 32
+or r11, r10
+// OS identity and hypercall configuration belong to the partition, not the VP.
+call .Lresident_hypercall_state_lock
+mov qword ptr [r9 + {event_hyperv_guest_os_id}], r11
+test r11, r11
+jnz .Lresident_dispatch_wrmsr_guest_os_id_done
+and qword ptr [r9 + {event_hyperv_hypercall_msr}], -2
+.Lresident_dispatch_wrmsr_guest_os_id_done:
+mov qword ptr [r9 + {event_hyperv_hypercall_lock}], 0
+call .Lresident_advance_guest_rip
+jmp .Lresident_dispatch_resume
+.Lresident_dispatch_wrmsr_hypercall:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+jne .Lresident_dispatch_wrmsr_hypercall_value
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_wrmsr_passthrough
+.Lresident_dispatch_wrmsr_hypercall_value:
+call .Lresident_hypercall_state_lock
+test byte ptr [r9 + {event_hyperv_hypercall_msr}], 2
+jnz .Lresident_dispatch_wrmsr_hypercall_done
+mov r11d, dword ptr [rsp + 0]
+mov r10d, dword ptr [rsp + 16]
+shl r10, 32
+or r11, r10
+test r11, 0xffc
+jnz .Lresident_dispatch_wrmsr_hypercall_invalid
+cmp qword ptr [r9 + {event_hyperv_guest_os_id}], 0
+je .Lresident_dispatch_wrmsr_hypercall_unidentified
+test r11b, 1
+jz .Lresident_dispatch_wrmsr_hypercall_store
+// Release the partition lock before synchronizing EPT pages, then recheck it
+// before publishing because another VP can lock the MSR during validation.
+mov qword ptr [r9 + {event_hyperv_hypercall_lock}], 0
+and r11, -4096
+test r11, r11
+jz .Lresident_dispatch_inject_gp
+call .Lresident_nested_physical_address_is_valid
+test eax, eax
+jz .Lresident_dispatch_inject_gp
+call .Lresident_hyperv_reference_page_is_writable
+test eax, eax
+jz .Lresident_dispatch_inject_gp
+call .Lresident_hypercall_state_lock
+test byte ptr [r9 + {event_hyperv_hypercall_msr}], 2
+jnz .Lresident_dispatch_wrmsr_hypercall_done
+cmp qword ptr [r9 + {event_hyperv_guest_os_id}], 0
+je .Lresident_dispatch_wrmsr_hypercall_unidentified
+mov rdi, r11
+mov eax, 0xcc
+mov ecx, 4096
+cld
+rep stosb
+mov byte ptr [r11], 0xb8
+mov dword ptr [r11 + 1], 2
+mov byte ptr [r11 + 5], 0xc3
+.Lresident_dispatch_wrmsr_hypercall_store:
+mov r11d, dword ptr [rsp + 0]
+mov r10d, dword ptr [rsp + 16]
+shl r10, 32
+or r11, r10
+mov qword ptr [r9 + {event_hyperv_hypercall_msr}], r11
+.Lresident_dispatch_wrmsr_hypercall_done:
+mov qword ptr [r9 + {event_hyperv_hypercall_lock}], 0
+call .Lresident_advance_guest_rip
+jmp .Lresident_dispatch_resume
+.Lresident_dispatch_wrmsr_hypercall_unidentified:
+mov r11d, dword ptr [rsp]
+mov r10d, dword ptr [rsp + 16]
+shl r10, 32
+or r11, r10
+btr r11, 0
+mov qword ptr [r9 + {event_hyperv_hypercall_msr}], r11
+jmp .Lresident_dispatch_wrmsr_hypercall_done
+.Lresident_dispatch_wrmsr_hypercall_invalid:
+mov qword ptr [r9 + {event_hyperv_hypercall_lock}], 0
+jmp .Lresident_dispatch_inject_gp
+.Lresident_hypercall_state_lock:
+mov r9, qword ptr [r12 + {b_event_context}]
+.Lresident_hypercall_state_lock_retry:
+lock bts qword ptr [r9 + {event_hyperv_hypercall_lock}], 0
+jnc .Lresident_hypercall_state_locked
+pause
+jmp .Lresident_hypercall_state_lock_retry
+.Lresident_hypercall_state_locked:
+ret
+.Lresident_dispatch_wrmsr_reference_count:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+je .Lresident_dispatch_wrmsr_passthrough
+jmp .Lresident_dispatch_inject_gp
+.Lresident_dispatch_wrmsr_reference_tsc:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+je .Lresident_dispatch_wrmsr_passthrough
+mov r11d, dword ptr [rsp]
+mov r10d, dword ptr [rsp + 16]
+shl r10, 32
+or r11, r10
+test r11b, 1
+jz .Lresident_hyperv_reference_tsc_validated
+and r11, -4096
+test r11, r11
+jz .Lresident_dispatch_inject_gp
+call .Lresident_nested_physical_address_is_valid
+test eax, eax
+jz .Lresident_dispatch_inject_gp
+call .Lresident_hyperv_reference_page_is_writable
+test eax, eax
+jz .Lresident_dispatch_inject_gp
+.Lresident_hyperv_reference_tsc_validated:
+mov rdi, r11
+call .Lresident_nested_eptp_before_root_write
+mov r9, qword ptr [r12 + {b_event_context}]
+.Lresident_hyperv_reference_tsc_lock:
+lock bts qword ptr [r9 + {event_hyperv_reference_tsc_lock}], 0
+jnc .Lresident_hyperv_reference_tsc_locked
+pause
+jmp .Lresident_hyperv_reference_tsc_lock
+.Lresident_hyperv_reference_tsc_locked:
+mov r10, qword ptr [r9 + {event_hyperv_reference_tsc_msr}]
+test r10b, 1
+jz .Lresident_hyperv_reference_tsc_publish
+and r10, -4096
+mov r11, r10
+push r9
+call .Lresident_hyperv_guest_page_write_translation
+pop r9
+test eax, eax
+jz .Lresident_hyperv_reference_tsc_publish
+mov dword ptr [r11], 0
+.Lresident_hyperv_reference_tsc_publish:
+test byte ptr [rsp], 1
+jz .Lresident_hyperv_reference_tsc_store
+mov r11, rdi
+mov dword ptr [r11], 0
+mfence
+xor eax, eax
+mov ecx, 512
+cld
+rep stosq
+mov rax, qword ptr [r9 + {event_hyperv_tsc_scale}]
+mov qword ptr [r11 + 8], rax
+mov rax, qword ptr [r9 + {event_hyperv_tsc_offset}]
+mov qword ptr [r11 + 16], rax
+// Keep the generation across disable/re-enable and page relocation. A reader
+// spanning publication must never accept fields from an older generation.
+mov eax, dword ptr [r9 + {event_hyperv_reference_tsc_sequence}]
+inc eax
+jnz .Lresident_hyperv_reference_tsc_sequence_ready
+inc eax
+.Lresident_hyperv_reference_tsc_sequence_ready:
+mov qword ptr [r9 + {event_hyperv_reference_tsc_sequence}], rax
+mfence
+mov dword ptr [r11], eax
+.Lresident_hyperv_reference_tsc_store:
+mov r11d, dword ptr [rsp]
+mov r10d, dword ptr [rsp + 16]
+shl r10, 32
+or r11, r10
+mov qword ptr [r9 + {event_hyperv_reference_tsc_msr}], r11
+mov qword ptr [r9 + {event_hyperv_reference_tsc_lock}], 0
+call .Lresident_advance_guest_rip
+jmp .Lresident_dispatch_resume
+.Lresident_hyperv_guest_page_is_readable:
+mov edx, 1
+jmp .Lresident_hyperv_guest_page_translate
+.Lresident_hyperv_reference_page_is_writable:
+call .Lresident_nested_eptp_before_root_write
+.Lresident_hyperv_guest_page_write_translation:
+mov edx, 3
+.Lresident_hyperv_guest_page_translate:
+// R11 is an L1 GPA on entry and the mapped HPA on success. Require the requested
+// permissions at every EPT01 level before accessing a shared page from root.
+mov rax, r11
+shr rax, 48
+jnz .Lresident_hyperv_reference_page_denied
+mov r9, qword ptr [r12 + {b_cache_ept_pointer}]
+mov r8, {host_page_address_mask}
+and r9, r8
+test r9, r9
+jz .Lresident_hyperv_reference_page_denied
+mov ecx, 39
+.Lresident_hyperv_reference_page_walk:
+mov rax, r11
+shr rax, cl
+and eax, 511
+mov rax, qword ptr [r9 + rax * 8]
+mov r10d, eax
+and r10d, edx
+cmp r10d, edx
+jne .Lresident_hyperv_reference_page_denied
+cmp ecx, 12
+je .Lresident_hyperv_reference_page_allowed
+cmp ecx, 39
+je .Lresident_hyperv_reference_page_next
+test al, 0x80
+jnz .Lresident_hyperv_reference_page_allowed
+.Lresident_hyperv_reference_page_next:
+and rax, r8
+mov r9, rax
+sub ecx, 9
+jmp .Lresident_hyperv_reference_page_walk
+.Lresident_hyperv_reference_page_allowed:
+mov r10, 1
+shl r10, cl
+dec r10
+and r11, r10
+not r10
+and rax, r10
+and rax, r8
+or r11, rax
+jmp .Lresident_nested_host_page_is_mapped
+.Lresident_hyperv_reference_page_denied:
+xor eax, eax
+ret
 .Lresident_dispatch_xsetbv:
 resident_telemetry_counter inc, {b_xsetbv_count}, {b_telemetry_active}
 mov eax, {guest_cr4}
@@ -2208,6 +2733,11 @@ je .Lresident_dispatch_inject_gp_event
 mov eax, dword ptr [rsp + 8]
 mov qword ptr [r12 + {b_last_gp_msr}], rax
 .Lresident_dispatch_inject_gp_event:
+cmp qword ptr [r12 + {b_nested_l2_active}], 1
+jne .Lresident_dispatch_inject_gp_vmcs
+bt dword ptr [r12 + {b_nested_vmcs12_exception_bitmap}], 13
+jc .Lresident_nested_l2_msr_gp
+.Lresident_dispatch_inject_gp_vmcs:
 mov rax, {vm_entry_exception_error_code}
 xor r10d, r10d
 vmwrite rax, r10
@@ -2343,14 +2873,57 @@ vmwrite rax, r11
 jna .Lresident_dispatch_vmwrite_failed
 .Lresident_reload_diagnostic_done:
 ret
+.Lresident_sample_framebuffer_on_exit:
+// Nested hosts may omit the VMX timer. Sample ordinary L1 exits without telemetry.
+cmp qword ptr [r12 + {b_diagnostic_interval}], 0
+jne .Lresident_sample_framebuffer_done
+cmp qword ptr [r12 + {b_diagnostic_expired}], 0
+jne .Lresident_sample_framebuffer_done
+test byte ptr [rip + matrixhv_resident_island_log_backend], {log_framebuffer_sink}
+jz .Lresident_sample_framebuffer_done
+cmp qword ptr [r12 + {b_processor_number}], 0
+jne .Lresident_sample_framebuffer_done
+cmp qword ptr [r12 + {b_nested_l2_active}], 0
+jne .Lresident_sample_framebuffer_done
+mov r8, qword ptr [r12 + {b_event_context}]
+test r8, r8
+jz .Lresident_sample_framebuffer_done
+cmp qword ptr [r8 + {event_ebs_seen}], 0
+je .Lresident_sample_framebuffer_done
+call .Lresident_framebuffer_active
+jnc .Lresident_sample_framebuffer_expired
+cmp qword ptr [r8 + {event_visual_base}], 0
+je .Lresident_sample_framebuffer_expired
+cmp qword ptr [r8 + {event_diagnostic_halted}], 0
+jne .Lresident_sample_framebuffer_done
+rdtsc
+shl rdx, 32
+or rax, rdx
+cmp rax, qword ptr [r12 + {b_diagnostic_deadline}]
+jb .Lresident_sample_framebuffer_done
+add rax, qword ptr [r8 + {event_tsc_hz}]
+mov qword ptr [r12 + {b_diagnostic_deadline}], rax
+inc qword ptr [r12 + {b_diagnostic_samples}]
+jmp .Lresident_diagnostic_snapshot
+.Lresident_sample_framebuffer_expired:
+mov qword ptr [r12 + {b_diagnostic_expired}], 1
+.Lresident_sample_framebuffer_done:
+ret
 .Lresident_dispatch_resume:
+cmp qword ptr [r12 + {b_nested_l2_active}], 1
+jne .Lresident_dispatch_resume_l1
+call .Lresident_nested_restore_internal_msr_entry
+jmp .Lresident_nested_l2_resume
+.Lresident_dispatch_resume_l1:
 call .Lresident_watchdog_handler_returned
 call .Lresident_sync_ept_cache
 call .Lresident_deliver_pending_nmi
 call .Lresident_reload_diagnostic_timer
+call .Lresident_sample_framebuffer_on_exit
 call .Lresident_profile_exit_handler
 call .Lresident_watchdog_resuming
 call .Lresident_nested_eptp_sync_enter
+call .Lresident_nested_prepare_full_msr_entry
 pop rax
 pop rcx
 pop rdx
@@ -2384,6 +2957,7 @@ push rcx
 push rax
 mov r12, qword ptr [rsp + 120]
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
+call .Lresident_nested_restore_root_spec_ctrl
 mov rdi, qword ptr [r12 + {b_event_context}]
 test rdi, rdi
 jz .Lresident_dispatch_vmresume_error_normal

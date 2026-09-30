@@ -3,8 +3,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-const DEFAULT_FILE_TEXT: &str =
-    "MATRIXHV_CONFIG_V2\ncpuidpresence=false\nlogger=true\nVtNested=true\nVmxTest=false\n";
+const DEFAULT_FILE_TEXT: &str = "MATRIXHV_CONFIG_V2\ncpuidpresence=false\nlogger=true\nVtNested=true\nVtEvmcs=false\nVmxTest=false\n";
 
 fn main() {
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is missing");

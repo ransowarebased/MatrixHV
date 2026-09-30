@@ -4,6 +4,139 @@ mod policy {
         include!("../src/nested.rs");
     }
 
+    core::arch::global_asm!(
+        include_str!("../builds/evmcs-tests/handlers.S"),
+        b_nested_operand_linear_address = const core::mem::offset_of!(nested::NestedVmxState, operand_linear_address),
+        b_nested_current_vmcs = const core::mem::offset_of!(nested::NestedVmxState, current_vmcs),
+        b_nested_current_vmcs_is_shadow = const core::mem::offset_of!(nested::NestedVmxState, current_vmcs_is_shadow),
+        b_nested_evmcs_active = const core::mem::offset_of!(nested::NestedVmxState, evmcs_active),
+        b_nested_evmcs_enabled = const core::mem::offset_of!(nested::NestedVmxState, evmcs_enabled),
+        b_nested_vp_assist_msr = const core::mem::offset_of!(nested::NestedVmxState, vp_assist_msr),
+        b_cache_ept_pointer = const core::mem::offset_of!(nested::NestedVmxState, ept01_pointer),
+        b_nested_host_mapping_cache = const core::mem::offset_of!(nested::NestedVmxState, host_mapping_cache),
+        host_page_address_mask = const 0x000f_ffff_ffff_f000_u64,
+        b_nested_active = const core::mem::offset_of!(nested::NestedVmxState, active),
+        b_nested_last_operand = const core::mem::offset_of!(nested::NestedVmxState, last_operand),
+        b_nested_vmxon_region = const core::mem::offset_of!(nested::NestedVmxState, vmxon_region),
+        b_nested_vmx_procbased_ctls2 = const core::mem::offset_of!(nested::NestedVmxState, vmx_procbased_ctls2),
+        b_nested_vmclear_count = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, vmclear_count),
+        b_telemetry_active = const core::mem::offset_of!(nested::NestedVmxState, probe_complete),
+        guest_cs_selector = const 0x0802,
+        vmclear_invalid_physical_address_error = const nested::VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR,
+        vmclear_vmxon_pointer_error = const nested::VMCLEAR_VMXON_POINTER_ERROR,
+        vmcs12_backing_magic = const nested::VMCS12_BACKING_MAGIC,
+        vmcs12_backing_magic_offset = const nested::VMCS12_BACKING_MAGIC_OFFSET,
+        vmcs12_backing_state_offset = const nested::VMCS12_BACKING_STATE_OFFSET,
+        vmcs12_backing_qword_count = const nested::VMCS12_BACKING_QWORD_COUNT,
+        vmcs12_revision_id_offset = const core::mem::offset_of!(nested::NestedVmcs12State, revision_id),
+        vmcs12_launch_state_offset = const core::mem::offset_of!(nested::NestedVmcs12State, launch_state),
+        vmcs12_vmclear_count_offset = const core::mem::offset_of!(nested::NestedVmcs12State, vmclear_count),
+        vmcs12_launch_state_clear = const nested::VMCS12_LAUNCH_STATE_CLEAR,
+        b_nested_shadow_vmread_bitmap = const core::mem::offset_of!(nested::NestedVmxState, shadow_vmread_bitmap),
+        vmcs_shadow_read_byte_offset = const nested::VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET,
+        vmcs_shadow_read_bypass_mask = const nested::VMCS_SHADOW_READ_BYPASS_MASK,
+        b_nested_vmcs02_guest_cache_valid = const core::mem::offset_of!(nested::NestedVmxState, vmcs02_guest_cache_valid),
+        b_nested_vmcs02_control_cache_valid = const core::mem::offset_of!(nested::NestedVmxState, vmcs02_control_cache_valid),
+        b_nested_vmcs12_extended_fields = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields),
+        b_nested_vmcs12_revision_id = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, revision_id),
+        b_nested_vmcs12_guest_rip = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, guest_rip),
+        b_nested_vmcs12_guest_rsp = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, guest_rsp),
+        b_nested_vmcs12_guest_rflags = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, guest_rflags),
+        b_nested_vmcs12_host_rip = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, host_rip),
+        b_nested_vmcs12_host_rsp = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, host_rsp),
+        b_nested_vmcs12_exit_reason = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, exit_reason),
+        b_nested_vmcs12_vm_entry_intr_info = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields) + 13 * 8,
+        b_nested_vmcs12_vm_entry_controls = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields) + 11 * 8,
+        b_nested_vmcs12_vm_exit_controls = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields) + 4 * 8,
+        b_nested_l2_saved_pat = const core::mem::offset_of!(nested::NestedVmxState, l2_saved_pat),
+        b_nested_l2_saved_efer = const core::mem::offset_of!(nested::NestedVmxState, l2_saved_efer),
+        b_nested_vmx_misc = const core::mem::offset_of!(nested::NestedVmxState, vmx_misc),
+        guest_efer = const 0x2806,
+        guest_pat = const 0x2804,
+        b_nested_vmcs12_launch_state = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, launch_state),
+        b_nested_l2_entry_was_resume = const core::mem::offset_of!(nested::NestedVmxState, l2_entry_was_resume),
+        b_nested_vmcs02_launched = const core::mem::offset_of!(nested::NestedVmxState, vmcs02_launched),
+        matrixhv_status_leaf = const nested::MATRIXHV_STATUS_LEAF,
+        vmcs12_launch_state_launched = const nested::VMCS12_LAUNCH_STATE_LAUNCHED,
+        b_nested_vmcs12_exit_instruction_len = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, exit_instruction_len),
+        b_nested_vmcs12_exit_qualification = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
+            + core::mem::offset_of!(nested::NestedVmcs12State, exit_qualification),
+        evmcs_version = const nested::EVMCS_VERSION,
+        evmcs_guest_rip = const core::mem::offset_of!(nested::EnlightenedVmcs, guest_rip),
+        evmcs_guest_rsp = const core::mem::offset_of!(nested::EnlightenedVmcs, guest_rsp),
+        evmcs_guest_rflags = const core::mem::offset_of!(nested::EnlightenedVmcs, guest_rflags),
+        evmcs_host_rip = const core::mem::offset_of!(nested::EnlightenedVmcs, host_rip),
+        evmcs_host_rsp = const core::mem::offset_of!(nested::EnlightenedVmcs, host_rsp),
+        evmcs_exit_reason = const core::mem::offset_of!(nested::EnlightenedVmcs, exit_reason),
+        evmcs_exit_instruction_length = const core::mem::offset_of!(nested::EnlightenedVmcs, exit_instruction_length),
+        evmcs_exit_qualification = const core::mem::offset_of!(nested::EnlightenedVmcs, exit_qualification),
+        evmcs_clean_fields = const core::mem::offset_of!(nested::EnlightenedVmcs, clean_fields),
+        nested_extended_field_count = const nested::VMCS12_EXTENDED_FIELD_COUNT,
+        vp_assist_enlighten_vm_entry = const nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET,
+        vp_assist_current_nested_vmcs = const nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+    );
+
+    unsafe extern "C" {
+        fn test_evmcs_cpuid(leaf: u32, result: *mut u32);
+        fn test_select_evmcs(state: *mut nested::NestedVmxState) -> i32;
+        fn test_store_evmcs(state: *mut nested::NestedVmxState);
+        fn test_complete_evmcs_exit(state: *mut nested::NestedVmxState);
+        fn test_route_l2_cpuid(state: *mut nested::NestedVmxState, leaf: u64) -> u32;
+        fn test_write_vp_assist(state: *mut nested::NestedVmxState, value: u64) -> u32;
+        fn test_clear_evmcs(state: *mut nested::NestedVmxState, address: u64) -> u32;
+        fn test_capture_evmcs_entry_mode(state: *mut nested::NestedVmxState, efer: u64);
+    }
+
+    #[test]
+    fn evmcs_discovery_advertises_assist_page_and_disables_spin_hypercalls() {
+        let mut features = [0_u32; 4];
+        let mut recommendations = [0_u32; 4];
+        let mut versions = [0_u32; 4];
+        unsafe {
+            test_evmcs_cpuid(0x4000_0003, features.as_mut_ptr());
+            test_evmcs_cpuid(0x4000_0004, recommendations.as_mut_ptr());
+            test_evmcs_cpuid(0x4000_000a, versions.as_mut_ptr());
+        }
+        assert_ne!(features[0] & (1 << 4), 0);
+        assert_ne!(recommendations[0] & (1 << 14), 0);
+        assert_eq!(recommendations[1], u32::MAX);
+        assert_eq!(versions[0] & 0xffff, 0x0101);
+    }
+
+    #[test]
+    fn l2_routes_only_the_private_diagnostic_cpuid_to_root() {
+        for (reason, leaf, intercepted) in [
+            (10, nested::MATRIXHV_STATUS_LEAF, 1),
+            (10, 1, 0),
+            (10, 0x4000_0000, 0),
+            (10, 0x4000_000a, 0),
+            (18, nested::MATRIXHV_STATUS_LEAF, 0),
+            (0x8000_000a, nested::MATRIXHV_STATUS_LEAF, 0),
+        ] {
+            let mut state = nested_state(0);
+            state.vmcs12.exit_reason = reason;
+            assert_eq!(
+                unsafe { test_route_l2_cpuid(&mut state, u64::from(leaf)) },
+                intercepted
+            );
+            assert_eq!(state.vmcs02_launched, u64::from(intercepted));
+        }
+    }
+
     use nested::{
         CPUID_HYPERVISOR_PRESENT_BIT, CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, HYPERV_FEATURES_LEAF,
         HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START, HostVmxCapabilities,
@@ -36,6 +169,150 @@ mod policy {
     const VMPTRST_DESTINATION: u64 = VMCS12_OPERAND + 8;
     const VMCS01_REGION: u64 = 0x40_0000;
     const VMCS02_REGION: u64 = 0x50_0000;
+
+    #[test]
+    fn vmcs12_seed_preserves_guest_selectors_and_distinguishes_host_registers() {
+        let segments: [nested::NestedVmcs12SegmentState; 8] =
+            core::array::from_fn(|index| nested::NestedVmcs12SegmentState {
+                selector: 0x27 + index as u16 * 8,
+                base: 0x1000 * (index as u64 + 1),
+                limit: 0xffff + index as u32,
+                access_rights: 0x93 + index as u32,
+            });
+        let mut vmcs12 = NestedVmcs12State::new(1, 2, 3, 4);
+        vmcs12.extended_fields.fill(0xfeed);
+        vmcs12.guest_rip = 0x1234;
+        vmcs12.seed_core_state(nested::NestedVmcs12CoreState {
+            guest_cr0: 0x8000_0021,
+            guest_cr3: 0x1000,
+            guest_cr4: 0x20,
+            host_cr0: 0x8000_0031,
+            host_cr3: 0x2000,
+            host_cr4: 0x2020,
+            es: segments[0],
+            cs: segments[1],
+            ss: segments[2],
+            ds: segments[3],
+            fs: segments[4],
+            gs: segments[5],
+            ldtr: segments[6],
+            tr: segments[7],
+            gdtr_base: 0x9000,
+            gdtr_limit: 0x7f,
+            idtr_base: 0xa000,
+            idtr_limit: 0xfff,
+            sysenter_cs: 0x10,
+            sysenter_esp: 0xb000,
+            sysenter_eip: 0xc000,
+        });
+        let field_value = |encoding| {
+            let field = nested::VMCS12_EXTENDED_FIELDS
+                .iter()
+                .find(|field| field.encoding == encoding)
+                .unwrap();
+            vmcs12.extended_fields[field.index]
+        };
+        for (encoding, expected) in [
+            (0x2800, u64::MAX),
+            (0x6800, 0x8000_0021),
+            (0x6802, 0x1000),
+            (0x6804, 0x20),
+            (0x6c00, 0x8000_0031),
+            (0x6c02, 0x2000),
+            (0x6c04, 0x2020),
+            (0x6816, 0x9000),
+            (0x4810, 0x7f),
+            (0x6818, 0xa000),
+            (0x4812, 0xfff),
+            (0x6c0c, 0x9000),
+            (0x6c0e, 0xa000),
+            (0x4824, 0),
+            (0x4826, 0),
+            (0x6822, 0),
+            (0x482a, 0x10),
+            (0x6824, 0xb000),
+            (0x6826, 0xc000),
+            (0x4c00, 0x10),
+            (0x6c10, 0xb000),
+            (0x6c12, 0xc000),
+            (0x201a, 0xfeed),
+        ] {
+            assert_eq!(field_value(encoding), expected, "encoding={encoding:#x}");
+        }
+        for (index, segment) in segments.iter().enumerate() {
+            let offset = index as u64 * 2;
+            assert_eq!(field_value(0x0800 + offset), u64::from(segment.selector));
+            assert_eq!(field_value(0x6806 + offset), segment.base);
+            assert_eq!(field_value(0x4800 + offset), u64::from(segment.limit));
+            assert_eq!(
+                field_value(0x4814 + offset),
+                u64::from(segment.access_rights)
+            );
+            if index != 6 {
+                let host_index = if index == 7 { 6 } else { index };
+                assert_eq!(
+                    field_value(0x0c00 + host_index as u64 * 2),
+                    u64::from(segment.selector & !7),
+                );
+            }
+        }
+        assert_eq!(field_value(0x6c06), segments[4].base);
+        assert_eq!(field_value(0x6c08), segments[5].base);
+        assert_eq!(field_value(0x6c0a), segments[7].base);
+        assert_eq!(vmcs12.guest_rip, 0x1234);
+        assert_eq!(vmcs12.launch_state, VMCS12_LAUNCH_STATE_UNINITIALIZED);
+    }
+
+    #[test]
+    fn vmcs12_seed_backing_preserves_header_and_writes_unaligned_state() {
+        let mut storage = [0xa5a5_a5a5_a5a5_a5a5_u64; 513];
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                storage.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of_val(&storage),
+            )
+        };
+        let page = &mut bytes[1..4097];
+        page[..4].copy_from_slice(&0x1234_u32.to_ne_bytes());
+        let original = page.to_vec();
+        let mut vmcs12 = NestedVmcs12State::new(0x1234, 0x1000, 0x2000, 0x3000);
+        vmcs12.guest_rip = 0x4000;
+        vmcs12.vmwrite_count = 7;
+        vmcs12.extended_fields[nested::VMCS12_EXTENDED_FIELD_COUNT - 1] = 0x5000;
+        vmcs12.seed_backing(page);
+        let magic_end = VMCS12_BACKING_MAGIC_OFFSET + core::mem::size_of::<u64>();
+        let state_end = VMCS12_BACKING_STATE_OFFSET + core::mem::size_of::<NestedVmcs12State>();
+        assert_eq!(
+            &page[..VMCS12_BACKING_MAGIC_OFFSET],
+            &original[..VMCS12_BACKING_MAGIC_OFFSET]
+        );
+        assert_eq!(
+            &page[magic_end..VMCS12_BACKING_STATE_OFFSET],
+            &original[magic_end..VMCS12_BACKING_STATE_OFFSET]
+        );
+        assert_eq!(&page[state_end..], &original[state_end..]);
+        assert_eq!(
+            u64::from_ne_bytes(
+                page[VMCS12_BACKING_MAGIC_OFFSET..magic_end]
+                    .try_into()
+                    .unwrap()
+            ),
+            VMCS12_BACKING_MAGIC,
+        );
+        let backed_state = unsafe {
+            page.as_ptr()
+                .add(VMCS12_BACKING_STATE_OFFSET)
+                .cast::<NestedVmcs12State>()
+                .read_unaligned()
+        };
+        assert_eq!(backed_state, vmcs12);
+    }
+
+    #[test]
+    #[should_panic]
+    fn vmcs12_seed_backing_rejects_short_regions() {
+        NestedVmcs12State::new(1, 2, 3, 4).seed_backing(&mut [0; 4095]);
+    }
 
     fn control_capabilities(must_be_one: u32, may_be_one: u32) -> u64 {
         u64::from(must_be_one) | (u64::from(may_be_one) << 32)
@@ -88,8 +365,54 @@ mod policy {
         let mut state = nested_state(0);
 
         assert_eq!(state.l1_cr4, 0);
+        assert_eq!(state.shadow_vmcs_region, 0);
+        assert_eq!(state.shadow_vmread_bitmap, 0);
         state.l1_cr4 = 0x2660;
         assert_eq!(state.l1_cr4, 0x2660);
+    }
+
+    #[test]
+    fn native_vmcs_shadowing_requires_host_may_be_one_capability() {
+        let bit = nested::VMX_SECONDARY_VMCS_SHADOWING;
+        assert!(!nested::native_vmcs_shadowing_available(
+            control_capabilities(0, nested::VMX_SECONDARY_ENABLE_EPT,)
+        ));
+        assert!(!nested::native_vmcs_shadowing_available(
+            control_capabilities(bit, 0)
+        ));
+        assert!(nested::native_vmcs_shadowing_available(
+            control_capabilities(0, bit)
+        ));
+
+        let guest = NestedVmxCapabilities::from_host(host_vmx_capabilities());
+        assert_eq!((guest.vmx_procbased_ctls2 >> 32) as u32 & bit, bit);
+        let mut host = host_vmx_capabilities();
+        host.procbased_ctls2 &= !(u64::from(bit) << 32);
+        let guest = NestedVmxCapabilities::from_host(host);
+        assert_eq!((guest.vmx_procbased_ctls2 >> 32) as u32 & bit, 0);
+        for supported in [false, true] {
+            let mut host = host_vmx_capabilities();
+            host.misc = (host.misc & !(1 << 29)) | (u64::from(supported) << 29);
+            let guest = NestedVmxCapabilities::from_host(host);
+            assert_eq!(guest.vmx_misc & (1 << 29), host.misc & (1 << 29));
+        }
+    }
+
+    #[test]
+    fn vmcs_shadow_read_bitmap_bypasses_only_selected_host_fields() {
+        let byte = nested::VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET;
+        let bypass = nested::VMCS_SHADOW_READ_BYPASS_MASK;
+        assert!(byte < 4096);
+        assert_eq!(byte, (nested::VMCS_FIELD_HOST_RIP >> 3) as usize);
+        assert_eq!(bypass, 0x50);
+        assert_eq!(nested::VMCS_SHADOW_READ_TRAP_MASK, !bypass);
+        let mut bitmap = [0xff_u8; 4096];
+        bitmap[byte] &= nested::VMCS_SHADOW_READ_TRAP_MASK;
+        assert_eq!(bitmap[byte], 0xaf);
+        assert_eq!(bitmap[byte - 1], 0xff);
+        assert_eq!(bitmap[byte + 1], 0xff);
+        bitmap[byte] |= bypass;
+        assert_eq!(bitmap[byte], 0xff);
     }
 
     #[test]
@@ -252,6 +575,7 @@ mod policy {
                 | nested::VMX_SECONDARY_RDRAND_EXITING
                 | nested::VMX_SECONDARY_ENABLE_INVPCID
                 | nested::VMX_SECONDARY_ENABLE_VM_FUNCTIONS
+                | nested::VMX_SECONDARY_VMCS_SHADOWING
                 | nested::VMX_SECONDARY_ENABLE_XSAVES
                 | nested::VMX_SECONDARY_MODE_BASED_EXECUTE,
         );
@@ -262,7 +586,8 @@ mod policy {
         assert_eq!(capabilities.vmx_entry_ctls, legacy_entry_control);
         assert_eq!(
             capabilities.vmx_misc,
-            (host.misc & !((0x1ff_u64 << 16) | (1 << 29))) | (nested::VMX_CR3_TARGET_COUNT << 16)
+            (host.misc & !((0x1ff_u64 << 16) | (7_u64 << 25)))
+                | (nested::VMX_CR3_TARGET_COUNT << 16)
         );
         assert_eq!(capabilities.vmx_cr0_fixed0, host.cr0_fixed0);
         assert_eq!(capabilities.vmx_cr0_fixed1, host.cr0_fixed1);
@@ -933,6 +1258,625 @@ mod policy {
             0
         );
     }
+    use core::mem::{offset_of, size_of};
+    use nested::EnlightenedVmcs;
+
+    fn field_map() -> Vec<(usize, u16)> {
+        let assembly = include_str!("../src/asm/nested.S");
+        let start = assembly.find(".Lresident_evmcs_field_map:").unwrap();
+        let end = assembly[start..]
+            .find(".Lresident_vmcs12_field_index_table:")
+            .unwrap()
+            + start;
+        assembly[start..end]
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(".short "))
+            .map(|line| {
+                let (offset, flags) = line.split_once(',').unwrap();
+                (
+                    offset.trim().parse().unwrap(),
+                    flags.trim().parse().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn version_one_layout_and_field_map_match() {
+        let fields = field_map();
+        assert_eq!(nested::EVMCS_VERSION, 1);
+        assert_eq!(nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET, 40);
+        assert_eq!(nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET, 48);
+        assert_eq!(size_of::<EnlightenedVmcs>(), 1024);
+        assert_eq!(fields.len(), nested::VMCS12_EXTENDED_FIELD_COUNT);
+        for (offset, flags) in fields.iter().copied() {
+            if flags != 0 {
+                assert!([2, 4, 8].contains(&(flags & 15)));
+                assert!(offset + usize::from(flags & 15) <= 1024);
+            }
+        }
+        assert_eq!(fields[0], (offset_of!(EnlightenedVmcs, vpid), 2));
+        assert_eq!(fields[16], (offset_of!(EnlightenedVmcs, ept_root), 8));
+        assert_eq!(fields[18], (offset_of!(EnlightenedVmcs, msr_bitmap), 8));
+        assert_eq!(
+            fields[11],
+            (offset_of!(EnlightenedVmcs, entry_controls), 0x84)
+        );
+        assert_eq!(fields[25], (offset_of!(EnlightenedVmcs, guest_pat), 0x88));
+        assert_eq!(fields[29], (offset_of!(EnlightenedVmcs, guest_cr0), 0x88));
+        assert_eq!(
+            fields[35],
+            (offset_of!(EnlightenedVmcs, guest_es_selector), 0x82)
+        );
+        assert_eq!(
+            fields[43],
+            (offset_of!(EnlightenedVmcs, host_es_selector), 2)
+        );
+        assert_eq!(
+            fields[50],
+            (offset_of!(EnlightenedVmcs, guest_es_base), 0x88)
+        );
+        assert_eq!(
+            fields[65],
+            (offset_of!(EnlightenedVmcs, guest_es_limit), 0x84)
+        );
+        assert_eq!(
+            fields[75],
+            (offset_of!(EnlightenedVmcs, guest_es_attributes), 0x84)
+        );
+        assert_eq!(
+            fields[83],
+            (offset_of!(EnlightenedVmcs, guest_interruptibility), 0x84)
+        );
+        assert_eq!(
+            fields[95],
+            (offset_of!(EnlightenedVmcs, xss_exiting_bitmap), 8)
+        );
+        assert_eq!(fields[102], (0, 0));
+        assert_eq!(
+            fields[106],
+            (offset_of!(EnlightenedVmcs, exit_interruption_info), 0x44)
+        );
+        assert_eq!(
+            fields[110],
+            (offset_of!(EnlightenedVmcs, exit_ept_fault_gpa), 0x48)
+        );
+        assert_eq!(
+            fields[111],
+            (offset_of!(EnlightenedVmcs, guest_pdpte_0), 0x88)
+        );
+        assert_eq!(
+            fields[116],
+            (offset_of!(EnlightenedVmcs, guest_linear_address), 0x48)
+        );
+        assert_eq!(fields[117], (0, 0));
+        assert_eq!(fields[118], (0, 0));
+        assert_eq!(fields[119], (0, 0));
+    }
+
+    #[repr(align(4096))]
+    struct EvmcsTestPage([u8; 4096]);
+
+    fn page_u64(page: &EvmcsTestPage, offset: usize) -> u64 {
+        u64::from_le_bytes(page.0[offset..offset + 8].try_into().unwrap())
+    }
+
+    fn write_page_u64(page: &mut EvmcsTestPage, offset: usize, value: u64) {
+        page.0[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    struct EvmcsTestEpt {
+        tables: Vec<Box<EvmcsTestPage>>,
+    }
+
+    impl EvmcsTestEpt {
+        fn new(state: &mut NestedVmxState) -> Self {
+            let tables = vec![Box::new(EvmcsTestPage([0; 4096]))];
+            state.ept01_pointer = tables[0].0.as_ptr() as u64;
+            Self { tables }
+        }
+
+        fn map(&mut self, guest_address: u64, host_address: u64, permissions: u64) {
+            self.set_entry(guest_address, 12, host_address | permissions);
+        }
+
+        fn set_entry(&mut self, guest_address: u64, leaf_shift: u32, value: u64) {
+            let mut table_index = 0;
+            for shift in [39, 30, 21, 12] {
+                let offset = ((guest_address >> shift) & 511) as usize * 8;
+                if shift == leaf_shift {
+                    write_page_u64(&mut self.tables[table_index], offset, value);
+                    return;
+                }
+                let entry = page_u64(&self.tables[table_index], offset);
+                table_index = if entry == 0 {
+                    let next = Box::new(EvmcsTestPage([0; 4096]));
+                    let address = next.0.as_ptr() as u64;
+                    write_page_u64(&mut self.tables[table_index], offset, address | 7);
+                    self.tables.push(next);
+                    self.tables.len() - 1
+                } else {
+                    self.tables
+                        .iter()
+                        .position(|page| page.0.as_ptr() as u64 == entry & !4095)
+                        .unwrap()
+                };
+            }
+            panic!("invalid EPT leaf shift {leaf_shift}");
+        }
+
+        fn entry(&self, guest_address: u64, leaf_shift: u32) -> u64 {
+            let mut table_index = 0;
+            for shift in [39, 30, 21, 12] {
+                let offset = ((guest_address >> shift) & 511) as usize * 8;
+                let entry = page_u64(&self.tables[table_index], offset);
+                if shift == leaf_shift {
+                    return entry;
+                }
+                table_index = self
+                    .tables
+                    .iter()
+                    .position(|page| page.0.as_ptr() as u64 == entry & !4095)
+                    .unwrap();
+            }
+            panic!("invalid EPT leaf shift {leaf_shift}");
+        }
+    }
+
+    #[test]
+    fn vp_assist_rejects_ept_denials_without_writing_root_memory() {
+        for (shift, permissions) in [
+            (12, 0),
+            (12, 1),
+            (12, 2),
+            (12, 5),
+            (39, 1),
+            (30, 1),
+            (21, 1),
+        ] {
+            let page = Box::new(EvmcsTestPage([0xa5; 4096]));
+            let address = page.0.as_ptr() as u64;
+            let mut state = nested_state(0);
+            state.evmcs_enabled = 1;
+            let mut ept = EvmcsTestEpt::new(&mut state);
+            ept.map(address, address, 7);
+            let entry = ept.entry(address, shift);
+            ept.set_entry(address, shift, entry & !7 | permissions);
+            assert_eq!(unsafe { test_write_vp_assist(&mut state, address | 1) }, 0);
+            assert_eq!(state.vp_assist_msr, 0);
+            assert_eq!(page.0, [0xa5; 4096]);
+        }
+    }
+
+    #[test]
+    fn vp_assist_writes_the_translated_page_and_preserves_nested_fields() {
+        let decoy = Box::new(EvmcsTestPage([0x5a; 4096]));
+        let page = Box::new(EvmcsTestPage([0xa5; 4096]));
+        let guest_address = decoy.0.as_ptr() as u64;
+        let host_address = page.0.as_ptr() as u64;
+        let mut state = nested_state(0);
+        state.evmcs_enabled = 1;
+        let mut ept = EvmcsTestEpt::new(&mut state);
+        ept.map(guest_address, host_address, 7);
+        for _ in 0..2 {
+            assert_eq!(
+                unsafe { test_write_vp_assist(&mut state, guest_address | 1) },
+                1
+            );
+            assert_eq!(state.vp_assist_msr, guest_address | 1);
+            assert_eq!(&page.0[..4], &[0; 4]);
+            assert!(page.0[4..].iter().all(|byte| *byte == 0xa5));
+            assert_eq!(decoy.0, [0x5a; 4096]);
+        }
+    }
+
+    #[test]
+    fn evmcs_selection_checks_assist_read_access_and_state_write_access() {
+        for (assist_permissions, vmcs_permissions) in
+            [(0, 7), (2, 7), (4, 7), (7, 0), (7, 1), (7, 2), (7, 5)]
+        {
+            let mut assist = Box::new(EvmcsTestPage([0; 4096]));
+            let mut evmcs = Box::new(EvmcsTestPage([0; 4096]));
+            let mut state = nested_state(0);
+            state.evmcs_enabled = 1;
+            state.vp_assist_msr = assist.0.as_ptr() as u64 | 1;
+            let address = evmcs.0.as_ptr() as u64;
+            write_page_u64(&mut assist, nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET, 1);
+            write_page_u64(
+                &mut assist,
+                nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+                address,
+            );
+            evmcs.0[..4].copy_from_slice(&nested::EVMCS_VERSION.to_le_bytes());
+            let mut ept = EvmcsTestEpt::new(&mut state);
+            ept.map(
+                state.vp_assist_msr & !4095,
+                state.vp_assist_msr & !4095,
+                assist_permissions,
+            );
+            ept.map(address, address, vmcs_permissions);
+            assert_eq!(unsafe { test_select_evmcs(&mut state) }, -1);
+            assert_eq!(state.current_vmcs, INVALID_VMCS_POINTER);
+            assert_eq!(state.evmcs_active, 0);
+            assert_eq!(
+                page_u64(&evmcs, offset_of!(EnlightenedVmcs, clean_fields)),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn evmcs_selection_and_writeback_follow_non_identity_ept01_mappings() {
+        let assist_decoy = Box::new(EvmcsTestPage([0x5a; 4096]));
+        let vmcs_decoy = Box::new(EvmcsTestPage([0xa5; 4096]));
+        let mut assist = Box::new(EvmcsTestPage([0; 4096]));
+        let mut evmcs = Box::new(EvmcsTestPage([0; 4096]));
+        let mut state = nested_state(0);
+        let guest_address = vmcs_decoy.0.as_ptr() as u64;
+        state.evmcs_enabled = 1;
+        state.vp_assist_msr = assist_decoy.0.as_ptr() as u64 | 1;
+        write_page_u64(&mut assist, nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET, 1);
+        write_page_u64(
+            &mut assist,
+            nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+            guest_address,
+        );
+        evmcs.0[..4].copy_from_slice(&nested::EVMCS_VERSION.to_le_bytes());
+        write_page_u64(&mut evmcs, offset_of!(EnlightenedVmcs, guest_rip), 0x1234);
+        let mut ept = EvmcsTestEpt::new(&mut state);
+        ept.map(state.vp_assist_msr & !4095, assist.0.as_ptr() as u64, 1);
+        ept.map(guest_address, evmcs.0.as_ptr() as u64, 7);
+        assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
+        assert_eq!(state.current_vmcs, guest_address);
+        assert_eq!(state.vmcs12.guest_rip, 0x1234);
+        state.vmcs12.guest_rip = 0x5678;
+        unsafe { test_store_evmcs(&mut state) };
+        assert_eq!(
+            page_u64(&evmcs, offset_of!(EnlightenedVmcs, guest_rip)),
+            0x5678
+        );
+        assert_eq!(assist_decoy.0, [0x5a; 4096]);
+        assert_eq!(vmcs_decoy.0, [0xa5; 4096]);
+        let before = evmcs.0;
+        ept.map(guest_address, evmcs.0.as_ptr() as u64, 1);
+        state.vmcs12.guest_rip = 0xabcd;
+        unsafe { test_store_evmcs(&mut state) };
+        assert_eq!(evmcs.0, before);
+        assert_eq!(unsafe { test_select_evmcs(&mut state) }, -1);
+        ept.map(guest_address, evmcs.0.as_ptr() as u64, 7);
+        state.host_mapping_cache[0] = evmcs.0.as_ptr() as u64;
+        assert_eq!(unsafe { test_select_evmcs(&mut state) }, -1);
+    }
+
+    #[test]
+    fn vmclear_preserves_non_current_evmcs_pages_and_the_current_selection() {
+        for use_revision in [false, true] {
+            let mut assist = Box::new(EvmcsTestPage([0; 4096]));
+            let mut first = Box::new(EvmcsTestPage([0xa5; 4096]));
+            let mut second = Box::new(EvmcsTestPage([0; 4096]));
+            let first_address = first.0.as_ptr() as u64;
+            let second_address = second.0.as_ptr() as u64;
+            let mut state = nested_state(0);
+            state.active = 1;
+            state.evmcs_enabled = 1;
+            state.vp_assist_msr = assist.0.as_ptr() as u64 | 1;
+            let version = if use_revision {
+                state.vmcs12.revision_id as u32
+            } else {
+                nested::EVMCS_VERSION
+            };
+            first.0[..4].copy_from_slice(&version.to_le_bytes());
+            second.0[..4].copy_from_slice(&nested::EVMCS_VERSION.to_le_bytes());
+            write_page_u64(&mut assist, nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET, 1);
+            write_page_u64(
+                &mut assist,
+                nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+                second_address,
+            );
+            let mut ept = EvmcsTestEpt::new(&mut state);
+            ept.map(state.vp_assist_msr & !4095, state.vp_assist_msr & !4095, 7);
+            ept.map(first_address, first_address, 7);
+            ept.map(second_address, second_address, 7);
+            assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
+            state.vmcs02_launched = 1;
+            state.vmcs02_guest_cache_valid = 1;
+            state.vmcs02_control_cache_valid = [1, 1];
+            let before = first.0;
+            assert_eq!(unsafe { test_clear_evmcs(&mut state, first_address) }, 1);
+            assert_eq!(first.0, before);
+            assert_eq!(state.current_vmcs, second_address);
+            assert_eq!(state.evmcs_active, 1);
+            assert_eq!(state.vmcs02_launched, 1);
+            assert_eq!(state.vmcs02_guest_cache_valid, 1);
+            assert_eq!(state.vmcs02_control_cache_valid, [1, 1]);
+            if !use_revision {
+                state.vp_assist_msr = 0;
+                assert_eq!(unsafe { test_clear_evmcs(&mut state, first_address) }, 1);
+                assert_eq!(first.0, before);
+            }
+            assert_eq!(unsafe { test_clear_evmcs(&mut state, second_address) }, 1);
+            assert_eq!(state.current_vmcs, INVALID_VMCS_POINTER);
+            assert_eq!(state.evmcs_active, 0);
+            assert_eq!(state.vmcs02_launched, 0);
+            assert_eq!(state.vmcs02_guest_cache_valid, 0);
+            assert_eq!(state.vmcs02_control_cache_valid, [0, 0]);
+        }
+    }
+
+    #[test]
+    fn ordinary_vmclear_requires_ept_write_access_at_every_level() {
+        for deny_shift in [39, 30, 21, 12] {
+            let mut page = Box::new(EvmcsTestPage([0x5a; 4096]));
+            let address = page.0.as_mut_ptr() as u64;
+            let before = page.0;
+            let mut state = nested_state(0);
+            state.active = 1;
+            state.current_vmcs = address;
+            state.vmcs02_launched = 1;
+            let mut ept = EvmcsTestEpt::new(&mut state);
+            ept.map(address, address, 7);
+            let entry = ept.entry(address, deny_shift);
+            ept.set_entry(address, deny_shift, entry & !2);
+            assert_eq!(unsafe { test_clear_evmcs(&mut state, address) }, 0);
+            assert_eq!(page.0, before);
+            assert_eq!(state.current_vmcs, address);
+            assert_eq!(state.vmcs02_launched, 1);
+        }
+    }
+
+    #[test]
+    fn ordinary_vmclear_writes_the_hpa_and_compares_the_current_gpa() {
+        for current in [false, true] {
+            let mut page = Box::new(EvmcsTestPage([0; 4096]));
+            let address = page.0.as_mut_ptr() as u64;
+            let guest_address = 0x1234_0000;
+            let mut state = nested_state(0);
+            state.active = 1;
+            if current {
+                state.current_vmcs = guest_address;
+            }
+            let mut ept = EvmcsTestEpt::new(&mut state);
+            ept.map(guest_address, address, 7);
+            assert_eq!(unsafe { test_clear_evmcs(&mut state, guest_address) }, 1);
+            assert_eq!(
+                page_u64(&page, VMCS12_BACKING_MAGIC_OFFSET),
+                VMCS12_BACKING_MAGIC
+            );
+            assert_eq!(
+                page_u64(
+                    &page,
+                    VMCS12_BACKING_STATE_OFFSET + offset_of!(NestedVmcs12State, launch_state)
+                ),
+                VMCS12_LAUNCH_STATE_CLEAR
+            );
+            assert_eq!(state.current_vmcs, INVALID_VMCS_POINTER);
+        }
+    }
+
+    #[test]
+    fn nested_misc_advertises_exactly_512_msr_entries_for_every_host_limit() {
+        for limit in 0..8 {
+            let mut host = host_vmx_capabilities();
+            host.misc = (host.misc & !(7 << 25)) | (limit << 25);
+            let guest = NestedVmxCapabilities::from_host(host);
+            assert_eq!(512 * (((guest.vmx_misc >> 25) & 7) + 1), 512);
+            assert_eq!(guest.host_misc, host.misc);
+        }
+    }
+
+    #[test]
+    fn vmclear_keeps_the_ordinary_backing_layout_outside_enlightened_mode() {
+        let mut page = Box::new(EvmcsTestPage([0; 4096]));
+        let address = page.0.as_ptr() as u64;
+        let mut state = nested_state(0);
+        state.active = 1;
+        state.evmcs_enabled = 1;
+        page.0[..4].copy_from_slice(&(state.vmcs12.revision_id as u32).to_le_bytes());
+        let mut ept = EvmcsTestEpt::new(&mut state);
+        ept.map(address, address, 7);
+        assert_eq!(unsafe { test_clear_evmcs(&mut state, address) }, 1);
+        assert_eq!(
+            page_u64(&page, VMCS12_BACKING_MAGIC_OFFSET),
+            VMCS12_BACKING_MAGIC
+        );
+    }
+
+    #[test]
+    fn evmcs_writeback_preserves_ia32e_entry_mode_across_selection() {
+        let mut assist = Box::new(EvmcsTestPage([0; 4096]));
+        let mut evmcs = Box::new(EvmcsTestPage([0; 4096]));
+        let address = evmcs.0.as_ptr() as u64;
+        let mut state = nested_state(0);
+        state.evmcs_enabled = 1;
+        state.vp_assist_msr = assist.0.as_ptr() as u64 | 1;
+        write_page_u64(&mut assist, nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET, 1);
+        write_page_u64(
+            &mut assist,
+            nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+            address,
+        );
+        evmcs.0[..4].copy_from_slice(&nested::EVMCS_VERSION.to_le_bytes());
+        let mut ept = EvmcsTestEpt::new(&mut state);
+        ept.map(state.vp_assist_msr & !4095, state.vp_assist_msr & !4095, 7);
+        ept.map(address, address, 7);
+        assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
+        state.vmcs12.extended_fields[11] = 0x4004;
+        state.vmx_misc |= 1 << 5;
+        for (efer, expected) in [(0x500, 0x4204), (0x100, 0x4004), (0x500, 0x4204)] {
+            unsafe { test_capture_evmcs_entry_mode(&mut state, efer) };
+            assert_eq!(state.vmcs12.extended_fields[11], expected);
+            unsafe { test_store_evmcs(&mut state) };
+            assert_eq!(
+                page_u64(&evmcs, offset_of!(EnlightenedVmcs, entry_controls)) as u32,
+                expected as u32
+            );
+            assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
+            assert_eq!(state.vmcs12.extended_fields[11], expected);
+        }
+    }
+
+    #[test]
+    fn resident_evmcs_handlers_transfer_entry_and_exit_state() {
+        let mut assist = Box::new(EvmcsTestPage([0; 4096]));
+        let mut evmcs = Box::new(EvmcsTestPage([0; 4096]));
+        let mut vmread_bitmap = Box::new(EvmcsTestPage([0xff; 4096]));
+        let mut state = nested_state(0);
+        let evmcs_address = evmcs.0.as_ptr() as u64;
+        let shadow_byte = nested::VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET;
+        vmread_bitmap.0[shadow_byte] = nested::VMCS_SHADOW_READ_TRAP_MASK;
+        state.shadow_vmread_bitmap = vmread_bitmap.0.as_ptr() as u64;
+        state.evmcs_enabled = 1;
+        state.vp_assist_msr = assist.0.as_ptr() as u64 | 1;
+        let mut ept = EvmcsTestEpt::new(&mut state);
+        ept.map(state.vp_assist_msr & !4095, state.vp_assist_msr & !4095, 7);
+        ept.map(evmcs_address, evmcs_address, 7);
+        state.vmcs02_guest_cache_valid = 1;
+        state.vmcs02_control_cache_valid = [1, 1];
+        assist.0[nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET..][..4]
+            .copy_from_slice(&1u32.to_le_bytes());
+        write_page_u64(
+            &mut assist,
+            nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+            evmcs_address,
+        );
+        evmcs.0[..4].copy_from_slice(&nested::EVMCS_VERSION.to_le_bytes());
+        write_page_u64(
+            &mut evmcs,
+            offset_of!(EnlightenedVmcs, ept_root),
+            0x4560_001e,
+        );
+        write_page_u64(
+            &mut evmcs,
+            offset_of!(EnlightenedVmcs, guest_cr0),
+            0x8000_0031,
+        );
+        write_page_u64(
+            &mut evmcs,
+            offset_of!(EnlightenedVmcs, guest_rip),
+            0x1234_5678,
+        );
+        write_page_u64(
+            &mut evmcs,
+            offset_of!(EnlightenedVmcs, guest_rsp),
+            0x1234_f000,
+        );
+        write_page_u64(&mut evmcs, offset_of!(EnlightenedVmcs, guest_rflags), 0x202);
+        write_page_u64(
+            &mut evmcs,
+            offset_of!(EnlightenedVmcs, host_rip),
+            0xabcd_1000,
+        );
+        write_page_u64(
+            &mut evmcs,
+            offset_of!(EnlightenedVmcs, host_rsp),
+            0xabcd_f000,
+        );
+        evmcs.0[offset_of!(EnlightenedVmcs, guest_es_selector)..][..2]
+            .copy_from_slice(&0x28u16.to_le_bytes());
+
+        assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
+        assert_eq!(vmread_bitmap.0[shadow_byte], 0xff);
+        assert_eq!(state.evmcs_active, 1);
+        assert_eq!(state.current_vmcs, evmcs_address);
+        assert_eq!(state.vmcs12.extended_fields[16], 0x4560_001e);
+        assert_eq!(state.vmcs12.extended_fields[29], 0x8000_0031);
+        assert_eq!(state.vmcs12.extended_fields[35], 0x28);
+        assert_eq!(state.vmcs12.guest_rip, 0x1234_5678);
+        assert_eq!(state.vmcs12.guest_rsp, 0x1234_f000);
+        assert_eq!(state.vmcs12.guest_rflags, 0x202);
+        assert_eq!(state.vmcs12.host_rip, 0xabcd_1000);
+        assert_eq!(state.vmcs12.host_rsp, 0xabcd_f000);
+        assert_eq!(state.vmcs02_guest_cache_valid, 0);
+        assert_eq!(state.vmcs02_control_cache_valid, [0, 0]);
+
+        state.vmcs12.guest_rip = 0x1234_5680;
+        state.vmcs12.extended_fields[29] = 0x8000_0033;
+        state.vmcs12.extended_fields[106] = 0x8000_0202;
+        state.vmcs12.exit_reason = 18;
+        state.vmcs12.exit_instruction_len = 3;
+        state.vmcs12.exit_qualification = 0x42;
+        evmcs.0[offset_of!(EnlightenedVmcs, clean_fields)..][..4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        unsafe { test_store_evmcs(&mut state) };
+        assert_eq!(
+            page_u64(&evmcs, offset_of!(EnlightenedVmcs, guest_rip)),
+            0x1234_5680
+        );
+        assert_eq!(
+            page_u64(&evmcs, offset_of!(EnlightenedVmcs, guest_cr0)),
+            0x8000_0033
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                evmcs.0[offset_of!(EnlightenedVmcs, exit_interruption_info)..][..4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x8000_0202
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                evmcs.0[offset_of!(EnlightenedVmcs, exit_reason)..][..4]
+                    .try_into()
+                    .unwrap()
+            ),
+            18
+        );
+        assert_eq!(
+            page_u64(&evmcs, offset_of!(EnlightenedVmcs, exit_qualification)),
+            0x42
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                evmcs.0[offset_of!(EnlightenedVmcs, clean_fields)..][..4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0
+        );
+
+        evmcs.0[..4].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(unsafe { test_select_evmcs(&mut state) }, -1);
+        evmcs.0[..4].copy_from_slice(&(state.vmcs12.revision_id as u32).to_le_bytes());
+        assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
+        assist.0[nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET..][..4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(unsafe { test_select_evmcs(&mut state) }, 0);
+        assert_eq!(state.evmcs_active, 0);
+        assert_eq!(state.current_vmcs, nested::INVALID_VMCS_POINTER);
+    }
+
+    #[test]
+    fn evmcs_exit_consumes_delivered_event_but_preserves_failed_entry() {
+        for (exit_reason, expected) in [(18, 0x40), (0x8000_0021, 0x8000_0040)] {
+            let mut evmcs = Box::new(EvmcsTestPage([0; 4096]));
+            let mut assist = Box::new(EvmcsTestPage([0; 4096]));
+            let mut state = nested_state(0);
+            state.evmcs_enabled = 1;
+            state.evmcs_active = 1;
+            state.current_vmcs = evmcs.0.as_ptr() as u64;
+            state.vp_assist_msr = assist.0.as_ptr() as u64 | 1;
+            let mut ept = EvmcsTestEpt::new(&mut state);
+            ept.map(state.vp_assist_msr & !4095, state.vp_assist_msr & !4095, 7);
+            ept.map(state.current_vmcs, state.current_vmcs, 7);
+            assist.0[nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET..][..4]
+                .copy_from_slice(&1u32.to_le_bytes());
+            write_page_u64(
+                &mut assist,
+                nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+                state.current_vmcs,
+            );
+            evmcs.0[..4].copy_from_slice(&nested::EVMCS_VERSION.to_le_bytes());
+            state.vmcs12.exit_reason = exit_reason;
+            state.vmcs12.extended_fields[13] = 0x8000_0040;
+            state.vmcs12.guest_rflags = 0x46;
+            unsafe { test_complete_evmcs_exit(&mut state) };
+            assert_eq!(state.vmcs12.extended_fields[13], expected);
+            assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
+            assert_eq!(state.vmcs12.extended_fields[13], expected);
+            assert_eq!(state.vmcs12.guest_rflags, 0x46);
+        }
+    }
 }
 
 #[cfg(test_harness = "ept")]
@@ -949,7 +1893,8 @@ mod ept {
         vpid: u64,
         merged_secondary: u64,
         xss_bitmap: u64,
-        hardware: [u64; 3],
+        hardware: [u64; 5],
+        extended_fields: [u64; 122],
     }
 
     core::arch::global_asm!(
@@ -972,6 +1917,7 @@ mod ept {
         b_nested_vmcs02_last_vpid = const std::mem::offset_of!(InterceptContext, vpid),
         b_nested_last_merged_secondary_controls = const std::mem::offset_of!(InterceptContext, merged_secondary),
         test_hardware = const std::mem::offset_of!(InterceptContext, hardware),
+        b_nested_vmcs12_extended_fields = const std::mem::offset_of!(InterceptContext, extended_fields),
     );
 
     unsafe extern "win64" {
@@ -994,18 +1940,77 @@ mod ept {
             vpid: 0,
             merged_secondary: 0,
             xss_bitmap: 0,
-            hardware: [0; 3],
+            hardware: [0; 5],
+            extended_fields: [0; 122],
         };
         merge_test_intercepts(&mut context);
         assert_eq!(
-            context.hardware,
+            context.hardware[..3],
             [(1 << 31) | (1 << 28) | (1 << 27), (1 << 1) | (1 << 6), 0]
         );
         assert_eq!(context.merged_secondary, context.hardware[1]);
         context.l1_primary = 0;
         context.l1_secondary = 0;
         merge_test_intercepts(&mut context);
-        assert_eq!(context.hardware, [1 << 28, 1 << 1, 0]);
+        assert_eq!(context.hardware[..3], [1 << 28, 1 << 1, 0]);
+    }
+
+    #[test]
+    fn instruction_enables_follow_l1_and_intercepts_keep_l0_requirements() {
+        let enables = (1 << 3) | (1 << 12) | (1 << 20);
+        let intercepts = (1 << 2) | (1 << 6) | (1 << 11);
+        let mut context = InterceptContext {
+            l0_primary: 1 << 31,
+            l1_primary: 1 << 31,
+            l0_secondary: 2 | enables | intercepts,
+            l1_secondary: 0,
+            vpid: 0,
+            merged_secondary: 0,
+            xss_bitmap: 0,
+            hardware: [0; 5],
+            extended_fields: [0; 122],
+        };
+        for requested in [0, 1 << 3, 1 << 12, 1 << 20, enables] {
+            context.l1_secondary = requested;
+            merge_test_intercepts(&mut context);
+            assert_eq!(context.hardware[1] & enables, requested);
+            assert_eq!(context.hardware[1] & intercepts, intercepts);
+            assert_ne!(context.hardware[1] & 2, 0);
+        }
+        context.l1_primary = 0;
+        merge_test_intercepts(&mut context);
+        assert_eq!(context.hardware[1] & enables, 0);
+    }
+
+    #[test]
+    fn l0_vmcs_shadowing_does_not_reach_vmcs02() {
+        let mut context = InterceptContext {
+            l0_primary: 1 << 31,
+            l1_primary: 1 << 31,
+            l0_secondary: (1 << 1) | (1 << 14),
+            l1_secondary: 0,
+            vpid: 0,
+            merged_secondary: 0,
+            xss_bitmap: 0,
+            hardware: [0; 5],
+            extended_fields: [0; 122],
+        };
+        merge_test_intercepts(&mut context);
+        assert_eq!(context.hardware[1], 1 << 1);
+        assert_eq!(context.merged_secondary, 1 << 1);
+        context.l1_secondary = 1 << 14;
+        context.extended_fields[120] = 0x1234_0000;
+        context.extended_fields[121] = 0x5678_0000;
+        merge_test_intercepts(&mut context);
+        assert_eq!(context.hardware[1], (1 << 1) | (1 << 14));
+        assert_eq!(context.hardware[3..], [0x1234_0000, 0x5678_0000]);
+        context.l1_primary = 0;
+        merge_test_intercepts(&mut context);
+        assert_eq!(context.hardware[1], 1 << 1);
+        context.l1_primary = 1 << 31;
+        context.l1_secondary = 0;
+        merge_test_intercepts(&mut context);
+        assert_eq!(context.hardware[1], 1 << 1);
     }
 
     #[test]
@@ -1018,7 +2023,8 @@ mod ept {
             vpid: 0,
             merged_secondary: 0,
             xss_bitmap: 0,
-            hardware: [0; 3],
+            hardware: [0; 5],
+            extended_fields: [0; 122],
         };
         merge_test_intercepts(&mut context);
         assert_eq!(context.hardware[1], 0x2002);
@@ -1041,7 +2047,8 @@ mod ept {
             vpid: 0,
             merged_secondary: 0,
             xss_bitmap: u64::MAX,
-            hardware: [0; 3],
+            hardware: [0; 5],
+            extended_fields: [0; 122],
         };
         merge_test_intercepts(&mut context);
         assert_eq!(context.hardware[1], 2);
@@ -1358,6 +2365,7 @@ mod ept {
         root_guest: u64,
         l1_store: u64,
         l1_store_count: u64,
+        captured_count: u64,
         l1_load: u64,
         l1_load_count: u64,
         l1_entry: u64,
@@ -1386,6 +2394,9 @@ mod ept {
         b_nested_l0_msr_guest_list = const std::mem::offset_of!(MsrContext, root_guest),
         b_nested_vmcs12_vm_exit_msr_store_addr = const std::mem::offset_of!(MsrContext, l1_store),
         b_nested_vmcs12_vm_exit_msr_store_count = const std::mem::offset_of!(MsrContext, l1_store_count),
+        b_nested_captured_msr_store_count = const std::mem::offset_of!(MsrContext, captured_count),
+        b_nested_current_vmcs = const std::mem::offset_of!(MsrContext, l1_store),
+        nested_guest_msr_list_capacity = const 512,
         b_nested_vmcs12_vm_exit_msr_load_addr = const std::mem::offset_of!(MsrContext, l1_load),
         b_nested_vmcs12_vm_exit_msr_load_count = const std::mem::offset_of!(MsrContext, l1_load_count),
         b_nested_vmcs01_entry_msr_list = const std::mem::offset_of!(MsrContext, l1_entry),
@@ -1412,6 +2423,7 @@ mod ept {
             root_guest: buffers + 0x100,
             l1_store: buffers + 0x200,
             l1_store_count: 3,
+            captured_count: 4,
             l1_load: buffers + 0x300,
             l1_load_count: 2,
             l1_entry: buffers + 0x400,
@@ -3884,6 +4896,336 @@ mod ept {
     }
 }
 
+#[cfg(test_harness = "native_shadow")]
+mod native_shadow {
+    include!("../builds/native-shadow-tests/offsets.rs");
+    core::arch::global_asm!(include_str!("../builds/native-shadow-tests/handlers.S"));
+
+    unsafe extern "win64" {
+        fn test_native_shadow_read(context: *mut u64, field: u64, value: u64) -> u64;
+        fn test_native_shadow_write(context: *mut u64, field: u64, value: u64) -> u64;
+        fn test_native_shadow_validate(context: *mut u64, field: u64, value: u64) -> u64;
+        fn test_native_shadow_load(context: *mut u64, field: u64, value: u64) -> u64;
+        fn test_native_shadow_clear(context: *mut u64, field: u64, value: u64) -> u64;
+        fn test_native_shadow_flush(context: *mut u64, field: u64, value: u64) -> u64;
+        fn test_native_shadow_link(context: *mut u64, field: u64, value: u64) -> u64;
+        fn test_native_shadow_launch(context: *mut u64, field: u64, value: u64) -> u64;
+        fn test_native_shadow_resume(context: *mut u64, field: u64, value: u64) -> u64;
+        fn test_native_shadow_field(context: *mut u64, field: u64, value: u64) -> u64;
+        fn test_native_shadow_software_write(context: *mut u64, field: u64, value: u64) -> u64;
+    }
+
+    type Handler = unsafe extern "win64" fn(*mut u64, u64, u64) -> u64;
+    fn run(context: &mut [u64], handler: Handler, field: u64, value: u64) -> u64 {
+        unsafe { handler(context.as_mut_ptr(), field, value) }
+    }
+
+    fn context() -> Vec<u64> {
+        let mut state = vec![0; CONTEXT_QWORDS];
+        for (name, value) in [
+            ("b_nested_active", 1),
+            ("b_nested_physical_address_bits", 48),
+            ("b_nested_vmcs12_revision_id", 0x42),
+            ("b_nested_vmx_procbased_ctls2", 1 << 46),
+            ("b_nested_vmcs01_region", 0x1000),
+            ("b_nested_current_vmcs", u64::MAX),
+            ("test_mapped", 1),
+            ("test_native_flags", 2),
+        ] {
+            state[offset(name)] = value;
+        }
+        state
+    }
+
+    #[repr(C, align(4096))]
+    struct Page([u8; 4096]);
+
+    #[test]
+    fn shadow_pointer_lifecycle_preserves_native_backing_and_rejects_entry() {
+        let mut page = Box::new(Page([0; 4096]));
+        page.0[..4].copy_from_slice(&0x8000_0042_u32.to_le_bytes());
+        let address = page.0.as_mut_ptr() as u64;
+        let mut bitmap = Box::new(Page([0; 4096]));
+        let mut state = context();
+        state[offset("b_nested_shadow_vmread_bitmap")] = bitmap.0.as_mut_ptr() as u64;
+        state[offset("test_operand")] = address;
+        assert_eq!(run(&mut state, test_native_shadow_load, 0, 0), 0);
+        assert_eq!(state[offset("b_nested_current_vmcs")], address);
+        assert_eq!(state[offset("b_nested_current_vmcs_is_shadow")], 1);
+        assert_eq!(bitmap.0[0xd82], 0x50);
+        assert_eq!(run(&mut state, test_native_shadow_launch, 0, 0), u64::MAX);
+        assert_eq!(run(&mut state, test_native_shadow_resume, 0, 0), u64::MAX);
+        assert_eq!(run(&mut state, test_native_shadow_clear, 0, address), 0);
+        assert_eq!(state[offset("test_cleared")], address);
+        assert_eq!(state[offset("b_nested_current_vmcs")], u64::MAX);
+        assert_eq!(state[offset("b_nested_current_vmcs_is_shadow")], 0);
+        assert!(page.0[4..].iter().all(|byte| *byte == 0));
+        state[offset("b_nested_vmx_procbased_ctls2")] = 0;
+        assert_eq!(run(&mut state, test_native_shadow_load, 0, 0), 11);
+        state[offset("b_nested_vmx_procbased_ctls2")] = 1 << 46;
+        page.0[0] = 0x43;
+        assert_eq!(run(&mut state, test_native_shadow_load, 0, 0), 11);
+        page.0[0] = 0x42;
+        state[offset("test_mapped")] = 0;
+        assert_eq!(run(&mut state, test_native_shadow_load, 0, 0), 9);
+    }
+
+    #[test]
+    fn native_access_flushes_shadow_and_restores_vmcs01_on_success_and_failure() {
+        let mut state = context();
+        state[offset("b_nested_current_vmcs")] = 0x2000;
+        state[offset("b_last_reason")] = 25;
+        assert_eq!(run(&mut state, test_native_shadow_write, 0x681e, 0x1234), 0);
+        assert_eq!(state[offset("test_shadow_value")], 0x1234);
+        assert_eq!(state[offset("test_selected")], 0x1000);
+        assert_eq!(state[offset("test_cleared")], 0x2000);
+        state[offset("b_last_reason")] = 23;
+        assert_eq!(run(&mut state, test_native_shadow_read, 0x681e, 0), 0);
+        assert_eq!(state[offset("test_read_value")], 0x1234);
+        assert_eq!(state[offset("test_clear_count")], 2);
+        assert_eq!(state[offset("test_root_writes")], 2);
+        for flags in [3, 0x42] {
+            state[offset("test_native_flags")] = flags;
+            state[offset("test_rflags")] = 0xad7;
+            run(&mut state, test_native_shadow_read, 0x7fff, 0);
+            assert_eq!(
+                state[offset("test_rflags")],
+                (0xad7 & !0x8d5) | (flags & 0x41)
+            );
+            assert_eq!(state[offset("test_selected")], 0x1000);
+        }
+        state[offset("b_nested_vmx_misc")] = 1 << 29;
+        state[offset("test_native_flags")] = 2;
+        state[offset("b_last_reason")] = 25;
+        assert_eq!(run(&mut state, test_native_shadow_write, 0x4402, 0x1234), 0);
+        assert_eq!(state[offset("test_shadow_value")], 0x1234);
+    }
+
+    #[test]
+    fn software_exit_field_writes_match_native_misc_capability_and_field_width() {
+        let mut state = context();
+        let fields = offset("b_nested_vmcs12_extended_fields");
+        let value = 0x1234_5678_8765_4321;
+        let cases = [
+            (0x4400, offset("b_nested_instruction_error"), 0x8765_4321),
+            (0x4402, offset("b_nested_vmcs12_exit_reason"), 0x8765_4321),
+            (
+                0x440c,
+                offset("b_nested_vmcs12_exit_instruction_len"),
+                0x8765_4321,
+            ),
+            (0x6400, offset("b_nested_vmcs12_exit_qualification"), value),
+            (0x440e, fields + 115, 0x8765_4321),
+            (0x2400, fields + 110, value),
+            (0x640a, fields + 116, value),
+        ];
+        for (field, destination, expected) in cases {
+            state[offset("b_nested_vmx_misc")] = 0;
+            assert_eq!(
+                run(&mut state, test_native_shadow_software_write, field, value),
+                13
+            );
+            assert_eq!(state[destination], 0);
+            state[offset("b_nested_vmx_misc")] = 1 << 29;
+            assert_eq!(
+                run(&mut state, test_native_shadow_software_write, field, value),
+                0
+            );
+            assert_eq!(state[destination], expected);
+        }
+        state[offset("b_nested_vmx_misc")] = 0;
+        assert_eq!(
+            run(&mut state, test_native_shadow_software_write, 0x2401, value),
+            13
+        );
+        state[offset("b_nested_vmx_misc")] = 1 << 29;
+        assert_eq!(
+            run(&mut state, test_native_shadow_software_write, 0x2401, value),
+            0
+        );
+        assert_eq!(state[fields + 110], 0x8765_4321_8765_4321);
+        assert_eq!(
+            run(&mut state, test_native_shadow_software_write, 0x7fff, value),
+            12
+        );
+        for (field, index) in [(0x2026, 120), (0x2028, 121)] {
+            assert_eq!(
+                run(&mut state, test_native_shadow_software_write, field, value),
+                0
+            );
+            assert_eq!(state[fields + index], value);
+            assert_eq!(
+                run(
+                    &mut state,
+                    test_native_shadow_software_write,
+                    field + 1,
+                    0xabcd
+                ),
+                0
+            );
+            assert_eq!(state[fields + index], 0xabcd_8765_4321);
+        }
+    }
+
+    #[test]
+    fn shadow_controls_require_valid_mapped_bitmaps_only_when_enabled() {
+        let mut state = context();
+        let fields = offset("b_nested_vmcs12_extended_fields");
+        state[offset("b_nested_vmcs12_primary_control")] = 1 << 31;
+        state[offset("b_nested_vmcs12_secondary_control")] = 1 << 14;
+        state[fields + 120] = 0x2000;
+        state[fields + 121] = 0x3000;
+        state[fields + 23] = u64::MAX;
+        assert_eq!(run(&mut state, test_native_shadow_validate, 0, 0), 1);
+        for index in [120, 121] {
+            for invalid in [0x2001, 1 << 48, u64::MAX] {
+                state[fields + index] = invalid;
+                assert_eq!(run(&mut state, test_native_shadow_validate, 0, 0), 0);
+            }
+            state[fields + index] = 0x2000;
+        }
+        state[offset("test_mapped")] = 0;
+        assert_eq!(run(&mut state, test_native_shadow_validate, 0, 0), 0);
+        state[offset("b_nested_vmcs12_primary_control")] = 0;
+        assert_eq!(run(&mut state, test_native_shadow_validate, 0, 0), 1);
+        state[offset("b_nested_vmcs12_primary_control")] = 1 << 31;
+        state[offset("b_nested_vmcs12_secondary_control")] = 0;
+        assert_eq!(run(&mut state, test_native_shadow_validate, 0, 0), 1);
+    }
+
+    #[test]
+    fn bitmap_field_availability_includes_high_halves_and_tracks_capability() {
+        let mut state = context();
+        for supported in [false, true] {
+            state[offset("b_nested_vmx_procbased_ctls2")] = u64::from(supported) << 46;
+            for field in 0x2026..=0x2029 {
+                assert_eq!(
+                    run(&mut state, test_native_shadow_field, field, 0),
+                    u64::from(supported)
+                );
+            }
+            assert_eq!(run(&mut state, test_native_shadow_field, 0x681e, 0), 1);
+        }
+    }
+
+    #[test]
+    fn l2_link_and_flush_follow_effective_controls_and_entry_success() {
+        let mut state = context();
+        let fields = offset("b_nested_vmcs12_extended_fields");
+        state[fields + 23] = 0x3000;
+        run(&mut state, test_native_shadow_link, 0, 0);
+        assert_eq!(state[offset("test_link")], u64::MAX);
+        state[offset("b_nested_last_merged_secondary_controls")] = 1 << 14;
+        run(&mut state, test_native_shadow_link, 0, 0);
+        assert_eq!(state[offset("test_link")], 0x3000);
+        run(&mut state, test_native_shadow_flush, 0, 0);
+        assert_eq!(state[offset("test_cleared")], 0x3000);
+        state[offset("b_last_reason")] = 0x8000_0021;
+        run(&mut state, test_native_shadow_flush, 0, 0);
+        assert_eq!(state[offset("test_clear_count")], 1);
+        state[offset("b_last_reason")] = 10;
+        state[fields + 23] = u64::MAX;
+        run(&mut state, test_native_shadow_flush, 0, 0);
+        assert_eq!(state[offset("test_clear_count")], 1);
+        state[fields + 23] = 0x3000;
+        state[offset("b_nested_last_merged_secondary_controls")] = 0;
+        run(&mut state, test_native_shadow_flush, 0, 0);
+        assert_eq!(state[offset("test_clear_count")], 1);
+    }
+}
+
+#[cfg(test_harness = "shadow")]
+mod shadow {
+    const HOST_RSP: u64 = 0x6c14;
+    const HOST_RIP: u64 = 0x6c16;
+    const READ_BITMAP_BYTE: usize = (HOST_RSP >> 3) as usize;
+    const READ_BYPASS_MASK: u8 = 0x50;
+    const READ_TRAP_MASK: u8 = !READ_BYPASS_MASK;
+
+    #[repr(C)]
+    struct Context {
+        shadow_vmcs_region: u64,
+        shadow_vmread_bitmap: u64,
+        probe_complete: u64,
+        vmcs12_host_rip: u64,
+        vmcs12_host_rsp: u64,
+        telemetry_probe_active: u64,
+        current_vmcs: u64,
+        shadow_rip: u64,
+        shadow_rsp: u64,
+    }
+
+    core::arch::global_asm!(
+        include_str!("../builds/vmcs-shadow-tests/handlers.S"),
+        b_nested_shadow_vmcs_region = const core::mem::offset_of!(Context, shadow_vmcs_region),
+        b_nested_shadow_vmread_bitmap = const core::mem::offset_of!(Context, shadow_vmread_bitmap),
+        b_nested_probe_complete = const core::mem::offset_of!(Context, probe_complete),
+        b_nested_vmcs12_host_rip = const core::mem::offset_of!(Context, vmcs12_host_rip),
+        b_nested_vmcs12_host_rsp = const core::mem::offset_of!(Context, vmcs12_host_rsp),
+        b_telemetry_probe_active = const core::mem::offset_of!(Context, telemetry_probe_active),
+        test_current_vmcs = const core::mem::offset_of!(Context, current_vmcs),
+        test_shadow_rip = const core::mem::offset_of!(Context, shadow_rip),
+        test_shadow_rsp = const core::mem::offset_of!(Context, shadow_rsp),
+        host_rip = const HOST_RIP,
+        host_rsp = const HOST_RSP,
+        vmcs_shadow_read_byte_offset = const READ_BITMAP_BYTE,
+        vmcs_shadow_read_bypass_mask = const READ_BYPASS_MASK,
+        vmcs_shadow_read_trap_mask = const READ_TRAP_MASK,
+    );
+
+    unsafe extern "win64" {
+        fn test_shadow_sync(context: *mut Context);
+        fn test_shadow_write(context: *mut Context, field: u64, value: u64);
+        fn test_shadow_intercept(context: *mut Context);
+    }
+
+    #[test]
+    fn shadow_vmcs_sync_respects_capability_probe_and_lifecycle() {
+        let mut bitmap = vec![0xff_u8; 4096];
+        let byte = READ_BITMAP_BYTE;
+        let mut context = Context {
+            shadow_vmcs_region: 0,
+            shadow_vmread_bitmap: bitmap.as_mut_ptr() as u64,
+            probe_complete: 0,
+            vmcs12_host_rip: 0x1234_5678,
+            vmcs12_host_rsp: 0x1234_f000,
+            telemetry_probe_active: 0,
+            current_vmcs: 0,
+            shadow_rip: 0,
+            shadow_rsp: 0,
+        };
+        unsafe { test_shadow_sync(&mut context) };
+        assert_eq!(bitmap[byte], 0xff);
+        assert_eq!((context.shadow_rip, context.shadow_rsp), (0, 0));
+
+        context.shadow_vmcs_region = 0x6000;
+        bitmap[byte] = READ_TRAP_MASK;
+        unsafe { test_shadow_sync(&mut context) };
+        assert_eq!(bitmap[byte], 0xff);
+        assert_eq!((context.shadow_rip, context.shadow_rsp), (0, 0));
+
+        context.probe_complete = 1;
+        context.telemetry_probe_active = 1;
+        bitmap[byte] = READ_TRAP_MASK;
+        unsafe { test_shadow_sync(&mut context) };
+        assert_eq!(bitmap[byte], 0xff);
+        assert_eq!((context.shadow_rip, context.shadow_rsp), (0, 0));
+
+        context.telemetry_probe_active = 0;
+        unsafe { test_shadow_sync(&mut context) };
+        assert_eq!(bitmap[byte], READ_TRAP_MASK);
+        assert_eq!(context.current_vmcs, 0);
+        assert_eq!(context.shadow_rip, context.vmcs12_host_rip);
+        assert_eq!(context.shadow_rsp, context.vmcs12_host_rsp);
+
+        unsafe { test_shadow_write(&mut context, HOST_RIP, 0x9876_5432) };
+        assert_eq!(context.shadow_rip, 0x9876_5432);
+        assert_eq!(context.current_vmcs, 0);
+        unsafe { test_shadow_intercept(&mut context) };
+        assert_eq!(bitmap[byte], 0xff);
+    }
+}
+
 #[cfg(test_harness = "logging")]
 core::arch::global_asm!(include_str!("../builds/nested-logging-tests/lifecycle.S"));
 #[cfg(test_harness = "logging")]
@@ -3901,6 +5243,10 @@ unsafe extern "win64" {
 fn lifecycle(probe_active: bool, telemetry_active: bool) -> u64 {
     let revision = 1_u64;
     let mut context = [0_u64; 64];
+    let mut vmread_bitmap = vec![0xff_u8; 4096];
+    let shadow_byte = 0xd82;
+    vmread_bitmap[shadow_byte] = 0xaf;
+    context[offset("b_nested_shadow_vmread_bitmap")] = vmread_bitmap.as_mut_ptr() as u64;
     context[offset("b_nested_l1_cr4")] = 1 << 13;
     context[offset("b_nested_feature_control")] = 5;
     context[offset("b_nested_vmx_basic")] = revision;
@@ -3916,14 +5262,17 @@ fn lifecycle(probe_active: bool, telemetry_active: bool) -> u64 {
     assert_eq!(context[offset("b_nested_instruction_error")], 0);
     assert_eq!(context[offset("b_test_rflags")], 0x202);
     assert_eq!(context[offset("b_test_rip")], 0x1003);
+    assert_eq!(vmread_bitmap[shadow_byte], 0xff);
 
     context[offset("b_test_rflags")] |= 0x8d5;
+    vmread_bitmap[shadow_byte] = 0xaf;
     assert_eq!(unsafe { test_vmx_lifecycle(context.as_mut_ptr(), 1) }, 0);
     assert_eq!(context[offset("b_nested_active")], 0);
     assert_eq!(context[offset("b_nested_current_vmcs")], u64::MAX);
     assert_eq!(context[offset("b_test_stores")], 1);
     assert_eq!(context[offset("b_test_rflags")], 0x202);
     assert_eq!(context[offset("b_test_rip")], 0x1006);
+    assert_eq!(vmread_bitmap[shadow_byte], 0xff);
     for name in ["b_nested_vmxon_count", "b_nested_vmxoff_count"] {
         assert_eq!(context[offset(name)], u64::from(telemetry_active));
     }
@@ -3959,5 +5308,494 @@ fn firmware_display_is_writable_only_during_the_post_ebs_window() {
                 writable
             );
         }
+    }
+}
+
+#[cfg(test_harness = "regressions")]
+mod regressions {
+    include!("../builds/nested-regression-tests/offsets.rs");
+    core::arch::global_asm!(include_str!("../builds/nested-regression-tests/handlers.S"));
+
+    unsafe extern "win64" {
+        fn test_nested_regression(
+            state: *mut u64,
+            operation: u32,
+            value: u64,
+            root_count: u64,
+        ) -> u32;
+    }
+
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[repr(C, align(4096))]
+    struct Page([u64; 512]);
+
+    struct Arena(Vec<Box<Page>>);
+
+    impl Arena {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+
+        fn page(&mut self) -> u64 {
+            let mut page = Box::new(Page([0; 512]));
+            let address = page.0.as_mut_ptr() as u64;
+            self.0.push(page);
+            address
+        }
+
+        fn map(&mut self, root: u64, address: u64, target: u64, permissions: u64) {
+            let mut table = root;
+            for shift in [39, 30, 21, 12] {
+                let slot = unsafe { (table as *mut u64).add(((address >> shift) & 511) as usize) };
+                if shift == 12 {
+                    unsafe { slot.write(target | permissions) };
+                    return;
+                }
+                let mut entry = unsafe { slot.read() };
+                if entry == 0 {
+                    entry = self.page() | 7;
+                    unsafe { slot.write(entry) };
+                }
+                table = entry & !4095;
+            }
+        }
+    }
+
+    fn run(state: &mut [u64], operation: u32, value: u64, root_count: u64) -> u32 {
+        unsafe { test_nested_regression(state.as_mut_ptr(), operation, value, root_count) }
+    }
+
+    fn paging_state(arena: &mut Arena, first: u64, second: u64) -> (Vec<u64>, u64, u64) {
+        let mut state = vec![0; CONTEXT_QWORDS];
+        let root = arena.page();
+        let ept = arena.page();
+        arena.map(root, 0x400000, 0x1000000, 7);
+        arena.map(root, 0x401000, 0x3000000, 7);
+        arena.map(ept, 0x1000000, first, 7);
+        arena.map(ept, 0x3000000, second, 7);
+        state[offset("b_cache_ept_pointer")] = ept;
+        let vmcs = offset("test_vmcs");
+        state[vmcs] = 1 << 31;
+        state[vmcs + 2] = root;
+        state[vmcs + 3] = 1 << 9;
+        state[vmcs + 4] = 1 << 13;
+        (state, root, ept)
+    }
+
+    #[test]
+    fn operands_read_and_write_every_cross_page_split_through_both_translations() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for width in [4, 8, 16] {
+            for first_length in 1..width {
+                let mut arena = Arena::new();
+                let first = arena.page();
+                let second = arena.page();
+                let (mut state, _, _) = paging_state(&mut arena, first, second);
+                state[offset("b_nested_operand_linear_address")] = 0x401000 - first_length;
+                let expected: Vec<u8> = (0..width).map(|index| (index * 13 + 7) as u8).collect();
+                unsafe {
+                    let first_bytes = std::slice::from_raw_parts_mut(first as *mut u8, 4096);
+                    let second_bytes = std::slice::from_raw_parts_mut(second as *mut u8, 4096);
+                    first_bytes.fill(0xa5);
+                    second_bytes.fill(0x5a);
+                    first_bytes[4096 - first_length as usize..]
+                        .copy_from_slice(&expected[..first_length as usize]);
+                    second_bytes[..(width - first_length) as usize]
+                        .copy_from_slice(&expected[first_length as usize..]);
+                    assert_eq!(run(&mut state, 0, width, 0), 1);
+                    let scratch = state.as_ptr().add(offset("b_nested_operand_data")) as *const u8;
+                    assert_eq!(
+                        std::slice::from_raw_parts(scratch, width as usize),
+                        expected
+                    );
+                    let replacement: Vec<u8> = expected.iter().map(|value| value ^ 0xff).collect();
+                    let scratch =
+                        state.as_mut_ptr().add(offset("b_nested_operand_data")) as *mut u8;
+                    std::ptr::copy_nonoverlapping(replacement.as_ptr(), scratch, width as usize);
+                    assert_eq!(run(&mut state, 1, width, 0), 1);
+                    assert_eq!(
+                        &first_bytes[4096 - first_length as usize..],
+                        &replacement[..first_length as usize]
+                    );
+                    assert_eq!(
+                        &second_bytes[..(width - first_length) as usize],
+                        &replacement[first_length as usize..]
+                    );
+                    assert!(
+                        first_bytes[..4096 - first_length as usize]
+                            .iter()
+                            .all(|value| *value == 0xa5)
+                    );
+                    assert!(
+                        second_bytes[(width - first_length) as usize..]
+                            .iter()
+                            .all(|value| *value == 0x5a)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_or_readonly_second_page_never_partially_writes_a_vmx_operand() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for missing_pte in [false, true] {
+            let mut arena = Arena::new();
+            let first = arena.page();
+            let second = arena.page();
+            let (mut state, root, ept) = paging_state(&mut arena, first, second);
+            state[offset("b_nested_operand_linear_address")] = 0x400ffc;
+            state[offset("b_nested_operand_data")] = u64::MAX;
+            if missing_pte {
+                arena.map(root, 0x401000, 0, 0);
+            } else {
+                arena.map(ept, 0x3000000, second, 5);
+                assert_eq!(run(&mut state, 0, 8, 0), 1);
+                state[offset("b_nested_operand_data")] = u64::MAX;
+            }
+            assert_eq!(run(&mut state, 1, 8, 0), 0);
+            assert_eq!(state[offset("test_fault_address")], 0x401000);
+            unsafe {
+                assert_eq!((first as *const u64).add(511).read(), 0);
+                assert_eq!((second as *const u64).read(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn l1_msr_bitmap_checks_read_write_low_high_boundaries_and_unconditional_exits() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let mut arena = Arena::new();
+        let bitmap = arena.page();
+        let ept = arena.page();
+        arena.map(ept, 0x800000, bitmap, 7);
+        let mut state = vec![0; CONTEXT_QWORDS];
+        state[offset("b_cache_ept_pointer")] = ept;
+        state[offset("b_nested_vmcs12_msr_bitmap")] = 0x800000;
+        state[offset("b_nested_vmcs12_primary_control")] = 1 << 28;
+        for msr in [0, 0x1fff, 0xc0000000, 0xc0000080, 0xc0001fff] {
+            for write in [0, 1] {
+                state[offset("test_write")] = write;
+                let byte_offset = (if msr >= 0xc0000000 { 1024 } else { 0 })
+                    + write as usize * 2048
+                    + (msr as usize & 0x1fff) / 8;
+                let bit = 1 << (msr & 7);
+                unsafe { (bitmap as *mut u8).add(byte_offset).write(0) };
+                assert_eq!(run(&mut state, 2, msr, 0), 0);
+                unsafe { (bitmap as *mut u8).add(byte_offset).write(bit) };
+                assert_eq!(run(&mut state, 2, msr, 0), 1);
+                state[offset("test_write")] = write ^ 1;
+                assert_eq!(run(&mut state, 2, msr, 0), 0);
+                unsafe { (bitmap as *mut u8).add(byte_offset).write(0) };
+            }
+        }
+        for msr in [0x2000, 0xbfffffff, 0xc0002000, u32::MAX as u64] {
+            assert_eq!(run(&mut state, 2, msr, 0), 1);
+        }
+        state[offset("b_nested_vmcs12_primary_control")] = 0;
+        assert_eq!(run(&mut state, 2, 0xc0000080, 0), 1);
+        state[offset("b_nested_vmcs12_primary_control")] = 1 << 28;
+        arena.map(ept, 0x800000, bitmap, 0);
+        assert_eq!(run(&mut state, 2, 0xc0000080, 0), 1);
+    }
+
+    fn msr_state(
+        root_count: u64,
+        requested: &[[u64; 2]],
+    ) -> (
+        Vec<u64>,
+        Vec<[u64; 2]>,
+        Vec<[u64; 2]>,
+        Vec<[u64; 2]>,
+        Vec<[u64; 2]>,
+    ) {
+        let mut state = vec![0; CONTEXT_QWORDS];
+        let mut root = vec![[0x48, 0x11]];
+        let mut entry = vec![[0xdead, 0xbeef]; 514];
+        let mut captured = vec![[0xdead, 0xbeef]; 514];
+        let mut l1 = requested.to_vec();
+        state[offset("b_nested_l0_msr_guest_list")] = root.as_mut_ptr() as u64;
+        state[offset("b_nested_l0_msr_host_list")] = root.as_ptr() as u64;
+        state[offset("b_nested_vmcs02_entry_msr_list")] = entry.as_mut_ptr() as u64;
+        state[offset("b_nested_vmcs01_entry_msr_list")] = entry.as_mut_ptr() as u64;
+        state[offset("b_nested_vmcs02_exit_store_msr_list")] = captured.as_mut_ptr() as u64;
+        state[offset("b_nested_vmcs12_vm_exit_msr_store_addr")] = l1.as_mut_ptr() as u64;
+        state[offset("b_nested_vmcs12_vm_exit_msr_store_count")] = l1.len() as u64;
+        run(&mut state, 3, 0, root_count);
+        (state, root, entry, captured, l1)
+    }
+
+    #[test]
+    fn mixed_and_repeated_msr_stores_publish_captured_guest_values_and_saved_vmcs_fields() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for root_count in [0, 1] {
+            let requested = [
+                [0x277, 0xdead],
+                [0xc0000102, 0xbeef],
+                [0x48, 0x1234],
+                [0x123, 0x5678],
+                [0x277, 0xabcd],
+                [0xc0000102, 0xef],
+            ];
+            let (mut state, root, _entry, mut captured, l1) = msr_state(root_count, &requested);
+            assert_eq!(
+                state[offset("b_nested_vmcs12_vm_exit_msr_store_count")],
+                requested.len() as u64
+            );
+            assert_eq!(state[offset("b_nested_captured_msr_store_count")], 2);
+            assert_eq!(state[offset("test_controls") + 3], 2);
+            for slot in captured.iter_mut().take(2) {
+                slot[1] = match slot[0] {
+                    0x48 => 0x55,
+                    0xc0000102 => 0x6677,
+                    _ => panic!("unexpected captured MSR"),
+                };
+            }
+            state[offset("test_vmcs") + 5] = 0x0007040600070406;
+            state[offset("test_software_msr")] = 0x9876543210;
+            assert_eq!(run(&mut state, 4, 10, root_count), 1);
+            let values: Vec<u64> = l1.iter().map(|slot| slot[1]).collect();
+            assert_eq!(
+                values,
+                [
+                    0x0007040600070406,
+                    0x6677,
+                    0x55,
+                    0x9876543210,
+                    0x0007040600070406,
+                    0x6677
+                ]
+            );
+            assert_eq!(root[0][1], if root_count == 1 { 0x55 } else { 0x11 });
+            assert_eq!(captured[2], [0xdead, 0xbeef]);
+        }
+    }
+
+    #[test]
+    fn pat_only_list_does_not_read_stale_hardware_slots_and_failed_entry_does_not_publish() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for root_count in [0, 1] {
+            let (mut state, _root, _entry, captured, l1) =
+                msr_state(root_count, &[[0x277, 0xdeadbeef]]);
+            assert_eq!(
+                state[offset("b_nested_captured_msr_store_count")],
+                root_count
+            );
+            state[offset("test_vmcs") + 5] = 0x0606060606060606;
+            assert_eq!(run(&mut state, 4, 0x80000021, root_count), 1);
+            assert_eq!(l1[0][1], 0xdeadbeef);
+            assert_eq!(run(&mut state, 4, 10, root_count), 1);
+            assert_eq!(l1[0][1], 0x0606060606060606);
+            assert_eq!(captured[root_count as usize], [0xdead, 0xbeef]);
+        }
+    }
+
+    #[test]
+    fn invalid_store_entry_aborts_with_architectural_indicator_without_publishing_stale_data() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for requested in [
+            [[0xdead, 0x55]],
+            [[(1 << 32) | 0x277, 0x55]],
+            [[0x802, 0x55]],
+        ] {
+            let (mut state, _root, _entry, _captured, l1) = msr_state(0, &requested);
+            let mut arena = Arena::new();
+            let vmcs = arena.page();
+            let ept = arena.page();
+            arena.map(ept, 0x100000, vmcs, 7);
+            state[offset("b_cache_ept_pointer")] = ept;
+            state[offset("b_nested_current_vmcs")] = 0x100000;
+            assert_eq!(run(&mut state, 4, 10, 0), 0);
+            assert_eq!(state[offset("test_aborted")], 1);
+            assert_eq!(l1[0][1], 0x55);
+            assert_eq!(unsafe { (vmcs as *const u32).add(1).read() }, 1);
+        }
+    }
+
+    #[test]
+    fn full_list_software_switch_and_internal_resume_preserve_the_current_spec_ctrl() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for root_count in [0, 1] {
+            let (mut state, mut root, _entry, mut captured, _l1) = msr_state(root_count, &[]);
+            let host = [0x48_u64, 0x99];
+            state[offset("b_nested_l0_msr_host_list")] = host.as_ptr() as u64;
+            state[offset("test_vmcs") + 1] = 512;
+            assert_eq!(run(&mut state, 7, 0, root_count), 1);
+            assert_eq!(state[offset("test_spec_ctrl_writes")], root_count);
+            if root_count == 1 {
+                assert_eq!(state[offset("test_spec_ctrl")], root[0][1]);
+            }
+            assert_eq!(run(&mut state, 8, 0, root_count), 1);
+            assert_eq!(state[offset("test_spec_ctrl_writes")], root_count * 2);
+            if root_count == 1 {
+                assert_eq!(state[offset("test_spec_ctrl")], 0x99);
+            }
+            state[offset("test_vmcs") + 1] = 1;
+            assert_eq!(run(&mut state, 7, 0, root_count), 1);
+            assert_eq!(state[offset("test_spec_ctrl_writes")], root_count * 2);
+            captured[0] = [0x48, 0x77];
+            root[0][1] = 0x33;
+            assert_eq!(run(&mut state, 10, 0, root_count), 1);
+            assert_eq!(state[offset("test_controls")], captured.as_ptr() as u64);
+            assert_eq!(state[offset("test_controls") + 1], root_count);
+            assert_eq!(captured[0][1], 0x77);
+            assert_eq!(root[0][1], 0x33);
+        }
+    }
+
+    #[test]
+    fn l0_only_efer_exits_emulate_and_resume_l2_while_l1_requests_are_reflected() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for (write, intercepted, fault, exception_intercepted) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, false, true, false),
+            (true, false, true, true),
+            (false, true, false, false),
+            (true, true, false, false),
+        ] {
+            let (mut state, _root, _entry, captured, _l1) = msr_state(1, &[]);
+            let mut arena = Arena::new();
+            let bitmap = arena.page();
+            let ept = arena.page();
+            arena.map(ept, 0x800000, bitmap, 7);
+            state[offset("b_cache_ept_pointer")] = ept;
+            state[offset("b_nested_vmcs12_msr_bitmap")] = 0x800000;
+            state[offset("b_nested_vmcs12_primary_control")] = 1 << 28;
+            if intercepted {
+                let byte_offset = 1024 + u64::from(write) * 2048 + 0x80 / 8;
+                unsafe { (bitmap as *mut u8).add(byte_offset as usize).write(1) };
+            }
+            state[offset("b_nested_l2_active")] = 1;
+            state[offset("b_nested_vmcs12_exception_bitmap")] =
+                if exception_intercepted { 1 << 13 } else { 0 };
+            state[offset("b_last_reason")] = if write { 32 } else { 31 };
+            state[offset("b_last_instruction_len")] = 2;
+            state[offset("b_last_qualification")] = 0x777;
+            state[offset("test_guest_rcx")] = 0xc0000080;
+            state[offset("test_guest_rax")] = 0xd01;
+            state[offset("test_guest_rdx")] = 0;
+            state[offset("test_vmcs") + 6] = 0x501;
+            state[offset("test_vmcs")] = 1 << 31;
+            state[offset("test_msr_fault")] = u64::from(fault);
+            state[offset("test_controls") + 13] = 0x80000320;
+            assert_eq!(run(&mut state, 9, 0, 1), 1);
+            assert_eq!(
+                state[offset("test_reflected")],
+                u64::from(intercepted || exception_intercepted)
+            );
+            assert_eq!(
+                state[offset("test_advances")],
+                u64::from(!intercepted && !fault)
+            );
+            if intercepted {
+                assert_eq!(state[offset("test_guest_rax")], 0xd01);
+                assert_eq!(state[offset("test_controls") + 13], 0x80000320);
+            } else if exception_intercepted {
+                assert_eq!(state[offset("b_last_reason")], 0);
+                assert_eq!(state[offset("b_last_qualification")], 0);
+                assert_eq!(state[offset("b_last_instruction_len")], 0);
+                assert_eq!(state[offset("b_nested_l2_msr_gp_pending")], 0);
+                assert_eq!(
+                    state[offset("b_nested_vmcs12_vm_exit_intr_info")],
+                    0x80000b0d
+                );
+                assert_eq!(state[offset("b_nested_vmcs12_vm_exit_intr_error")], 0);
+                assert_eq!(state[offset("test_controls") + 13], 0);
+                assert_eq!(state[offset("test_guest_rax")], 0xd01);
+            } else {
+                assert_eq!(state[offset("test_controls")], captured.as_ptr() as u64);
+                assert_eq!(state[offset("test_controls") + 1], 1);
+                assert_eq!(
+                    state[offset("test_controls") + 13],
+                    if fault { 0x80000b0d } else { 0 }
+                );
+                if !write {
+                    assert_eq!(state[offset("test_guest_rax")], 0x501);
+                    assert_eq!(state[offset("test_guest_rdx")], 0);
+                } else if !fault {
+                    assert_eq!(state[offset("test_controls") + 6], 0xd01);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn l0_only_debugctl_exits_use_guest_state_and_preserve_root_state() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for (write, fault) in [(false, false), (true, false), (true, true)] {
+            let (mut state, _root, _entry, captured, _l1) = msr_state(1, &[]);
+            let mut arena = Arena::new();
+            let bitmap = arena.page();
+            let ept = arena.page();
+            arena.map(ept, 0x800000, bitmap, 7);
+            state[offset("b_cache_ept_pointer")] = ept;
+            state[offset("b_nested_vmcs12_msr_bitmap")] = 0x800000;
+            state[offset("b_nested_vmcs12_primary_control")] = 1 << 28;
+            state[offset("b_nested_l2_active")] = 1;
+            state[offset("b_last_reason")] = if write { 32 } else { 31 };
+            state[offset("test_guest_rcx")] = 0x1d9;
+            state[offset("test_guest_rax")] = 2;
+            state[offset("test_vmcs") + 7] = 1;
+            state[offset("test_host_debugctl")] = 0;
+            state[offset("test_msr_fault")] = u64::from(fault);
+            assert_eq!(run(&mut state, 9, 0, 1), 1);
+            assert_eq!(state[offset("test_reflected")], 0);
+            assert_eq!(state[offset("test_advances")], u64::from(!fault));
+            assert_eq!(state[offset("test_host_debugctl")], 0);
+            assert_eq!(state[offset("test_controls")], captured.as_ptr() as u64);
+            assert_eq!(state[offset("test_controls") + 1], 1);
+            assert_eq!(
+                state[offset("test_controls") + 13],
+                if fault { 0x80000b0d } else { 0 }
+            );
+            if !write {
+                assert_eq!(state[offset("test_guest_rax")], 1);
+                assert_eq!(state[offset("test_guest_rdx")], 0);
+            } else if !fault {
+                assert_eq!(state[offset("test_controls") + 7], 2);
+            } else {
+                assert_eq!(state[offset("test_controls") + 7], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn full_512_entry_load_and_store_lists_fit_without_exceeding_host_hardware_capacity() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for root_count in [0, 1] {
+            for count in [511, 512] {
+                let requested = vec![[0x277, 0x1234]; count];
+                let (mut state, _root, entry, _captured, l1) = msr_state(root_count, &requested);
+                state[offset("b_nested_vmcs12_vm_entry_msr_load_addr")] = l1.as_ptr() as u64;
+                state[offset("b_nested_vmcs12_vm_entry_msr_load_count")] = count as u64;
+                state[offset("b_nested_vmcs12_vm_exit_msr_load_addr")] = l1.as_ptr() as u64;
+                state[offset("b_nested_vmcs12_vm_exit_msr_load_count")] = count as u64;
+                assert_eq!(run(&mut state, 3, 0, root_count), 1);
+                let prefix = if count == 512 { 0 } else { root_count };
+                let selected = entry.as_ptr() as u64 + if prefix != root_count { 16 } else { 0 };
+                assert_eq!(state[offset("test_controls")], selected);
+                assert_eq!(state[offset("test_controls") + 1], count as u64 + prefix);
+                assert_eq!(state[offset("b_nested_entry_msr_prefix_count")], prefix);
+                assert_eq!(
+                    &entry[root_count as usize..root_count as usize + count],
+                    requested
+                );
+                assert_eq!(run(&mut state, 5, 0, root_count), 1);
+                assert_eq!(state[offset("test_controls")], selected);
+                assert_eq!(state[offset("test_controls") + 1], count as u64 + prefix);
+                state[offset("b_nested_vmcs12_vm_exit_msr_load_count")] = 0;
+                state[offset("test_vmcs") + 5] = 0x777;
+                assert_eq!(run(&mut state, 4, 10, root_count), 1);
+                assert!(l1.iter().all(|slot| slot[1] == 0x777));
+                assert_eq!(entry[count + root_count as usize], [0xdead, 0xbeef]);
+            }
+        }
+        let mut state = vec![0; CONTEXT_QWORDS];
+        state[offset("b_nested_physical_address_bits")] = 48;
+        state[offset("test_list_address")] = 0x10000;
+        assert_eq!(run(&mut state, 6, 512, 0), 1);
+        assert_eq!(run(&mut state, 6, 513, 0), 0);
     }
 }

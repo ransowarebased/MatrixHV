@@ -80,6 +80,7 @@ pub const VMX_SECONDARY_UNRESTRICTED_GUEST: u32 = 1 << 7;
 pub const VMX_SECONDARY_RDRAND_EXITING: u32 = 1 << 11;
 pub const VMX_SECONDARY_ENABLE_INVPCID: u32 = 1 << 12;
 pub const VMX_SECONDARY_ENABLE_VM_FUNCTIONS: u32 = 1 << 13;
+pub const VMX_SECONDARY_VMCS_SHADOWING: u32 = 1 << 14;
 pub const VMX_SECONDARY_ENABLE_XSAVES: u32 = 1 << 20;
 pub const VMX_SECONDARY_MODE_BASED_EXECUTE: u32 = 1 << 22;
 pub const VMX_LEGACY_PINBASED_DEFAULT1: u32 = 0x0000_0016;
@@ -114,8 +115,8 @@ pub const VMX_SOFTWARE_INVALIDATION_CAPABILITIES: u64 = VMX_EPT_INVEPT
     | VMX_VPID_INVVPID_SINGLE_CONTEXT
     | VMX_VPID_INVVPID_ALL_CONTEXTS
     | VMX_VPID_INVVPID_SINGLE_CONTEXT_RETAINING_GLOBALS;
+pub const VMX_MSR_LIST_CAPACITY: usize = 512;
 pub const VMX_CR3_TARGET_COUNT: u64 = 4;
-pub const VMX_MISC_VMWRITE_READ_ONLY_FIELDS: u64 = 1 << 29;
 pub const VMCS12_MAX_ENUM_INDEX: u64 = 22;
 
 pub const CPUID_VMX_BIT: u32 = 1 << 5;
@@ -289,6 +290,7 @@ impl NestedVmxCapabilities {
                 | secondary_invpcid
                 | secondary_xsaves
                 | secondary_mbec
+                | restrict_control(host.procbased_ctls2, VMX_SECONDARY_VMCS_SHADOWING, 0)
                 | restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_VM_FUNCTIONS, 0)
                 | (u64::from(VMX_SECONDARY_ENABLE_VPID) << 32)
         } else {
@@ -364,9 +366,10 @@ impl NestedVmxCapabilities {
             vmx_entry_ctls: entry_ctls,
             host_procbased_ctls2: host.procbased_ctls2,
             host_misc: host.misc,
-            // VMCS12 rejects writes to exit-information fields regardless of host support.
-            vmx_misc: (host.misc & !((0x1ff_u64 << 16) | VMX_MISC_VMWRITE_READ_ONLY_FIELDS))
-                | (VMX_CR3_TARGET_COUNT << 16),
+            // Native shadow VMCS accesses must observe the same read-only-write capability.
+            vmx_misc: (host.misc & !((0x1ff_u64 << 16) | (7_u64 << 25)))
+                | (VMX_CR3_TARGET_COUNT << 16)
+                | (((VMX_MSR_LIST_CAPACITY / 512 - 1) as u64) << 25),
             vmx_cr0_fixed0: host.cr0_fixed0,
             vmx_cr0_fixed1: host.cr0_fixed1,
             vmx_cr4_fixed0: host.cr4_fixed0,
@@ -626,8 +629,18 @@ pub const VMCS_FIELD_HOST_SYSENTER_ESP: u64 = 0x6c10;
 pub const VMCS_FIELD_HOST_SYSENTER_EIP: u64 = 0x6c12;
 pub const VMCS_FIELD_HOST_RSP: u64 = 0x6c14;
 pub const VMCS_FIELD_HOST_RIP: u64 = 0x6c16;
+pub const VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET: usize = (VMCS_FIELD_HOST_RSP >> 3) as usize;
+pub const VMCS_SHADOW_READ_BYPASS_MASK: u8 =
+    (1 << (VMCS_FIELD_HOST_RSP & 7)) | (1 << (VMCS_FIELD_HOST_RIP & 7));
+pub const VMCS_SHADOW_READ_TRAP_MASK: u8 = !VMCS_SHADOW_READ_BYPASS_MASK;
 
-pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 120;
+pub fn native_vmcs_shadowing_available(host_secondary_controls: u64) -> bool {
+    control_may_be_one(host_secondary_controls, VMX_SECONDARY_VMCS_SHADOWING)
+}
+
+pub const VMCS_FIELD_VMREAD_BITMAP: u64 = 0x2026;
+pub const VMCS_FIELD_VMWRITE_BITMAP: u64 = 0x2028;
+pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 122;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Vmcs12ExtendedField {
@@ -1116,6 +1129,14 @@ pub const VMCS12_EXTENDED_FIELDS: [Vmcs12ExtendedField; VMCS12_EXTENDED_FIELD_CO
         encoding: VMCS_FIELD_EPTP_LIST_ADDRESS,
         index: 119,
     },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_VMREAD_BITMAP,
+        index: 120,
+    },
+    Vmcs12ExtendedField {
+        encoding: VMCS_FIELD_VMWRITE_BITMAP,
+        index: 121,
+    },
 ];
 
 #[repr(C)]
@@ -1146,6 +1167,39 @@ pub struct NestedVmcs12State {
     pub exit_qualification: u64,
     pub extended_fields: [u64; VMCS12_EXTENDED_FIELD_COUNT],
     pub control_validation_count: u64,
+    pub instruction_error: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct NestedVmcs12SegmentState {
+    pub selector: u16,
+    pub base: u64,
+    pub limit: u32,
+    pub access_rights: u32,
+}
+
+pub struct NestedVmcs12CoreState {
+    pub guest_cr0: u64,
+    pub guest_cr3: u64,
+    pub guest_cr4: u64,
+    pub host_cr0: u64,
+    pub host_cr3: u64,
+    pub host_cr4: u64,
+    pub es: NestedVmcs12SegmentState,
+    pub cs: NestedVmcs12SegmentState,
+    pub ss: NestedVmcs12SegmentState,
+    pub ds: NestedVmcs12SegmentState,
+    pub fs: NestedVmcs12SegmentState,
+    pub gs: NestedVmcs12SegmentState,
+    pub ldtr: NestedVmcs12SegmentState,
+    pub tr: NestedVmcs12SegmentState,
+    pub gdtr_base: u64,
+    pub gdtr_limit: u16,
+    pub idtr_base: u64,
+    pub idtr_limit: u16,
+    pub sysenter_cs: u64,
+    pub sysenter_esp: u64,
+    pub sysenter_eip: u64,
 }
 
 impl NestedVmcs12State {
@@ -1176,6 +1230,167 @@ impl NestedVmcs12State {
             exit_qualification: 0,
             extended_fields: [0; VMCS12_EXTENDED_FIELD_COUNT],
             control_validation_count: 0,
+            instruction_error: 0,
+        }
+    }
+
+    fn set_extended_field(&mut self, encoding: u64, value: u64) {
+        let field = VMCS12_EXTENDED_FIELDS
+            .iter()
+            .find(|field| field.encoding == encoding)
+            .expect("VMCS12 core field must be supported");
+        self.extended_fields[field.index] = value;
+    }
+
+    fn set_guest_segment(
+        &mut self,
+        selector: u64,
+        base: u64,
+        limit: u64,
+        access_rights: u64,
+        segment: NestedVmcs12SegmentState,
+    ) {
+        self.set_extended_field(selector, u64::from(segment.selector));
+        self.set_extended_field(base, segment.base);
+        self.set_extended_field(limit, u64::from(segment.limit));
+        self.set_extended_field(access_rights, u64::from(segment.access_rights));
+    }
+
+    pub fn seed_core_state(&mut self, core_state: NestedVmcs12CoreState) {
+        self.set_extended_field(VMCS_FIELD_VMCS_LINK_POINTER, u64::MAX);
+        self.set_extended_field(VMCS_FIELD_GUEST_CR0, core_state.guest_cr0);
+        self.set_extended_field(VMCS_FIELD_GUEST_CR3, core_state.guest_cr3);
+        self.set_extended_field(VMCS_FIELD_GUEST_CR4, core_state.guest_cr4);
+        self.set_guest_segment(
+            VMCS_FIELD_GUEST_ES_SELECTOR,
+            VMCS_FIELD_GUEST_ES_BASE,
+            VMCS_FIELD_GUEST_ES_LIMIT,
+            VMCS_FIELD_GUEST_ES_AR_BYTES,
+            core_state.es,
+        );
+        self.set_guest_segment(
+            VMCS_FIELD_GUEST_CS_SELECTOR,
+            VMCS_FIELD_GUEST_CS_BASE,
+            VMCS_FIELD_GUEST_CS_LIMIT,
+            VMCS_FIELD_GUEST_CS_AR_BYTES,
+            core_state.cs,
+        );
+        self.set_guest_segment(
+            VMCS_FIELD_GUEST_SS_SELECTOR,
+            VMCS_FIELD_GUEST_SS_BASE,
+            VMCS_FIELD_GUEST_SS_LIMIT,
+            VMCS_FIELD_GUEST_SS_AR_BYTES,
+            core_state.ss,
+        );
+        self.set_guest_segment(
+            VMCS_FIELD_GUEST_DS_SELECTOR,
+            VMCS_FIELD_GUEST_DS_BASE,
+            VMCS_FIELD_GUEST_DS_LIMIT,
+            VMCS_FIELD_GUEST_DS_AR_BYTES,
+            core_state.ds,
+        );
+        self.set_guest_segment(
+            VMCS_FIELD_GUEST_FS_SELECTOR,
+            VMCS_FIELD_GUEST_FS_BASE,
+            VMCS_FIELD_GUEST_FS_LIMIT,
+            VMCS_FIELD_GUEST_FS_AR_BYTES,
+            core_state.fs,
+        );
+        self.set_guest_segment(
+            VMCS_FIELD_GUEST_GS_SELECTOR,
+            VMCS_FIELD_GUEST_GS_BASE,
+            VMCS_FIELD_GUEST_GS_LIMIT,
+            VMCS_FIELD_GUEST_GS_AR_BYTES,
+            core_state.gs,
+        );
+        self.set_guest_segment(
+            VMCS_FIELD_GUEST_LDTR_SELECTOR,
+            VMCS_FIELD_GUEST_LDTR_BASE,
+            VMCS_FIELD_GUEST_LDTR_LIMIT,
+            VMCS_FIELD_GUEST_LDTR_AR_BYTES,
+            core_state.ldtr,
+        );
+        self.set_guest_segment(
+            VMCS_FIELD_GUEST_TR_SELECTOR,
+            VMCS_FIELD_GUEST_TR_BASE,
+            VMCS_FIELD_GUEST_TR_LIMIT,
+            VMCS_FIELD_GUEST_TR_AR_BYTES,
+            core_state.tr,
+        );
+        self.set_extended_field(VMCS_FIELD_GUEST_GDTR_BASE, core_state.gdtr_base);
+        self.set_extended_field(
+            VMCS_FIELD_GUEST_GDTR_LIMIT,
+            u64::from(core_state.gdtr_limit),
+        );
+        self.set_extended_field(VMCS_FIELD_GUEST_IDTR_BASE, core_state.idtr_base);
+        self.set_extended_field(
+            VMCS_FIELD_GUEST_IDTR_LIMIT,
+            u64::from(core_state.idtr_limit),
+        );
+        self.set_extended_field(VMCS_FIELD_GUEST_INTERRUPTIBILITY_INFO, 0);
+        self.set_extended_field(VMCS_FIELD_GUEST_ACTIVITY_STATE, 0);
+        self.set_extended_field(VMCS_FIELD_GUEST_PENDING_DBG_EXCEPTIONS, 0);
+
+        let sysenter_cs = core_state.sysenter_cs;
+        let sysenter_esp = core_state.sysenter_esp;
+        let sysenter_eip = core_state.sysenter_eip;
+        self.set_extended_field(VMCS_FIELD_GUEST_SYSENTER_CS, sysenter_cs);
+        self.set_extended_field(VMCS_FIELD_GUEST_SYSENTER_ESP, sysenter_esp);
+        self.set_extended_field(VMCS_FIELD_GUEST_SYSENTER_EIP, sysenter_eip);
+
+        let host_selector = |selector: u16| u64::from(selector & !0x7);
+        self.set_extended_field(VMCS_FIELD_HOST_CR0, core_state.host_cr0);
+        self.set_extended_field(VMCS_FIELD_HOST_CR3, core_state.host_cr3);
+        self.set_extended_field(VMCS_FIELD_HOST_CR4, core_state.host_cr4);
+        self.set_extended_field(
+            VMCS_FIELD_HOST_ES_SELECTOR,
+            host_selector(core_state.es.selector),
+        );
+        self.set_extended_field(
+            VMCS_FIELD_HOST_CS_SELECTOR,
+            host_selector(core_state.cs.selector),
+        );
+        self.set_extended_field(
+            VMCS_FIELD_HOST_SS_SELECTOR,
+            host_selector(core_state.ss.selector),
+        );
+        self.set_extended_field(
+            VMCS_FIELD_HOST_DS_SELECTOR,
+            host_selector(core_state.ds.selector),
+        );
+        self.set_extended_field(
+            VMCS_FIELD_HOST_FS_SELECTOR,
+            host_selector(core_state.fs.selector),
+        );
+        self.set_extended_field(
+            VMCS_FIELD_HOST_GS_SELECTOR,
+            host_selector(core_state.gs.selector),
+        );
+        self.set_extended_field(
+            VMCS_FIELD_HOST_TR_SELECTOR,
+            host_selector(core_state.tr.selector),
+        );
+        self.set_extended_field(VMCS_FIELD_HOST_FS_BASE, core_state.fs.base);
+        self.set_extended_field(VMCS_FIELD_HOST_GS_BASE, core_state.gs.base);
+        self.set_extended_field(VMCS_FIELD_HOST_TR_BASE, core_state.tr.base);
+        self.set_extended_field(VMCS_FIELD_HOST_GDTR_BASE, core_state.gdtr_base);
+        self.set_extended_field(VMCS_FIELD_HOST_IDTR_BASE, core_state.idtr_base);
+        self.set_extended_field(VMCS_FIELD_HOST_SYSENTER_CS, sysenter_cs);
+        self.set_extended_field(VMCS_FIELD_HOST_SYSENTER_ESP, sysenter_esp);
+        self.set_extended_field(VMCS_FIELD_HOST_SYSENTER_EIP, sysenter_eip);
+    }
+
+    pub fn seed_backing(&self, bytes: &mut [u8]) {
+        assert!(bytes.len() >= VMX_REGION_SIZE as usize);
+        // Byte slices need not be aligned; preserve the revision header outside the backing data.
+        unsafe {
+            let base = bytes.as_mut_ptr();
+            base.add(VMCS12_BACKING_MAGIC_OFFSET)
+                .cast::<u64>()
+                .write_unaligned(VMCS12_BACKING_MAGIC);
+            base.add(VMCS12_BACKING_STATE_OFFSET)
+                .cast::<Self>()
+                .write_unaligned(*self);
         }
     }
 }
@@ -1190,6 +1405,14 @@ const _: () = assert!(VMCS12_BACKING_MAGIC_OFFSET + core::mem::size_of::<u64>() 
 const _: () = assert!(VMCS12_BACKING_STATE_OFFSET & 7 == 0);
 const _: () =
     assert!(VMCS12_BACKING_STATE_OFFSET + core::mem::size_of::<NestedVmcs12State>() <= 4096);
+
+const _: () = {
+    let mut index = 0;
+    while index < VMCS12_EXTENDED_FIELDS.len() {
+        assert!(VMCS12_EXTENDED_FIELDS[index].index == index);
+        index += 1;
+    }
+};
 
 pub const INVALID_VMCS_POINTER: u64 = u64::MAX;
 
@@ -1221,9 +1444,9 @@ pub struct NestedVmxState {
     pub vmxon_operand: u64,
     pub vmxon_region: u64,
     pub current_vmcs: u64,
+    pub current_vmcs_is_shadow: u64,
     pub last_operand: u64,
     pub last_vmcs_field: u64,
-    pub instruction_error: u64,
     pub vmxon_count: u64,
     pub vmxoff_count: u64,
     pub failure_count: u64,
@@ -1232,6 +1455,8 @@ pub struct NestedVmxState {
     pub vmcs12: NestedVmcs12State,
     pub vmcs01_region: u64,
     pub vmcs02_region: u64,
+    pub shadow_vmcs_region: u64,
+    pub shadow_vmread_bitmap: u64,
     pub l2_active: u64,
     pub l2_entry_was_resume: u64,
     pub l2_entry_count: u64,
@@ -1340,6 +1565,15 @@ pub struct NestedVmxState {
     pub eptp_table_pages: u64,
     pub eptp_table_used: u64,
     pub exit_reason_counts: [u64; 128],
+    pub evmcs_enabled: u64,
+    pub vp_assist_msr: u64,
+    pub evmcs_active: u64,
+    pub current_vmcs_hpa: u64,
+    pub captured_msr_store_count: u64,
+    pub entry_msr_prefix_count: u64,
+    pub l2_msr_gp_pending: u64,
+    pub operand_linear_address: u64,
+    pub operand_data: [u64; 2],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1410,9 +1644,9 @@ impl NestedVmxState {
             vmxon_operand,
             vmxon_region,
             current_vmcs: INVALID_VMCS_POINTER,
+            current_vmcs_is_shadow: 0,
             last_operand: 0,
             last_vmcs_field: 0,
-            instruction_error: 0,
             vmxon_count: 0,
             vmxoff_count: 0,
             failure_count: 0,
@@ -1421,6 +1655,8 @@ impl NestedVmxState {
             vmcs12,
             vmcs01_region,
             vmcs02_region,
+            shadow_vmcs_region: 0,
+            shadow_vmread_bitmap: 0,
             l2_active: 0,
             l2_entry_was_resume: 0,
             l2_entry_count: 0,
@@ -1529,6 +1765,15 @@ impl NestedVmxState {
             eptp_table_pages: 0,
             eptp_table_used: 0,
             exit_reason_counts: [0; 128],
+            evmcs_enabled: 0,
+            vp_assist_msr: 0,
+            evmcs_active: 0,
+            current_vmcs_hpa: 0,
+            captured_msr_store_count: 0,
+            entry_msr_prefix_count: 0,
+            l2_msr_gp_pending: 0,
+            operand_linear_address: 0,
+            operand_data: [0; 2],
         }
     }
 
@@ -1573,3 +1818,184 @@ impl NestedVmxState {
         self.ept02_cached_pointer = configuration.alternate_ept02_pointer;
     }
 }
+
+pub const EVMCS_VERSION: u32 = 1;
+pub const EVMCS_PAGE_SIZE: usize = 4096;
+pub const VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET: usize = 40;
+pub const VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET: usize = 48;
+
+#[repr(C, packed)]
+pub struct EnlightenedVmcs {
+    pub version_number: u32,
+    pub abort_indicator: u32,
+    pub host_es_selector: u16,
+    pub host_cs_selector: u16,
+    pub host_ss_selector: u16,
+    pub host_ds_selector: u16,
+    pub host_fs_selector: u16,
+    pub host_gs_selector: u16,
+    pub host_tr_selector: u16,
+    pub reserved_0: u16,
+    pub host_pat: u64,
+    pub host_efer: u64,
+    pub host_cr0: u64,
+    pub host_cr3: u64,
+    pub host_cr4: u64,
+    pub host_sysenter_esp: u64,
+    pub host_sysenter_eip: u64,
+    pub host_rip: u64,
+    pub host_sysenter_cs: u32,
+    pub pin_controls: u32,
+    pub exit_controls: u32,
+    pub secondary_processor_controls: u32,
+    pub io_bitmap_a: u64,
+    pub io_bitmap_b: u64,
+    pub msr_bitmap: u64,
+    pub guest_es_selector: u16,
+    pub guest_cs_selector: u16,
+    pub guest_ss_selector: u16,
+    pub guest_ds_selector: u16,
+    pub guest_fs_selector: u16,
+    pub guest_gs_selector: u16,
+    pub guest_ldtr_selector: u16,
+    pub guest_tr_selector: u16,
+    pub guest_es_limit: u32,
+    pub guest_cs_limit: u32,
+    pub guest_ss_limit: u32,
+    pub guest_ds_limit: u32,
+    pub guest_fs_limit: u32,
+    pub guest_gs_limit: u32,
+    pub guest_ldtr_limit: u32,
+    pub guest_tr_limit: u32,
+    pub guest_gdtr_limit: u32,
+    pub guest_idtr_limit: u32,
+    pub guest_es_attributes: u32,
+    pub guest_cs_attributes: u32,
+    pub guest_ss_attributes: u32,
+    pub guest_ds_attributes: u32,
+    pub guest_fs_attributes: u32,
+    pub guest_gs_attributes: u32,
+    pub guest_ldtr_attributes: u32,
+    pub guest_tr_attributes: u32,
+    pub guest_es_base: u64,
+    pub guest_cs_base: u64,
+    pub guest_ss_base: u64,
+    pub guest_ds_base: u64,
+    pub guest_fs_base: u64,
+    pub guest_gs_base: u64,
+    pub guest_ldtr_base: u64,
+    pub guest_tr_base: u64,
+    pub guest_gdtr_base: u64,
+    pub guest_idtr_base: u64,
+    pub reserved_1: [u64; 3],
+    pub exit_msr_store_address: u64,
+    pub exit_msr_load_address: u64,
+    pub entry_msr_load_address: u64,
+    pub cr3_target_0: u64,
+    pub cr3_target_1: u64,
+    pub cr3_target_2: u64,
+    pub cr3_target_3: u64,
+    pub pfec_mask: u32,
+    pub pfec_match: u32,
+    pub cr3_target_count: u32,
+    pub exit_msr_store_count: u32,
+    pub exit_msr_load_count: u32,
+    pub entry_msr_load_count: u32,
+    pub tsc_offset: u64,
+    pub virtual_apic_page: u64,
+    pub guest_working_vmcs_ptr: u64,
+    pub guest_ia32_debugctl: u64,
+    pub guest_pat: u64,
+    pub guest_efer: u64,
+    pub guest_pdpte_0: u64,
+    pub guest_pdpte_1: u64,
+    pub guest_pdpte_2: u64,
+    pub guest_pdpte_3: u64,
+    pub guest_pending_debug_exceptions: u64,
+    pub guest_sysenter_esp: u64,
+    pub guest_sysenter_eip: u64,
+    pub guest_activity_state: u32,
+    pub guest_sysenter_cs: u32,
+    pub cr0_guest_host_mask: u64,
+    pub cr4_guest_host_mask: u64,
+    pub cr0_read_shadow: u64,
+    pub cr4_read_shadow: u64,
+    pub guest_cr0: u64,
+    pub guest_cr3: u64,
+    pub guest_cr4: u64,
+    pub guest_dr7: u64,
+    pub host_fs_base: u64,
+    pub host_gs_base: u64,
+    pub host_tr_base: u64,
+    pub host_gdtr_base: u64,
+    pub host_idtr_base: u64,
+    pub host_rsp: u64,
+    pub ept_root: u64,
+    pub vpid: u16,
+    pub reserved_2: [u16; 3],
+    pub reserved_3: [u64; 4],
+    pub exit_extended_instruction_info: u64,
+    pub exit_ept_fault_gpa: u64,
+    pub exit_instruction_error: u32,
+    pub exit_reason: u32,
+    pub exit_interruption_info: u32,
+    pub exit_exception_error_code: u32,
+    pub exit_idt_vectoring_info: u32,
+    pub exit_idt_vectoring_error_code: u32,
+    pub exit_instruction_length: u32,
+    pub exit_instruction_info: u32,
+    pub exit_qualification: u64,
+    pub exit_io_instruction_ecx: u64,
+    pub exit_io_instruction_esi: u64,
+    pub exit_io_instruction_edi: u64,
+    pub exit_io_instruction_eip: u64,
+    pub guest_linear_address: u64,
+    pub guest_rsp: u64,
+    pub guest_rflags: u64,
+    pub guest_interruptibility: u32,
+    pub processor_controls: u32,
+    pub exception_bitmap: u32,
+    pub entry_controls: u32,
+    pub entry_interrupt_info: u32,
+    pub entry_exception_error_code: u32,
+    pub entry_instruction_length: u32,
+    pub tpr_threshold: u32,
+    pub guest_rip: u64,
+    pub clean_fields: u32,
+    pub reserved_4: u32,
+    pub synthetic_controls: u32,
+    pub enlightenments_control: u32,
+    pub vp_id: u32,
+    pub reserved_5: u32,
+    pub vm_id: u64,
+    pub partition_assist_page: u64,
+    pub reserved_6: [u64; 4],
+    pub guest_bndcfgs: u64,
+    pub guest_perf_global_ctrl: u64,
+    pub guest_s_cet: u64,
+    pub guest_ssp: u64,
+    pub guest_interrupt_ssp_table_addr: u64,
+    pub guest_lbr_ctl: u64,
+    pub reserved_7: [u64; 2],
+    pub xss_exiting_bitmap: u64,
+    pub encls_exiting_bitmap: u64,
+    pub host_perf_global_ctrl: u64,
+    pub tsc_multiplier: u64,
+    pub host_s_cet: u64,
+    pub host_ssp: u64,
+    pub host_interrupt_ssp_table_addr: u64,
+    pub tertiary_processor_controls: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<EnlightenedVmcs>() == 1024);
+const _: () = assert!(core::mem::size_of::<EnlightenedVmcs>() <= EVMCS_PAGE_SIZE);
+const _: () = assert!(core::mem::offset_of!(EnlightenedVmcs, host_pat) == 24);
+const _: () = assert!(core::mem::offset_of!(EnlightenedVmcs, host_rsp) == 616);
+const _: () = assert!(core::mem::offset_of!(EnlightenedVmcs, exit_reason) == 692);
+const _: () = assert!(core::mem::offset_of!(EnlightenedVmcs, exit_instruction_length) == 712);
+const _: () = assert!(core::mem::offset_of!(EnlightenedVmcs, exit_qualification) == 720);
+const _: () = assert!(core::mem::offset_of!(EnlightenedVmcs, guest_rsp) == 768);
+const _: () = assert!(core::mem::offset_of!(EnlightenedVmcs, guest_rflags) == 776);
+const _: () = assert!(core::mem::offset_of!(EnlightenedVmcs, guest_rip) == 816);
+const _: () = assert!(core::mem::offset_of!(EnlightenedVmcs, clean_fields) == 824);
+const _: () = assert!(core::mem::offset_of!(EnlightenedVmcs, xss_exiting_bitmap) == 960);

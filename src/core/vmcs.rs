@@ -2,7 +2,7 @@ use core::arch::asm;
 
 use uefi::Status;
 
-use super::vt_vmxon::{self, VmxInstructionResult, VmxonError, VmxonReport};
+use super::vmxon::{self, VmxInstructionResult, VmxonError, VmxonReport};
 
 use crate::memory::{AddressConstraint, ResidentPages};
 use crate::runtime;
@@ -46,6 +46,8 @@ pub const VIRTUAL_APIC_PAGE_ADDR: u64 = 0x2012;
 pub const EPT_POINTER: u64 = 0x201a;
 pub const VM_FUNCTION_CONTROL: u64 = 0x2018;
 pub const EPTP_LIST_ADDRESS: u64 = 0x2024;
+pub const VMREAD_BITMAP: u64 = 0x2026;
+pub const VMWRITE_BITMAP: u64 = 0x2028;
 pub const XSS_EXITING_BITMAP: u64 = 0x202c;
 
 pub const PIN_BASED_VM_EXEC_CONTROL: u64 = 0x4000;
@@ -168,7 +170,7 @@ pub(crate) struct VmcsRegion {
 
 impl VmcsRegion {
     pub(crate) fn allocate(vmx_basic: u64) -> Result<Self, VmcsError> {
-        let constraint = if vt_vmxon::region_uses_32_bit_physical_addresses(vmx_basic) {
+        let constraint = if vmxon::region_uses_32_bit_physical_addresses(vmx_basic) {
             AddressConstraint::Max(u32::MAX as u64)
         } else {
             AddressConstraint::Any
@@ -193,12 +195,12 @@ impl VmcsRegion {
 }
 
 pub fn probe_vmcs() -> Result<VmcsReport, VmcsError> {
-    let vmx_basic = vt_vmxon::vmx_basic();
-    let revision_id = vt_vmxon::revision_id(vmx_basic);
+    let vmx_basic = vmxon::vmx_basic();
+    let revision_id = vmxon::revision_id(vmx_basic);
     let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
     vmcs_region.write_revision_id(revision_id);
     let region_physical_address = vmcs_region.physical_address();
-    let session = vt_vmxon::enter_vmx_root().map_err(VmcsError::Vmxon)?;
+    let session = vmxon::enter_vmx_root().map_err(VmcsError::Vmxon)?;
     let vmxon_report = session.report();
 
     runtime::phase("vmx.vmcs.vmclear.start");
@@ -269,7 +271,7 @@ pub(crate) unsafe fn vmclear(physical_address: u64) -> VmxInstructionResult {
             options(nostack)
         );
     }
-    vt_vmxon::decode_flags(carry, zero)
+    vmxon::decode_flags(carry, zero)
 }
 
 pub(crate) unsafe fn vmptrld(physical_address: u64) -> VmxInstructionResult {
@@ -286,7 +288,7 @@ pub(crate) unsafe fn vmptrld(physical_address: u64) -> VmxInstructionResult {
             options(nostack)
         );
     }
-    vt_vmxon::decode_flags(carry, zero)
+    vmxon::decode_flags(carry, zero)
 }
 
 unsafe fn vmptrst() -> u64 {
@@ -317,7 +319,7 @@ pub(crate) unsafe fn vmread_raw(field: u64) -> (u64, VmxInstructionResult) {
             options(nostack)
         );
     }
-    (value, vt_vmxon::decode_flags(carry, zero))
+    (value, vmxon::decode_flags(carry, zero))
 }
 
 pub(crate) fn vmread(field: u64) -> Result<u64, VmcsError> {
@@ -344,7 +346,7 @@ pub(crate) fn vmwrite(field: u64, value: u64) -> Result<(), VmcsError> {
             options(nostack)
         );
     }
-    let result = vt_vmxon::decode_flags(carry, zero);
+    let result = vmxon::decode_flags(carry, zero);
     if result == VmxInstructionResult::Succeeded {
         Ok(())
     } else {

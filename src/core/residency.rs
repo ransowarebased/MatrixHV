@@ -9,10 +9,10 @@ use uefi::boot::{self, EventNotifyFn, EventType, Tpl};
 
 use super::vmcs;
 use super::vmcs::*;
-use super::vt_controls::{self, VmxControlsError};
-use super::vt_ept::{self, EptError};
-use super::vt_state;
-use super::vt_vmxon::{self, VmxInstructionResult, VmxonError};
+use super::controls::{self, VmxControlsError};
+use super::ept::{self, EptError};
+use super::state;
+use super::vmxon::{self, VmxInstructionResult, VmxonError};
 use crate::arch;
 use crate::memory::{
     AddressConstraint, HostAddressSpace, HostPagingError, PAGE_SIZE, RESIDENT_CODE_MEMORY_TYPE,
@@ -29,26 +29,23 @@ use crate::nested::{
     IA32_VMX_VMCS_ENUM_MSR, INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR, INVEPT_EXIT_REASON,
     INVVPID_EXIT_REASON, MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_PROTOCOL,
     MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX, MATRIXHV_STATUS_SIGNATURE_ECX,
-    NestedEptConfiguration, NestedMsrComposition, NestedVmcs12State, NestedVmxCapabilities,
-    NestedVmxState, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
-    VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR, VMCLEAR_EXIT_REASON,
-    VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
-    VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_LINEAR_ADDRESS,
-    VMCS_FIELD_GUEST_PHYSICAL_ADDRESS, VMCS_FIELD_GUEST_RFLAGS, VMCS_FIELD_GUEST_RIP,
+    NestedEptConfiguration, NestedMsrComposition, NestedVmcs12CoreState, NestedVmcs12SegmentState,
+    NestedVmcs12State, NestedVmxCapabilities, NestedVmxState, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR,
+    VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR, VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR,
+    VMCLEAR_EXIT_REASON, VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
+    VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS, VMCS_FIELD_GUEST_RIP,
     VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
-    VMCS_FIELD_IDT_VECTORING_ERROR_CODE, VMCS_FIELD_IDT_VECTORING_INFO_FIELD,
-    VMCS_FIELD_VM_EXIT_INSTRUCTION_INFO, VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN,
-    VMCS_FIELD_VM_EXIT_INTR_ERROR_CODE, VMCS_FIELD_VM_EXIT_INTR_INFO, VMCS_FIELD_VM_EXIT_REASON,
-    VMCS_FIELD_VM_INSTRUCTION_ERROR, VMCS_UNSUPPORTED_COMPONENT_ERROR, VMCS12_BACKING_MAGIC,
-    VMCS12_BACKING_MAGIC_OFFSET, VMCS12_BACKING_QWORD_COUNT, VMCS12_BACKING_STATE_OFFSET,
-    VMCS12_EXTENDED_FIELD_COUNT, VMCS12_EXTENDED_FIELDS, VMCS12_LAUNCH_STATE_CLEAR,
-    VMCS12_LAUNCH_STATE_LAUNCHED, VMFAIL_INVALID_STATUS, VMFAIL_VALID_STATUS, VMLAUNCH_EXIT_REASON,
-    VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_EXIT_REASON, VMPTRLD_INCORRECT_REVISION_ERROR,
-    VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR, VMPTRLD_VMXON_POINTER_ERROR, VMPTRST_EXIT_REASON,
-    VMREAD_EXIT_REASON, VMRESUME_EXIT_REASON, VMRESUME_NON_LAUNCHED_VMCS_ERROR,
-    VMWRITE_EXIT_REASON, VMWRITE_READ_ONLY_COMPONENT_ERROR, VMX_BASIC_TRUE_CONTROLS,
-    VMX_SECONDARY_ENABLE_EPT, VMX_SECONDARY_ENABLE_VPID, VMX_STATUS_FLAGS_CLEAR_MASK,
-    VMXOFF_EXIT_REASON, VMXON_EXIT_REASON, VMXON_IN_VMX_ROOT_ERROR,
+    VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR,
+    VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET, VMCS_SHADOW_READ_BYPASS_MASK, VMCS_SHADOW_READ_TRAP_MASK,
+    VMCS_UNSUPPORTED_COMPONENT_ERROR, VMCS12_BACKING_MAGIC, VMCS12_BACKING_MAGIC_OFFSET,
+    VMCS12_BACKING_QWORD_COUNT, VMCS12_BACKING_STATE_OFFSET, VMCS12_EXTENDED_FIELD_COUNT,
+    VMCS12_LAUNCH_STATE_CLEAR, VMCS12_LAUNCH_STATE_LAUNCHED, VMFAIL_INVALID_STATUS,
+    VMFAIL_VALID_STATUS, VMLAUNCH_EXIT_REASON, VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_EXIT_REASON,
+    VMPTRLD_INCORRECT_REVISION_ERROR, VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR,
+    VMPTRLD_VMXON_POINTER_ERROR, VMPTRST_EXIT_REASON, VMREAD_EXIT_REASON, VMRESUME_EXIT_REASON,
+    VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_EXIT_REASON, VMWRITE_READ_ONLY_COMPONENT_ERROR,
+    VMX_BASIC_TRUE_CONTROLS, VMX_SECONDARY_ENABLE_EPT, VMX_SECONDARY_ENABLE_VPID,
+    VMX_STATUS_FLAGS_CLEAR_MASK, VMXOFF_EXIT_REASON, VMXON_EXIT_REASON, VMXON_IN_VMX_ROOT_ERROR,
 };
 use crate::smp::ResidentCpuResources;
 
@@ -120,6 +117,7 @@ const HYPERV_GUEST_IDLE_FEATURE_MASK: u32 = !(1 << 5);
 const HYPERV_GUEST_OS_ID_MSR: u32 = 0x4000_0000;
 const HYPERV_HYPERCALL_MSR: u32 = 0x4000_0001;
 const HYPERV_VP_INDEX_MSR: u32 = 0x4000_0002;
+const HYPERV_REFERENCE_COUNT_MSR: u32 = 0x4000_0020;
 const HYPERV_REFERENCE_TSC_MSR: u32 = 0x4000_0021;
 const HYPERV_APIC_FREQUENCY_MSR: u32 = 0x4000_0023;
 const HYPERV_REFERENCE_TIME_MSR_SPAN: u32 = HYPERV_APIC_FREQUENCY_MSR - HYPERV_REFERENCE_TSC_MSR;
@@ -140,11 +138,13 @@ const IA32_TSC_AUX_MSR: u32 = 0xc000_0103;
 const RESIDENT_MSR_SWITCH_CAPACITY: usize = 1;
 const NESTED_MSR_BITMAP_OFFSET: u64 = 0;
 const NESTED_VMCS02_ENTRY_MSR_LIST_OFFSET: u64 = PAGE_SIZE as u64;
-const NESTED_VMCS02_EXIT_STORE_MSR_LIST_OFFSET: u64 = (PAGE_SIZE * 3) as u64;
-const NESTED_VMCS01_ENTRY_MSR_LIST_OFFSET: u64 = (PAGE_SIZE * 5) as u64;
-const NESTED_MSR_LIST_CAPACITY: usize = (PAGE_SIZE * 2) / size_of::<VmxMsrEntry>();
-const NESTED_GUEST_MSR_LIST_CAPACITY: usize =
-    NESTED_MSR_LIST_CAPACITY - RESIDENT_MSR_SWITCH_CAPACITY;
+const NESTED_VMCS02_EXIT_STORE_MSR_LIST_OFFSET: u64 = (PAGE_SIZE * 4) as u64;
+const NESTED_VMCS01_ENTRY_MSR_LIST_OFFSET: u64 = (PAGE_SIZE * 7) as u64;
+const NESTED_GUEST_MSR_LIST_CAPACITY: usize = crate::nested::VMX_MSR_LIST_CAPACITY;
+const _: () = assert!(
+    (NESTED_GUEST_MSR_LIST_CAPACITY + RESIDENT_MSR_SWITCH_CAPACITY) * size_of::<VmxMsrEntry>()
+        <= PAGE_SIZE * 3
+);
 const NESTED_MSR_BITMAP_QWORD_COUNT: usize = PAGE_SIZE / size_of::<u64>();
 const HOST_PAGE_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -414,6 +414,41 @@ struct ResidentEventContext {
     control_apic_ids: [u32; 64],
     control_probe_states: [ControlProbeSnapshot; 64],
     control_cpu_states: [ControlCpuState; 64],
+    hyperv_tsc_scale: u64,
+    hyperv_tsc_offset: u64,
+    hyperv_reference_tsc_msr: AtomicU64,
+    hyperv_reference_tsc_lock: AtomicU64,
+    hyperv_reference_tsc_sequence: AtomicU64,
+    hyperv_guest_os_id: AtomicU64,
+    hyperv_hypercall_msr: AtomicU64,
+    hyperv_hypercall_lock: AtomicU64,
+}
+
+fn hyperv_reference_tsc_scale(denominator: u32, numerator: u32, crystal_hz: u32) -> u64 {
+    if denominator == 0 || numerator == 0 || crystal_hz == 0 {
+        return 0;
+    }
+    let tsc_hz = u64::from(crystal_hz) * u64::from(numerator) / u64::from(denominator);
+    if tsc_hz <= 10_000_000 {
+        return 0;
+    }
+    ((10_000_000_u128 << 64) / u128::from(tsc_hz)) as u64
+}
+
+fn native_hyperv_reference_tsc() -> (u64, u64) {
+    let cpuid = core::arch::x86_64::__cpuid;
+    if cpuid(0).eax < 0x15
+        || cpuid(1).ecx & CPUID_HYPERVISOR_PRESENT_BIT != 0
+        || cpuid(0x8000_0000).eax < 0x8000_0007
+        || cpuid(0x8000_0007).edx & (1 << 8) == 0
+    {
+        return (0, 0);
+    }
+    let frequency = cpuid(0x15);
+    let scale = hyperv_reference_tsc_scale(frequency.eax, frequency.ebx, frequency.ecx);
+    let epoch = unsafe { core::arch::x86_64::_rdtsc() };
+    let offset = ((u128::from(epoch) * u128::from(scale)) >> 64) as u64;
+    (scale, offset.wrapping_neg())
 }
 
 #[repr(C)]
@@ -574,6 +609,7 @@ struct ResidentBootContext {
     init_count: u64,
     sipi_count: u64,
     cpuid_presence: u64,
+    hyperv_timing_supported: u64,
     cpuid_leaf1_count: u64,
     cpuid_hypervisor_count: u64,
     cpuid_leaf1_ecx: u64,
@@ -680,6 +716,7 @@ impl ResidentBootContext {
             init_count: 0,
             sipi_count: 0,
             cpuid_presence: u64::from(crate::boot::current().cpuid_presence),
+            hyperv_timing_supported: 0,
             cpuid_leaf1_count: 0,
             cpuid_hypervisor_count: 0,
             cpuid_leaf1_ecx: 0,
@@ -879,7 +916,8 @@ const BCTX_NESTED_LAST_OPERAND: usize = core::mem::offset_of!(ResidentBootContex
 const BCTX_NESTED_LAST_VMCS_FIELD: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, last_vmcs_field);
 const BCTX_NESTED_INSTRUCTION_ERROR: usize = core::mem::offset_of!(ResidentBootContext, nested)
-    + core::mem::offset_of!(NestedVmxState, instruction_error);
+    + core::mem::offset_of!(NestedVmxState, vmcs12)
+    + core::mem::offset_of!(NestedVmcs12State, instruction_error);
 const BCTX_NESTED_VMXON_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, vmxon_count);
 const BCTX_NESTED_VMXOFF_COUNT: usize = core::mem::offset_of!(ResidentBootContext, nested)
@@ -1022,6 +1060,10 @@ const BCTX_NESTED_VMCS01_REGION: usize = core::mem::offset_of!(ResidentBootConte
     + core::mem::offset_of!(NestedVmxState, vmcs01_region);
 const BCTX_NESTED_VMCS02_REGION: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, vmcs02_region);
+const BCTX_NESTED_SHADOW_VMCS_REGION: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, shadow_vmcs_region);
+const BCTX_NESTED_SHADOW_VMREAD_BITMAP: usize = core::mem::offset_of!(ResidentBootContext, nested)
+    + core::mem::offset_of!(NestedVmxState, shadow_vmread_bitmap);
 const BCTX_NESTED_L2_ACTIVE: usize = core::mem::offset_of!(ResidentBootContext, nested)
     + core::mem::offset_of!(NestedVmxState, l2_active);
 const BCTX_NESTED_L2_ENTRY_WAS_RESUME: usize = core::mem::offset_of!(ResidentBootContext, nested)
@@ -1559,15 +1601,15 @@ pub fn probe() -> Result<ResidentProbeReport, ResidentProbeError> {
         .map_err(ResidentProbeError::Allocation)?;
     let mut host_address_space = HostAddressSpace::reserve().map_err(ResidentProbeError::Paging)?;
 
-    let vmx_basic = vt_vmxon::vmx_basic();
-    let revision_id = vt_vmxon::revision_id(vmx_basic);
+    let vmx_basic = vmxon::vmx_basic();
+    let revision_id = vmxon::revision_id(vmx_basic);
     let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
     vmcs_region.write_revision_id(revision_id);
     let vmcs_physical_address = vmcs_region.physical_address();
     let host_space = host_address_space
         .clone_current()
         .map_err(ResidentProbeError::Paging)?;
-    let session = vt_vmxon::enter_vmx_root().map_err(ResidentProbeError::Vmxon)?;
+    let session = vmxon::enter_vmx_root().map_err(ResidentProbeError::Vmxon)?;
     let source_cr3 = host_space.source_cr3;
     let context = context_pages.pointer().as_ptr().cast::<ResidentContext>();
     unsafe {
@@ -1585,10 +1627,10 @@ pub fn probe() -> Result<ResidentProbeReport, ResidentProbeError> {
         return Err(ResidentProbeError::Vmcs(VmcsError::Vmptrld(load_result)));
     }
 
-    let _controls = vt_controls::configure()?;
+    let _controls = controls::configure()?;
     configure_resident_host(host_space.host_cr3, &tables, root_segments)?;
     let guest_rsp = guest_stack.physical_address() + guest_stack.byte_len() as u64;
-    let guest = vt_state::configure_guest(guest_probe_address(), guest_rsp & !0xf)?;
+    let guest = state::configure_guest(guest_probe_address(), guest_rsp & !0xf)?;
 
     let host_rsp = (host_stack.physical_address() + host_stack.byte_len() as u64 - 8) & !0xf;
     unsafe {
@@ -1698,6 +1740,7 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
         .pointer()
         .as_ptr()
         .cast::<ResidentEventContext>();
+    let (hyperv_tsc_scale, hyperv_tsc_offset) = native_hyperv_reference_tsc();
     unsafe {
         context.write(ResidentEventContext {
             magic: EVENT_CONTEXT_MAGIC,
@@ -1737,6 +1780,14 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
             control_apic_ids: [u32::MAX; 64],
             control_probe_states: [ControlProbeSnapshot::default(); 64],
             control_cpu_states: [ControlCpuState::default(); 64],
+            hyperv_tsc_scale,
+            hyperv_tsc_offset,
+            hyperv_reference_tsc_msr: AtomicU64::new(0),
+            hyperv_reference_tsc_lock: AtomicU64::new(0),
+            hyperv_reference_tsc_sequence: AtomicU64::new(0),
+            hyperv_guest_os_id: AtomicU64::new(0),
+            hyperv_hypercall_msr: AtomicU64::new(0),
+            hyperv_hypercall_lock: AtomicU64::new(0),
         });
         for (index, state) in (*context).control_cpu_states.iter_mut().enumerate() {
             let address = native_storage_pages.physical_address()
@@ -2019,11 +2070,11 @@ fn configure_nested_vmcs02(
     }
 
     let configure_result = (|| -> Result<(), ResidentProbeError> {
-        let mut controls = vt_controls::configure_resident_boot(
+        let mut controls = controls::configure_resident_boot(
             configuration.msr_bitmap,
             configuration.ept_pointer,
         )?;
-        vt_controls::enable_resident_vpid(&mut controls, 2)?;
+        controls::enable_resident_vpid(&mut controls, 2)?;
         if unsafe { arch::read_msr(arch::IA32_VMX_PROCBASED_CTLS2) }
             & (u64::from(crate::nested::VMX_SECONDARY_ENABLE_VM_FUNCTIONS) << 32)
             != 0
@@ -2038,12 +2089,12 @@ fn configure_nested_vmcs02(
             configuration.host_tables,
             configuration.segments,
         )?;
-        vt_state::configure_guest_with_rflags(
+        state::configure_guest_with_rflags(
             configuration.guest_rip,
             configuration.guest_rsp,
             configuration.guest_rflags,
         )?;
-        vt_controls::virtualize_resident_cr4_vmxe(configuration.l1_cr4)?;
+        controls::virtualize_resident_cr4_vmxe(configuration.l1_cr4)?;
         vmwrite(HOST_RSP, configuration.host_rsp)?;
         vmwrite(HOST_RIP, configuration.host_rip)?;
         Ok(())
@@ -2061,193 +2112,67 @@ fn configure_nested_vmcs02(
     configure_result
 }
 
-fn vmcs12_extended_fields_are_dense() -> bool {
-    VMCS12_EXTENDED_FIELDS
-        .iter()
-        .enumerate()
-        .all(|(index, field)| field.index == index)
+fn configure_resident_vmcs_shadowing(
+    controls: &mut controls::VmxControls,
+    shadow_resources: Option<(u64, u64, u64)>,
+) -> Result<Option<(u64, u64)>, ResidentProbeError> {
+    let Some((shadow_vmcs, vmread_bitmap, vmwrite_bitmap)) = shadow_resources else {
+        return Ok(None);
+    };
+    if !crate::nested::native_vmcs_shadowing_available(unsafe {
+        arch::read_msr(arch::IA32_VMX_PROCBASED_CTLS2)
+    }) {
+        return Ok(None);
+    }
+    let clear = unsafe { vmcs::vmclear(shadow_vmcs) };
+    if clear != VmxInstructionResult::Succeeded {
+        return Err(ResidentProbeError::Vmclear(clear));
+    }
+    if controls::enable_resident_vmcs_shadowing(
+        controls,
+        shadow_vmcs,
+        vmread_bitmap,
+        vmwrite_bitmap,
+    )? {
+        Ok(Some((shadow_vmcs, vmread_bitmap)))
+    } else {
+        Ok(None)
+    }
 }
 
-fn set_vmcs12_extended_field(vmcs12: &mut NestedVmcs12State, encoding: u64, value: u64) {
-    let field = VMCS12_EXTENDED_FIELDS
-        .iter()
-        .find(|field| field.encoding == encoding)
-        .expect("VMCS12 core field must be supported");
-    vmcs12.extended_fields[field.index] = value;
-}
-
-fn set_vmcs12_guest_segment(
-    vmcs12: &mut NestedVmcs12State,
-    selector: u64,
-    base: u64,
-    limit: u64,
-    access_rights: u64,
-    segment: arch::SegmentState,
-) {
-    set_vmcs12_extended_field(vmcs12, selector, u64::from(segment.selector));
-    set_vmcs12_extended_field(vmcs12, base, segment.base);
-    set_vmcs12_extended_field(vmcs12, limit, u64::from(segment.limit));
-    set_vmcs12_extended_field(vmcs12, access_rights, u64::from(segment.access_rights));
-}
-
-fn seed_nested_vmcs12_core_state(
-    vmcs12: &mut NestedVmcs12State,
+fn capture_nested_vmcs12_core_state(
     mut segments: arch::SegmentationState,
     l1_cr4: u64,
-) {
-    use crate::nested::*;
-
+) -> NestedVmcs12CoreState {
     segments.tr = arch::vmx_usable_tr(segments.tr);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_VMCS_LINK_POINTER, u64::MAX);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_CR0, arch::read_cr0());
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_CR3, arch::read_cr3());
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_CR4, l1_cr4);
-    set_vmcs12_guest_segment(
-        vmcs12,
-        VMCS_FIELD_GUEST_ES_SELECTOR,
-        VMCS_FIELD_GUEST_ES_BASE,
-        VMCS_FIELD_GUEST_ES_LIMIT,
-        VMCS_FIELD_GUEST_ES_AR_BYTES,
-        segments.es,
-    );
-    set_vmcs12_guest_segment(
-        vmcs12,
-        VMCS_FIELD_GUEST_CS_SELECTOR,
-        VMCS_FIELD_GUEST_CS_BASE,
-        VMCS_FIELD_GUEST_CS_LIMIT,
-        VMCS_FIELD_GUEST_CS_AR_BYTES,
-        segments.cs,
-    );
-    set_vmcs12_guest_segment(
-        vmcs12,
-        VMCS_FIELD_GUEST_SS_SELECTOR,
-        VMCS_FIELD_GUEST_SS_BASE,
-        VMCS_FIELD_GUEST_SS_LIMIT,
-        VMCS_FIELD_GUEST_SS_AR_BYTES,
-        segments.ss,
-    );
-    set_vmcs12_guest_segment(
-        vmcs12,
-        VMCS_FIELD_GUEST_DS_SELECTOR,
-        VMCS_FIELD_GUEST_DS_BASE,
-        VMCS_FIELD_GUEST_DS_LIMIT,
-        VMCS_FIELD_GUEST_DS_AR_BYTES,
-        segments.ds,
-    );
-    set_vmcs12_guest_segment(
-        vmcs12,
-        VMCS_FIELD_GUEST_FS_SELECTOR,
-        VMCS_FIELD_GUEST_FS_BASE,
-        VMCS_FIELD_GUEST_FS_LIMIT,
-        VMCS_FIELD_GUEST_FS_AR_BYTES,
-        segments.fs,
-    );
-    set_vmcs12_guest_segment(
-        vmcs12,
-        VMCS_FIELD_GUEST_GS_SELECTOR,
-        VMCS_FIELD_GUEST_GS_BASE,
-        VMCS_FIELD_GUEST_GS_LIMIT,
-        VMCS_FIELD_GUEST_GS_AR_BYTES,
-        segments.gs,
-    );
-    set_vmcs12_guest_segment(
-        vmcs12,
-        VMCS_FIELD_GUEST_LDTR_SELECTOR,
-        VMCS_FIELD_GUEST_LDTR_BASE,
-        VMCS_FIELD_GUEST_LDTR_LIMIT,
-        VMCS_FIELD_GUEST_LDTR_AR_BYTES,
-        segments.ldtr,
-    );
-    set_vmcs12_guest_segment(
-        vmcs12,
-        VMCS_FIELD_GUEST_TR_SELECTOR,
-        VMCS_FIELD_GUEST_TR_BASE,
-        VMCS_FIELD_GUEST_TR_LIMIT,
-        VMCS_FIELD_GUEST_TR_AR_BYTES,
-        segments.tr,
-    );
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_GDTR_BASE, segments.gdtr.base);
-    set_vmcs12_extended_field(
-        vmcs12,
-        VMCS_FIELD_GUEST_GDTR_LIMIT,
-        u64::from(segments.gdtr.limit),
-    );
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_IDTR_BASE, segments.idtr.base);
-    set_vmcs12_extended_field(
-        vmcs12,
-        VMCS_FIELD_GUEST_IDTR_LIMIT,
-        u64::from(segments.idtr.limit),
-    );
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_INTERRUPTIBILITY_INFO, 0);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_ACTIVITY_STATE, 0);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_PENDING_DBG_EXCEPTIONS, 0);
-
-    let sysenter_cs = arch::ArchitecturalMsr::SysenterCs.read();
-    let sysenter_esp = arch::ArchitecturalMsr::SysenterEsp.read();
-    let sysenter_eip = arch::ArchitecturalMsr::SysenterEip.read();
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_SYSENTER_CS, sysenter_cs);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_SYSENTER_ESP, sysenter_esp);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_GUEST_SYSENTER_EIP, sysenter_eip);
-
-    let host_selector = |selector: u16| u64::from(selector & !0x7);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_HOST_CR0, arch::read_cr0());
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_HOST_CR3, arch::read_cr3());
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_HOST_CR4, arch::read_cr4());
-    set_vmcs12_extended_field(
-        vmcs12,
-        VMCS_FIELD_HOST_ES_SELECTOR,
-        host_selector(segments.es.selector),
-    );
-    set_vmcs12_extended_field(
-        vmcs12,
-        VMCS_FIELD_HOST_CS_SELECTOR,
-        host_selector(segments.cs.selector),
-    );
-    set_vmcs12_extended_field(
-        vmcs12,
-        VMCS_FIELD_HOST_SS_SELECTOR,
-        host_selector(segments.ss.selector),
-    );
-    set_vmcs12_extended_field(
-        vmcs12,
-        VMCS_FIELD_HOST_DS_SELECTOR,
-        host_selector(segments.ds.selector),
-    );
-    set_vmcs12_extended_field(
-        vmcs12,
-        VMCS_FIELD_HOST_FS_SELECTOR,
-        host_selector(segments.fs.selector),
-    );
-    set_vmcs12_extended_field(
-        vmcs12,
-        VMCS_FIELD_HOST_GS_SELECTOR,
-        host_selector(segments.gs.selector),
-    );
-    set_vmcs12_extended_field(
-        vmcs12,
-        VMCS_FIELD_HOST_TR_SELECTOR,
-        host_selector(segments.tr.selector),
-    );
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_HOST_FS_BASE, segments.fs.base);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_HOST_GS_BASE, segments.gs.base);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_HOST_TR_BASE, segments.tr.base);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_HOST_GDTR_BASE, segments.gdtr.base);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_HOST_IDTR_BASE, segments.idtr.base);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_HOST_SYSENTER_CS, sysenter_cs);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_HOST_SYSENTER_ESP, sysenter_esp);
-    set_vmcs12_extended_field(vmcs12, VMCS_FIELD_HOST_SYSENTER_EIP, sysenter_eip);
-}
-
-fn seed_nested_vmcs12_backing(region: &ResidentPages, vmcs12: &NestedVmcs12State) {
-    debug_assert!(region.byte_len() >= PAGE_SIZE);
-    unsafe {
-        let base = region.pointer().as_ptr();
-        base.add(VMCS12_BACKING_MAGIC_OFFSET)
-            .cast::<u64>()
-            .write(VMCS12_BACKING_MAGIC);
-        base.add(VMCS12_BACKING_STATE_OFFSET)
-            .cast::<NestedVmcs12State>()
-            .write(*vmcs12);
+    let segment_state = |segment: arch::SegmentState| NestedVmcs12SegmentState {
+        selector: segment.selector,
+        base: segment.base,
+        limit: segment.limit,
+        access_rights: segment.access_rights,
+    };
+    NestedVmcs12CoreState {
+        guest_cr0: arch::read_cr0(),
+        guest_cr3: arch::read_cr3(),
+        guest_cr4: l1_cr4,
+        host_cr0: arch::read_cr0(),
+        host_cr3: arch::read_cr3(),
+        host_cr4: arch::read_cr4(),
+        es: segment_state(segments.es),
+        cs: segment_state(segments.cs),
+        ss: segment_state(segments.ss),
+        ds: segment_state(segments.ds),
+        fs: segment_state(segments.fs),
+        gs: segment_state(segments.gs),
+        ldtr: segment_state(segments.ldtr),
+        tr: segment_state(segments.tr),
+        gdtr_base: segments.gdtr.base,
+        gdtr_limit: segments.gdtr.limit,
+        idtr_base: segments.idtr.base,
+        idtr_limit: segments.idtr.limit,
+        sysenter_cs: arch::ArchitecturalMsr::SysenterCs.read(),
+        sysenter_esp: arch::ArchitecturalMsr::SysenterEsp.read(),
+        sysenter_eip: arch::ArchitecturalMsr::SysenterEip.read(),
     }
 }
 
@@ -2302,6 +2227,12 @@ fn nested_vmx_capabilities(host_vmx_basic: u64) -> NestedVmxCapabilities {
         capabilities.vmx_ept_vpid_cap,
     ));
     capabilities.expose_vmx = crate::boot::current().vt_nested;
+    if crate::boot::current().vt_evmcs {
+        capabilities.vmx_procbased_ctls2 &= !(u64::from(
+            crate::nested::VMX_SECONDARY_ENABLE_VM_FUNCTIONS
+                | crate::nested::VMX_SECONDARY_VMCS_SHADOWING,
+        ) << 32);
+    }
     debug_assert_eq!(
         capabilities.vmx_msr(IA32_VMX_BASIC_MSR),
         Some(capabilities.vmx_basic)
@@ -2315,10 +2246,6 @@ pub fn run_boot_loader(
     ept_probe_fault_rip: u64,
     ept_probe_resume_rip: u64,
 ) -> Result<ResidentBootReport, ResidentProbeError> {
-    if !vmcs12_extended_fields_are_dense() {
-        return Err(ResidentProbeError::Allocation(Status::OUT_OF_RESOURCES));
-    }
-
     crate::boot::screen::stage("resident resource allocation");
     let initial_rflags = arch::read_rflags();
     let code = ResidentCode::allocate(event_context)?;
@@ -2382,47 +2309,26 @@ pub fn run_boot_loader(
     let zero_page = ResidentPages::allocate(1, AddressConstraint::Any)
         .map_err(ResidentProbeError::Allocation)?;
     let mut host_address_space = HostAddressSpace::reserve().map_err(ResidentProbeError::Paging)?;
-    let vmx_basic = vt_vmxon::vmx_basic();
+    let vmx_basic = vmxon::vmx_basic();
     let mut cpu_resources = ResidentCpuResources::allocate(
         vmx_basic,
         code.fatal,
         code.gp_handler,
         code.exception_stubs,
     )?;
-    let topology = crate::smp::enumerate().map_err(ResidentProbeError::Allocation)?;
-    if topology.total_processors > 64 || topology.bsp_processor != 0 {
-        return Err(ResidentProbeError::Allocation(Status::UNSUPPORTED));
-    }
-    let mut ap_resources = alloc::vec::Vec::new();
-    {
-        let handle = boot::get_handle_for_protocol::<uefi::proto::pi::mp::MpServices>()
-            .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
-        let mp = boot::open_protocol_exclusive::<uefi::proto::pi::mp::MpServices>(handle)
-            .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
-        for processor_number in 0..topology.total_processors {
-            let info = mp
-                .get_processor_info(processor_number)
-                .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
-            if info.is_enabled() && !info.is_bsp() {
-                ap_resources.push((
-                    processor_number,
-                    ResidentCpuResources::allocate(
-                        vmx_basic,
-                        code.fatal,
-                        code.gp_handler,
-                        code.exception_stubs,
-                    )?,
-                ));
-            }
-        }
-    }
+    let mut ap_resources = crate::smp::allocate_resident_ap_resources(
+        vmx_basic,
+        code.fatal,
+        code.gp_handler,
+        code.exception_stubs,
+    )?;
 
     crate::boot::screen::stage("resident host paging");
     let host_space = host_address_space
         .clone_current()
         .map_err(ResidentProbeError::Paging)?;
     crate::boot::screen::stage("resident EPT setup");
-    let mut ept = vt_ept::IdentityEpt::build()?;
+    let mut ept = ept::IdentityEpt::build()?;
     let pci_bar_ranges = ept.map_pci_bars()?;
     let high_address_end = ept.map_high_address_gaps()?;
     crate::boot::screen::message(format_args!(
@@ -2463,7 +2369,7 @@ pub fn run_boot_loader(
     }
     ept.conceal_guest_access_to_tables(zero_page_physical_address)?;
     crate::boot::screen::stage("resident nested EPT setup");
-    let mut ept12_template = vt_ept::IdentityEpt::build()?;
+    let mut ept12_template = ept::IdentityEpt::build()?;
     ept12_template.map_high_address_gaps()?;
     let bsp_ept_composition = cpu_resources.prepare_nested_ept(&ept, &ept12_template)?;
     for (_, resources) in &mut ap_resources {
@@ -2505,15 +2411,16 @@ pub fn run_boot_loader(
     let nested_vmptrst_destination = nested_vmcs12_operand + 8;
     let vmcs_physical_address = cpu_resources.vmcs_region.physical_address();
     let nested_vmcs02_physical_address = cpu_resources.nested_vmcs02_region.physical_address();
+    let shadow_resources = cpu_resources.vmcs_shadow_resources();
     let l0_msr_guest_list = cpu_resources.resident_msr_state.physical_address();
     let nested_msr_state = cpu_resources.nested_msr_state.physical_address();
     // Calibration can call Stall; finish all diagnostic protocol work before VMXON.
     let (diagnostic_interval_tsc, diagnostic_timer_rate) =
-        vt_controls::resident_boot_timer_parameters();
+        controls::resident_boot_timer_parameters();
     let watchdog_tsc_hz = if diagnostic_interval_tsc != 0 {
         diagnostic_interval_tsc
     } else {
-        vt_controls::resident_tsc_hz()
+        controls::resident_tsc_hz()
     };
     if crate::runtime::framebuffer_enabled()
         && crate::boot::screen::prepare_resident_visuals()
@@ -2526,9 +2433,13 @@ pub fn run_boot_loader(
             (*event_context).visual_stride_bytes = visual_stride_bytes;
         }
     }
+    crate::runtime::info(format_args!(
+        "nested VMCS shadowing resources={}",
+        shadow_resources.is_some()
+    ));
     crate::boot::screen::stage("resident BSP VMCS setup");
     let session =
-        vt_vmxon::enter_vmx_root_with_borrowed_region(vmx_basic, &mut cpu_resources.vmxon_region)
+        vmxon::enter_vmx_root_with_borrowed_region(vmx_basic, &mut cpu_resources.vmxon_region)
             .map_err(ResidentProbeError::Vmxon)?;
     let l1_cr4 = session.report().original_cr4;
     EPT_TEST_PAGE_GPA.store(ept_test_page.physical_address(), Ordering::Release);
@@ -2544,9 +2455,9 @@ pub fn run_boot_loader(
     }
 
     let mut controls =
-        vt_controls::configure_resident_boot(msr_bitmap.physical_address(), ept.ept_pointer())?;
-    vt_controls::enable_resident_vpid(&mut controls, 1)?;
-    vt_controls::enable_resident_boot_timer(
+        controls::configure_resident_boot(msr_bitmap.physical_address(), ept.ept_pointer())?;
+    controls::enable_resident_vpid(&mut controls, 1)?;
+    controls::enable_resident_boot_timer(
         &mut controls,
         diagnostic_interval_tsc,
         diagnostic_timer_rate,
@@ -2559,8 +2470,9 @@ pub fn run_boot_loader(
     )?;
     let guest_rsp =
         cpu_resources.guest_stack.physical_address() + cpu_resources.guest_stack.byte_len() as u64;
-    let guest = vt_state::configure_guest_with_rflags(entry_rip, guest_rsp & !0xf, initial_rflags)?;
-    vt_controls::virtualize_resident_cr4_vmxe(l1_cr4)?;
+    let guest = state::configure_guest_with_rflags(entry_rip, guest_rsp & !0xf, initial_rflags)?;
+    controls::virtualize_resident_cr4_vmxe(l1_cr4)?;
+    let vmcs_shadow = configure_resident_vmcs_shadowing(&mut controls, shadow_resources)?;
     let nested_capabilities = nested_vmx_capabilities(vmx_basic);
     let mut nested_state = NestedVmxState::new(
         nested_capabilities,
@@ -2576,6 +2488,11 @@ pub fn run_boot_loader(
         nested_vmcs02_physical_address,
     );
     nested_state.l1_cr4 = l1_cr4;
+    if let Some((shadow_vmcs, vmread_bitmap)) = vmcs_shadow {
+        nested_state.shadow_vmcs_region = shadow_vmcs;
+        nested_state.shadow_vmread_bitmap = vmread_bitmap;
+    }
+    nested_state.evmcs_enabled = u64::from(crate::boot::current().vt_evmcs);
     configure_nested_msr_composition(
         &mut nested_state,
         msr_bitmap.physical_address(),
@@ -2600,10 +2517,19 @@ pub fn run_boot_loader(
     nested_state.eptp_shadow_list = cpu_resources.nested_eptp_list.physical_address();
     nested_state.eptp_table_pool = cpu_resources.nested_eptp_tables.physical_address();
     nested_state.eptp_table_pages = cpu_resources.nested_eptp_tables.pages() as u64;
-    nested_state.eptp_native_supported = u64::from(vt_controls::native_eptp_switching_supported());
+    nested_state.eptp_native_supported = u64::from(controls::native_eptp_switching_supported());
     nested_state.eptp_sync_apic_id = u64::from(arch::apic_id());
-    seed_nested_vmcs12_core_state(&mut nested_state.vmcs12, root_segments, l1_cr4);
-    seed_nested_vmcs12_backing(&cpu_resources.nested_vmcs12_pages, &nested_state.vmcs12);
+    nested_state
+        .vmcs12
+        .seed_core_state(capture_nested_vmcs12_core_state(root_segments, l1_cr4));
+    unsafe {
+        nested_state
+            .vmcs12
+            .seed_backing(core::slice::from_raw_parts_mut(
+                cpu_resources.nested_vmcs12_pages.pointer().as_ptr(),
+                cpu_resources.nested_vmcs12_pages.byte_len(),
+            ));
+    }
 
     let context = cpu_resources
         .context_pages
@@ -2623,6 +2549,8 @@ pub fn run_boot_loader(
         (*context).diagnostic_interval_tsc = diagnostic_interval_tsc;
         (*context).watchdog_tsc_hz = watchdog_tsc_hz;
         let shared = event_context as *mut ResidentEventContext;
+        (*context).hyperv_timing_supported =
+            u64::from((*context).cpuid_presence != 0 && (*shared).hyperv_tsc_scale != 0);
         (*shared).watchdog_tsc_hz = watchdog_tsc_hz;
         (*shared).cpu_contexts[0] = context as u64;
         (*shared).control_apic_ids[0] = arch::apic_id();
@@ -2733,10 +2661,11 @@ pub fn run_boot_loader(
             nested.vmcs12.entry_rejection_count
         ));
         crate::runtime::info(format_args!(
-            "nested AP L2 processor={} vmcs01={:#x} vmcs02={:#x} entries={} exits={} reflections={} resumes={} resume_exits={} reason={:#x} rip={:#x} rsp={:#x}",
+            "nested AP L2 processor={} vmcs01={:#x} vmcs02={:#x} shadow_vmcs={:#x} entries={} exits={} reflections={} resumes={} resume_exits={} reason={:#x} rip={:#x} rsp={:#x}",
             processor_number,
             nested.vmcs01_region,
             nested.vmcs02_region,
+            nested.shadow_vmcs_region,
             nested.l2_entry_count,
             nested.l2_exit_count,
             nested.l1_reflection_count,
@@ -2930,15 +2859,20 @@ pub fn run_boot_loader(
             u64::from(expected_mask.count_ones());
     }
     crate::boot::screen::message(format_args!(
-        "BSP boot timer available={} interval TSC={:#x} rate={} samples=60",
+        "BSP boot timer available={} interval TSC={:#x} rate={} display sampling={}",
         diagnostic_interval_tsc != 0,
         diagnostic_interval_tsc,
-        diagnostic_timer_rate
+        diagnostic_timer_rate,
+        if diagnostic_interval_tsc == 0 {
+            "VM exits"
+        } else {
+            "VMX timer"
+        }
     ));
     crate::boot::screen::message(format_args!(
         "EPT halt hex at right: GPA / guest RIP / qualification"
     ));
-    let session = match vt_vmxon::enter_vmx_root_with_borrowed_region(
+    let session = match vmxon::enter_vmx_root_with_borrowed_region(
         vmx_basic,
         &mut cpu_resources.vmxon_region,
     ) {
@@ -2972,10 +2906,17 @@ pub fn run_boot_loader(
         cpu_resources.host_tables.pages.preserve();
     }
     let vm_instruction_error = vmcs::vmread(VM_INSTRUCTION_ERROR).unwrap_or(u64::MAX);
+    let shadow_clear =
+        shadow_resources.map(|(shadow_vmcs, _, _)| unsafe { vmcs::vmclear(shadow_vmcs) });
     let final_clear = unsafe { vmcs::vmclear(vmcs_physical_address) };
     host_address_space.restore_source_cr3();
     drop(session);
     let _ = &ept;
+    if let Some(clear) = shadow_clear
+        && clear != VmxInstructionResult::Succeeded
+    {
+        return Err(ResidentProbeError::Vmclear(clear));
+    }
     if final_clear != VmxInstructionResult::Succeeded {
         return Err(ResidentProbeError::Vmclear(final_clear));
     }
@@ -3063,6 +3004,7 @@ impl ResidentApLaunch<'_> {
         let nested_vmcs12_region = self.resources.nested_vmcs12_region();
         let nested_vmptrst_destination = self.resources.nested_vmptrst_destination();
         let nested_vmcs02_region = self.resources.nested_vmcs02_region();
+        let shadow_resources = self.resources.vmcs_shadow_resources();
         let l0_msr_guest_list = self.resources.resident_msr_state.physical_address();
         let nested_msr_state = self.resources.nested_msr_state.physical_address();
         let nested_ept12_pointer = self
@@ -3095,8 +3037,8 @@ impl ResidentApLaunch<'_> {
             .resources
             .nested_ept_alternate_composition()
             .ok_or(EptError::InvalidPageTable)?;
-        let vmx_basic = vt_vmxon::vmx_basic();
-        let session = vt_vmxon::enter_vmx_root_with_borrowed_region(
+        let vmx_basic = vmxon::vmx_basic();
+        let session = vmxon::enter_vmx_root_with_borrowed_region(
             vmx_basic,
             &mut self.resources.vmxon_region,
         )
@@ -3111,12 +3053,13 @@ impl ResidentApLaunch<'_> {
         if load != VmxInstructionResult::Succeeded {
             return Err(ResidentProbeError::Vmcs(VmcsError::Vmptrld(load)));
         }
-        let mut controls = vt_controls::configure_resident_ap(self.msr_bitmap, self.ept_pointer)?;
-        vt_controls::enable_resident_vpid(&mut controls, 1)?;
+        let mut controls = controls::configure_resident_ap(self.msr_bitmap, self.ept_pointer)?;
+        controls::enable_resident_vpid(&mut controls, 1)?;
         configure_resident_msr_switch(&self.resources.resident_msr_state)?;
         configure_resident_host(self.host_cr3, &self.resources.host_tables, segments)?;
-        let guest = vt_state::configure_guest(guest_rip, guest_rsp)?;
-        vt_controls::virtualize_resident_cr4_vmxe(l1_cr4)?;
+        let guest = state::configure_guest(guest_rip, guest_rsp)?;
+        controls::virtualize_resident_cr4_vmxe(l1_cr4)?;
+        let vmcs_shadow = configure_resident_vmcs_shadowing(&mut controls, shadow_resources)?;
         let nested_capabilities = nested_vmx_capabilities(vmx_basic);
         let mut nested_state = NestedVmxState::new(
             nested_capabilities,
@@ -3132,6 +3075,11 @@ impl ResidentApLaunch<'_> {
             nested_vmcs02_region,
         );
         nested_state.l1_cr4 = l1_cr4;
+        if let Some((shadow_vmcs, vmread_bitmap)) = vmcs_shadow {
+            nested_state.shadow_vmcs_region = shadow_vmcs;
+            nested_state.shadow_vmread_bitmap = vmread_bitmap;
+        }
+        nested_state.evmcs_enabled = u64::from(crate::boot::current().vt_evmcs);
         configure_nested_msr_composition(
             &mut nested_state,
             self.msr_bitmap,
@@ -3157,10 +3105,19 @@ impl ResidentApLaunch<'_> {
         nested_state.eptp_table_pool = self.resources.nested_eptp_tables.physical_address();
         nested_state.eptp_table_pages = self.resources.nested_eptp_tables.pages() as u64;
         nested_state.eptp_native_supported =
-            u64::from(vt_controls::native_eptp_switching_supported());
+            u64::from(controls::native_eptp_switching_supported());
         nested_state.eptp_sync_apic_id = u64::from(arch::apic_id());
-        seed_nested_vmcs12_core_state(&mut nested_state.vmcs12, segments, l1_cr4);
-        seed_nested_vmcs12_backing(&self.resources.nested_vmcs12_pages, &nested_state.vmcs12);
+        nested_state
+            .vmcs12
+            .seed_core_state(capture_nested_vmcs12_core_state(segments, l1_cr4));
+        unsafe {
+            nested_state
+                .vmcs12
+                .seed_backing(core::slice::from_raw_parts_mut(
+                    self.resources.nested_vmcs12_pages.pointer().as_ptr(),
+                    self.resources.nested_vmcs12_pages.byte_len(),
+                ));
+        }
         let context = self
             .resources
             .context_pages
@@ -3181,6 +3138,12 @@ impl ResidentApLaunch<'_> {
         state.telemetry_probe_active = 1;
         state.watchdog_tsc_hz =
             unsafe { (*(self.event_context as *const ResidentEventContext)).watchdog_tsc_hz };
+        state.hyperv_timing_supported = u64::from(
+            state.cpuid_presence != 0
+                && unsafe {
+                    (*(self.event_context as *const ResidentEventContext)).hyperv_tsc_scale != 0
+                },
+        );
         state.cache_ept_pointer = self.ept_pointer;
         let host_rsp = (self.resources.host_stack.physical_address()
             + self.resources.host_stack.byte_len() as u64
@@ -3340,7 +3303,7 @@ global_asm!(
     include_str!("../asm/ept_cache.S"),
     include_str!("../asm/eptp_switch.S"),
     include_str!("../asm/nested.S"),
-    include_str!("../asm/resident_island.S"),
+    include_str!("../asm/residency.S"),
     host_rsp = const HOST_RSP,
     host_rip = const HOST_RIP,
     host_es_selector = const HOST_ES_SELECTOR,
@@ -3586,6 +3549,7 @@ global_asm!(
     hyperv_stimer0_config_msr = const HYPERV_STIMER0_CONFIG_MSR,
     hyperv_stimer0_count_msr = const HYPERV_STIMER0_COUNT_MSR,
     hyperv_reference_tsc_msr = const HYPERV_REFERENCE_TSC_MSR,
+    hyperv_reference_count_msr = const HYPERV_REFERENCE_COUNT_MSR,
     hyperv_reference_time_msr_span = const HYPERV_REFERENCE_TIME_MSR_SPAN,
     hyperv_vp_assist_msr = const HYPERV_VP_ASSIST_MSR,
     efer_msr = const IA32_EFER_MSR,
@@ -3648,6 +3612,7 @@ global_asm!(
     b_telemetry_active = const core::mem::offset_of!(ResidentBootContext, telemetry_active),
     b_telemetry_probe_active = const core::mem::offset_of!(ResidentBootContext, telemetry_probe_active),
     b_watchdog_tsc_hz = const core::mem::offset_of!(ResidentBootContext, watchdog_tsc_hz),
+    b_hyperv_timing_supported = const core::mem::offset_of!(ResidentBootContext, hyperv_timing_supported),
     b_watchdog_deadline = const core::mem::offset_of!(ResidentBootContext, watchdog_deadline_tsc),
     b_watchdog_sequence = const core::mem::offset_of!(ResidentBootContext, watchdog_sequence),
     b_watchdog_exit_count = const core::mem::offset_of!(ResidentBootContext, watchdog_exit_count),
@@ -3742,6 +3707,30 @@ global_asm!(
     b_nested_vmxon_operand = const BCTX_NESTED_VMXON_OPERAND,
     b_nested_vmxon_region = const BCTX_NESTED_VMXON_REGION,
     b_nested_current_vmcs = const BCTX_NESTED_CURRENT_VMCS,
+    b_nested_current_vmcs_is_shadow = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, current_vmcs_is_shadow),
+    b_nested_evmcs_enabled = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, evmcs_enabled),
+    b_nested_vp_assist_msr = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, vp_assist_msr),
+    b_nested_evmcs_active = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, evmcs_active),
+    event_hyperv_guest_os_id = const core::mem::offset_of!(ResidentEventContext, hyperv_guest_os_id),
+    event_hyperv_hypercall_msr = const core::mem::offset_of!(ResidentEventContext, hyperv_hypercall_msr),
+    event_hyperv_hypercall_lock = const core::mem::offset_of!(ResidentEventContext, hyperv_hypercall_lock),
+    evmcs_version = const crate::nested::EVMCS_VERSION,
+    evmcs_guest_rip = const core::mem::offset_of!(crate::nested::EnlightenedVmcs, guest_rip),
+    evmcs_guest_rsp = const core::mem::offset_of!(crate::nested::EnlightenedVmcs, guest_rsp),
+    evmcs_guest_rflags = const core::mem::offset_of!(crate::nested::EnlightenedVmcs, guest_rflags),
+    evmcs_host_rsp = const core::mem::offset_of!(crate::nested::EnlightenedVmcs, host_rsp),
+    evmcs_host_rip = const core::mem::offset_of!(crate::nested::EnlightenedVmcs, host_rip),
+    evmcs_exit_reason = const core::mem::offset_of!(crate::nested::EnlightenedVmcs, exit_reason),
+    evmcs_exit_instruction_error = const core::mem::offset_of!(crate::nested::EnlightenedVmcs, exit_instruction_error),
+    evmcs_exit_instruction_length = const core::mem::offset_of!(crate::nested::EnlightenedVmcs, exit_instruction_length),
+    evmcs_exit_qualification = const core::mem::offset_of!(crate::nested::EnlightenedVmcs, exit_qualification),
+    evmcs_clean_fields = const core::mem::offset_of!(crate::nested::EnlightenedVmcs, clean_fields),
+    vp_assist_enlighten_vm_entry = const crate::nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET,
+    vp_assist_current_nested_vmcs = const crate::nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
     b_nested_last_operand = const BCTX_NESTED_LAST_OPERAND,
     b_nested_last_vmcs_field = const BCTX_NESTED_LAST_VMCS_FIELD,
     b_nested_instruction_error = const BCTX_NESTED_INSTRUCTION_ERROR,
@@ -3823,6 +3812,11 @@ global_asm!(
     b_nested_entry_rejection_count = const BCTX_NESTED_ENTRY_REJECTION_COUNT,
     b_nested_vmcs01_region = const BCTX_NESTED_VMCS01_REGION,
     b_nested_vmcs02_region = const BCTX_NESTED_VMCS02_REGION,
+    b_nested_shadow_vmcs_region = const BCTX_NESTED_SHADOW_VMCS_REGION,
+    b_nested_shadow_vmread_bitmap = const BCTX_NESTED_SHADOW_VMREAD_BITMAP,
+    vmcs_shadow_read_byte_offset = const VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET,
+    vmcs_shadow_read_bypass_mask = const VMCS_SHADOW_READ_BYPASS_MASK,
+    vmcs_shadow_read_trap_mask = const VMCS_SHADOW_READ_TRAP_MASK,
     b_nested_vmcs02_control_cache_valid = const core::mem::offset_of!(ResidentBootContext, nested)
         + core::mem::offset_of!(NestedVmxState, vmcs02_control_cache_valid),
     b_nested_vmcs02_guest_cache_valid = const core::mem::offset_of!(ResidentBootContext, nested)
@@ -3938,6 +3932,12 @@ global_asm!(
     b_nested_vmcs02_exit_store_msr_list = const BCTX_NESTED_VMCS02_EXIT_STORE_MSR_LIST,
     b_nested_vmcs01_entry_msr_list = const BCTX_NESTED_VMCS01_ENTRY_MSR_LIST,
     b_nested_vmcs01_msr_entry_composed = const BCTX_NESTED_VMCS01_MSR_ENTRY_COMPOSED,
+    b_nested_current_vmcs_hpa = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, current_vmcs_hpa),
+    b_nested_l2_msr_gp_pending = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, l2_msr_gp_pending),
+    b_nested_entry_msr_prefix_count = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, entry_msr_prefix_count),
+    b_nested_captured_msr_store_count = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, captured_msr_store_count),
+    b_nested_operand_linear_address = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, operand_linear_address),
+    b_nested_operand_data = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, operand_data),
     b_nested_ept_observed_value_after_invept = const BCTX_NESTED_EPT_OBSERVED_VALUE_AFTER_INVEPT,
     nested_invept_descriptor_offset = const crate::smp::NESTED_INVEPT_DESCRIPTOR_OFFSET,
     nested_invept_rip_offset = const crate::smp::NESTED_INVEPT_RIP_OFFSET,
@@ -3966,14 +3966,7 @@ global_asm!(
     vmcs_field_host_rip = const VMCS_FIELD_HOST_RIP,
     vmcs_field_host_rsp = const VMCS_FIELD_HOST_RSP,
     vmcs_field_exit_instruction_len = const VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN,
-    vmcs_field_exit_instruction_info = const VMCS_FIELD_VM_EXIT_INSTRUCTION_INFO,
     vmcs_field_exit_reason = const VMCS_FIELD_VM_EXIT_REASON,
-    vmcs_field_exit_intr_info = const VMCS_FIELD_VM_EXIT_INTR_INFO,
-    vmcs_field_exit_intr_error = const VMCS_FIELD_VM_EXIT_INTR_ERROR_CODE,
-    vmcs_field_idt_vectoring_info = const VMCS_FIELD_IDT_VECTORING_INFO_FIELD,
-    vmcs_field_idt_vectoring_error = const VMCS_FIELD_IDT_VECTORING_ERROR_CODE,
-    vmcs_field_guest_physical_address = const VMCS_FIELD_GUEST_PHYSICAL_ADDRESS,
-    vmcs_field_guest_linear_address = const VMCS_FIELD_GUEST_LINEAR_ADDRESS,
     vmcs_field_instruction_error = const VMCS_FIELD_VM_INSTRUCTION_ERROR,
     event_magic_offset = const EVENT_CTX_MAGIC,
     event_ebs_seen = const EVENT_CTX_EBS_SEEN,
@@ -3983,6 +3976,11 @@ global_asm!(
     event_visual_stride_bytes = const EVENT_CTX_VISUAL_STRIDE_BYTES,
     event_visual_deadline = const core::mem::offset_of!(ResidentEventContext, visual_deadline_tsc),
     event_tsc_hz = const core::mem::offset_of!(ResidentEventContext, watchdog_tsc_hz),
+    event_hyperv_tsc_scale = const core::mem::offset_of!(ResidentEventContext, hyperv_tsc_scale),
+    event_hyperv_tsc_offset = const core::mem::offset_of!(ResidentEventContext, hyperv_tsc_offset),
+    event_hyperv_reference_tsc_msr = const core::mem::offset_of!(ResidentEventContext, hyperv_reference_tsc_msr),
+    event_hyperv_reference_tsc_lock = const core::mem::offset_of!(ResidentEventContext, hyperv_reference_tsc_lock),
+    event_hyperv_reference_tsc_sequence = const core::mem::offset_of!(ResidentEventContext, hyperv_reference_tsc_sequence),
     event_post_ebs_cpu_mask = const EVENT_CTX_POST_EBS_CPU_MASK,
     event_diagnostic_halted = const EVENT_CTX_DIAGNOSTIC_HALTED,
     event_host_fault_vector = const EVENT_CTX_HOST_FAULT_VECTOR,
@@ -4138,6 +4136,7 @@ global_asm!(
     post_ebs_stop_message_len = const POST_EBS_STOP_MESSAGE_LEN,
     unsupported_exit_message_len = const UNSUPPORTED_EXIT_MESSAGE_LEN,
     nested_entry_failure_dump_message_len = const b"[MATRIXHV][NESTED] VM_ENTRY_FAILURE_VMCS12 ".len(),
+    nested_vmcs02_failure_dump_message_len = const b"[MATRIXHV][NESTED] VM_ENTRY_FAILURE_VMCS02 ".len(),
     nested_extended_field_count = const crate::nested::VMCS12_EXTENDED_FIELD_COUNT,
     host_cr3_mismatch_message_len = const HOST_CR3_MISMATCH_MESSAGE_LEN,
     event_corrupt_message_len = const EVENT_CORRUPT_MESSAGE_LEN,

@@ -26,6 +26,7 @@ pub const CONFIG_HEADER: &str = "MATRIXHV_CONFIG_V2";
 pub const CPUIDPRESENCE_KEY: &str = "cpuidpresence";
 pub const LOGGER_KEY: &str = "logger";
 pub const VT_NESTED_KEY: &str = "VtNested";
+pub const VT_EVMCS_KEY: &str = "VtEvmcs";
 pub const VMX_TEST_KEY: &str = "VmxTest";
 
 const CONFIG_FILE_PATH: &CStr16 = cstr16!(r"\MatrixConfig.bin");
@@ -34,6 +35,7 @@ const CONFIG_FILE_MAX_BYTES: usize = 4096;
 static CPUID_PRESENCE: AtomicBool = AtomicBool::new(false);
 static LOGGER: AtomicBool = AtomicBool::new(true);
 static VT_NESTED: AtomicBool = AtomicBool::new(true);
+static VT_EVMCS: AtomicBool = AtomicBool::new(false);
 static VMX_TEST: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +43,7 @@ pub struct MatrixConfig {
     pub cpuid_presence: bool,
     pub logger: bool,
     pub vt_nested: bool,
+    pub vt_evmcs: bool,
     pub vmx_test: bool,
 }
 
@@ -50,6 +53,7 @@ impl Default for MatrixConfig {
             cpuid_presence: false,
             logger: true,
             vt_nested: true,
+            vt_evmcs: false,
             vmx_test: false,
         }
     }
@@ -86,6 +90,7 @@ pub fn parse(bytes: &[u8]) -> Result<MatrixConfig, ParseError> {
             CPUIDPRESENCE_KEY => config.cpuid_presence = parsed,
             LOGGER_KEY => config.logger = parsed,
             VT_NESTED_KEY => config.vt_nested = parsed,
+            VT_EVMCS_KEY => config.vt_evmcs = parsed,
             VMX_TEST_KEY => config.vmx_test = parsed,
             _ => return Err(ParseError::UnknownKey),
         }
@@ -93,6 +98,10 @@ pub fn parse(bytes: &[u8]) -> Result<MatrixConfig, ParseError> {
 
     if !has_header {
         return Err(ParseError::MissingHeader);
+    }
+    if config.vt_evmcs {
+        config.cpuid_presence = true;
+        config.vt_nested = true;
     }
     if config.vmx_test && !config.vt_nested {
         return Err(ParseError::VmxTestRequiresVtNested);
@@ -115,6 +124,7 @@ pub fn apply(config: MatrixConfig) {
     CPUID_PRESENCE.store(config.cpuid_presence, Ordering::Relaxed);
     LOGGER.store(config.logger, Ordering::Relaxed);
     VT_NESTED.store(config.vt_nested, Ordering::Relaxed);
+    VT_EVMCS.store(config.vt_evmcs, Ordering::Relaxed);
     VMX_TEST.store(config.vmx_test, Ordering::Relaxed);
 }
 
@@ -123,6 +133,7 @@ pub fn current() -> MatrixConfig {
         cpuid_presence: CPUID_PRESENCE.load(Ordering::Relaxed),
         logger: LOGGER.load(Ordering::Relaxed),
         vt_nested: VT_NESTED.load(Ordering::Relaxed),
+        vt_evmcs: VT_EVMCS.load(Ordering::Relaxed),
         vmx_test: VMX_TEST.load(Ordering::Relaxed),
     }
 }
@@ -433,7 +444,7 @@ pub mod screen {
     }
 
     fn console_available() -> bool {
-        if crate::hv_core::vt_resident::boot_services_exited() {
+        if crate::hv_core::residency::boot_services_exited() {
             return false;
         }
         // UEFI protocols run on the BSP with interrupts enabled. In particular,
@@ -481,6 +492,7 @@ pub mod screen {
             return false;
         }
         let Ok(handle) = boot::get_handle_for_protocol::<GraphicsOutput>() else {
+            crate::runtime::info(format_args!("resident framebuffer GOP unavailable"));
             return false;
         };
         let params = OpenProtocolParams {
@@ -504,6 +516,10 @@ pub mod screen {
         let mode = graphics.current_mode_info();
         let (width, height) = mode.resolution();
         let stride = mode.stride();
+        crate::runtime::info(format_args!(
+            "resident framebuffer mode={mode_number} resolution={width}x{height} stride={stride} format={:?}",
+            mode.pixel_format()
+        ));
         let required_width = RESIDENT_MARKER_X
             + ((RESIDENT_MARKER_COUNT - 1) * RESIDENT_MARKER_STEP + RESIDENT_MARKER_SIZE)
                 .max((RESIDENT_HEX_ROWS - 1) / 16 * RESIDENT_HEX_COLUMN_STEP + 18 * 8);
@@ -544,6 +560,9 @@ pub mod screen {
         GOP_MODE_NUMBER.store(mode_number as usize, Ordering::Relaxed);
         GOP_PROTOCOL_POINTER.store(protocol_pointer as usize, Ordering::Relaxed);
         FRAMEBUFFER_BASE.store(base, Ordering::Release);
+        crate::runtime::info(format_args!(
+            "resident framebuffer base={base:#x} size={size:#x}"
+        ));
         true
     }
 
@@ -602,7 +621,7 @@ pub mod screen {
     }
 
     fn gop_mode_unchanged() -> bool {
-        if crate::hv_core::vt_resident::boot_services_exited() {
+        if crate::hv_core::residency::boot_services_exited() {
             return false;
         }
         let protocol =
@@ -817,7 +836,7 @@ pub fn run() -> Result<(), Status> {
     if current().vmx_test {
         screen::stage("VMXON proof");
         runtime::phase("vmx.vmxon.start");
-        match hv_core::vt_vmxon::probe_vmxon() {
+        match hv_core::vmxon::probe_vmxon() {
             Ok(report) => {
                 log::info!(
                     "VMXON probe succeeded: revision={:#x}, region_size={}, region_pa={:#x}, cr0={:#x}->{:#x}, cr4={:#x}->{:#x}",
@@ -875,7 +894,7 @@ pub fn run() -> Result<(), Status> {
 
         screen::stage("VMLAUNCH proof");
         runtime::phase("vmx.vmlaunch_probe.start");
-        match hv_core::vt_entry::probe_vmlaunch() {
+        match hv_core::entry::probe_vmlaunch() {
             Ok(report) => {
                 runtime::info(format_args!(
                     "vmlaunch proof vmcs_pa={:#x} exit_reason={:#x} qualification={:#x} instruction_len={} guest_rip_after_exit={:#x}",
@@ -909,7 +928,7 @@ pub fn run() -> Result<(), Status> {
 
         screen::stage("VM-exit dispatcher proof");
         runtime::phase("vmx.dispatch_probe.start");
-        match hv_core::vt_entry::probe_vmexit_dispatcher() {
+        match hv_core::entry::probe_vmexit_dispatcher() {
             Ok(report) => {
                 let diagnostics = report.diagnostics;
                 runtime::info(format_args!(
@@ -964,7 +983,7 @@ pub fn run() -> Result<(), Status> {
 
     screen::stage("resident host proof");
     runtime::phase("vmx.resident_host_probe.start");
-    match hv_core::vt_resident::probe() {
+    match hv_core::residency::probe() {
         Ok(report) => {
             screen::message(format_args!(
                 "resident host tables={}/{}",
@@ -996,7 +1015,7 @@ pub fn run() -> Result<(), Status> {
             runtime::error(format_args!("resident_host error={error:?}"));
             runtime::phase("vmx.resident_host_probe.failed");
             screen::error(format_args!("resident host: {error:?}"));
-            return Err(hv_core::vt_resident::status_from_error(&error));
+            return Err(hv_core::residency::status_from_error(&error));
         }
     }
 
@@ -1134,7 +1153,7 @@ pub fn run() -> Result<(), Status> {
 
     screen::stage("resident event setup");
     runtime::phase("vmx.residency_events.arm.start");
-    let residency_events = match hv_core::vt_resident::arm_residency_events() {
+    let residency_events = match hv_core::residency::arm_residency_events() {
         Ok(report) => {
             runtime::info(format_args!(
                 "residency_events code_pa={:#x} context_pa={:#x} code_type={} data_type={} ebs_event={:#x} va_event={:#x}",
@@ -1152,7 +1171,7 @@ pub fn run() -> Result<(), Status> {
             runtime::error(format_args!("residency_events error={error:?}"));
             runtime::phase("vmx.residency_events.failed");
             screen::error(format_args!("resident events: {error:?}"));
-            return Err(hv_core::vt_resident::status_from_error(&error));
+            return Err(hv_core::residency::status_from_error(&error));
         }
     };
 
@@ -1231,7 +1250,7 @@ pub fn run() -> Result<(), Status> {
         guest::start_entry_address(),
         residency_events.context_physical_address
     ));
-    match hv_core::vt_resident::run_boot_loader(
+    match hv_core::residency::run_boot_loader(
         guest::start_entry_address(),
         residency_events.context_physical_address,
         guest::ept_probe_fault_address(),
@@ -1291,7 +1310,7 @@ pub fn run() -> Result<(), Status> {
             runtime::error(format_args!("boot_loader_start_vcpu error={error:?}"));
             runtime::phase("vmx.boot_loader_start_vcpu.failed");
             screen::error(format_args!("boot vCPU failed: {error:?}"));
-            Err(hv_core::vt_resident::status_from_error(&error))
+            Err(hv_core::residency::status_from_error(&error))
         }
     }
 }

@@ -120,6 +120,21 @@ mod logger {
     }
 
     #[test]
+    fn configuration_toggle_preserves_detected_serial_port() {
+        SERIAL_PRESENT.store(true, Ordering::Release);
+        set_enabled(true);
+        assert_eq!(backend(), LogBackend::SerialAndFramebuffer);
+        set_enabled(false);
+        assert_eq!(backend(), LogBackend::Disabled);
+        set_enabled(true);
+        assert_eq!(backend(), LogBackend::SerialAndFramebuffer);
+        SERIAL_PRESENT.store(false, Ordering::Release);
+        set_enabled(true);
+        assert_eq!(backend(), LogBackend::Framebuffer);
+        set_enabled(false);
+    }
+
+    #[test]
     fn absent_ports_select_framebuffer_without_initializing_a_uart() {
         for mode in [
             UartMode::FloatingBus,

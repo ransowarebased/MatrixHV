@@ -346,11 +346,521 @@ mod control {
     }
 }
 
+#[cfg(test_harness = "hyperv_time")]
+mod hyperv_time {
+    include!("../builds/hyperv-time-tests/definitions.rs");
+    core::arch::global_asm!(include_str!("../builds/hyperv-time-tests/handlers.S"));
+
+    #[repr(C, align(4096))]
+    #[derive(Clone, Copy)]
+    struct Page([u64; 512]);
+
+    unsafe extern "win64" {
+        fn test_time_msr(context: *mut u64, registers: *mut u64, operation: u32) -> u32;
+        fn test_time_cpuid(context: *mut u64, registers: *mut u32, leaf: u32);
+    }
+
+    struct Scenario {
+        context: [u64; 8],
+        shared: Box<[u64; 8]>,
+        page: Box<Page>,
+        tables: Box<[Page; 4]>,
+    }
+
+    impl Scenario {
+        fn new() -> Self {
+            let mut shared = Box::new([
+                hyperv_reference_tsc_scale(2, 208, 24_000_000),
+                0_u64.wrapping_sub(1_000_000),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]);
+            let page = Box::new(Page([u64::MAX; 512]));
+            let mut tables = Box::new([Page([0; 512]); 4]);
+            let address = page.0.as_ptr() as u64;
+            for (level, shift) in [39, 30, 21].into_iter().enumerate() {
+                tables[level].0[((address >> shift) & 511) as usize] =
+                    tables[level + 1].0.as_ptr() as u64 | 7;
+            }
+            tables[3].0[((address >> 12) & 511) as usize] = address | 7;
+            let context = [
+                shared.as_mut_ptr() as u64,
+                1,
+                2_496_000_000,
+                tables[0].0.as_ptr() as u64,
+                1,
+                0,
+                0,
+                0,
+            ];
+            Self {
+                context,
+                shared,
+                page,
+                tables,
+            }
+        }
+
+        fn msr(&mut self, operation: u32, value: u64) -> (u32, u64) {
+            let mut registers = [value & u64::from(u32::MAX), value >> 32];
+            let result = unsafe {
+                test_time_msr(self.context.as_mut_ptr(), registers.as_mut_ptr(), operation)
+            };
+            (result, registers[0] | registers[1] << 32)
+        }
+
+        fn features(&mut self, leaf: u32) -> [u32; 4] {
+            let mut registers = [0; 4];
+            unsafe { test_time_cpuid(self.context.as_mut_ptr(), registers.as_mut_ptr(), leaf) };
+            registers
+        }
+    }
+
+    #[test]
+    fn reference_scale_requires_a_complete_frequency_above_the_reference_rate() {
+        for (denominator, numerator, crystal) in [
+            (0, 208, 24_000_000),
+            (2, 0, 24_000_000),
+            (2, 208, 0),
+            (1, 1, 10_000_000),
+            (2, 1, 10_000_000),
+        ] {
+            assert_eq!(
+                hyperv_reference_tsc_scale(denominator, numerator, crystal),
+                0
+            );
+        }
+        let scale = hyperv_reference_tsc_scale(2, 208, 24_000_000);
+        assert_eq!((2_496_000_000_u128 * u128::from(scale)) >> 64, 9_999_999);
+    }
+
+    #[test]
+    fn cpuid_exposes_reference_time_only_when_supported_and_keeps_evmcs_optional() {
+        let mut scenario = Scenario::new();
+        assert_eq!(scenario.features(0x4000_0003), [0x272, 0, 0, 0]);
+        scenario.context[1] = 0;
+        assert_eq!(scenario.features(0x4000_0003), [0x70, 0, 0, 0]);
+        scenario.context[1] = 1;
+        scenario.context[4] = 0;
+        assert_eq!(scenario.features(0x4000_0003), [0x262, 0, 0, 0]);
+        assert_eq!(scenario.features(0x4000_0004), [0, u32::MAX, 0, 0]);
+        assert_eq!(scenario.features(0x4000_000a), [0; 4]);
+    }
+
+    #[test]
+    fn page_enable_matches_reference_counter_and_is_visible_across_processors() {
+        let mut scenario = Scenario::new();
+        let address = scenario.page.0.as_ptr() as u64;
+        let register = address | 0x7ff;
+        assert_eq!(scenario.msr(2, register).0, 1);
+        assert_eq!(scenario.shared[2], register);
+        assert_eq!(scenario.shared[3], 0);
+        assert_eq!(scenario.page.0[0], 1);
+        assert_eq!(scenario.page.0[1], scenario.shared[0]);
+        assert_eq!(scenario.page.0[2], scenario.shared[1]);
+        assert!(scenario.page.0[3..].iter().all(|value| *value == 0));
+        let expected = (((u128::from(scenario.context[2]) * u128::from(scenario.page.0[1])) >> 64)
+            as u64)
+            .wrapping_add(scenario.page.0[2]);
+        assert_eq!(scenario.msr(0, 0), (1, expected));
+        let before = expected;
+        scenario.context[2] += 2496;
+        assert!(scenario.msr(0, 0).1 > before);
+        let mut second_context = scenario.context;
+        let mut registers = [0_u64; 2];
+        assert_eq!(
+            unsafe { test_time_msr(second_context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
+            1
+        );
+        assert_eq!(registers[0] | registers[1] << 32, register);
+    }
+
+    #[test]
+    fn disabled_reference_page_invalidates_the_sequence_and_preserves_reserved_bits() {
+        let mut scenario = Scenario::new();
+        let address = scenario.page.0.as_ptr() as u64;
+        assert_eq!(scenario.msr(2, address | 1).0, 1);
+        let disabled = address | 0x7fe;
+        assert_eq!(scenario.msr(2, disabled).0, 1);
+        assert_eq!(scenario.page.0[0], 0);
+        assert_eq!(scenario.msr(1, 0), (1, disabled));
+        assert_eq!(scenario.msr(3, 0).0, 0);
+    }
+
+    #[test]
+    fn republishing_reference_tsc_rejects_a_reader_spanning_cleared_fields() {
+        let mut scenario = Scenario::new();
+        let address = scenario.page.0.as_ptr() as u64;
+        assert_eq!(scenario.msr(2, address | 1).0, 1);
+        let before = scenario.page.0[0] as u32;
+        assert_eq!(scenario.msr(2, address | 1).0, 1);
+        // The assembly harness samples exactly between clearing and publication.
+        let observed_scale = scenario.context[6];
+        let observed_offset = scenario.context[7];
+        let after = scenario.page.0[0] as u32;
+        assert_eq!((observed_scale, observed_offset), (0, 0));
+        assert_ne!(before, after, "a spanning reader must retry publication");
+        assert_ne!(after, 0);
+        assert_eq!(scenario.page.0[1], scenario.shared[0]);
+        assert_eq!(scenario.page.0[2], scenario.shared[1]);
+        assert_eq!(scenario.shared[3], 0);
+    }
+
+    #[test]
+    fn reference_tsc_generations_survive_disable_and_skip_zero_on_wrap() {
+        let mut scenario = Scenario::new();
+        let address = scenario.page.0.as_ptr() as u64;
+        assert_eq!(scenario.msr(2, address | 1).0, 1);
+        let before = scenario.page.0[0];
+        assert_eq!(scenario.msr(2, 0).0, 1);
+        assert_eq!(scenario.page.0[0], 0);
+        assert_eq!(scenario.msr(2, address | 1).0, 1);
+        assert_ne!(scenario.page.0[0], before);
+        scenario.shared[7] = u64::from(u32::MAX);
+        assert_eq!(scenario.msr(2, address | 1).0, 1);
+        assert_eq!(scenario.page.0[0], 1);
+        assert_eq!(scenario.shared[7], 1);
+    }
+
+    #[test]
+    fn hyperv_shared_pages_use_the_ept01_translation_for_setup_and_invalidation() {
+        for operation in [2, 7] {
+            let mut scenario = Scenario::new();
+            let translated = Box::new(Page([u64::MAX; 512]));
+            let guest_address = scenario.page.0.as_ptr() as u64;
+            let host_address = translated.0.as_ptr() as u64;
+            scenario.tables[3].0[((guest_address >> 12) & 511) as usize] = host_address | 7;
+            assert_eq!(scenario.msr(6, 1).0, 1);
+            assert_eq!(scenario.msr(operation, guest_address | 1).0, 1);
+            assert!(scenario.page.0.iter().all(|value| *value == u64::MAX));
+            if operation == 2 {
+                assert_eq!(translated.0[0], 1);
+                assert_eq!(translated.0[1], scenario.shared[0]);
+                assert_eq!(translated.0[2], scenario.shared[1]);
+                assert_eq!(scenario.msr(2, 0).0, 1);
+                assert_eq!(translated.0[0], 0);
+            } else {
+                assert_eq!(translated.0[0] & 0xffffffffffff, 0xc300000002b8);
+            }
+        }
+    }
+
+    #[test]
+    fn reference_tsc_does_not_invalidate_a_page_after_ept_write_access_is_removed() {
+        let mut scenario = Scenario::new();
+        let address = scenario.page.0.as_ptr() as u64;
+        assert_eq!(scenario.msr(2, address | 1).0, 1);
+        scenario.tables[3].0[((address >> 12) & 511) as usize] &= !2;
+        let before = scenario.page.0;
+        assert_eq!(scenario.msr(2, 0).0, 1);
+        assert_eq!(scenario.page.0, before);
+        assert_eq!(scenario.msr(1, 0), (1, 0));
+        assert_eq!(scenario.shared[3], 0);
+    }
+
+    #[test]
+    fn unmapped_or_guest_read_only_pages_are_rejected_before_any_root_write() {
+        let mut scenario = Scenario::new();
+        assert_eq!(scenario.msr(2, 1).0, 0);
+        let address = scenario.page.0.as_ptr() as u64;
+        scenario.context[5] = address;
+        assert_eq!(scenario.msr(2, address | 1).0, 0);
+        scenario.context[5] = 0;
+        scenario.tables[3].0[((address >> 12) & 511) as usize] &= !2;
+        assert_eq!(scenario.msr(2, address | 1).0, 0);
+        assert_eq!(scenario.shared[2], 0);
+        assert_eq!(scenario.shared[3], 0);
+        assert!(scenario.page.0.iter().all(|value| *value == u64::MAX));
+    }
+
+    #[test]
+    fn unsupported_reference_time_defers_to_the_parent_hypervisor() {
+        let mut scenario = Scenario::new();
+        scenario.context[1] = 0;
+        for operation in 0..4 {
+            assert_eq!(scenario.msr(operation, 1).0, 2);
+        }
+        assert_eq!(scenario.shared[2], 0);
+    }
+
+    #[test]
+    fn reference_pages_accept_large_ept_leaves_and_honor_parent_write_denials() {
+        for (level, shift) in [(1, 30), (2, 21)] {
+            let mut scenario = Scenario::new();
+            let address = scenario.page.0.as_ptr() as u64;
+            let index = ((address >> shift) & 511) as usize;
+            scenario.tables[level].0[index] = (address & !((1 << shift) - 1)) | 0x87;
+            assert_eq!(scenario.msr(2, address | 1).0, 1);
+            assert_eq!(scenario.msr(2, 0).0, 1);
+            scenario.tables[0].0[((address >> 39) & 511) as usize] &= !2;
+            assert_eq!(scenario.msr(2, address | 1).0, 0);
+            assert_eq!(scenario.page.0[0], 0);
+        }
+    }
+
+    #[test]
+    fn partition_msr_writes_are_visible_from_another_virtual_processor() {
+        let mut scenario = Scenario::new();
+        scenario.context[1] = 0;
+        let identity = 0x1040a00e465f4;
+        let address = scenario.page.0.as_ptr() as u64;
+        assert_eq!(scenario.msr(6, identity).0, 1);
+        let mut other = scenario.context;
+        let mut registers = [0; 2];
+        assert_eq!(
+            unsafe { test_time_msr(other.as_mut_ptr(), registers.as_mut_ptr(), 4) },
+            1
+        );
+        assert_eq!(registers[0] | registers[1] << 32, identity);
+        registers = [address as u32 as u64 | 1, address >> 32];
+        assert_eq!(
+            unsafe { test_time_msr(other.as_mut_ptr(), registers.as_mut_ptr(), 7) },
+            1
+        );
+        assert_eq!(scenario.msr(5, 0), (1, address | 1));
+        assert_eq!(scenario.page.0[0] & 0xffffffffffff, 0xc300000002b8);
+        assert_eq!(scenario.shared[6], 0);
+        assert_eq!(scenario.msr(6, 0).0, 1);
+        registers = [0; 2];
+        assert_eq!(
+            unsafe { test_time_msr(other.as_mut_ptr(), registers.as_mut_ptr(), 5) },
+            1
+        );
+        assert_eq!(registers[0] | registers[1] << 32, address);
+    }
+
+    #[test]
+    fn hypercall_enable_without_identity_clears_enable_and_does_not_write_the_page() {
+        let mut scenario = Scenario::new();
+        let address = scenario.page.0.as_ptr() as u64;
+        assert_eq!(scenario.msr(7, address | 1).0, 1);
+        assert_eq!(scenario.msr(5, 0), (1, address));
+        assert!(scenario.page.0.iter().all(|value| *value == u64::MAX));
+        assert_eq!(scenario.shared[6], 0);
+    }
+
+    #[test]
+    fn hypercall_page_setup_requires_guest_write_access() {
+        let mut scenario = Scenario::new();
+        assert_eq!(scenario.msr(6, 1).0, 1);
+        let address = scenario.page.0.as_ptr() as u64;
+        scenario.tables[3].0[((address >> 12) & 511) as usize] &= !2;
+        assert_eq!(scenario.msr(7, address | 1).0, 0);
+        assert_eq!(scenario.msr(5, 0), (1, 0));
+        assert!(scenario.page.0.iter().all(|value| *value == u64::MAX));
+        assert_eq!(scenario.shared[6], 0);
+    }
+
+    #[test]
+    fn hypercall_locked_bit_makes_the_partition_msr_immutable_on_every_processor() {
+        let mut scenario = Scenario::new();
+        let address = scenario.page.0.as_ptr() as u64;
+        assert_eq!(scenario.msr(6, 1).0, 1);
+        assert_eq!(scenario.msr(7, address | 3).0, 1);
+        assert_eq!(scenario.msr(5, 0), (1, address | 3));
+        let before = scenario.page.0;
+        let mut other = scenario.context;
+        for value in [
+            0,
+            address | 1,
+            address | 2,
+            (address + 4096) | 3,
+            0xffc,
+            u64::MAX,
+        ] {
+            let mut registers = [value as u32 as u64, value >> 32];
+            assert_eq!(
+                unsafe { test_time_msr(other.as_mut_ptr(), registers.as_mut_ptr(), 7) },
+                1
+            );
+            assert_eq!(scenario.msr(5, 0), (1, address | 3));
+            assert_eq!(scenario.page.0, before);
+            assert_eq!(scenario.shared[6], 0);
+        }
+        assert_eq!(scenario.msr(6, 0).0, 1);
+        assert_eq!(scenario.msr(5, 0), (1, address | 2));
+        assert_eq!(scenario.msr(6, 1).0, 1);
+        assert_eq!(scenario.msr(7, address | 3).0, 1);
+        assert_eq!(scenario.msr(5, 0), (1, address | 2));
+    }
+
+    #[test]
+    fn disabled_hypercall_pages_can_be_locked_without_initializing_memory() {
+        let mut scenario = Scenario::new();
+        let address = scenario.page.0.as_ptr() as u64;
+        assert_eq!(scenario.msr(7, address | 3).0, 1);
+        assert_eq!(scenario.msr(5, 0), (1, address | 2));
+        assert!(scenario.page.0.iter().all(|value| *value == u64::MAX));
+        assert_eq!(scenario.msr(6, 1).0, 1);
+        assert_eq!(scenario.msr(7, address | 1).0, 1);
+        assert_eq!(scenario.msr(5, 0), (1, address | 2));
+        assert!(scenario.page.0.iter().all(|value| *value == u64::MAX));
+    }
+
+    #[test]
+    fn invalid_hypercall_configuration_does_not_latch_the_locked_bit() {
+        let mut scenario = Scenario::new();
+        let address = scenario.page.0.as_ptr() as u64;
+        assert_eq!(scenario.msr(6, 1).0, 1);
+        assert_eq!(scenario.msr(7, address | 7).0, 0);
+        assert_eq!(scenario.shared[6], 0);
+        scenario.tables[3].0[((address >> 12) & 511) as usize] &= !2;
+        assert_eq!(scenario.msr(7, address | 3).0, 0);
+        assert_eq!(scenario.msr(5, 0), (1, 0));
+        assert_eq!(scenario.shared[6], 0);
+        assert!(scenario.page.0.iter().all(|value| *value == u64::MAX));
+    }
+
+    #[test]
+    fn concurrent_identity_clear_cannot_leave_the_hypercall_page_enabled() {
+        let mut scenario = Scenario::new();
+        let address = scenario.page.0.as_ptr() as u64;
+        let context = scenario.context;
+        assert_eq!(scenario.msr(6, 1).0, 1);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let mut context = context;
+                for _ in 0..1000 {
+                    let mut registers = [address as u32 as u64 | 1, address >> 32];
+                    assert_eq!(
+                        unsafe { test_time_msr(context.as_mut_ptr(), registers.as_mut_ptr(), 7) },
+                        1
+                    );
+                }
+            });
+            scope.spawn(move || {
+                let mut context = context;
+                let mut registers = [0; 2];
+                assert_eq!(
+                    unsafe { test_time_msr(context.as_mut_ptr(), registers.as_mut_ptr(), 6) },
+                    1
+                );
+            });
+        });
+        assert_eq!(scenario.msr(4, 0), (1, 0));
+        assert_eq!(scenario.msr(5, 0), (1, address));
+        assert_eq!(scenario.shared[6], 0);
+    }
+}
+
 #[cfg(test_harness = "msr")]
 mod msr {
     include!("../builds/resident-msr-tests/definitions.rs");
 
     use core::arch::global_asm;
+
+    global_asm!(include_str!(
+        "../builds/resident-msr-tests/resident-hyperv-apic.S"
+    ));
+
+    unsafe extern "C" {
+        fn test_hyperv_apic(context: *mut u64, registers: *mut u64, write: u32) -> u32;
+    }
+
+    #[test]
+    fn hyperv_apic_routes_x2apic_access_and_rejects_reserved_writes() {
+        for (synthetic_msr, native_msr) in [
+            (0x4000_0070, 0x80b),
+            (0x4000_0071, 0x830),
+            (0x4000_0072, 0x808),
+        ] {
+            let mut context = [1, 0xfee0_0c00, 0, 0];
+            let mut registers = [0, synthetic_msr, 0];
+            assert_eq!(
+                unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
+                1
+            );
+            assert_eq!(context[2], native_msr);
+            if synthetic_msr == 0x4000_0070 {
+                assert_eq!(
+                    unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 0) },
+                    0
+                );
+            } else {
+                context[3] = if synthetic_msr == 0x4000_0071 {
+                    0x0000_0012_0000_0034
+                } else {
+                    0x34
+                };
+                assert_eq!(
+                    unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 0) },
+                    1
+                );
+                let expected = if synthetic_msr == 0x4000_0071 {
+                    0x1200_0000_0000_0034
+                } else {
+                    0x34
+                };
+                assert_eq!((registers[2] << 32) | registers[0], expected);
+            }
+        }
+        for (msr, low, high) in [
+            (0x4000_0070, 1, 0),
+            (0x4000_0070, 0, 1),
+            (0x4000_0072, 0x100, 0),
+            (0x4000_0072, 0, 1),
+        ] {
+            let mut context = [1, 0xfee0_0c00, 0, 0];
+            let mut registers = [low, msr, high];
+            assert_eq!(
+                unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
+                0
+            );
+            assert_eq!(context[2], 0);
+        }
+    }
+
+    #[test]
+    fn hyperv_apic_preserves_xapic_destination_and_tpr() {
+        #[repr(C, align(4096))]
+        struct ApicPage([u32; 1024]);
+        let mut page = ApicPage([0; 1024]);
+        let mut context = [1, page.0.as_mut_ptr() as u64 | 0x800, 0, 0];
+        let mut registers = [0x45, 0x4000_0071, 0x1200_0000];
+        assert_eq!(
+            unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
+            1
+        );
+        assert_eq!(page.0[0x300 / 4], 0x45);
+        assert_eq!(page.0[0x310 / 4], 0x1200_0000);
+        registers[0] = 0;
+        registers[2] = 0;
+        assert_eq!(
+            unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 0) },
+            1
+        );
+        assert_eq!(registers, [0x45, 0x4000_0071, 0x1200_0000]);
+        registers = [0xa0, 0x4000_0072, 0];
+        assert_eq!(
+            unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
+            1
+        );
+        assert_eq!(page.0[0x80 / 4], 0xa0);
+        context[1] &= !0x800;
+        assert_eq!(
+            unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
+            0
+        );
+    }
+
+    #[test]
+    fn hyperv_icr_translates_x2apic_destination_and_broadcast() {
+        for (destination, native_destination) in [(0x1200_0000, 0x12), (0xff00_0000, 0xffff_ffff)] {
+            let mut context = [1, 0xfee0_0c00, 0, 0];
+            let mut registers = [0x45, 0x4000_0071, destination];
+            assert_eq!(
+                unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
+                1
+            );
+            assert_eq!(context[2], 0x830);
+            assert_eq!(context[3], (native_destination << 32) | 0x45);
+            assert_eq!(registers, [0x45, 0x4000_0071, destination]);
+        }
+    }
 
     struct ResidentPages {
         bytes: [u8; 4096],
@@ -606,6 +1116,7 @@ mod msr {
         guest: *mut MsrEntry,
         l1_store: *mut MsrEntry,
         l1_store_count: u64,
+        captured_count: u64,
         l1_load: *const MsrEntry,
         l1_load_count: u64,
         entry: *mut MsrEntry,
@@ -617,6 +1128,8 @@ mod msr {
         b_nested_l0_msr_guest_list = const core::mem::offset_of!(Context, guest),
         b_nested_vmcs12_vm_exit_msr_store_addr = const core::mem::offset_of!(Context, l1_store),
         b_nested_vmcs12_vm_exit_msr_store_count = const core::mem::offset_of!(Context, l1_store_count),
+        b_nested_captured_msr_store_count = const core::mem::offset_of!(Context, captured_count),
+        b_nested_current_vmcs = const core::mem::offset_of!(Context, l1_store),
         b_nested_vmcs12_vm_exit_msr_load_addr = const core::mem::offset_of!(Context, l1_load),
         b_nested_vmcs12_vm_exit_msr_load_count = const core::mem::offset_of!(Context, l1_load_count),
         b_nested_vmcs01_entry_msr_list = const core::mem::offset_of!(Context, entry),
@@ -671,6 +1184,7 @@ mod msr {
                 guest: guest.as_mut_ptr(),
                 l1_store: store.as_mut_ptr(),
                 l1_store_count: 2,
+                captured_count: 2 + root_count,
                 l1_load: load.as_ptr(),
                 l1_load_count: 2,
                 entry: composed.as_mut_ptr(),
@@ -701,6 +1215,7 @@ mod msr {
                 guest: &mut guest,
                 l1_store: core::ptr::null_mut(),
                 l1_store_count: 2,
+                captured_count: 2 + root_count,
                 l1_load: load.as_ptr(),
                 l1_load_count: 1,
                 entry: composed.as_mut_ptr(),
@@ -719,6 +1234,7 @@ mod msr {
             guest: core::ptr::null_mut(),
             l1_store: core::ptr::null_mut(),
             l1_store_count: 0,
+            captured_count: 0,
             l1_load: core::ptr::null(),
             l1_load_count: 0,
             entry: core::ptr::null_mut(),
@@ -894,7 +1410,7 @@ mod pages {
     }
 
     mod hv_core {
-        pub mod vt_resident {
+        pub mod residency {
             pub fn boot_services_exited() -> bool {
                 false
             }
@@ -1506,6 +2022,8 @@ mod visual {
         cached_pin_controls: u64,
         event_context: *mut EventContext,
         snapshots: u64,
+        processor_number: u64,
+        nested_l2_active: u64,
     }
 
     global_asm!(
@@ -1519,6 +2037,11 @@ mod visual {
         b_event_context = const core::mem::offset_of!(TimerContext, event_context),
         test_pin_controls = const core::mem::offset_of!(TimerContext, pin_controls),
         test_snapshot_count = const core::mem::offset_of!(TimerContext, snapshots),
+        b_processor_number = const core::mem::offset_of!(TimerContext, processor_number),
+        b_nested_l2_active = const core::mem::offset_of!(TimerContext, nested_l2_active),
+        log_framebuffer_sink = const 2,
+        event_visual_base = const core::mem::offset_of!(EventContext, visual_base),
+        event_tsc_hz = const core::mem::offset_of!(EventContext, tsc_hz),
         event_ebs_seen = const core::mem::offset_of!(EventContext, exit_boot_services_seen),
         event_diagnostic_halted = const core::mem::offset_of!(EventContext, diagnostic_halted),
         event_visual_deadline = const core::mem::offset_of!(EventContext, visual_deadline),
@@ -1599,6 +2122,7 @@ mod visual {
     );
 
     unsafe extern "win64" {
+        fn test_sample_framebuffer(context: *mut TimerContext);
         fn test_dispatch_timer(context: *mut TimerContext);
         static mut test_visual_tsc: u64;
         fn test_claim_diagnostic(context: *mut EventContext) -> u64;
@@ -1797,6 +2321,99 @@ mod visual {
         assert_eq!(timer.expired, 1);
         assert_eq!(event_context.visual_base, 0);
         unsafe { test_set_backend(2) };
+    }
+
+    #[test]
+    fn ordinary_exits_sample_without_a_vmx_timer_or_user_telemetry() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let mut pixels = vec![BACKGROUND; WIDTH * HEIGHT];
+        let mut event_context = context(&mut pixels);
+        event_context.telemetry_enabled = 0;
+        event_context.visual_deadline = 5_000;
+        let mut timer = TimerContext {
+            event_context: &mut event_context,
+            ..Default::default()
+        };
+        unsafe {
+            test_set_backend(2);
+            test_visual_tsc = 1_000;
+            test_sample_framebuffer(&mut timer);
+        }
+        assert_eq!(timer.samples, 1);
+        assert_eq!(timer.snapshots, 1);
+        assert_eq!(timer.deadline_tsc, 1_100);
+        for now in [1_001, 1_050, 1_099] {
+            unsafe {
+                test_visual_tsc = now;
+                test_sample_framebuffer(&mut timer);
+            }
+        }
+        assert_eq!(timer.snapshots, 1);
+        unsafe {
+            test_visual_tsc = 1_100;
+            test_sample_framebuffer(&mut timer);
+        }
+        assert_eq!(timer.snapshots, 2);
+        assert_eq!(timer.deadline_tsc, 1_200);
+        unsafe {
+            test_visual_tsc = 5_000;
+            test_sample_framebuffer(&mut timer);
+        }
+        assert_eq!(timer.expired, 1);
+        assert_eq!(event_context.visual_base, 0);
+        unsafe {
+            test_set_backend(2);
+            test_visual_tsc = 1_000;
+            test_sample_framebuffer(&mut timer);
+        }
+        assert_eq!(timer.snapshots, 2);
+    }
+
+    #[test]
+    fn ordinary_exit_sampling_respects_boot_display_and_cpu_guards() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let mut pixels = vec![BACKGROUND; WIDTH * HEIGHT];
+        let mut event_context = context(&mut pixels);
+        for case in 0..8 {
+            event_context.exit_boot_services_seen = u64::from(case != 0);
+            event_context.diagnostic_halted = u64::from(case == 1);
+            let mut timer = TimerContext {
+                event_context: if case == 2 {
+                    core::ptr::null_mut()
+                } else {
+                    &mut event_context
+                },
+                processor_number: u64::from(case == 3),
+                nested_l2_active: u64::from(case == 4),
+                interval_tsc: u64::from(case == 5),
+                ..Default::default()
+            };
+            unsafe {
+                test_set_backend(if case == 6 {
+                    0
+                } else if case == 7 {
+                    1
+                } else {
+                    2
+                });
+                test_visual_tsc = 1_000;
+                test_sample_framebuffer(&mut timer);
+            }
+            assert_eq!(timer.snapshots, 0, "case {case}");
+            assert_eq!(timer.deadline_tsc, 0, "case {case}");
+        }
+        event_context.diagnostic_halted = 0;
+        event_context.visual_base = 0;
+        let mut timer = TimerContext {
+            event_context: &mut event_context,
+            ..Default::default()
+        };
+        unsafe {
+            test_set_backend(2);
+            test_sample_framebuffer(&mut timer);
+        }
+        assert_eq!(timer.snapshots, 0);
+        assert_eq!(timer.expired, 1);
     }
 
     fn context(pixels: &mut [u32]) -> EventContext {

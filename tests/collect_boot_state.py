@@ -26,7 +26,7 @@ def structure(source, name):
     return source.split(f"struct {name} {{", 1)[1].split("\n}", 1)[0]
 
 
-resident = (project / "src/core/vt_resident.rs").read_text()
+resident = (project / "src/core/residency.rs").read_text()
 nested = (project / "src/nested.rs").read_text()
 fields = {}
 formats = {}
@@ -138,6 +138,8 @@ try:
         values["event.cpu_mask"] = event[7]
         values["event.halted"] = event[8]
         values["event.host_fault_vector"] = event[9]
+        values["event.visual_base"] = event[5]
+        values["event.visual_stride_bytes"] = event[6]
         if os.environ.get("MATRIXHV_VMFUNC_PROBE") == "1" and values["processor_number"] == 0:
             probe_address = values["nested.vmxon_operand"] + 136
             ida_dbg.invalidate_dbgmem_contents(probe_address, 24)

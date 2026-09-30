@@ -12,6 +12,9 @@ param(
     [string]$VtNested,
 
     [ValidateSet('true', 'false')]
+    [string]$VtEvmcs,
+
+    [ValidateSet('true', 'false')]
     [string]$VmxTest,
 
     [string]$OutputPath
@@ -29,6 +32,7 @@ $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 $CurrentCpuidPresence = $false
 $CurrentLogger = $true
 $CurrentVtNested = $true
+$CurrentVtEvmcs = $false
 $CurrentVmxTest = $false
 if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
     foreach ($Line in Get-Content -LiteralPath $OutputPath) {
@@ -40,6 +44,9 @@ if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
         }
         elseif ($Line -match '^\s*VtNested\s*=\s*(true|false)\s*$') {
             $CurrentVtNested = [bool]::Parse($Matches[1])
+        }
+        elseif ($Line -match '^\s*VtEvmcs\s*=\s*(true|false)\s*$') {
+            $CurrentVtEvmcs = [bool]::Parse($Matches[1])
         }
         elseif ($Line -match '^\s*VmxTest\s*=\s*(true|false)\s*$') {
             $CurrentVmxTest = [bool]::Parse($Matches[1])
@@ -56,8 +63,15 @@ if (-not [string]::IsNullOrWhiteSpace($Logger)) {
 if (-not [string]::IsNullOrWhiteSpace($VtNested)) {
     $CurrentVtNested = [bool]::Parse($VtNested)
 }
+if (-not [string]::IsNullOrWhiteSpace($VtEvmcs)) {
+    $CurrentVtEvmcs = [bool]::Parse($VtEvmcs)
+}
 if (-not [string]::IsNullOrWhiteSpace($VmxTest)) {
     $CurrentVmxTest = [bool]::Parse($VmxTest)
+}
+if ($CurrentVtEvmcs) {
+    $CurrentCpuidPresence = $true
+    $CurrentVtNested = $true
 }
 if ($CurrentVmxTest -and -not $CurrentVtNested) {
     throw 'VmxTest requires VtNested=true.'
@@ -71,6 +85,7 @@ $Contents = @(
     "cpuidpresence=$($CurrentCpuidPresence.ToString().ToLowerInvariant())"
     "logger=$($CurrentLogger.ToString().ToLowerInvariant())"
     "VtNested=$($CurrentVtNested.ToString().ToLowerInvariant())"
+    "VtEvmcs=$($CurrentVtEvmcs.ToString().ToLowerInvariant())"
     "VmxTest=$($CurrentVmxTest.ToString().ToLowerInvariant())"
 ) -join "`n"
 

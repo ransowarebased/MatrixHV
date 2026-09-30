@@ -1,7 +1,9 @@
 use core::arch::asm;
 
 use crate::arch::{self, CR4_VMXE};
-use crate::nested::IA32_VMX_MISC_MSR;
+use crate::nested::{
+    IA32_VMX_MISC_MSR, VMX_SECONDARY_VMCS_SHADOWING, native_vmcs_shadowing_available,
+};
 
 use super::vmcs::*;
 
@@ -53,6 +55,7 @@ pub enum VmxControlsError {
     EferControlsUnavailable,
     VpidInvalidationFailed,
     VirtualNmisUnavailable,
+    VmcsShadowingUnexpectedlyRequired,
 }
 
 struct RequestedControls {
@@ -233,6 +236,30 @@ pub(crate) fn native_eptp_switching_supported() -> bool {
         && unsafe { arch::read_msr(crate::nested::IA32_VMX_VMFUNC_MSR) } & 1 != 0
 }
 
+pub(crate) fn enable_resident_vmcs_shadowing(
+    controls: &mut VmxControls,
+    shadow_vmcs: u64,
+    vmread_bitmap: u64,
+    vmwrite_bitmap: u64,
+) -> Result<bool, VmxControlsError> {
+    let secondary = unsafe { arch::read_msr(arch::IA32_VMX_PROCBASED_CTLS2) };
+    if controls.primary_processor_based & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS == 0
+        || !native_vmcs_shadowing_available(secondary)
+    {
+        return Ok(false);
+    }
+
+    vmwrite(VMREAD_BITMAP, vmread_bitmap)?;
+    vmwrite(VMWRITE_BITMAP, vmwrite_bitmap)?;
+    vmwrite(VMCS_LINK_POINTER, shadow_vmcs)?;
+    controls.secondary_processor_based |= VMX_SECONDARY_VMCS_SHADOWING;
+    vmwrite(
+        SECONDARY_VM_EXEC_CONTROL,
+        u64::from(controls.secondary_processor_based),
+    )?;
+    Ok(true)
+}
+
 fn configure_internal(requested: RequestedControls) -> Result<VmxControls, VmxControlsError> {
     let basic = unsafe { arch::read_msr(arch::IA32_VMX_BASIC) };
     let use_true_controls = basic & IA32_VMX_BASIC_TRUE_CTLS != 0;
@@ -276,6 +303,9 @@ fn configure_internal(requested: RequestedControls) -> Result<VmxControls, VmxCo
         } else {
             0
         };
+    if secondary_processor_based & VMX_SECONDARY_VMCS_SHADOWING != 0 {
+        return Err(VmxControlsError::VmcsShadowingUnexpectedlyRequired);
+    }
     let vm_exit = adjust_control(
         VM_EXIT_HOST_ADDRESS_SPACE_SIZE | requested.vm_exit,
         exit_msr,

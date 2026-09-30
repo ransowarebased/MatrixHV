@@ -1,5 +1,5 @@
 .macro matrixhv_resident_ept_cache
-// MTRR snapshots match vt_ept::MtrrState. No firmware, allocator, or guest pointer
+// MTRR snapshots match ept::MtrrState. No firmware, allocator, or guest pointer
 // is used here; the shared EPT keeps its original mappings and access rights.
 .Lresident_update_dirty_mtrrs:
     cmp qword ptr [r12 + {b_mtrr_dirty}], 0

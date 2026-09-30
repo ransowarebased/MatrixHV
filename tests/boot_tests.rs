@@ -153,6 +153,28 @@ mod config {
     }
 
     #[test]
+    fn evmcs_enables_nested_vmx_and_hypervisor_cpuid() {
+        for input in [
+            b"MATRIXHV_CONFIG_V2\nVtEvmcs=true\n".as_slice(),
+            b"MATRIXHV_CONFIG_V2\ncpuidpresence=false\nlogger=false\nVtNested=false\nVtEvmcs=true\nVmxTest=false\n",
+            b"MATRIXHV_CONFIG_V2\nVtEvmcs=true\ncpuidpresence=false\nVtNested=false\n",
+            b"MATRIXHV_CONFIG_V2\ncpuidpresence=true\nVtNested=false\nVtEvmcs=true\n",
+        ] {
+            let config = boot::parse(input).unwrap();
+            assert!(config.cpuid_presence);
+            assert!(config.vt_nested);
+            assert!(config.vt_evmcs);
+        }
+
+        let config = boot::parse(
+            b"MATRIXHV_CONFIG_V2\ncpuidpresence=false\nlogger=false\nVtNested=false\nVtEvmcs=true\nVmxTest=false\n",
+        )
+        .unwrap();
+        assert!(!config.logger);
+        assert!(!config.vmx_test);
+    }
+
+    #[test]
     fn edited_configuration_round_trips_through_runtime_state() {
         let edited = boot::parse(
             b"MATRIXHV_CONFIG_V2\ncpuidpresence=true\nlogger=false\nVtNested=true\nVmxTest=true\n",

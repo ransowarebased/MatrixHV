@@ -12,17 +12,17 @@ use uefi::proto::pi::mp::MpServices;
 
 use crate::arch;
 use crate::hv_core::vmcs::VmcsRegion;
-use crate::hv_core::vt_entry::{
+use crate::hv_core::entry::{
     VmlaunchError, VmlaunchProbeResourceAddresses, VmlaunchProbeResources, VmlaunchReport,
 };
-use crate::hv_core::vt_ept::{EptComposition, EptError, IdentityEpt};
-use crate::hv_core::vt_resident::{
+use crate::hv_core::ept::{EptComposition, EptError, IdentityEpt};
+use crate::hv_core::residency::{
     BOOT_GUEST_STACK_PAGES, HOST_STACK_PAGES, RESIDENT_BOOT_CONTEXT_PAGES, ResidentApLaunch,
     ResidentHostSelectors, ResidentHostTables, ResidentProbeError,
 };
-use crate::hv_core::vt_vmxon::{self, VmxonRegion};
+use crate::hv_core::vmxon::{self, VmxonRegion};
 use crate::memory::{AddressConstraint, PAGE_SIZE, ResidentPages};
-use crate::nested::NestedVmxCapabilities;
+use crate::nested::{NestedVmxCapabilities, native_vmcs_shadowing_available};
 use crate::runtime;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,12 +99,19 @@ pub(crate) const NESTED_INVVPID_AFTER_RIP_OFFSET: usize = 128;
 pub(crate) const NESTED_EPT_SOURCE_MARKER: u64 = 0x4e45_5054_5352_4331;
 pub(crate) const NESTED_EPT_TARGET_MARKER: u64 = 0x4e45_5054_5447_5431;
 pub(crate) const NESTED_EPT_SECOND_TARGET_MARKER: u64 = 0x4e45_5054_5447_5432;
-const NESTED_MSR_STATE_PAGES: usize = 7;
+const NESTED_MSR_STATE_PAGES: usize = 10;
+
+struct ResidentVmcsShadow {
+    vmcs_region: VmcsRegion,
+    vmread_bitmap: ResidentPages,
+    vmwrite_bitmap: ResidentPages,
+}
 
 pub(crate) struct ResidentCpuResources {
     pub(crate) vmxon_region: VmxonRegion,
     pub(crate) vmcs_region: VmcsRegion,
     pub(crate) nested_vmcs02_region: VmcsRegion,
+    vmcs_shadow: Option<ResidentVmcsShadow>,
     pub(crate) host_tables: ResidentHostTables,
     pub(crate) context_pages: ResidentPages,
     pub(crate) guest_stack: ResidentPages,
@@ -136,9 +143,37 @@ impl ResidentCpuResources {
     ) -> Result<Self, ResidentProbeError> {
         let vmxon_region = VmxonRegion::allocate(vmx_basic).map_err(ResidentProbeError::Vmxon)?;
         let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
-        vmcs_region.write_revision_id(vt_vmxon::revision_id(vmx_basic));
+        vmcs_region.write_revision_id(vmxon::revision_id(vmx_basic));
         let mut nested_vmcs02_region = VmcsRegion::allocate(vmx_basic)?;
-        nested_vmcs02_region.write_revision_id(vt_vmxon::revision_id(vmx_basic));
+        nested_vmcs02_region.write_revision_id(vmxon::revision_id(vmx_basic));
+        let vmcs_shadow = if native_vmcs_shadowing_available(unsafe {
+            arch::read_msr(arch::IA32_VMX_PROCBASED_CTLS2)
+        }) {
+            let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
+            vmcs_region.write_revision_id(vmxon::revision_id(vmx_basic) | (1 << 31));
+            let bitmap_constraint = if vmxon::region_uses_32_bit_physical_addresses(vmx_basic) {
+                AddressConstraint::Max(u32::MAX as u64)
+            } else {
+                AddressConstraint::Any
+            };
+            let vmread_bitmap =
+                ResidentPages::allocate_initialized(1, bitmap_constraint, |bytes| {
+                    bytes.fill(0xff);
+                })
+                .map_err(ResidentProbeError::Allocation)?;
+            let vmwrite_bitmap =
+                ResidentPages::allocate_initialized(1, bitmap_constraint, |bytes| {
+                    bytes.fill(0xff);
+                })
+                .map_err(ResidentProbeError::Allocation)?;
+            Some(ResidentVmcsShadow {
+                vmcs_region,
+                vmread_bitmap,
+                vmwrite_bitmap,
+            })
+        } else {
+            None
+        };
         let host_tables = ResidentHostTables::allocate(
             fatal_handler,
             gp_handler,
@@ -227,6 +262,7 @@ impl ResidentCpuResources {
             vmxon_region,
             vmcs_region,
             nested_vmcs02_region,
+            vmcs_shadow,
             host_tables,
             context_pages,
             guest_stack,
@@ -341,6 +377,16 @@ impl ResidentCpuResources {
         self.nested_vmcs02_region.physical_address()
     }
 
+    pub(crate) fn vmcs_shadow_resources(&self) -> Option<(u64, u64, u64)> {
+        self.vmcs_shadow.as_ref().map(|shadow| {
+            (
+                shadow.vmcs_region.physical_address(),
+                shadow.vmread_bitmap.physical_address(),
+                shadow.vmwrite_bitmap.physical_address(),
+            )
+        })
+    }
+
     pub(crate) fn nested_ept12_pointer(&self) -> Option<u64> {
         self.nested_ept12.as_ref().map(IdentityEpt::ept_pointer)
     }
@@ -434,6 +480,23 @@ impl ResidentCpuResources {
             1,
             zero_page_physical_address,
         )?;
+        if let Some(shadow) = &self.vmcs_shadow {
+            ept.conceal_guest_access(
+                shadow.vmcs_region.physical_address(),
+                1,
+                zero_page_physical_address,
+            )?;
+            ept.conceal_guest_access(
+                shadow.vmread_bitmap.physical_address(),
+                shadow.vmread_bitmap.pages(),
+                zero_page_physical_address,
+            )?;
+            ept.conceal_guest_access(
+                shadow.vmwrite_bitmap.physical_address(),
+                shadow.vmwrite_bitmap.pages(),
+                zero_page_physical_address,
+            )?;
+        }
         ept.conceal_guest_access(
             self.host_tables.pages.physical_address(),
             self.host_tables.pages.pages(),
@@ -461,6 +524,40 @@ impl ResidentCpuResources {
         )?;
         Ok(())
     }
+}
+
+pub(crate) fn allocate_resident_ap_resources(
+    vmx_basic: u64,
+    fatal_handler: u64,
+    gp_handler: u64,
+    exception_stubs: u64,
+) -> Result<Vec<(usize, ResidentCpuResources)>, ResidentProbeError> {
+    let topology = enumerate().map_err(ResidentProbeError::Allocation)?;
+    if topology.total_processors > 64 || topology.bsp_processor != 0 {
+        return Err(ResidentProbeError::Allocation(Status::UNSUPPORTED));
+    }
+    let mut ap_resources = Vec::new();
+    let handle = boot::get_handle_for_protocol::<MpServices>()
+        .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
+    let mp = boot::open_protocol_exclusive::<MpServices>(handle)
+        .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
+    for processor_number in 0..topology.total_processors {
+        let info = mp
+            .get_processor_info(processor_number)
+            .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
+        if info.is_enabled() && !info.is_bsp() {
+            ap_resources.push((
+                processor_number,
+                ResidentCpuResources::allocate(
+                    vmx_basic,
+                    fatal_handler,
+                    gp_handler,
+                    exception_stubs,
+                )?,
+            ));
+        }
+    }
+    Ok(ap_resources)
 }
 
 const INTERRUPT_FLAG: u64 = 1 << 9;
@@ -789,7 +886,7 @@ extern "efiapi" fn matrixhv_ap_launch_failed(flags: u64) -> ! {
 // Only the persistent exit stack and VMCS remain owned by root after this point.
 global_asm!(
     include_str!("asm/ap_launch.S"),
-    nested_probe_failed = const crate::hv_core::vt_resident::RESIDENT_VMCALL_NESTED_PROBE_FAILED,
+    nested_probe_failed = const crate::hv_core::residency::RESIDENT_VMCALL_NESTED_PROBE_FAILED,
     guest_rip_field = const crate::nested::VMCS_FIELD_GUEST_RIP,
     guest_rsp_field = const crate::nested::VMCS_FIELD_GUEST_RSP,
     guest_rflags_field = const crate::nested::VMCS_FIELD_GUEST_RFLAGS,
@@ -831,10 +928,10 @@ global_asm!(
     invalid_control_error = const crate::nested::VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
     non_launched_error = const crate::nested::VMRESUME_NON_LAUNCHED_VMCS_ERROR,
     invalid_invalidation_operand_error = const crate::nested::INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR,
-    vmcs12_test_value = const crate::hv_core::vt_resident::NESTED_VMCS12_TEST_VALUE,
-    l2_vmcall_magic = const crate::hv_core::vt_resident::NESTED_L2_VMCALL_MAGIC,
-    l2_vmresume_magic = const crate::hv_core::vt_resident::NESTED_L2_VMRESUME_MAGIC,
-    l2_post_invept_magic = const crate::hv_core::vt_resident::NESTED_L2_POST_INVEPT_MAGIC,
+    vmcs12_test_value = const crate::hv_core::residency::NESTED_VMCS12_TEST_VALUE,
+    l2_vmcall_magic = const crate::hv_core::residency::NESTED_L2_VMCALL_MAGIC,
+    l2_vmresume_magic = const crate::hv_core::residency::NESTED_L2_VMRESUME_MAGIC,
+    l2_post_invept_magic = const crate::hv_core::residency::NESTED_L2_POST_INVEPT_MAGIC,
     sysenter_cs_msr = const crate::arch::IA32_SYSENTER_CS,
     sysenter_esp_msr = const crate::arch::IA32_SYSENTER_ESP,
     sysenter_eip_msr = const crate::arch::IA32_SYSENTER_EIP,

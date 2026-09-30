@@ -1,11 +1,12 @@
 use core::arch::asm;
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 const LOG_BUFFER_CAPACITY: usize = 512;
 pub(crate) const SERIAL_SINK: u8 = 1;
 pub(crate) const FRAMEBUFFER_SINK: u8 = 2;
 static BACKEND: AtomicU8 = AtomicU8::new(LogBackend::Disabled as u8);
+static SERIAL_PRESENT: AtomicBool = AtomicBool::new(false);
 static LOG_ADAPTER: LogAdapter = LogAdapter;
 
 #[repr(u8)]
@@ -74,6 +75,10 @@ impl Write for LogBuffer {
 
 pub fn initialize() {
     let selected = select_backend(enabled(), initialize_serial);
+    SERIAL_PRESENT.store(
+        selected == LogBackend::SerialAndFramebuffer,
+        Ordering::Release,
+    );
     BACKEND.store(selected as u8, Ordering::Release);
     let _ = log::set_logger(&LOG_ADAPTER);
     log::set_max_level(if selected == LogBackend::Disabled {
@@ -88,14 +93,8 @@ pub fn enabled() -> bool {
 }
 
 pub fn set_enabled(enabled: bool) {
-    BACKEND.store(
-        if enabled {
-            LogBackend::Framebuffer
-        } else {
-            LogBackend::Disabled
-        } as u8,
-        Ordering::Release,
-    );
+    let selected = select_backend(enabled, || SERIAL_PRESENT.load(Ordering::Acquire));
+    BACKEND.store(selected as u8, Ordering::Release);
 }
 
 pub(crate) fn backend() -> LogBackend {

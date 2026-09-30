@@ -46,7 +46,7 @@ impl ResidentPages {
             .checked_mul(PAGE_SIZE)
             .filter(|length| *length != 0 && *length <= isize::MAX as usize)
             .ok_or(Status::INVALID_PARAMETER)?;
-        if crate::hv_core::vt_resident::boot_services_exited() {
+        if crate::hv_core::residency::boot_services_exited() {
             return Err(Status::UNSUPPORTED);
         }
         let allocate_type = match constraint {
@@ -103,7 +103,7 @@ impl ResidentPages {
 
 impl Drop for ResidentPages {
     fn drop(&mut self) {
-        if self.release_on_drop && !crate::hv_core::vt_resident::boot_services_exited() {
+        if self.release_on_drop && !crate::hv_core::residency::boot_services_exited() {
             unsafe {
                 let _ = boot::free_pages(self.pointer, self.pages);
             }

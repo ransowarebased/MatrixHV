@@ -9,12 +9,12 @@ use uefi::{Handle, Status};
 use crate::arch;
 use crate::boot as boot_environment;
 use crate::hv_core::vmcs::{self, VM_INSTRUCTION_ERROR, VmcsError, VmcsRegion};
-use crate::hv_core::vt_controls::{self, VmxControls, VmxControlsError};
-use crate::hv_core::vt_entry;
-use crate::hv_core::vt_exits::{self, DispatchDiagnostics, VmRunContext};
-use crate::hv_core::vt_resident;
-use crate::hv_core::vt_state::{self, GuestStateReport, HostStateReport};
-use crate::hv_core::vt_vmxon::{
+use crate::hv_core::controls::{self, VmxControls, VmxControlsError};
+use crate::hv_core::entry;
+use crate::hv_core::exits::{self, DispatchDiagnostics, VmRunContext};
+use crate::hv_core::residency;
+use crate::hv_core::state::{self, GuestStateReport, HostStateReport};
+use crate::hv_core::vmxon::{
     self, VmxInstructionResult, VmxRootSession, VmxonError, VmxonReport,
 };
 use crate::memory::{
@@ -160,8 +160,8 @@ pub struct Vcpu {
 impl Vcpu {
     pub fn new(entry_rip: u64) -> Result<Self, PersistentVcpuError> {
         let initial_rflags = arch::read_rflags();
-        let vmx_basic = vt_vmxon::vmx_basic();
-        let revision_id = vt_vmxon::revision_id(vmx_basic);
+        let vmx_basic = vmxon::vmx_basic();
+        let revision_id = vmxon::revision_id(vmx_basic);
         let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
         vmcs_region.write_revision_id(revision_id);
         let vmcs_physical_address = vmcs_region.physical_address();
@@ -174,7 +174,7 @@ impl Vcpu {
         let host_address_space_report = host_address_space
             .clone_current()
             .map_err(PersistentVcpuError::HostPaging)?;
-        let session = vt_vmxon::enter_vmx_root().map_err(PersistentVcpuError::Vmxon)?;
+        let session = vmxon::enter_vmx_root().map_err(PersistentVcpuError::Vmxon)?;
         let vmxon = session.report();
 
         runtime::phase("vmx.vcpu.vmclear.start");
@@ -193,10 +193,10 @@ impl Vcpu {
         }
         runtime::phase("vmx.vcpu.vmptrld.ok");
 
-        let controls = vt_controls::configure()?;
-        let host = vt_state::configure_host_with_cr3(host_address_space_report.host_cr3)?;
+        let controls = controls::configure()?;
+        let host = state::configure_host_with_cr3(host_address_space_report.host_cr3)?;
         let guest =
-            vt_state::configure_guest_with_rflags(entry_rip, guest_stack.top(), initial_rflags)?;
+            state::configure_guest_with_rflags(entry_rip, guest_stack.top(), initial_rflags)?;
         if host.cr3 == guest.cr3 {
             drop(session);
             return Err(PersistentVcpuError::HostCr3NotIndependent {
@@ -251,13 +251,13 @@ impl Vcpu {
     pub fn run(mut self) -> Result<PersistentVcpuReport, PersistentVcpuError> {
         let context = self.run_context.as_mut_ptr();
         let host_exit_rsp = self.host_exit_stack.prepare_host_exit(context);
-        vt_exits::reset_diagnostics();
+        exits::reset_diagnostics();
         runtime::phase("vmx.vcpu.launch.start");
-        let raw_path = unsafe { vt_entry::run_persistent_loop(context, host_exit_rsp) };
+        let raw_path = unsafe { entry::run_persistent_loop(context, host_exit_rsp) };
         runtime::phase("vmx.vcpu.returned_to_host");
 
         let vm_instruction_error = vmcs::vmread(VM_INSTRUCTION_ERROR).unwrap_or(u64::MAX);
-        let diagnostics = vt_exits::diagnostics();
+        let diagnostics = exits::diagnostics();
         let validation = validate_run(
             raw_path,
             vm_instruction_error,
@@ -510,7 +510,7 @@ pub extern "efiapi" fn matrixhv_boot_loader_start_guest_stage() -> u64 {
     }
     REPORT_FLAGS.fetch_or(FLAG_START_CHECKPOINT_COMPLETE, Ordering::Release);
     crate::boot::screen::message(format_args!("resident guest checkpoint complete"));
-    let ept_test_page_gpa = vt_resident::ept_test_page_gpa();
+    let ept_test_page_gpa = residency::ept_test_page_gpa();
     if ept_test_page_gpa != 0 {
         unsafe {
             matrixhv_boot_loader_ept_probe_asm(ept_test_page_gpa);
@@ -635,9 +635,9 @@ global_asm!(
 
 global_asm!(
     include_str!("asm/guest_boot.S"),
-    checkpoint_magic = const vt_resident::RESIDENT_VMCALL_START_CHECKPOINT,
-    stop_magic = const vt_resident::RESIDENT_VMCALL_STOP,
-    nested_probe_failed = const vt_resident::RESIDENT_VMCALL_NESTED_PROBE_FAILED,
+    checkpoint_magic = const residency::RESIDENT_VMCALL_START_CHECKPOINT,
+    stop_magic = const residency::RESIDENT_VMCALL_STOP,
+    nested_probe_failed = const residency::RESIDENT_VMCALL_NESTED_PROBE_FAILED,
     guest_rip_field = const crate::nested::VMCS_FIELD_GUEST_RIP,
     guest_rsp_field = const crate::nested::VMCS_FIELD_GUEST_RSP,
     guest_rflags_field = const crate::nested::VMCS_FIELD_GUEST_RFLAGS,
@@ -679,10 +679,10 @@ global_asm!(
     invalid_control_error = const crate::nested::VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
     non_launched_error = const crate::nested::VMRESUME_NON_LAUNCHED_VMCS_ERROR,
     invalid_invalidation_operand_error = const crate::nested::INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR,
-    vmcs12_test_value = const vt_resident::NESTED_VMCS12_TEST_VALUE,
-    l2_vmcall_magic = const vt_resident::NESTED_L2_VMCALL_MAGIC,
-    l2_vmresume_magic = const vt_resident::NESTED_L2_VMRESUME_MAGIC,
-    l2_post_invept_magic = const vt_resident::NESTED_L2_POST_INVEPT_MAGIC,
+    vmcs12_test_value = const residency::NESTED_VMCS12_TEST_VALUE,
+    l2_vmcall_magic = const residency::NESTED_L2_VMCALL_MAGIC,
+    l2_vmresume_magic = const residency::NESTED_L2_VMRESUME_MAGIC,
+    l2_post_invept_magic = const residency::NESTED_L2_POST_INVEPT_MAGIC,
     sysenter_cs_msr = const crate::arch::IA32_SYSENTER_CS,
     sysenter_esp_msr = const crate::arch::IA32_SYSENTER_ESP,
     sysenter_eip_msr = const crate::arch::IA32_SYSENTER_EIP,
