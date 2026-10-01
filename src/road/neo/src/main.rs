@@ -1,5 +1,7 @@
 mod commands;
 mod matrix;
+#[path = "../../../protocol.rs"]
+pub mod protocol;
 mod server;
 mod startup;
 mod telemetry;

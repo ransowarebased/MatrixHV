@@ -1,3 +1,9 @@
+// AP architectural exits enter with R12=context and the dispatcher GPR frame.
+// INIT clears that frame and programs reset VMCS state; SIPI consumes the
+// recorded vector and resumes without advancing RIP. Scratch GPRs/flags may
+// change, R12/root stack/SIMD stay intact, and VMCS failures use common errors.
+// Reset tables are island-relative. CR writes and VPID retirement belong to
+// exits.S; this component calls its .Lap_flush_guest_tlb helper after reset.
 .macro matrixhv_resident_ap_startup
 .Lresident_ap_ready:
     mov qword ptr [r12 + {b_ap_started}], 1
@@ -83,108 +89,7 @@
     jz .Lresident_dispatch_vmwrite_failed
     jmp .Lresident_dispatch_resume
 
-.Lresident_ap_cr_access:
-    mov r11, [r12 + {b_last_qualification}]
-    test r11d, 0x30
-    jnz .Lresident_dispatch_unsupported
-    mov eax, r11d
-    shr eax, 8
-    and eax, 15
-    cmp eax, 4
-    je .Lap_cr_source_rsp
-    lea rdx, [rip + .Lap_gpr_offsets]
-    movzx eax, byte ptr [rdx + rax]
-    mov r10, [rsp + rax]
-    jmp .Lap_cr_value
-.Lap_cr_source_rsp:
-    mov rax, {guest_rsp}
-    vmread r10, rax
-    jc .Lresident_dispatch_vmread_failed
-    jz .Lresident_dispatch_vmread_failed
-.Lap_cr_value:
-    and r11d, 15
-    cmp r11d, 0
-    je .Lap_write_cr0
-    cmp r11d, 4
-    jne .Lresident_dispatch_unsupported
-    mov [r12 + {b_nested_l1_cr4}], r10
-    mov rax, {cr4_read_shadow}
-    vmwrite rax, r10
-    jc .Lresident_dispatch_vmwrite_failed
-    jz .Lresident_dispatch_vmwrite_failed
-    or r10, 0x2000
-    mov rax, {guest_cr4}
-    vmwrite rax, r10
-    jc .Lresident_dispatch_vmwrite_failed
-    jz .Lresident_dispatch_vmwrite_failed
-    jmp .Lap_cr_done
-// Unrestricted guest allows PE/PG to clear; NE and VMXE remain set in the hardware state.
-.Lap_write_cr0:
-    mov rax, {cr0_read_shadow}
-    vmwrite rax, r10
-    jc .Lresident_dispatch_vmwrite_failed
-    jz .Lresident_dispatch_vmwrite_failed
-    or r10, 0x20
-    mov rax, {guest_cr0}
-    vmwrite rax, r10
-    jc .Lresident_dispatch_vmwrite_failed
-    jz .Lresident_dispatch_vmwrite_failed
-    mov rax, {guest_efer}
-    vmread r11, rax
-    jc .Lresident_dispatch_vmread_failed
-    jz .Lresident_dispatch_vmread_failed
-    and r11, -1025
-    bt r10, 31
-    jnc .Lap_cr_efer
-    test r11, 0x100
-    jz .Lap_cr_efer
-    or r11, 0x400
-.Lap_cr_efer:
-    vmwrite rax, r11
-    jc .Lresident_dispatch_vmwrite_failed
-    jz .Lresident_dispatch_vmwrite_failed
-    mov rax, {vm_entry_controls}
-    vmread r10, rax
-    jc .Lresident_dispatch_vmread_failed
-    jz .Lresident_dispatch_vmread_failed
-    and r10, -513
-    test r11, 0x400
-    jz .Lap_cr_entry
-    or r10, 0x200
-.Lap_cr_entry:
-    vmwrite rax, r10
-    jc .Lresident_dispatch_vmwrite_failed
-    jz .Lresident_dispatch_vmwrite_failed
-.Lap_cr_done:
-    call .Lresident_update_dirty_mtrrs
-    call .Lap_flush_guest_tlb
-    call .Lresident_advance_guest_rip
-    jmp .Lresident_dispatch_resume
-
-// VMWRITE does not perform the TLB invalidation of INIT or MOV CR0/CR4.
-// Retained VPID translations must not carry firmware mappings into the OS.
-.Lap_flush_guest_tlb:
-    mov eax, {secondary_vm_exec_control}
-    vmread r11, rax
-    jna .Lresident_dispatch_vmread_failed
-    bt r11d, 5
-    jnc .Lap_flush_guest_tlb_done
-    mov eax, {virtual_processor_id}
-    vmread r11, rax
-    jna .Lresident_dispatch_vmread_failed
-    sub rsp, 16
-    mov qword ptr [rsp], r11
-    mov qword ptr [rsp + 8], 0
-    mov eax, 1
-    invvpid rax, xmmword ptr [rsp]
-    lea rsp, [rsp + 16]
-    jna .Lresident_dispatch_halt
-.Lap_flush_guest_tlb_done:
-    ret
-
-.Lap_gpr_offsets:
-    .byte 0, 8, 16, 24, 0, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112
-.p2align 3
+matrixhv_island_cr_access
 .Lap_reset_fields:
     .quad {guest_cr0}, 0x60000030
     .quad {cr0_read_shadow}, 0x60000010

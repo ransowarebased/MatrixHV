@@ -1,8 +1,12 @@
-pub mod vmcs;
+pub mod bridge;
 pub mod controls;
 pub mod entry;
 pub mod ept;
 pub mod exits;
-pub mod residency;
+pub mod msr;
+pub mod nested;
+pub mod resident;
 pub mod state;
+pub mod vcpu;
+pub mod vmcs;
 pub mod vmxon;

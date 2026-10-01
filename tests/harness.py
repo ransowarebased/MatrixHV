@@ -8,20 +8,33 @@ import subprocess
 import textwrap
 
 
+def read_resident_rust(project: Path) -> str:
+    return (project / "src/protocol.rs").read_text(encoding="utf-8") + "\n" + "\n".join((project / "src/core" / name).read_text(encoding="utf-8")
+                     for name in ("resident/mod.rs", "resident/abi.rs", "resident/boot.rs", "state.rs", "msr.rs", "nested.rs", "bridge.rs", "entry.rs", "exits.rs"))
+
+
 def read_resident_assembly(project: Path) -> str:
     assembly = project / "src" / "asm"
-    island = (assembly / "residency.S").read_text(encoding="utf-8")
-    nested = (assembly / "nested.S").read_text(encoding="utf-8")
-    lines = nested.splitlines(keepends=True)
+    island = (assembly / "island.S").read_text(encoding="utf-8")
+    macros = "\n".join(
+        (assembly / name).read_text(encoding="utf-8")
+        for name in ("nested.S", "hyperv.S", "exits.S", "msr.S", "control.S", "diagnostics.S", "ept_cache.S", "eptp_switch.S", "ap_startup.S")
+    )
+    lines = macros.splitlines(keepends=True)
+    definitions = {}
+    expansions = {}
+    helpers = []
     index = 0
     while index < len(lines):
         declaration = re.fullmatch(
-            r"\.macro (matrixhv_resident_nested_\w+)\s*", lines[index]
+            r"\.macro ((?:matrixhv_|resident_hyperv_|resident_diagnostic_)\w+)(?:[ \t]+([^\n]*))?[ \t]*\n?", lines[index]
         )
-        if declaration is None:
+        helper = re.fullmatch(r"\.macro resident_\w+[^\n]*\s*", lines[index])
+        if declaration is None and helper is None:
             index += 1
             continue
-        name = declaration[1]
+        name = declaration[1] if declaration else None
+        declaration_index = index
         start = index + 1
         index = start
         depth = 1
@@ -36,35 +49,47 @@ def read_resident_assembly(project: Path) -> str:
             index += 1
         if depth:
             raise ValueError(f"Unterminated resident assembly macro: {name}")
-        invocation = re.compile(rf"^{re.escape(name)}\n", re.MULTILINE)
-        island, count = invocation.subn(lambda match: "".join(lines[start:index]), island)
-        if count != 1:
-            raise ValueError(f"Expected one resident expansion for {name}, found {count}")
+        if name is None:
+            helpers.append("".join(lines[declaration_index:index + 1]))
+        else:
+            definitions[name] = ("".join(lines[start:index]),
+                                 [argument.strip() for argument in (declaration[2] or "").split(",") if argument.strip()])
+            expansions[name] = 0
         index += 1
-    return island
+    for _ in range(len(definitions) + 1):
+        changed = False
+        for name, (body, parameters) in definitions.items():
+            invocation = re.compile(rf"^{re.escape(name)}(?:[ \t]+([^\n]*))?\n", re.MULTILINE)
+            def expand(match, body=body, parameters=parameters):
+                arguments = [argument.strip() for argument in (match[1] or "").split(",") if argument.strip()]
+                if len(arguments) != len(parameters):
+                    raise ValueError(f"Invalid arguments for resident macro {name}: {arguments}")
+                result = body
+                for parameter, argument in zip(parameters, arguments):
+                    result = re.sub(rf"\\{re.escape(parameter)}\b", lambda match, argument=argument: argument, result)
+                return result
+            island, count = invocation.subn(expand, island)
+            expansions[name] += count
+            changed |= count != 0
+        if not changed:
+            for name, count in expansions.items():
+                if count < 1 or (name.startswith("matrixhv_") and count != 1):
+                    expected = "one" if name.startswith("matrixhv_") else "at least one"
+                    raise ValueError(f"Expected {expected} resident expansion for {name}, found {count}")
+            return "\n".join(helpers) + island
+    raise ValueError("Cyclic resident assembly macro composition")
 
 
 def prepare_boot_order(project: Path):
     output = project / "builds/boot-order-tests"
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src" / "boot.rs").read_text(encoding="utf-8")
+    source = (project / "src" / "firmware.rs").read_text(encoding="utf-8")
     start = source.index("mod boot_order {")
-    end = source.index("\nmod memory_map {", start)
+    end = source.index("\npub(crate) mod memory_map {", start)
     parser = source[start:end]
     (output / "definitions.rs").write_text(parser, encoding="utf-8")
 
 
-def prepare_config(project: Path):
-    output = project / "builds" / "config-tests"
-    output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src/boot.rs").read_text(encoding="utf-8")
-    start = source.index("pub const CONFIG_HEADER:")
-    end = source.index("\n#[derive(Clone, Copy, Debug, Eq, PartialEq)]\npub enum ConfigLoadError", start)
-    parser = source[start:source.index("const CONFIG_FILE_PATH", start)]
-    parser += source[source.index("static CPUID_PRESENCE", start):end]
-    (output / "definitions.rs").write_text("mod boot {\nuse core::str;\n"
-        "use core::sync::atomic::{AtomicBool, Ordering};\n"
-        + parser + "\n}\n", encoding="utf-8")
 
 
 def prepare_ept_cache(project: Path):
@@ -187,7 +212,7 @@ def prepare_logger(project: Path):
     output = project / "builds" / "logger-tests"
     output.mkdir(parents=True, exist_ok=True)
     runtime = (project / "src/runtime.rs").read_text(encoding="utf-8")
-    screen = (project / "src/boot.rs").read_text(encoding="utf-8")
+    screen = (project / "src/diagnostics.rs").read_text(encoding="utf-8")
     def item(source, declaration):
         start = source.index(declaration)
         opening = source.index("{", start)
@@ -219,7 +244,7 @@ def prepare_logger(project: Path):
 def prepare_evmcs(project: Path):
     output = project / "builds" / "evmcs-tests"
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src/asm/nested.S").read_text(encoding="utf-8")
+    source = read_resident_assembly(project)
     completion = source.split('call .Lresident_nested_complete_vmcs02_msr_exit\n', 1)[1].split(
         'mov qword ptr [r12 + {b_nested_l2_active}], 0', 1)[0]
     completion = '.Ltest_complete_evmcs_exit:\n' + completion + 'ret\n'
@@ -227,7 +252,7 @@ def prepare_evmcs(project: Path):
                      source.index('.Lresident_nested_l2_reflect:')]
     routing = routing.replace('{b_last_reason}', '{b_nested_vmcs12_exit_reason}')
     handlers = source[
-        source.index(".Lresident_nested_select_evmcs:"):
+        source.index(".Lresident_hyperv_evmcs_select:"):
         source.index(".Lresident_dispatch_vmclear:")
     ]
     vmclear = source[source.index('.Lresident_dispatch_vmclear:'):
@@ -248,8 +273,8 @@ def prepare_evmcs(project: Path):
         source.index(".Lresident_evmcs_field_map:"):
         source.index(".Lresident_vmcs12_field_index_table:")
     ]
-    island = (project / "src/asm/residency.S").read_text(encoding="utf-8")
-    translation = island[island.index('.Lresident_hyperv_guest_page_is_readable:'):
+    island = read_resident_assembly(project)
+    translation = island[island.index('.Lresident_ept01_page_is_readable:'):
                          island.index('.Lresident_dispatch_xsetbv:')]
     assist_write = island[island.index('.Lresident_dispatch_wrmsr_vp_assist:'):
                           island.index('.Lresident_dispatch_wrmsr_hyperv_apic:')]
@@ -293,7 +318,7 @@ def prepare_evmcs(project: Path):
         push rsi
         push rdi
         mov r12, rcx
-        call .Lresident_nested_select_evmcs
+        call .Lresident_hyperv_evmcs_select
         pop rdi
         pop rsi
         pop r13
@@ -324,7 +349,7 @@ def prepare_evmcs(project: Path):
         push rsi
         push rdi
         mov r12, rcx
-        call .Lresident_nested_store_evmcs
+        call .Lresident_hyperv_evmcs_store
         pop rdi
         pop rsi
         pop r13
@@ -349,7 +374,7 @@ def prepare_evmcs(project: Path):
     .Lresident_nested_physical_address_is_valid:
         mov eax, 1
         ret
-    .Lresident_nested_host_page_is_mapped:
+    .Lresident_ept01_host_page_is_mapped:
         xor eax, eax
         cmp r11, [r12 + {b_nested_host_mapping_cache}]
         setne al
@@ -450,7 +475,7 @@ def prepare_evmcs(project: Path):
 def prepare_vmcs_shadow(project: Path):
     output = project / "builds/vmcs-shadow-tests"
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src/asm/nested.S").read_text(encoding="utf-8")
+    source = read_resident_assembly(project)
     handlers = source[
         source.index(".Lresident_nested_shadow_intercept_reads:"):
         source.index(".Lresident_nested_translate_current_vmcs:")
@@ -519,7 +544,7 @@ def prepare_vmcs_shadow(project: Path):
 def prepare_native_shadow(project: Path):
     output = project / "builds/native-shadow-tests"
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src/asm/nested.S").read_text(encoding="utf-8")
+    source = read_resident_assembly(project)
     def block(start, end):
         begin = source.index(start)
         return source[begin:source.index(end, begin)]
@@ -605,8 +630,8 @@ def prepare_native_shadow(project: Path):
     .Ltest_read_vmcs01_done:
         test r12, r12
         ret
-    .Lresident_hyperv_reference_page_is_writable:
-    .Lresident_nested_host_page_is_mapped:
+    .Lresident_ept01_page_is_writable:
+    .Lresident_ept01_host_page_is_mapped:
         mov rax, [r12 + {test_mapped}]
         ret
     .Lresident_nested_eptp_before_root_write:
@@ -849,7 +874,7 @@ def prepare_nested_ept(project: Path):
     msr_assembly = (source[msr_start:msr_end] + source[mapped_start:mapped_end]).strip()
     select_start = source.index(".Lresident_nested_select_msr_entry_list:")
     select_end = source.index(".Lresident_nested_prepare_full_msr_entry:", select_start)
-    msr_assembly += "\n" + source[select_start:select_end] + '\n.Lresident_nested_read_saved_msr:\nud2\n.Lresident_hyperv_reference_page_is_writable:\nmov eax, 1\nret\n'
+    msr_assembly += "\n" + source[select_start:select_end] + '\n.Lresident_nested_read_saved_msr:\nud2\n.Lresident_ept01_page_is_writable:\nmov eax, 1\nret\n'
     msr_assembly = msr_assembly.replace(
         'call .Lresident_nested_eptp_before_root_write',
         'call .Ltest_msr_root_write',
@@ -917,6 +942,8 @@ def prepare_nested_ept(project: Path):
     policy_start = source.index('bt dword ptr [r12 + {b_nested_vmcs12_primary_control}], 28', merge_start)
     policy_end = source.index('.Lresident_nested_merge_msr_bitmap_done:', policy_start)
     policy_assembly = source[policy_start:policy_end].replace(
+        '.Lresident_ept01_host_page_is_mapped', '.Ltest_msr_policy_host_page_is_mapped'
+    ).replace(
         '.Lresident_nested_', '.Ltest_msr_policy_'
     )
     policy_assembly += (
@@ -938,7 +965,7 @@ def prepare_nested_regressions(project: Path):
     assembly = "\n".join([
         block('.Lresident_nested_msr_exit_requested:', '.Lresident_nested_read_gpr:'),
         block('.Lresident_nested_operand_width:', '.Lresident_nested_physical_address_is_valid:'),
-        block('.Lresident_hyperv_guest_page_is_readable:', '.Lresident_dispatch_xsetbv:'),
+        block('.Lresident_ept01_page_is_readable:', '.Lresident_dispatch_xsetbv:'),
         block('.Lresident_nested_msr_requires_hardware_store:', '.Lresident_nested_store_current_vmcs12:'),
         block('.Lresident_nested_select_msr_entry_list:', '.Lresident_nested_compose_vmcs02_msr_lists:'),
         block('.Lresident_nested_restore_internal_msr_entry:', '.Lresident_nested_l2_resume_ept:'),
@@ -1126,7 +1153,7 @@ def prepare_nested_regressions(project: Path):
         mov [r12 + {test_controls} + rax * 8], r11
         cmp r12, 0
         ret
-    .Lresident_nested_host_page_is_mapped:
+    .Lresident_ept01_host_page_is_mapped:
     .Lresident_nested_host_msr_list_is_mapped:
         mov eax, 1
         ret
@@ -1277,7 +1304,7 @@ def prepare_nested_logging(project: Path):
         mov r10, [r12 + {b_nested_operand_linear_address}]
         clc
         ret
-    .Lresident_hyperv_guest_page_is_readable:
+    .Lresident_ept01_page_is_readable:
     .Lresident_nested_physical_address_is_valid:
         mov eax, 1
         ret
@@ -1354,14 +1381,14 @@ def prepare_nested_logging(project: Path):
 def prepare_pci_bar(project: Path):
     output = project / "builds/pci-bar-tests"
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src" / "core" / "ept.rs").read_text(encoding="utf-8")
+    source = (project / "src" / "firmware.rs").read_text(encoding="utf-8")
     start = source.index("fn read_pci_bar_range(")
     opening = source.index("{", start)
     depth, end = 1, opening + 1
     while depth:
         depth += (source[end] == "{") - (source[end] == "}")
         end += 1
-    parser = source[start:end]
+    parser = source[start:end].replace("PciDiscoveryError", "EptError").replace("FIRMWARE_PHYSICAL_LIMIT", "EPT_GUEST_PHYSICAL_LIMIT")
     stubs = """
     const PCI_BAR_DESCRIPTOR_SIZE: usize = 46;
     const EPT_GUEST_PHYSICAL_LIMIT: u64 = 1 << 48;
@@ -1719,10 +1746,10 @@ def prepare_resident_control(project: Path):
 def prepare_hyperv_time(project: Path):
     output = project / 'builds/hyperv-time-tests'
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / 'src/core/residency.rs').read_text(encoding='utf-8')
-    scale = source[source.index('fn hyperv_reference_tsc_scale('):source.index('fn native_hyperv_reference_tsc(')]
+    source = (project / 'src/hyperv.rs').read_text(encoding='utf-8')
+    scale = source[source.index('pub fn hyperv_reference_tsc_scale('):source.index('pub fn native_hyperv_reference_tsc(')]
     (output / 'definitions.rs').write_text(scale, encoding='utf-8')
-    source = (project / 'src/asm/residency.S').read_text(encoding='utf-8')
+    source = read_resident_assembly(project)
     read = source[source.index('.Lresident_dispatch_rdmsr_reference_count:'):source.index('.Lresident_dispatch_rdmsr_zero:')]
     write = source[source.index('.Lresident_dispatch_wrmsr_reference_count:'):source.index('.Lresident_dispatch_xsetbv:')]
     read += source[source.index('.Lresident_dispatch_rdmsr_guest_os_id:'):source.index('.Lresident_dispatch_rdmsr_vp_index:')]
@@ -1804,7 +1831,7 @@ def prepare_hyperv_time(project: Path):
         test r11, 0xfff
         setz al
         ret
-    .Lresident_nested_host_page_is_mapped:
+    .Lresident_ept01_host_page_is_mapped:
         xor eax, eax
         cmp r11, [r12 + 40]
         setne al
@@ -1837,7 +1864,7 @@ def prepare_hyperv_time(project: Path):
 def prepare_resident_msr(project: Path):
     output = project / "builds" / "resident-msr-tests"
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src/core/residency.rs").read_text(encoding="utf-8")
+    source = read_resident_rust(project)
     assembly_source = read_resident_assembly(project)
     apic = assembly_source[assembly_source.index('.Lresident_dispatch_rdmsr_hyperv_apic:'):
                            assembly_source.index('.Lresident_dispatch_rdmsr_guest_os_id:')]
@@ -1919,7 +1946,7 @@ def prepare_resident_msr(project: Path):
     start = assembly_source.index('.Lresident_nested_complete_vmcs02_msr_exit:')
     end = assembly_source.index('.Lresident_nested_activate_vmcs01_msr_entry:', start)
     assembly = assembly_source[start:end].strip()
-    assembly += '\n.Lresident_nested_read_saved_msr:\nud2\n.Lresident_hyperv_reference_page_is_writable:\nmov eax, 1\nret\n\n.Lresident_dispatch_halt:\nud2\n'
+    assembly += '\n.Lresident_nested_read_saved_msr:\nud2\n.Lresident_ept01_page_is_writable:\nmov eax, 1\nret\n\n.Lresident_dispatch_halt:\nud2\n'
     assembly += '\n.Lresident_nested_eptp_before_root_write:\nret\n'
     start = assembly_source.index('.Lresident_validate_efer:')
     end = assembly_source.index('.Lresident_guarded_rdmsr:', start)
@@ -1994,7 +2021,7 @@ def prepare_resident_msr(project: Path):
     cache_flush = assembly_source[start:end].strip()
     cache_flush = cache_flush.replace("wbinvd", "inc qword ptr [r12 + 8]")
     cache_flush += """
-    .Lresident_msr_privilege:
+    .Lresident_guest_privilege:
         bt qword ptr [r12], 0
         ret
     .Lresident_dispatch_inject_gp:
@@ -2076,7 +2103,7 @@ def prepare_resident_telemetry(project: Path):
     source = read_resident_assembly(project)
     start = source.index('.Lresident_dispatch_cpuid_diagnostic:')
     end = source.index('.Lresident_dispatch_cpuid_standard:', start)
-    trace_start = source.index('.Lresident_nested_record_failure:')
+    trace_start = source.index('.Lresident_diagnostic_nested_record_failure:')
     trace_end = source.index('.Lresident_dispatch_cpuid:', trace_start)
     assembly = source[trace_start:trace_end] + "\n" + source[start:end]
     profile_start = source.index('.Lresident_profile_exit_handler:')
@@ -2162,7 +2189,7 @@ def prepare_resident_telemetry(project: Path):
         mov r12, rcx
         mov r10, r8
         mov r8, rdx
-        call .Lresident_nested_record_failure
+        call .Lresident_diagnostic_nested_record_failure
         pop r12
         ret
     .globl test_diagnostic
@@ -2289,7 +2316,7 @@ def prepare_resident_visual(project: Path):
     )
     assembly += "\njmp .Ltest_exception_return"
     assembly = assembly.replace("rdtsc", "mov rax, qword ptr [rip + test_visual_tsc]\nmov rdx, rax\nshr rdx, 32")
-    screen = (project / "src/boot.rs").read_text(encoding="utf-8")
+    screen = (project / "src/diagnostics.rs").read_text(encoding="utf-8")
     def marker_constant(name):
         return int(re.search(rf"const {name}: usize = (\d+);", screen).group(1))
     wrappers = """
@@ -2374,7 +2401,7 @@ def prepare_resident_visual(project: Path):
     .globl test_msr_fault_fixup
     test_msr_fault_fixup:
         mov rax, rcx
-        jmp .Lresident_msr_fault_fixup
+        jmp .Lresident_access_fault_fixup
     .globl test_read_fault_rip
     test_read_fault_rip:
         lea rax, [rip + .Lresident_rdmsr_instruction]
@@ -2389,7 +2416,7 @@ def prepare_resident_visual(project: Path):
         ret
     .globl test_fault_resume_rip
     test_fault_resume_rip:
-        lea rax, [rip + .Lresident_msr_fault_return]
+        lea rax, [rip + .Lresident_access_fault_return]
         ret
     .globl test_gp_frame
     test_gp_frame:
@@ -2518,7 +2545,7 @@ def prepare_resident_visual(project: Path):
 
 
 def prepare_boot_state(project: Path):
-    resident = (project / "src/core/residency.rs").read_text()
+    resident = read_resident_rust(project)
     nested = (project / "src/nested.rs").read_text()
     collector = ast.parse((project / "tests/collect_boot_state.py").read_text())
     functions = [node for node in collector.body if isinstance(node, ast.FunctionDef)
@@ -2530,18 +2557,12 @@ def prepare_boot_state(project: Path):
     output = project / "builds/boot-state-tests"
     output.mkdir(parents=True, exist_ok=True)
     harness = "use std::mem::{offset_of, size_of};\n"
-    for name in ("VMCS12_EXTENDED_FIELD_COUNT", "NESTED_FAILURE_TRACE_WORD_COUNT"):
-        count = re.search(r"const " + name + r": usize = (\d+)", nested)[1]
-        harness += f"const {name}: usize = {count};\n"
-    harness += "#[repr(C, align(16))]\npub struct RootFxState(pub [u8; 512]);\n"
-    for source, name, alignment in (
-        (resident, "WatchdogGuestState", ""),
-        (nested, "NestedVmcs12State", ""),
-        (nested, "NestedVmxState", ""),
-        (resident, "ResidentBootContext", ", align(16)"),
-    ):
-        harness += f"#[repr(C{alignment})]\npub struct {name} {{"
-        harness += namespace["structure"](source, name) + "\n}\n"
+    harness += 'pub mod protocol { include!("../../src/protocol.rs"); }\n'
+    harness += 'pub mod nested { include!("../../src/nested.rs"); }\n'
+    harness += 'pub mod memory { pub const PAGE_SIZE: usize = 4096; }\n'
+    harness += 'pub mod hv_core { pub mod bridge { include!("../../src/core/bridge.rs"); } }\n'
+    harness += 'pub mod abi { include!("../../src/core/resident/abi.rs"); }\n'
+    harness += "use abi::ResidentBootContext;\n"
     harness += "fn main() {\n"
     for name, format_code in namespace["formats"].items():
         path = name
@@ -2570,7 +2591,7 @@ def prepare_boot_state(project: Path):
 COMPONENTS = {
     "boot": {
         "order": prepare_boot_order,
-        "config": prepare_config,
+        "config": None,
     },
     "ept": {
         "cache": prepare_ept_cache,

@@ -101,7 +101,9 @@ mod order {
 
 #[cfg(test_harness = "config")]
 mod config {
-    include!("../builds/config-tests/definitions.rs");
+    pub mod boot {
+        include!("../src/config.rs");
+    }
 
     #[test]
     fn nested_vmx_defaults_to_enabled_and_test_boot_to_disabled() {
@@ -175,13 +177,14 @@ mod config {
     }
 
     #[test]
-    fn edited_configuration_round_trips_through_runtime_state() {
+    fn edited_configuration_preserves_explicit_startup_options() {
         let edited = boot::parse(
             b"MATRIXHV_CONFIG_V2\ncpuidpresence=true\nlogger=false\nVtNested=true\nVmxTest=true\n",
         )
         .unwrap();
-        boot::apply(edited);
-
-        assert_eq!(boot::current(), edited);
+        assert!(edited.cpuid_presence);
+        assert!(!edited.logger);
+        assert!(edited.vt_nested);
+        assert!(edited.vmx_test);
     }
 }

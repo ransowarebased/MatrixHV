@@ -1,3 +1,9 @@
+// Called inside root with R12=context and an intact dispatcher guest frame.
+// Cache helpers use b_* offsets and clobber scratch GPRs/flags, retain R12,
+// balance their local stack and leave SIMD untouched. Range/table arguments
+// are documented below; helpers RET or take common VMCS/invalidation errors.
+// Cache updates use a resident lock and generation counter; every CPU invalidates
+// locally before reentry. No page allocation or mapping lifetime changes occur here.
 .macro matrixhv_resident_ept_cache
 // MTRR snapshots match ept::MtrrState. No firmware, allocator, or guest pointer
 // is used here; the shared EPT keeps its original mappings and access rights.
@@ -312,4 +318,14 @@
     .quad 0
 .Lresident_cache_last_snapshot:
     .zero 4192
+.endm
+
+.macro matrixhv_island_cache_flush
+.Lresident_dispatch_cache_flush:
+call .Lresident_guest_privilege
+jc .Lresident_dispatch_inject_gp
+// INVD must not discard dirty host state on a CPU shared with the guest.
+wbinvd
+call .Lresident_advance_guest_rip
+jmp .Lresident_dispatch_resume
 .endm

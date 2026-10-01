@@ -1386,6 +1386,8 @@ mod msr {
 }
 
 #[cfg(test_harness = "pages")]
+use pages::firmware;
+#[cfg(test_harness = "pages")]
 mod pages {
     include!("../builds/resident-pages-tests/definitions.rs");
 
@@ -1409,11 +1411,9 @@ mod pages {
         }
     }
 
-    mod hv_core {
-        pub mod residency {
-            pub fn boot_services_exited() -> bool {
-                false
-            }
+    pub(crate) mod firmware {
+        pub fn boot_services_exited() -> bool {
+            false
         }
     }
 
@@ -1520,6 +1520,20 @@ mod pages {
             })
             .is_err()
         );
+        assert_eq!(boot::count(), 0);
+    }
+
+    #[test]
+    fn preserved_pages_remain_owned_after_the_resource_is_dropped() {
+        let mut pages = ResidentPages::allocate(1, AddressConstraint::Any).unwrap();
+        let pointer = pages.pointer();
+        assert_eq!(pointer.as_ptr() as usize as u64, pages.physical_address());
+        pages.preserve();
+        drop(pages);
+        assert_eq!(boot::count(), 1);
+        unsafe {
+            boot::free_pages(pointer, 1).unwrap();
+        }
         assert_eq!(boot::count(), 0);
     }
 }

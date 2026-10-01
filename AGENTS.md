@@ -46,11 +46,6 @@ All AI agents and contributors working on this repository must strictly adhere t
 
 ---
 
-## 6. Repository Architecture & File Directory Map
-For the canonical architectural layout, components, and responsibilities across the MatrixHV repository, refer directly to [README.md](README.md).
-
----
-
 ## 7. Rust Best Practices & Idiomatic Code
 - **No Dead Code or Dead Imports**: Strictly avoid leaving unused functions, constants, structs, or fields in the codebase. Every item must be actively referenced or promptly removed.
 - **No Lint Silencing**: Do NOT use `#[allow(dead_code)]` or `#[allow(unused_imports)]` to suppress compiler warnings or mask incomplete refactoring. Source code must compile warning-free under `--target x86_64-unknown-uefi` without silencing annotations.

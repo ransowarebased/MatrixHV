@@ -604,7 +604,7 @@ mod sync {
         "je .Ltest_send_failed_return",
         "mov qword ptr [r14 + {b_nested_eptp_sync_nmi}], 0",
         ".Ltest_send_failed_return:", "stc", "ret",
-        ".Lresident_nested_host_page_is_mapped:", "mov eax, 1", "ret",
+        ".Lresident_ept01_host_page_is_mapped:", "mov eax, 1", "ret",
         ".Lresident_nested_capture_native_eptp:",
         "inc qword ptr [r12 + {test_captures}]", "ret",
         ".Lresident_nested_invalidate_ept02:",

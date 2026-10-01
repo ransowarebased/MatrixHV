@@ -26,7 +26,8 @@ def structure(source, name):
     return source.split(f"struct {name} {{", 1)[1].split("\n}", 1)[0]
 
 
-resident = (project / "src/core/residency.rs").read_text()
+resident = "\n".join((project / "src/core" / name).read_text()
+                     for name in ("resident/abi.rs",))
 nested = (project / "src/nested.rs").read_text()
 fields = {}
 formats = {}

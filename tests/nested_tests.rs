@@ -1,6 +1,22 @@
 #[cfg(test_harness = "policy")]
+#[path = "../src/protocol.rs"]
+pub mod protocol;
+#[cfg(test_harness = "policy")]
+use policy::nested;
+#[cfg(test_harness = "policy")]
+#[path = "../src/config.rs"]
+pub mod config;
+#[cfg(test_harness = "policy")]
+pub mod hyperv {
+    include!("../src/hyperv.rs");
+}
+#[cfg(test_harness = "policy")]
 mod policy {
-    mod nested {
+    use crate::protocol::{
+        MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_PROTOCOL, MATRIXHV_STATUS_SIGNATURE_EAX,
+        MATRIXHV_STATUS_SIGNATURE_EBX, MATRIXHV_STATUS_SIGNATURE_ECX,
+    };
+    pub(crate) mod nested {
         include!("../src/nested.rs");
     }
 
@@ -69,25 +85,25 @@ mod policy {
             + core::mem::offset_of!(nested::NestedVmcs12State, launch_state),
         b_nested_l2_entry_was_resume = const core::mem::offset_of!(nested::NestedVmxState, l2_entry_was_resume),
         b_nested_vmcs02_launched = const core::mem::offset_of!(nested::NestedVmxState, vmcs02_launched),
-        matrixhv_status_leaf = const nested::MATRIXHV_STATUS_LEAF,
+        matrixhv_status_leaf = const crate::protocol::MATRIXHV_STATUS_LEAF,
         vmcs12_launch_state_launched = const nested::VMCS12_LAUNCH_STATE_LAUNCHED,
         b_nested_vmcs12_exit_instruction_len = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
             + core::mem::offset_of!(nested::NestedVmcs12State, exit_instruction_len),
         b_nested_vmcs12_exit_qualification = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
             + core::mem::offset_of!(nested::NestedVmcs12State, exit_qualification),
-        evmcs_version = const nested::EVMCS_VERSION,
-        evmcs_guest_rip = const core::mem::offset_of!(nested::EnlightenedVmcs, guest_rip),
-        evmcs_guest_rsp = const core::mem::offset_of!(nested::EnlightenedVmcs, guest_rsp),
-        evmcs_guest_rflags = const core::mem::offset_of!(nested::EnlightenedVmcs, guest_rflags),
-        evmcs_host_rip = const core::mem::offset_of!(nested::EnlightenedVmcs, host_rip),
-        evmcs_host_rsp = const core::mem::offset_of!(nested::EnlightenedVmcs, host_rsp),
-        evmcs_exit_reason = const core::mem::offset_of!(nested::EnlightenedVmcs, exit_reason),
-        evmcs_exit_instruction_length = const core::mem::offset_of!(nested::EnlightenedVmcs, exit_instruction_length),
-        evmcs_exit_qualification = const core::mem::offset_of!(nested::EnlightenedVmcs, exit_qualification),
-        evmcs_clean_fields = const core::mem::offset_of!(nested::EnlightenedVmcs, clean_fields),
+        evmcs_version = const crate::hyperv::EVMCS_VERSION,
+        evmcs_guest_rip = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, guest_rip),
+        evmcs_guest_rsp = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, guest_rsp),
+        evmcs_guest_rflags = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, guest_rflags),
+        evmcs_host_rip = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, host_rip),
+        evmcs_host_rsp = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, host_rsp),
+        evmcs_exit_reason = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, exit_reason),
+        evmcs_exit_instruction_length = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, exit_instruction_length),
+        evmcs_exit_qualification = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, exit_qualification),
+        evmcs_clean_fields = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, clean_fields),
         nested_extended_field_count = const nested::VMCS12_EXTENDED_FIELD_COUNT,
-        vp_assist_enlighten_vm_entry = const nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET,
-        vp_assist_current_nested_vmcs = const nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+        vp_assist_enlighten_vm_entry = const crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET,
+        vp_assist_current_nested_vmcs = const crate::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
     );
 
     unsafe extern "C" {
@@ -120,12 +136,12 @@ mod policy {
     #[test]
     fn l2_routes_only_the_private_diagnostic_cpuid_to_root() {
         for (reason, leaf, intercepted) in [
-            (10, nested::MATRIXHV_STATUS_LEAF, 1),
+            (10, crate::protocol::MATRIXHV_STATUS_LEAF, 1),
             (10, 1, 0),
             (10, 0x4000_0000, 0),
             (10, 0x4000_000a, 0),
-            (18, nested::MATRIXHV_STATUS_LEAF, 0),
-            (0x8000_000a, nested::MATRIXHV_STATUS_LEAF, 0),
+            (18, crate::protocol::MATRIXHV_STATUS_LEAF, 0),
+            (0x8000_000a, crate::protocol::MATRIXHV_STATUS_LEAF, 0),
         ] {
             let mut state = nested_state(0);
             state.vmcs12.exit_reason = reason;
@@ -137,14 +153,52 @@ mod policy {
         }
     }
 
+    #[test]
+    fn hyperv_exposure_requires_cpuid_and_nested_vmx_for_evmcs() {
+        for cpuid in [false, true] {
+            for nested in [false, true] {
+                for evmcs in [false, true] {
+                    let mut cpuid_presence = cpuid;
+                    let mut vt_nested = nested;
+                    crate::config::normalize_exposure(&mut cpuid_presence, &mut vt_nested, evmcs);
+                    assert_eq!(cpuid_presence, cpuid || evmcs);
+                    assert_eq!(vt_nested, nested || evmcs);
+                    assert_eq!(crate::hyperv::timing_supported(cpuid_presence, 0), false);
+                    assert_eq!(
+                        crate::hyperv::timing_supported(cpuid_presence, 1),
+                        cpuid_presence
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn evmcs_controls_preserve_required_bits_and_hide_unsupported_controls() {
+        let unsupported = u64::from(
+            nested::VMX_SECONDARY_ENABLE_VM_FUNCTIONS | nested::VMX_SECONDARY_VMCS_SHADOWING,
+        ) << 32;
+        for controls in [0, unsupported, u64::MAX, 0x1234_5678_9abc_def0] {
+            assert_eq!(
+                crate::hyperv::restrict_evmcs_controls(controls, false),
+                controls
+            );
+            assert_eq!(
+                crate::hyperv::restrict_evmcs_controls(controls, true),
+                controls & !unsupported
+            );
+        }
+    }
+
+    use crate::hyperv::{
+        CPUID_HYPERVISOR_PRESENT_BIT, HYPERV_FEATURES_LEAF, HYPERVISOR_LEAF_END,
+        HYPERVISOR_LEAF_START,
+    };
     use nested::{
-        CPUID_HYPERVISOR_PRESENT_BIT, CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, HYPERV_FEATURES_LEAF,
-        HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START, HostVmxCapabilities,
-        IA32_FEATURE_CONTROL_LOCKED, IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX,
-        INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR, INVALID_VMCS_POINTER, MATRIXHV_STATUS_LEAF,
-        MATRIXHV_STATUS_PROTOCOL, MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX,
-        MATRIXHV_STATUS_SIGNATURE_ECX, NestedEptConfiguration, NestedMsrComposition,
-        NestedVmcs12State, NestedVmxCapabilities, NestedVmxState, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR,
+        CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, HostVmxCapabilities, IA32_FEATURE_CONTROL_LOCKED,
+        IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX, INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR,
+        INVALID_VMCS_POINTER, NestedEptConfiguration, NestedMsrComposition, NestedVmcs12State,
+        NestedVmxCapabilities, NestedVmxState, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR,
         VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR, VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR,
         VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
         VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS, VMCS_FIELD_GUEST_RIP,
@@ -1258,16 +1312,13 @@ mod policy {
             0
         );
     }
+    use crate::hyperv::EnlightenedVmcs;
     use core::mem::{offset_of, size_of};
-    use nested::EnlightenedVmcs;
 
     fn field_map() -> Vec<(usize, u16)> {
-        let assembly = include_str!("../src/asm/nested.S");
+        let assembly = include_str!("../src/asm/hyperv.S");
         let start = assembly.find(".Lresident_evmcs_field_map:").unwrap();
-        let end = assembly[start..]
-            .find(".Lresident_vmcs12_field_index_table:")
-            .unwrap()
-            + start;
+        let end = assembly[start..].find(".endm").unwrap() + start;
         assembly[start..end]
             .lines()
             .filter_map(|line| line.trim().strip_prefix(".short "))
@@ -1284,9 +1335,9 @@ mod policy {
     #[test]
     fn version_one_layout_and_field_map_match() {
         let fields = field_map();
-        assert_eq!(nested::EVMCS_VERSION, 1);
-        assert_eq!(nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET, 40);
-        assert_eq!(nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET, 48);
+        assert_eq!(crate::hyperv::EVMCS_VERSION, 1);
+        assert_eq!(crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET, 40);
+        assert_eq!(crate::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET, 48);
         assert_eq!(size_of::<EnlightenedVmcs>(), 1024);
         assert_eq!(fields.len(), nested::VMCS12_EXTENDED_FIELD_COUNT);
         for (offset, flags) in fields.iter().copied() {
@@ -1481,13 +1532,17 @@ mod policy {
             state.evmcs_enabled = 1;
             state.vp_assist_msr = assist.0.as_ptr() as u64 | 1;
             let address = evmcs.0.as_ptr() as u64;
-            write_page_u64(&mut assist, nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET, 1);
             write_page_u64(
                 &mut assist,
-                nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+                crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET,
+                1,
+            );
+            write_page_u64(
+                &mut assist,
+                crate::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
                 address,
             );
-            evmcs.0[..4].copy_from_slice(&nested::EVMCS_VERSION.to_le_bytes());
+            evmcs.0[..4].copy_from_slice(&crate::hyperv::EVMCS_VERSION.to_le_bytes());
             let mut ept = EvmcsTestEpt::new(&mut state);
             ept.map(
                 state.vp_assist_msr & !4095,
@@ -1515,13 +1570,17 @@ mod policy {
         let guest_address = vmcs_decoy.0.as_ptr() as u64;
         state.evmcs_enabled = 1;
         state.vp_assist_msr = assist_decoy.0.as_ptr() as u64 | 1;
-        write_page_u64(&mut assist, nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET, 1);
         write_page_u64(
             &mut assist,
-            nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+            crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET,
+            1,
+        );
+        write_page_u64(
+            &mut assist,
+            crate::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
             guest_address,
         );
-        evmcs.0[..4].copy_from_slice(&nested::EVMCS_VERSION.to_le_bytes());
+        evmcs.0[..4].copy_from_slice(&crate::hyperv::EVMCS_VERSION.to_le_bytes());
         write_page_u64(&mut evmcs, offset_of!(EnlightenedVmcs, guest_rip), 0x1234);
         let mut ept = EvmcsTestEpt::new(&mut state);
         ept.map(state.vp_assist_msr & !4095, assist.0.as_ptr() as u64, 1);
@@ -1563,14 +1622,18 @@ mod policy {
             let version = if use_revision {
                 state.vmcs12.revision_id as u32
             } else {
-                nested::EVMCS_VERSION
+                crate::hyperv::EVMCS_VERSION
             };
             first.0[..4].copy_from_slice(&version.to_le_bytes());
-            second.0[..4].copy_from_slice(&nested::EVMCS_VERSION.to_le_bytes());
-            write_page_u64(&mut assist, nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET, 1);
+            second.0[..4].copy_from_slice(&crate::hyperv::EVMCS_VERSION.to_le_bytes());
             write_page_u64(
                 &mut assist,
-                nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+                crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET,
+                1,
+            );
+            write_page_u64(
+                &mut assist,
+                crate::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
                 second_address,
             );
             let mut ept = EvmcsTestEpt::new(&mut state);
@@ -1689,13 +1752,17 @@ mod policy {
         let mut state = nested_state(0);
         state.evmcs_enabled = 1;
         state.vp_assist_msr = assist.0.as_ptr() as u64 | 1;
-        write_page_u64(&mut assist, nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET, 1);
         write_page_u64(
             &mut assist,
-            nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+            crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET,
+            1,
+        );
+        write_page_u64(
+            &mut assist,
+            crate::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
             address,
         );
-        evmcs.0[..4].copy_from_slice(&nested::EVMCS_VERSION.to_le_bytes());
+        evmcs.0[..4].copy_from_slice(&crate::hyperv::EVMCS_VERSION.to_le_bytes());
         let mut ept = EvmcsTestEpt::new(&mut state);
         ept.map(state.vp_assist_msr & !4095, state.vp_assist_msr & !4095, 7);
         ept.map(address, address, 7);
@@ -1732,14 +1799,14 @@ mod policy {
         ept.map(evmcs_address, evmcs_address, 7);
         state.vmcs02_guest_cache_valid = 1;
         state.vmcs02_control_cache_valid = [1, 1];
-        assist.0[nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET..][..4]
+        assist.0[crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET..][..4]
             .copy_from_slice(&1u32.to_le_bytes());
         write_page_u64(
             &mut assist,
-            nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+            crate::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
             evmcs_address,
         );
-        evmcs.0[..4].copy_from_slice(&nested::EVMCS_VERSION.to_le_bytes());
+        evmcs.0[..4].copy_from_slice(&crate::hyperv::EVMCS_VERSION.to_le_bytes());
         write_page_u64(
             &mut evmcs,
             offset_of!(EnlightenedVmcs, ept_root),
@@ -1839,7 +1906,7 @@ mod policy {
         assert_eq!(unsafe { test_select_evmcs(&mut state) }, -1);
         evmcs.0[..4].copy_from_slice(&(state.vmcs12.revision_id as u32).to_le_bytes());
         assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
-        assist.0[nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET..][..4]
+        assist.0[crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET..][..4]
             .copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(unsafe { test_select_evmcs(&mut state) }, 0);
         assert_eq!(state.evmcs_active, 0);
@@ -1859,14 +1926,14 @@ mod policy {
             let mut ept = EvmcsTestEpt::new(&mut state);
             ept.map(state.vp_assist_msr & !4095, state.vp_assist_msr & !4095, 7);
             ept.map(state.current_vmcs, state.current_vmcs, 7);
-            assist.0[nested::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET..][..4]
+            assist.0[crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET..][..4]
                 .copy_from_slice(&1u32.to_le_bytes());
             write_page_u64(
                 &mut assist,
-                nested::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+                crate::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
                 state.current_vmcs,
             );
-            evmcs.0[..4].copy_from_slice(&nested::EVMCS_VERSION.to_le_bytes());
+            evmcs.0[..4].copy_from_slice(&crate::hyperv::EVMCS_VERSION.to_le_bytes());
             state.vmcs12.exit_reason = exit_reason;
             state.vmcs12.extended_fields[13] = 0x8000_0040;
             state.vmcs12.guest_rflags = 0x46;
@@ -2672,7 +2739,7 @@ mod ept {
         ".globl check_test_host_mapping",
         "check_test_host_mapping:",
         "push r12", "mov r12, rcx", "mov r11, rdx",
-        "call .Lresident_nested_host_page_is_mapped",
+        "call .Lresident_ept01_host_page_is_mapped",
         "pop r12", "ret",
         ".globl discard_test_ept",
         "discard_test_ept:",
@@ -3368,7 +3435,7 @@ mod ept {
             state.admission = 1;
             let original = [leaf(ept01, 0x9000), leaf(ept01, alias), leaf(ept01, 0xa000)];
 
-            // Failed quiescence must leave permissions and native execution unchanged.
+            // Failed quiescence preserves EPT permissions and keeps native VMFUNC disabled.
             unsafe { refresh_test_eptp_list(&mut state) };
             assert_eq!(state.native_enabled, 0);
             assert_eq!(leaf(ept01, 0x9000), original[0]);

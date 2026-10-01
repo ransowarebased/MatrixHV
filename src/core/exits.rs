@@ -1,11 +1,10 @@
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-
 use super::vmcs::{
     self, EXIT_QUALIFICATION, GUEST_CR3, GUEST_RIP, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_REASON,
     VmcsError,
 };
 use crate::arch;
 use crate::runtime;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const VM_ENTRY_FAILURE_BIT: u32 = 1 << 31;
 pub const BASIC_EXIT_REASON_MASK: u32 = 0xffff;
@@ -489,4 +488,74 @@ fn advance_guest_rip(guest_rip: u64, instruction_length: u32) -> Result<(), Vmcs
         GUEST_RIP,
         guest_rip.wrapping_add(u64::from(instruction_length)),
     )
+}
+
+pub(crate) const VMCALL_EXIT_REASON: u64 = 18;
+pub(crate) const CPUID_EXIT_REASON: u64 = 10;
+pub(crate) const RDMSR_EXIT_REASON: u64 = 31;
+pub(crate) const WRMSR_EXIT_REASON: u64 = 32;
+pub(crate) const XSETBV_EXIT_REASON: u64 = 55;
+pub(crate) const EPT_VIOLATION_EXIT_REASON: u64 = 48;
+pub(crate) const EPT_MISCONFIGURATION_EXIT_REASON: u64 = 49;
+pub(crate) const VMX_PREEMPTION_TIMER_EXIT_REASON: u64 = 52;
+pub(crate) const VM_ENTRY_FAILURE_MSR_LOADING_EXIT_REASON: u64 = 34;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResidentRunError {
+    VmlaunchVmFailInvalid,
+    VmlaunchVmFailValid(u64),
+    HostRspVmwrite,
+    HostRipVmwrite,
+    UnexpectedRunPath(u64),
+}
+pub(crate) fn validate_resident_run_path(
+    raw_path: u64,
+    vm_instruction_error: u64,
+) -> Result<(), ResidentRunError> {
+    match raw_path {
+        0 => Ok(()),
+        1 => Err(ResidentRunError::VmlaunchVmFailInvalid),
+        2 => Err(ResidentRunError::VmlaunchVmFailValid(vm_instruction_error)),
+        3 => Err(ResidentRunError::HostRspVmwrite),
+        4 => Err(ResidentRunError::HostRipVmwrite),
+        other => Err(ResidentRunError::UnexpectedRunPath(other)),
+    }
+}
+
+use crate::nested::NestedVmxState;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentBootReport {
+    pub raw_path: u64,
+    pub vm_instruction_error: u64,
+    pub host_cr3: u64,
+    pub initial_guest_cr3: u64,
+    pub exit_count: u64,
+    pub cpuid_count: u64,
+    pub rdmsr_count: u64,
+    pub wrmsr_count: u64,
+    pub xsetbv_count: u64,
+    pub vmcall_count: u64,
+    pub start_checkpoint_seen: u64,
+    pub post_start_exit_count: u64,
+    pub post_ebs_exit_count: u64,
+    pub post_va_exit_count: u64,
+    pub ept_test_violation_seen: u64,
+    pub last_reason: u64,
+    pub last_instruction_len: u64,
+    pub last_qualification: u64,
+    pub last_guest_physical_address: u64,
+    pub last_guest_rax: u64,
+    pub last_guest_rcx: u64,
+    pub last_guest_rdx: u64,
+    pub last_guest_rip: u64,
+    pub last_guest_cr3: u64,
+    pub last_host_cr3: u64,
+    pub stop_result: u64,
+    pub cpuid_presence: u64,
+    pub cpuid_leaf1_count: u64,
+    pub cpuid_hypervisor_count: u64,
+    pub cpuid_leaf1_ecx: u64,
+    pub cpuid_hypervisor_eax: u64,
+    pub nested: NestedVmxState,
 }

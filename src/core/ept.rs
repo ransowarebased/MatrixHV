@@ -1,14 +1,10 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use uefi::Status;
-use uefi::boot;
-use uefi::boot::{OpenProtocolAttributes, OpenProtocolParams};
-use uefi::mem::memory_map::{MemoryAttribute, MemoryDescriptor, MemoryMap, MemoryType};
-use uefi::proto::unsafe_protocol;
+use uefi::mem::memory_map::{MemoryAttribute, MemoryDescriptor, MemoryType};
 
 use crate::arch;
 use crate::memory::{AddressConstraint, PAGE_SIZE, ResidentPages};
@@ -33,7 +29,6 @@ const EPT_1GB_PAGE_SIZE: u64 = 1024 * 1024 * 1024;
 const EPT_512GB_PAGE_SIZE: u64 = 512 * EPT_1GB_PAGE_SIZE;
 const EPT_ENTRY_COUNT: usize = 512;
 const EPT_PROTECTION_TABLE_PAGES: usize = 128;
-const PCI_BAR_DESCRIPTOR_SIZE: usize = 46;
 
 const EPT_CAP_PAGE_WALK_LENGTH_4: u64 = 1 << 6;
 const EPT_CAP_MEMORY_TYPE_UC: u64 = 1 << 8;
@@ -177,8 +172,6 @@ pub enum EptError {
     InvalidProtectionAddress(u64),
     InvalidRemapAddress(u64),
     InvalidPageTable,
-    InvalidPciBar,
-    PciBar(Status),
     ProtectionTableCapacityExceeded,
 }
 
@@ -217,17 +210,6 @@ struct ProtectionTablePool {
     used_pages: usize,
 }
 
-#[repr(C)]
-#[unsafe_protocol("4cf5b200-68b8-4ca5-9eec-b23e3f50029a")]
-struct PciIoProtocol {
-    // EFI_PCI_IO_PROTOCOL places GetBarAttributes after sixteen function slots.
-    _preceding_functions: [usize; 16],
-    get_bar_attributes:
-        unsafe extern "efiapi" fn(*mut PciIoProtocol, u8, *mut u64, *mut *mut c_void) -> Status,
-}
-const _: () =
-    assert!(core::mem::offset_of!(PciIoProtocol, get_bar_attributes) == 16 * size_of::<usize>());
-
 impl ProtectionTablePool {
     fn allocate() -> Result<Self, EptError> {
         let pages = ResidentPages::allocate(EPT_PROTECTION_TABLE_PAGES, AddressConstraint::Any)
@@ -256,7 +238,7 @@ impl ProtectionTablePool {
 }
 
 impl IdentityEpt {
-    pub fn build() -> Result<Self, EptError> {
+    pub fn build(mut descriptors: Vec<MemoryDescriptor>) -> Result<Self, EptError> {
         let capabilities = unsafe { arch::read_msr(arch::IA32_VMX_EPT_VPID_CAP) };
         if capabilities & EPT_CAP_PAGE_WALK_LENGTH_4 == 0 {
             return Err(EptError::FourLevelWalkUnavailable);
@@ -277,10 +259,6 @@ impl IdentityEpt {
         let large_pages_supported = capabilities & EPT_CAP_2MB_PAGE != 0;
         let protection_pool = ProtectionTablePool::allocate()?;
 
-        let memory_map = boot::memory_map(MemoryType::LOADER_DATA)
-            .map_err(|error| EptError::Allocation(error.status()))?;
-        let mut descriptors: Vec<MemoryDescriptor> = memory_map.entries().copied().collect();
-        drop(memory_map);
         descriptors.retain(|descriptor| descriptor.page_count != 0);
         if descriptors.is_empty() {
             return Err(EptError::EmptyMemoryMap);
@@ -451,56 +429,11 @@ impl IdentityEpt {
         })
     }
 
-    pub fn map_pci_bars(&mut self) -> Result<Vec<(u64, u64)>, EptError> {
-        let handles = match boot::find_handles::<PciIoProtocol>() {
-            Ok(handles) => handles,
-            Err(error) if error.status() == Status::NOT_FOUND => return Ok(Vec::new()),
-            Err(error) => return Err(EptError::Allocation(error.status())),
-        };
-        let mut ranges = Vec::new();
-        for handle in handles {
-            let params = OpenProtocolParams {
-                handle,
-                agent: boot::image_handle(),
-                controller: None,
-            };
-            let pci_io = unsafe {
-                boot::open_protocol::<PciIoProtocol>(params, OpenProtocolAttributes::GetProtocol)
-            }
-            .map_err(|error| EptError::PciBar(error.status()))?;
-            let mut device_ranges = Vec::new();
-            for bar_index in 0..6 {
-                let mut resources = core::ptr::null_mut();
-                let status = unsafe {
-                    (pci_io.get_bar_attributes)(
-                        (&*pci_io as *const PciIoProtocol).cast_mut(),
-                        bar_index,
-                        core::ptr::null_mut(),
-                        &mut resources,
-                    )
-                };
-                if status == Status::UNSUPPORTED {
-                    continue;
-                }
-                if status != Status::SUCCESS {
-                    return Err(EptError::PciBar(status));
-                }
-                let resource_pointer =
-                    NonNull::new(resources.cast::<u8>()).ok_or(EptError::InvalidPciBar)?;
-                let range = read_pci_bar_range(resource_pointer.as_ptr());
-                unsafe { boot::free_pool(resource_pointer) }
-                    .map_err(|error| EptError::PciBar(error.status()))?;
-                if let Some(range) = range? {
-                    device_ranges.push(range);
-                }
-            }
-            drop(pci_io);
-            for (start, end) in device_ranges {
-                self.map_uncacheable_range(start, end)?;
-                ranges.push((start, end));
-            }
+    pub fn map_pci_bars(&mut self, ranges: &[(u64, u64)]) -> Result<(), EptError> {
+        for &(start, end) in ranges {
+            self.map_uncacheable_range(start, end)?;
         }
-        Ok(ranges)
+        Ok(())
     }
 
     // Firmware BARs do not describe addresses assigned by the guest OS later.
@@ -937,26 +870,6 @@ impl IdentityEpt {
     }
 }
 
-fn read_pci_bar_range(resources: *const u8) -> Result<Option<(u64, u64)>, EptError> {
-    if unsafe { resources.read() } != 0x8a {
-        return Ok(None);
-    }
-    let descriptor = unsafe { core::slice::from_raw_parts(resources, PCI_BAR_DESCRIPTOR_SIZE) };
-    if u16::from_le_bytes([descriptor[1], descriptor[2]]) != 0x2b || descriptor[3] != 0 {
-        return Ok(None);
-    }
-    let start = u64::from_le_bytes(descriptor[14..22].try_into().unwrap());
-    let length = u64::from_le_bytes(descriptor[38..46].try_into().unwrap());
-    if length == 0 {
-        return Ok(None);
-    }
-    let end = start.checked_add(length).ok_or(EptError::AddressOverflow)?;
-    if end > EPT_GUEST_PHYSICAL_LIMIT {
-        return Err(EptError::GuestPhysicalAddressTooWide(end));
-    }
-    Ok(Some((start, end)))
-}
-
 fn high_address_mapping_end(mapped_end: u64, physical_bits: u32) -> Result<u64, EptError> {
     let physical_limit = 1_u64 << physical_bits;
     align_up(
@@ -1102,8 +1015,8 @@ fn next_mapped_chunk(
     cursor: &mut usize,
     address: u64,
 ) -> Result<u64, EptError> {
-    // Keep legacy MMIO below 4 GiB covered. Above it, map described ranges and
-    // PCI BARs without allocating tables for potentially terabyte-sized holes.
+    // The initial build covers legacy MMIO below 4 GiB and described ranges above it.
+    // PCI BARs and high-address gaps are mapped in separate passes.
     if address < EPT_MINIMUM_MAPPED_END {
         return Ok(address);
     }

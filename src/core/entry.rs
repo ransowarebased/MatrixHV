@@ -1,21 +1,20 @@
-use core::arch::global_asm;
-use core::ptr::NonNull;
-
-use uefi::boot::{self, AllocateType};
-use uefi::mem::memory_map::MemoryType;
-
+use super::controls::{self, VmxControls, VmxControlsError};
+use super::exits::{self, DispatchDiagnostics, VmRunContext};
+use super::exits::{VMCALL_EXIT_REASON, validate_resident_run_path};
+use super::resident::abi::{CONTEXT_CANARY_END, CONTEXT_CANARY_START, ResidentContext};
+use super::resident::{CONTEXT_COMPLETE, ResidentProbeError};
+use super::state::configure_resident_host;
+use super::state::{self, GuestStateReport, HostStateReport};
+use super::vcpu::PreparedProbe;
+use super::vcpu::{HostExitStack, ProbeStack, VmlaunchProbeResources};
 use super::vmcs::{
     self, EXIT_QUALIFICATION, GUEST_RIP, GUEST_RSP, HOST_RIP, HOST_RSP, VM_EXIT_INSTRUCTION_LEN,
     VM_EXIT_REASON, VM_INSTRUCTION_ERROR, VmcsError, VmcsRegion,
 };
-use super::controls::{self, VmxControls, VmxControlsError};
-use super::exits::{self, DispatchDiagnostics, VmRunContext};
-use super::state::{self, GuestStateReport, HostStateReport};
 use super::vmxon::{self, VmxInstructionResult, VmxonError, VmxonReport};
+use crate::memory::{RESIDENT_CODE_MEMORY_TYPE, RESIDENT_MEMORY_TYPE};
 use crate::runtime;
-
-const PAGE_SIZE: usize = 4096;
-const HOST_EXIT_STACK_PAGES: usize = 4;
+use core::arch::global_asm;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VmlaunchError {
@@ -111,122 +110,12 @@ pub struct VmexitLoopReport {
     pub vmcall_rip_expected: u64,
 }
 
-struct ProbeStack {
-    pointer: NonNull<u8>,
-}
-
-impl ProbeStack {
-    fn allocate() -> Result<Self, VmcsError> {
-        let pointer = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
-            .map_err(|error| VmcsError::Allocation(error.status()))?;
-        unsafe {
-            pointer.as_ptr().write_bytes(0, PAGE_SIZE);
-        }
-        Ok(Self { pointer })
-    }
-
-    fn top(&self) -> u64 {
-        (self.pointer.as_ptr() as u64 + PAGE_SIZE as u64) & !0xf
-    }
-
-    fn physical_address(&self) -> u64 {
-        self.pointer.as_ptr() as u64
-    }
-}
-
-impl Drop for ProbeStack {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = boot::free_pages(self.pointer, 1);
-        }
-    }
-}
-
-struct HostExitStack {
-    pointer: NonNull<u8>,
-}
-
-impl HostExitStack {
-    fn allocate() -> Result<Self, VmcsError> {
-        let pointer = boot::allocate_pages(
-            AllocateType::AnyPages,
-            MemoryType::LOADER_DATA,
-            HOST_EXIT_STACK_PAGES,
-        )
-        .map_err(|error| VmcsError::Allocation(error.status()))?;
-        unsafe {
-            pointer
-                .as_ptr()
-                .write_bytes(0, PAGE_SIZE * HOST_EXIT_STACK_PAGES);
-        }
-        Ok(Self { pointer })
-    }
-
-    fn prepare(&mut self, context: *mut VmRunContext) -> u64 {
-        let end = self.pointer.as_ptr() as u64 + (PAGE_SIZE * HOST_EXIT_STACK_PAGES) as u64;
-        let host_rsp = (end - 16) & !0xf;
-        unsafe {
-            (host_rsp as *mut u64).write(context as u64);
-        }
-        host_rsp
-    }
-}
-
-impl Drop for HostExitStack {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = boot::free_pages(self.pointer, HOST_EXIT_STACK_PAGES);
-        }
-    }
-}
-
-pub(crate) struct VmlaunchProbeResources {
-    vmxon_region: vmxon::VmxonRegion,
-    vmcs_region: VmcsRegion,
-    guest_stack: ProbeStack,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct VmlaunchProbeResourceAddresses {
-    pub(crate) vmxon: u64,
-    pub(crate) vmcs: u64,
-    pub(crate) guest_stack: u64,
-}
-
-impl VmlaunchProbeResources {
-    pub(crate) fn allocate() -> Result<Self, VmlaunchError> {
-        let vmx_basic = vmxon::vmx_basic();
-        let vmxon_region =
-            vmxon::VmxonRegion::allocate(vmx_basic).map_err(VmlaunchError::Vmxon)?;
-        let mut vmcs_region = VmcsRegion::allocate(vmx_basic)?;
-        vmcs_region.write_revision_id(vmxon::revision_id(vmx_basic));
-        let guest_stack = ProbeStack::allocate()?;
-        Ok(Self {
-            vmxon_region,
-            vmcs_region,
-            guest_stack,
-        })
-    }
-
-    pub(crate) fn addresses(&self) -> VmlaunchProbeResourceAddresses {
-        VmlaunchProbeResourceAddresses {
-            vmxon: self.vmxon_region.physical_address(),
-            vmcs: self.vmcs_region.physical_address(),
-            guest_stack: self.guest_stack.physical_address(),
-        }
-    }
-
-    pub(crate) fn run(&mut self) -> Result<VmlaunchReport, VmlaunchError> {
-        run_vmlaunch_probe(self)
-    }
-}
-
 pub fn probe_vmlaunch() -> Result<VmlaunchReport, VmlaunchError> {
     let mut resources = VmlaunchProbeResources::allocate()?;
     run_vmlaunch_probe(&mut resources)
 }
 
-fn run_vmlaunch_probe(
+pub(crate) fn run_vmlaunch_probe(
     resources: &mut VmlaunchProbeResources,
 ) -> Result<VmlaunchReport, VmlaunchError> {
     let vmx_basic = vmxon::vmx_basic();
@@ -756,3 +645,133 @@ global_asm!(
     root_fx_state = const 16,
     guest_fx_state = const 528,
 );
+
+pub fn probe_residency() -> Result<ResidentProbeReport, ResidentProbeError> {
+    let PreparedProbe {
+        code_pages,
+        entry,
+        root_segments,
+        mut tables,
+        context_pages,
+        guest_stack,
+        host_stack,
+        host_address_space,
+        vmcs_physical_address,
+        vmcs_region,
+        host_space,
+    } = super::vcpu::prepare_probe()?;
+    let _vmcs_region = vmcs_region;
+    let session = vmxon::enter_vmx_root().map_err(ResidentProbeError::Vmxon)?;
+    let source_cr3 = host_space.source_cr3;
+    let context = context_pages.pointer().as_ptr().cast::<ResidentContext>();
+    unsafe {
+        context.write(ResidentContext::new(source_cr3, host_space.host_cr3));
+    }
+
+    let clear_result = unsafe { vmcs::vmclear(vmcs_physical_address) };
+    if clear_result != VmxInstructionResult::Succeeded {
+        drop(session);
+        return Err(ResidentProbeError::Vmclear(clear_result));
+    }
+    let load_result = unsafe { vmcs::vmptrld(vmcs_physical_address) };
+    if load_result != VmxInstructionResult::Succeeded {
+        drop(session);
+        return Err(ResidentProbeError::Vmcs(VmcsError::Vmptrld(load_result)));
+    }
+
+    let _controls = controls::configure()?;
+    configure_resident_host(host_space.host_cr3, &tables, root_segments)?;
+    let guest_rsp = guest_stack.physical_address() + guest_stack.byte_len() as u64;
+    let guest = state::configure_guest(super::resident::guest_probe_address(), guest_rsp & !0xf)?;
+
+    let host_rsp = (host_stack.physical_address() + host_stack.byte_len() as u64 - 8) & !0xf;
+    unsafe {
+        (host_rsp as *mut u64).write(context as u64);
+    }
+
+    let raw_path = unsafe { matrixhv_resident_probe_run_asm(context, host_rsp, entry) };
+    if raw_path == 0 {
+        tables.pages.preserve();
+    }
+    let vm_instruction_error = vmcs::vmread(VM_INSTRUCTION_ERROR).unwrap_or(u64::MAX);
+    let final_clear = unsafe { vmcs::vmclear(vmcs_physical_address) };
+    host_address_space.restore_source_cr3();
+    drop(session);
+    if final_clear != VmxInstructionResult::Succeeded {
+        return Err(ResidentProbeError::Vmclear(final_clear));
+    }
+    validate_resident_run_path(raw_path, vm_instruction_error)?;
+
+    let result = unsafe { &*context };
+    if result.completed != CONTEXT_COMPLETE {
+        return Err(ResidentProbeError::Incomplete(result.completed));
+    }
+    if result.canary_start != CONTEXT_CANARY_START || result.canary_end != CONTEXT_CANARY_END {
+        return Err(ResidentProbeError::CanaryCorrupted);
+    }
+    if result.exit_reason & 0xffff != VMCALL_EXIT_REASON {
+        return Err(ResidentProbeError::UnexpectedExitReason(result.exit_reason));
+    }
+    if result.observed_host_cr3 != host_space.host_cr3 {
+        return Err(ResidentProbeError::HostCr3Mismatch {
+            expected: host_space.host_cr3,
+            observed: result.observed_host_cr3,
+        });
+    }
+    if result.observed_guest_cr3 != guest.cr3 {
+        return Err(ResidentProbeError::GuestCr3Mismatch {
+            expected: guest.cr3,
+            observed: result.observed_guest_cr3,
+        });
+    }
+
+    let report = ResidentProbeReport {
+        code_physical_address: code_pages.physical_address(),
+        code_pages: code_pages.pages(),
+        host_table_pages: host_space.table_pages,
+        host_table_capacity: host_space.arena_pages,
+        data_memory_type: RESIDENT_MEMORY_TYPE.0,
+        code_memory_type: RESIDENT_CODE_MEMORY_TYPE.0,
+        host_cr3: host_space.host_cr3,
+        guest_cr3: guest.cr3,
+        observed_host_cr3: result.observed_host_cr3,
+        observed_guest_cr3: result.observed_guest_cr3,
+        exit_reason: result.exit_reason,
+        guest_rip: result.guest_rip,
+        host_gdt: tables.gdt,
+        host_idt: tables.idt,
+        host_tss: tables.tss,
+        host_stack: host_rsp,
+    };
+
+    let _ = &tables.pages;
+    Ok(report)
+}
+
+unsafe extern "efiapi" {
+    fn matrixhv_resident_probe_run_asm(
+        context: *mut ResidentContext,
+        host_rsp: u64,
+        host_rip: u64,
+    ) -> u64;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResidentProbeReport {
+    pub code_physical_address: u64,
+    pub code_pages: usize,
+    pub host_table_pages: usize,
+    pub host_table_capacity: usize,
+    pub data_memory_type: u32,
+    pub code_memory_type: u32,
+    pub host_cr3: u64,
+    pub guest_cr3: u64,
+    pub observed_host_cr3: u64,
+    pub observed_guest_cr3: u64,
+    pub exit_reason: u64,
+    pub guest_rip: u64,
+    pub host_gdt: u64,
+    pub host_idt: u64,
+    pub host_tss: u64,
+    pub host_stack: u64,
+}

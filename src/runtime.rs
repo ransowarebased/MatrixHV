@@ -135,7 +135,7 @@ fn write_record(level: &str, arguments: fmt::Arguments<'_>) {
     if let Some(message) = buffer.as_str() {
         let sinks = backend() as u8;
         if sinks & FRAMEBUFFER_SINK != 0 {
-            crate::boot::screen::write_record(message);
+            crate::diagnostics::write_record(message);
         }
         if sinks & SERIAL_SINK != 0 {
             write_line(message);
@@ -306,4 +306,29 @@ unsafe fn in8(port: u16) -> u8 {
         );
     }
     value
+}
+
+pub(crate) fn describe_resident_diagnostics() {
+    crate::diagnostics::message(format_args!(
+        "runtime framebuffer diagnostics stop 40 seconds after ExitBootServices"
+    ));
+    crate::diagnostics::message(format_args!(
+        "mark rows: first reason bits, VMRESUME error bits, first eight exits"
+    ));
+    crate::diagnostics::message(format_args!(
+        "hex rows: 0 exits 1 reason 2 RIP 3 RCX 4 MSR GP count 5 last GP MSR"
+    ));
+    crate::diagnostics::message(format_args!(
+        "hex rows: 6 GPA 7 qualification 8 CPU mask 9 CPU A host fault B host RIP"
+    ));
+    crate::diagnostics::message(format_args!("hex rows: C host error code D host CR2"));
+    crate::diagnostics::message(format_args!(
+        "hex left E timer samples F last normal reason; right 0 CR0 1 CR3 2 CR4 3 EFER"
+    ));
+    crate::diagnostics::message(format_args!(
+        "hex right 4 flags 5 activity 6 normal RIP 7 EFER write 8 RSP 9 interruptibility"
+    ));
+    crate::diagnostics::message(format_args!(
+        "hex right A RDMSR B WRMSR C L2 entries D nested failures E nested error F expired"
+    ));
 }

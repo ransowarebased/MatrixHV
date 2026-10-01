@@ -9,6 +9,10 @@ pub enum Command {
 #[cfg(target_os = "windows")]
 pub(crate) mod windows {
     use super::Command;
+    use crate::protocol::{
+        CONTROL_MAGIC, CONTROL_PROBE_OPERATION, CONTROL_VERSION, ControlProbeSnapshot,
+        ControlRequest, ControlStatus,
+    };
     use crate::server::protocol::{RequestKind, Response, read_response, write_response};
     use std::ffi::c_void;
     use std::io::{Read, Write};
@@ -17,9 +21,6 @@ pub(crate) mod windows {
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
-    const CONTROL_MAGIC: u64 = 0x4d41_5452_4958_4354;
-    const CONTROL_VERSION: u32 = 3;
-    const CONTROL_PROBE_OPERATION: u32 = 3;
     const VARIABLE_ATTRIBUTES: u32 = 0x07;
     const TOKEN_ADJUST_PRIVILEGES: u32 = 0x20;
     const TOKEN_QUERY: u32 = 0x08;
@@ -32,87 +33,6 @@ pub(crate) mod windows {
     const VARIABLE_NAME: &str = "MatrixHVControl";
     const VARIABLE_GUID: &str = "{a830e824-19a4-42c4-9178-81ee63c135cc}";
     const CONTROL_MUTEX_NAME: &str = "Global\\MatrixHVRuntimeControl";
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct ControlStatus {
-        magic: u64,
-        version: u32,
-        capabilities: u32,
-        current_apic_id: u32,
-        processor_count: u32,
-        expected_mask: u64,
-        active_mask: u64,
-        stopped_mask: u64,
-        failed_mask: u64,
-        exit_boot_services_seen: u64,
-        virtual_address_change_seen: u64,
-        virtual_address_error: u64,
-        completion_sequence: u64,
-        apic_ids: [u32; 64],
-        probe_snapshot: ControlProbeSnapshot,
-    }
-
-    impl Default for ControlStatus {
-        fn default() -> Self {
-            Self {
-                magic: 0,
-                version: 0,
-                capabilities: 0,
-                current_apic_id: 0,
-                processor_count: 0,
-                expected_mask: 0,
-                active_mask: 0,
-                stopped_mask: 0,
-                failed_mask: 0,
-                exit_boot_services_seen: 0,
-                virtual_address_change_seen: 0,
-                virtual_address_error: 0,
-                completion_sequence: 0,
-                apic_ids: [0; 64],
-                probe_snapshot: ControlProbeSnapshot::default(),
-            }
-        }
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    struct ControlProbeSnapshot {
-        sequence: u64,
-        guest_rip: u64,
-        guest_rsp: u64,
-        guest_rflags: u64,
-        guest_cr0: u64,
-        guest_cr3: u64,
-        guest_cr4: u64,
-        guest_efer: u64,
-        guest_pat: u64,
-        guest_gdtr_base: u64,
-        guest_gdtr_limit: u64,
-        guest_idtr_base: u64,
-        guest_idtr_limit: u64,
-        guest_cs_selector: u64,
-        guest_ss_selector: u64,
-        guest_tr_selector: u64,
-        guest_tr_access: u64,
-        guest_fs_base: u64,
-        guest_gs_base: u64,
-        guest_interruptibility: u64,
-        idt_vectoring: u64,
-        vm_entry_intr_info: u64,
-        runtime_get_variable: u64,
-        runtime_set_variable: u64,
-        runtime_context: u64,
-        guest_es_selector: u64,
-        guest_ds_selector: u64,
-        guest_fs_selector: u64,
-        guest_gs_selector: u64,
-        guest_ldtr_selector: u64,
-        guest_dr7: u64,
-        guest_cr4_read_shadow: u64,
-        guest_tr_base: u64,
-        guest_tr_limit: u64,
-    }
 
     impl ControlProbeSnapshot {
         fn checksum(self) -> u64 {
@@ -241,16 +161,6 @@ pub(crate) mod windows {
         hot_key: u32,
         icon_or_monitor: *mut c_void,
         pub(crate) process: *mut c_void,
-    }
-
-    #[repr(C)]
-    struct ControlRequest {
-        magic: u64,
-        version: u32,
-        operation: u32,
-        sequence: u64,
-        expected_apic_id: u32,
-        reserved: u32,
     }
 
     #[link(name = "kernel32")]

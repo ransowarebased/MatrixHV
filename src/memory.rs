@@ -5,7 +5,6 @@ use core::ptr::NonNull;
 use uefi::Status;
 use uefi::boot::{self, AllocateType};
 use uefi::mem::memory_map::MemoryType;
-use uefi::proto::loaded_image::LoadedImage;
 
 use crate::arch;
 
@@ -18,12 +17,6 @@ pub const RESIDENT_CODE_MEMORY_TYPE: MemoryType = MemoryType::RUNTIME_SERVICES_C
 pub enum AddressConstraint {
     Any,
     Max(u64),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ImageResidencyReport {
-    pub code_type: MemoryType,
-    pub data_type: MemoryType,
 }
 
 pub struct ResidentPages {
@@ -46,7 +39,7 @@ impl ResidentPages {
             .checked_mul(PAGE_SIZE)
             .filter(|length| *length != 0 && *length <= isize::MAX as usize)
             .ok_or(Status::INVALID_PARAMETER)?;
-        if crate::hv_core::residency::boot_services_exited() {
+        if crate::firmware::boot_services_exited() {
             return Err(Status::UNSUPPORTED);
         }
         let allocate_type = match constraint {
@@ -103,21 +96,12 @@ impl ResidentPages {
 
 impl Drop for ResidentPages {
     fn drop(&mut self) {
-        if self.release_on_drop && !crate::hv_core::residency::boot_services_exited() {
+        if self.release_on_drop && !crate::firmware::boot_services_exited() {
             unsafe {
                 let _ = boot::free_pages(self.pointer, self.pages);
             }
         }
     }
-}
-
-pub fn image_residency() -> Result<ImageResidencyReport, Status> {
-    let image = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
-        .map_err(|error| error.status())?;
-    Ok(ImageResidencyReport {
-        code_type: image.code_type(),
-        data_type: image.data_type(),
-    })
 }
 
 const PAGE_TABLE_ENTRIES: usize = 512;

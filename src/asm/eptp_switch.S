@@ -1,3 +1,11 @@
+// Root entry contract: R12=context, saved guest frame at RSP, b_*/event_*
+// offsets supplied by Rust. Internal helpers clobber scratch GPRs/flags and
+// balance their stack; store guards explicitly preserve the complete caller
+// state. SIMD is untouched. Helpers RET with validity/acquisition in EAX or
+// jump to resume, L1 reflection, software VMFUNC or common VMCS error paths.
+// Shared EPT stores occur only after peer acquisition; peers invalidate locally
+// after the owner releases the barrier and before reentry. Root pointers must
+// already be mapped.
 .macro matrixhv_resident_eptp_switch
 // Only publish stable, resident EPT02 roots. Zero slots take the VMFUNC exit
 // path, where a cold EPT12 is composed before the next publication.
@@ -510,7 +518,7 @@ not rax
 and r9, rax
 and r9, rdx
 or r11, r9
-call .Lresident_nested_host_page_is_mapped
+call .Lresident_ept01_host_page_is_mapped
 pop rdx
 test eax, eax
 jz .Lresident_nested_vmfunc_failed
@@ -745,7 +753,7 @@ and r13, rax
 test ebp, ebp
 jnz .Lresident_nested_eptp_sync_kick_scan
 mov r11, r13
-call .Lresident_nested_host_page_is_mapped
+call .Lresident_ept01_host_page_is_mapped
 test eax, eax
 jz .Lresident_nested_eptp_sync_busy
 .Lresident_nested_eptp_sync_kick_scan:
@@ -909,4 +917,124 @@ ret
 .quad 0
 .Lresident_eptp_lists_live:
 .quad 0
+.endm
+
+// Shared EPT01 page access: R11=L1 GPA, R12=context; translate returns EAX=1/0 and R11=HPA on success. EDX supplies required permissions; readable/writable entries set it. RAX/RCX/RDX/R8/R9/R10/flags are scratch. Balanced internal stack, unchanged R12/SIMD. Writable access retires protected source lists before stores; final root mapping validation is nested-owned.
+.macro matrixhv_ept01_page_translation
+.Lresident_ept01_page_is_readable:
+mov edx, 1
+jmp .Lresident_ept01_page_translate
+.Lresident_ept01_page_is_writable:
+call .Lresident_nested_eptp_before_root_write
+.Lresident_ept01_page_write_translation:
+mov edx, 3
+.Lresident_ept01_page_translate:
+// R11 is an L1 GPA on entry and the mapped HPA on success. Require the requested
+// permissions at every EPT01 level before accessing a shared page from root.
+mov rax, r11
+shr rax, 48
+jnz .Lresident_ept01_page_denied
+mov r9, qword ptr [r12 + {b_cache_ept_pointer}]
+mov r8, {host_page_address_mask}
+and r9, r8
+test r9, r9
+jz .Lresident_ept01_page_denied
+mov ecx, 39
+.Lresident_ept01_page_walk:
+mov rax, r11
+shr rax, cl
+and eax, 511
+mov rax, qword ptr [r9 + rax * 8]
+mov r10d, eax
+and r10d, edx
+cmp r10d, edx
+jne .Lresident_ept01_page_denied
+cmp ecx, 12
+je .Lresident_ept01_page_allowed
+cmp ecx, 39
+je .Lresident_ept01_page_next
+test al, 0x80
+jnz .Lresident_ept01_page_allowed
+.Lresident_ept01_page_next:
+and rax, r8
+mov r9, rax
+sub ecx, 9
+jmp .Lresident_ept01_page_walk
+.Lresident_ept01_page_allowed:
+mov r10, 1
+shl r10, cl
+dec r10
+and r11, r10
+not r10
+and rax, r10
+and rax, r8
+or r11, rax
+jmp .Lresident_ept01_host_page_is_mapped
+.Lresident_ept01_page_denied:
+xor eax, eax
+ret
+.endm
+
+// Root mapping validation: R11=HPA, R12=context; EAX=1/0 reports accessibility. RAX/RCX/RDX/flags are scratch, other GPRs/RSP/SIMD preserved. Cache only complete immutable 2 MiB host mappings, using existing per-CPU ABI offsets. Return without touching guest translation permissions.
+.macro matrixhv_ept01_host_mapping_validation
+.Lresident_ept01_host_page_is_mapped:
+// Root page tables never change after setup. Cache only fully mapped 2 MiB
+// ranges; a 4 KiB mapping cannot certify its neighbors across a hole.
+mov rdx, {host_page_address_mask}
+mov rcx, r11
+shr rcx, 21
+and ecx, 3
+mov rax, r11
+and rax, -2097152
+or rax, 1
+cmp rax, qword ptr [r12 + {b_nested_host_mapping_cache} + rcx * 8]
+je .Lresident_ept01_host_page_is_mapped_success
+mov rax, qword ptr [r12 + {b_expected_host_cr3}]
+and rax, rdx
+mov rcx, r11
+shr rcx, 39
+and ecx, 0x1ff
+mov rax, qword ptr [rax + rcx * 8]
+test al, 1
+jz .Lresident_ept01_host_page_is_unmapped
+and rax, rdx
+mov rcx, r11
+shr rcx, 30
+and ecx, 0x1ff
+mov rax, qword ptr [rax + rcx * 8]
+test al, 1
+jz .Lresident_ept01_host_page_is_unmapped
+test al, 0x80
+jnz .Lresident_ept01_host_mapping_cache_fill
+and rax, rdx
+mov rcx, r11
+shr rcx, 21
+and ecx, 0x1ff
+mov rax, qword ptr [rax + rcx * 8]
+test al, 1
+jz .Lresident_ept01_host_page_is_unmapped
+test al, 0x80
+jnz .Lresident_ept01_host_mapping_cache_fill
+and rax, rdx
+mov rcx, r11
+shr rcx, 12
+and ecx, 0x1ff
+mov rax, qword ptr [rax + rcx * 8]
+test al, 1
+jz .Lresident_ept01_host_page_is_unmapped
+jmp .Lresident_ept01_host_page_is_mapped_success
+.Lresident_ept01_host_mapping_cache_fill:
+mov rcx, r11
+shr rcx, 21
+and ecx, 3
+mov rax, r11
+and rax, -2097152
+or rax, 1
+mov qword ptr [r12 + {b_nested_host_mapping_cache} + rcx * 8], rax
+.Lresident_ept01_host_page_is_mapped_success:
+mov eax, 1
+ret
+.Lresident_ept01_host_page_is_unmapped:
+xor eax, eax
+ret
 .endm

@@ -1,4 +1,7 @@
-use crate::server::hypervisor::MATRIXHV_STATUS_LEAF;
+use crate::protocol::{
+    MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX,
+    MATRIXHV_STATUS_SIGNATURE_ECX,
+};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -787,9 +790,9 @@ fn append_nested_failure_trace(text: &mut String, cpu: u32, extended_invept: boo
 ))]
 fn verify_cpu(cpu: u32) -> Result<(), String> {
     let status = diagnostic(0);
-    if status.eax != 0x4d48_5631
-        || status.ebx != u32::from_le_bytes(*b"MATR")
-        || status.ecx != u32::from_le_bytes(*b"IXHV")
+    if status.eax != MATRIXHV_STATUS_SIGNATURE_EAX
+        || status.ebx != MATRIXHV_STATUS_SIGNATURE_EBX
+        || status.ecx != MATRIXHV_STATUS_SIGNATURE_ECX
     {
         return Err(format!("MatrixHV is not present on logical CPU {cpu}"));
     }

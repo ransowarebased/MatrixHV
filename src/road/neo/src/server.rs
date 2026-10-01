@@ -529,6 +529,10 @@ pub mod protocol {
     }
 }
 pub mod hypervisor {
+    use crate::protocol::{
+        MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX,
+        MATRIXHV_STATUS_SIGNATURE_ECX,
+    };
     #[derive(Debug)]
     pub struct HypervisorStatus {
         pub hypervisor_present: bool,
@@ -539,10 +543,6 @@ pub mod hypervisor {
 
     const HYPERVISOR_PRESENT_BIT: u32 = 1 << 31;
     const HYPERVISOR_VENDOR_LEAF: u32 = 0x4000_0000;
-    pub const MATRIXHV_STATUS_LEAF: u32 = 0x4d48_5652;
-    const MATRIXHV_SIGNATURE_EAX: u32 = 0x4d48_5631;
-    const MATRIXHV_SIGNATURE_EBX: u32 = u32::from_le_bytes(*b"MATR");
-    const MATRIXHV_SIGNATURE_ECX: u32 = u32::from_le_bytes(*b"IXHV");
 
     pub fn query() -> HypervisorStatus {
         #[cfg(target_arch = "x86_64")]
@@ -564,9 +564,9 @@ pub mod hypervisor {
                 "none".to_string()
             };
             let matrixhv = __cpuid_count(MATRIXHV_STATUS_LEAF, 0);
-            let matrixhv_present = matrixhv.eax == MATRIXHV_SIGNATURE_EAX
-                && matrixhv.ebx == MATRIXHV_SIGNATURE_EBX
-                && matrixhv.ecx == MATRIXHV_SIGNATURE_ECX;
+            let matrixhv_present = matrixhv.eax == MATRIXHV_STATUS_SIGNATURE_EAX
+                && matrixhv.ebx == MATRIXHV_STATUS_SIGNATURE_EBX
+                && matrixhv.ecx == MATRIXHV_STATUS_SIGNATURE_ECX;
             HypervisorStatus {
                 hypervisor_present,
                 hypervisor_vendor: vendor,
