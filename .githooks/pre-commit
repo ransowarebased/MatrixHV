@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+git ls-files --others --exclude-standard -z -- '*.py' '*.rs' |
+    git add --pathspec-from-file=- --pathspec-file-nul

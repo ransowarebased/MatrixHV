@@ -139,8 +139,11 @@ pub enum ResidentProbeError {
     Ept(EptError),
     Paging(HostPagingError),
     InvalidCodeLayout,
-    HostRspVmwrite,
-    HostRipVmwrite,
+    InvalidEptPoolUsage,
+    HostRspVmwriteVmFailValid(u64),
+    HostRspVmwriteVmFailInvalid,
+    HostRipVmwriteVmFailValid(u64),
+    HostRipVmwriteVmFailInvalid,
     VmlaunchVmFailInvalid,
     VmlaunchVmFailValid(u64),
     UnexpectedRunPath(u64),
@@ -361,7 +364,8 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
         .pointer()
         .as_ptr()
         .cast::<ResidentEventContext>();
-    let (hyperv_tsc_scale, hyperv_tsc_offset) = native_hyperv_reference_tsc();
+    let (hyperv_tsc_scale, hyperv_tsc_offset) =
+        native_hyperv_reference_tsc(crate::firmware::calibrate_reference_tsc);
     unsafe {
         context.write(ResidentEventContext {
             magic: EVENT_CONTEXT_MAGIC,
@@ -542,6 +546,7 @@ global_asm!(
     b_mtrr_dirty = const core::mem::offset_of!(ResidentBootContext, mtrr_dirty),
     b_mtrr_updates = const core::mem::offset_of!(ResidentBootContext, mtrr_updates),
     b_nmi_pending = const core::mem::offset_of!(ResidentBootContext, nmi_pending),
+    b_root_vmx_active = const core::mem::offset_of!(ResidentBootContext, root_vmx_active),
     b_nmi_count = const core::mem::offset_of!(ResidentBootContext, nmi_count),
     pin_based_vm_exec_control = const PIN_BASED_VM_EXEC_CONTROL,
     cpu_based_vm_exec_control = const CPU_BASED_VM_EXEC_CONTROL,
@@ -739,6 +744,37 @@ global_asm!(
     mtrr_fix4k_f8000_msr = const IA32_MTRR_FIX4K_F8000_MSR,
     mtrr_def_type_msr = const IA32_MTRR_DEF_TYPE_MSR,
     hyperv_guest_os_id_msr = const HYPERV_GUEST_OS_ID_MSR,
+    hv_interface_leaf = const crate::hyperv::HYPERV_INTERFACE_LEAF,
+    hv_identity_leaf = const crate::hyperv::HYPERV_IDENTITY_LEAF,
+    hv_recommendations_leaf = const crate::hyperv::HYPERV_RECOMMENDATIONS_LEAF,
+    hv_limits_leaf = const crate::hyperv::HYPERV_LIMITS_LEAF,
+    hv_hardware_leaf = const crate::hyperv::HYPERV_HARDWARE_LEAF,
+    hv_nested_features_leaf = const crate::hyperv::HYPERV_NESTED_FEATURES_LEAF,
+    hv_vendor_ebx = const crate::hyperv::HYPERV_VENDOR_EBX,
+    hv_vendor_ecx = const crate::hyperv::HYPERV_VENDOR_ECX,
+    hv_vendor_edx = const crate::hyperv::HYPERV_VENDOR_EDX,
+    hv_interface_signature = const crate::hyperv::HYPERV_INTERFACE_SIGNATURE,
+    hv_base_access = const crate::hyperv::HYPERV_BASE_ACCESS,
+    hv_apic_access = const crate::hyperv::HYPERV_APIC_ACCESS,
+    hv_time_access = const crate::hyperv::HYPERV_TIME_ACCESS,
+    hv_invariant_tsc_access = const crate::hyperv::HYPERV_INVARIANT_TSC_ACCESS,
+    hv_evmcs_recommendation = const crate::hyperv::HYPERV_EVMCS_RECOMMENDATION,
+    hv_evmcs_versions = const crate::hyperv::HYPERV_EVMCS_VERSIONS,
+    hv_build_number = const crate::hyperv::HYPERV_BUILD_NUMBER,
+    hv_product_version = const crate::hyperv::HYPERV_PRODUCT_VERSION,
+    hv_hardware_in_use = const crate::hyperv::HYPERV_HARDWARE_IN_USE,
+    hv_msr_range_span = const crate::hyperv::HYPERV_MSR_RANGE_SPAN,
+    hv_eoi_msr = const crate::hyperv::HYPERV_EOI_MSR,
+    hv_icr_msr = const crate::hyperv::HYPERV_ICR_MSR,
+    hv_tpr_msr = const crate::hyperv::HYPERV_TPR_MSR,
+    hv_notify_long_spin_wait = const crate::hyperv::HYPERV_NOTIFY_LONG_SPIN_WAIT,
+    hv_invalid_hypercall_code = const crate::hyperv::HYPERV_INVALID_HYPERCALL_CODE,
+    hv_invalid_hypercall_input = const crate::hyperv::HYPERV_INVALID_HYPERCALL_INPUT,
+    hv_invalid_alignment = const crate::hyperv::HYPERV_INVALID_ALIGNMENT,
+    hv_invalid_parameter = const crate::hyperv::HYPERV_INVALID_PARAMETER,
+    hv_processor_limit = const crate::hyperv::HYPERV_PROCESSOR_LIMIT,
+    hv_vendor_leaf = const crate::hyperv::HYPERVISOR_LEAF_START,
+    hv_msr_base = const crate::hyperv::HYPERV_GUEST_OS_ID_MSR,
     hyperv_features_leaf = const HYPERV_FEATURES_LEAF,
     hypervisor_leaf_start = const HYPERVISOR_LEAF_START,
     hypervisor_leaf_end = const HYPERVISOR_LEAF_END,
@@ -776,6 +812,8 @@ global_asm!(
     matrixhv_status_signature_ebx = const MATRIXHV_STATUS_SIGNATURE_EBX,
     matrixhv_status_signature_ecx = const MATRIXHV_STATUS_SIGNATURE_ECX,
     matrixhv_status_protocol = const MATRIXHV_STATUS_PROTOCOL,
+    guest_contract_subleaf = const crate::protocol::MATRIXHV_GUEST_CONTRACT_SUBLEAF,
+    guest_contract_unsupported = const crate::protocol::MATRIXHV_GUEST_CONTRACT_UNSUPPORTED,
     vmxon_in_vmx_root_error = const VMXON_IN_VMX_ROOT_ERROR,
     vmclear_invalid_physical_address_error = const VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR,
     vmclear_vmxon_pointer_error = const VMCLEAR_VMXON_POINTER_ERROR,
@@ -811,6 +849,11 @@ global_asm!(
     b_ept_probe_resume_rip = const BCTX_EPT_PROBE_RESUME_RIP,
     b_ept_test_violation_seen = const BCTX_EPT_TEST_VIOLATION_SEEN,
     b_exit_count = const BCTX_EXIT_COUNT,
+    b_flight_sequence = const core::mem::offset_of!(ResidentBootContext, flight_recorder_sequence),
+    b_flight_frozen = const core::mem::offset_of!(ResidentBootContext, flight_recorder_frozen),
+    b_flight_records = const core::mem::offset_of!(ResidentBootContext, flight_recorder_records),
+    flight_capacity_mask = const FLIGHT_RECORDER_CAPACITY - 1,
+    flight_record_bytes = const FLIGHT_RECORDER_RECORD_BYTES,
     b_telemetry_enabled = const core::mem::offset_of!(ResidentBootContext, telemetry_enabled),
     b_telemetry_active = const core::mem::offset_of!(ResidentBootContext, telemetry_active),
     b_telemetry_probe_active = const core::mem::offset_of!(ResidentBootContext, telemetry_probe_active),
@@ -827,6 +870,7 @@ global_asm!(
     b_entry_failure_state = const core::mem::offset_of!(ResidentBootContext, entry_failure_state),
     b_entry_failure_exit = const core::mem::offset_of!(ResidentBootContext, entry_failure_exit),
     b_entry_failure_tsc = const core::mem::offset_of!(ResidentBootContext, entry_failure_tsc),
+    b_vmresume_status_flags = const core::mem::offset_of!(ResidentBootContext, vmresume_status_flags),
     b_entry_failure_guest = const core::mem::offset_of!(ResidentBootContext, entry_failure),
     b_watchdog_before = const core::mem::offset_of!(ResidentBootContext, last_before),
     b_watchdog_after = const core::mem::offset_of!(ResidentBootContext, last_after_handler),
@@ -918,6 +962,8 @@ global_asm!(
         + core::mem::offset_of!(NestedVmxState, vp_assist_msr),
     b_nested_evmcs_active = const core::mem::offset_of!(ResidentBootContext, nested)
         + core::mem::offset_of!(NestedVmxState, evmcs_active),
+    b_nested_evmcs_page_cache = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, evmcs_page_cache),
     event_hyperv_guest_os_id = const core::mem::offset_of!(ResidentEventContext, hyperv_guest_os_id),
     event_hyperv_hypercall_msr = const core::mem::offset_of!(ResidentEventContext, hyperv_hypercall_msr),
     event_hyperv_hypercall_lock = const core::mem::offset_of!(ResidentEventContext, hyperv_hypercall_lock),
@@ -1139,6 +1185,7 @@ global_asm!(
     b_nested_vmcs01_msr_entry_composed = const BCTX_NESTED_VMCS01_MSR_ENTRY_COMPOSED,
     b_nested_current_vmcs_hpa = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, current_vmcs_hpa),
     b_nested_l2_msr_gp_pending = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, l2_msr_gp_pending),
+    b_nested_l2_nmi_exit_pending = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, l2_nmi_exit_pending),
     b_nested_entry_msr_prefix_count = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, entry_msr_prefix_count),
     b_nested_captured_msr_store_count = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, captured_msr_store_count),
     b_nested_operand_linear_address = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, operand_linear_address),
@@ -1340,6 +1387,7 @@ global_asm!(
     start_returned_message_len = const START_RETURNED_MESSAGE_LEN,
     post_ebs_stop_message_len = const POST_EBS_STOP_MESSAGE_LEN,
     unsupported_exit_message_len = const UNSUPPORTED_EXIT_MESSAGE_LEN,
+    task_switch_excluded_message_len = const b"[MATRIXHV][RESIDENT] HV:L1_CONTRACT_EXCLUDES_HARDWARE_TASK_SWITCH\r\n".len(),
     nested_entry_failure_dump_message_len = const b"[MATRIXHV][NESTED] VM_ENTRY_FAILURE_VMCS12 ".len(),
     nested_vmcs02_failure_dump_message_len = const b"[MATRIXHV][NESTED] VM_ENTRY_FAILURE_VMCS02 ".len(),
     nested_extended_field_count = const crate::nested::VMCS12_EXTENDED_FIELD_COUNT,
@@ -1348,6 +1396,7 @@ global_asm!(
     vmread_failed_message_len = const VMREAD_FAILED_MESSAGE_LEN,
     vmwrite_failed_message_len = const VMWRITE_FAILED_MESSAGE_LEN,
     vmresume_failed_message_len = const VMRESUME_FAILED_MESSAGE_LEN,
+    vmresume_status_flags_message_len = const b" vmx_status_flags=0x".len(),
     ept_test_violation_message_len = const EPT_TEST_VIOLATION_MESSAGE_LEN,
     ept_unexpected_violation_message_len = const EPT_UNEXPECTED_VIOLATION_MESSAGE_LEN,
     ept_violation_rip_len = const EPT_VIOLATION_RIP_LEN,
@@ -1381,6 +1430,7 @@ impl From<super::nested::NestedHardwareError> for ResidentProbeError {
             super::nested::NestedHardwareError::Vmcs(error) => Self::Vmcs(error),
             super::nested::NestedHardwareError::Controls(error) => Self::Controls(error),
             super::nested::NestedHardwareError::Ept(error) => Self::Ept(error),
+            super::nested::NestedHardwareError::InvalidEptPoolUsage => Self::InvalidEptPoolUsage,
         }
     }
 }
@@ -1392,8 +1442,18 @@ impl From<super::exits::ResidentRunError> for ResidentProbeError {
             super::exits::ResidentRunError::VmlaunchVmFailValid(error) => {
                 Self::VmlaunchVmFailValid(error)
             }
-            super::exits::ResidentRunError::HostRspVmwrite => Self::HostRspVmwrite,
-            super::exits::ResidentRunError::HostRipVmwrite => Self::HostRipVmwrite,
+            super::exits::ResidentRunError::HostRspVmwriteVmFailValid(error) => {
+                Self::HostRspVmwriteVmFailValid(error)
+            }
+            super::exits::ResidentRunError::HostRspVmwriteVmFailInvalid => {
+                Self::HostRspVmwriteVmFailInvalid
+            }
+            super::exits::ResidentRunError::HostRipVmwriteVmFailValid(error) => {
+                Self::HostRipVmwriteVmFailValid(error)
+            }
+            super::exits::ResidentRunError::HostRipVmwriteVmFailInvalid => {
+                Self::HostRipVmwriteVmFailInvalid
+            }
             super::exits::ResidentRunError::UnexpectedRunPath(path) => {
                 Self::UnexpectedRunPath(path)
             }

@@ -854,7 +854,8 @@ unsafe extern "efiapi" fn matrixhv_ap_prepare(
 }
 
 unsafe extern "efiapi" {
-    pub(crate) fn matrixhv_ap_launch_asm(argument: *mut c_void);
+    // Returns one after the resident guest probe, or zero if preparation failed.
+    pub(crate) fn matrixhv_ap_launch_asm(argument: *mut c_void) -> u64;
 }
 
 #[unsafe(no_mangle)]
@@ -997,8 +998,7 @@ impl ResidentApLaunch<'_> {
             guest.cr3,
             self.event_context,
             0,
-            0,
-            0,
+            (0, 0),
             nested_state,
             self.options.cpuid_presence,
         );

@@ -1,3 +1,448 @@
+mod transport {
+    use crate::server::protocol::{
+        MAX_FRAME_SIZE, ProtocolError, Request, RequestKind, Response, read_request, read_response,
+        write_request, write_response,
+    };
+    use crate::server::{
+        capture_stream, execute, handle_connection, valid_elf_update, validate_update_binary,
+    };
+    use std::io::{self, Read, Write};
+
+    #[test]
+    fn request_writer_rejects_argument_counts_the_reader_cannot_accept() {
+        for count in [0, 4097] {
+            let mut frame = Vec::new();
+            assert!(matches!(
+                write_request(
+                    &mut frame,
+                    42,
+                    &Request::Exec {
+                        arguments: vec![String::new(); count]
+                    }
+                ),
+                Err(ProtocolError::InvalidPayload(_))
+            ));
+            assert!(frame.is_empty());
+        }
+        let request = Request::Exec {
+            arguments: vec!["argument".into(); 4096],
+        };
+        let mut frame = Vec::new();
+        write_request(&mut frame, 42, &request).unwrap();
+        assert_eq!(read_request(&mut frame.as_slice()).unwrap(), (42, request));
+    }
+
+    #[test]
+    fn oversized_payloads_are_rejected_before_writing_any_frame() {
+        let mut frame = Vec::new();
+        let request = Request::Update {
+            binary: vec![0; MAX_FRAME_SIZE - 3],
+        };
+        assert!(matches!(
+            write_request(&mut frame, 1, &request),
+            Err(ProtocolError::FrameTooLarge(_))
+        ));
+        assert!(frame.is_empty());
+        drop(request);
+        let mut response = Response::success(RequestKind::Exec, "");
+        response.stdout = vec![0; MAX_FRAME_SIZE - 19];
+        assert!(matches!(
+            write_response(&mut frame, 1, &response),
+            Err(ProtocolError::FrameTooLarge(_))
+        ));
+        assert!(frame.is_empty());
+    }
+
+    #[test]
+    fn response_status_only_accepts_the_published_boolean_encoding() {
+        for (status, success) in [(0u32, true), (1, false), (2, false), (u32::MAX, false)] {
+            let mut frame = Vec::new();
+            let response = Response::success(RequestKind::Status, "ready");
+            write_response(&mut frame, 42, &response).unwrap();
+            frame[20..24].copy_from_slice(&status.to_le_bytes());
+            let result = read_response(&mut frame.as_slice());
+            if status <= 1 {
+                assert_eq!(result.unwrap().1.success, success);
+            } else {
+                assert!(matches!(result, Err(ProtocolError::InvalidPayload(_))));
+            }
+        }
+    }
+
+    fn header(kind: u16, payload_size: u32) -> Vec<u8> {
+        let mut frame = b"ROAD".to_vec();
+        frame.extend_from_slice(&1u16.to_le_bytes());
+        frame.extend_from_slice(&kind.to_le_bytes());
+        frame.extend_from_slice(&payload_size.to_le_bytes());
+        frame.extend_from_slice(&42u64.to_le_bytes());
+        frame
+    }
+
+    #[test]
+    fn invalid_request_headers_are_rejected_without_reading_the_payload() {
+        for (kind, size) in [(1, 1), (2, MAX_FRAME_SIZE as u32), (3, 7), (4, 3), (5, 9)] {
+            assert!(matches!(
+                read_request(&mut header(kind, size).as_slice()),
+                Err(ProtocolError::InvalidPayload(_))
+            ));
+        }
+        for kind in [0, 6, 0x8001, u16::MAX] {
+            assert!(matches!(
+                read_request(&mut header(kind, MAX_FRAME_SIZE as u32).as_slice()),
+                Err(ProtocolError::InvalidKind(value)) if value == kind
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_response_headers_are_rejected_without_reading_the_payload() {
+        assert!(matches!(
+            read_response(&mut header(1, MAX_FRAME_SIZE as u32).as_slice()),
+            Err(ProtocolError::InvalidResponseKind(1))
+        ));
+        assert!(matches!(
+            read_response(&mut header(0x8006, MAX_FRAME_SIZE as u32).as_slice()),
+            Err(ProtocolError::InvalidKind(6))
+        ));
+        assert!(matches!(
+            read_response(&mut header(0x8001, 19).as_slice()),
+            Err(ProtocolError::TruncatedPayload)
+        ));
+    }
+
+    #[test]
+    fn update_requires_a_complete_executable_for_the_current_platform() {
+        for binary in [
+            &b""[..],
+            &b"MZ"[..],
+            &b"\x7fELF"[..],
+            &b"MZinvalid executable"[..],
+        ] {
+            assert!(validate_update_binary(binary).is_err());
+        }
+        let binary = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        assert!(validate_update_binary(&binary).is_ok());
+        for length in [64, 128, binary.len() / 2] {
+            assert!(validate_update_binary(&binary[..length]).is_err());
+        }
+        let mut invalid = binary;
+        #[cfg(target_os = "windows")]
+        {
+            let pe_offset = u32::from_le_bytes(invalid[60..64].try_into().unwrap()) as usize;
+            invalid[pe_offset + 4..pe_offset + 6].copy_from_slice(&0x14cu16.to_le_bytes());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            invalid[18..20].copy_from_slice(&3u16.to_le_bytes());
+        }
+        assert!(validate_update_binary(&invalid).is_err());
+    }
+
+    #[test]
+    fn elf_updates_require_a_file_backed_executable_entry_point() {
+        let mut binary = vec![0; 128];
+        binary[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        binary[16..18].copy_from_slice(&2u16.to_le_bytes());
+        binary[18..20].copy_from_slice(&62u16.to_le_bytes());
+        binary[20..24].copy_from_slice(&1u32.to_le_bytes());
+        binary[24..32].copy_from_slice(&0x400078u64.to_le_bytes());
+        binary[32..40].copy_from_slice(&64u64.to_le_bytes());
+        binary[52..54].copy_from_slice(&64u16.to_le_bytes());
+        binary[54..56].copy_from_slice(&56u16.to_le_bytes());
+        binary[56..58].copy_from_slice(&1u16.to_le_bytes());
+        binary[64..68].copy_from_slice(&1u32.to_le_bytes());
+        binary[68..72].copy_from_slice(&5u32.to_le_bytes());
+        binary[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+        binary[96..104].copy_from_slice(&128u64.to_le_bytes());
+        binary[104..112].copy_from_slice(&128u64.to_le_bytes());
+        binary[120] = 0xc3;
+        assert!(valid_elf_update(&binary));
+        for length in 0..binary.len() {
+            assert!(!valid_elf_update(&binary[..length]));
+        }
+        for (offset, bytes) in [
+            (32, u64::MAX.to_le_bytes()),
+            (72, u64::MAX.to_le_bytes()),
+            (80, u64::MAX.to_le_bytes()),
+            (96, 129u64.to_le_bytes()),
+            (104, 120u64.to_le_bytes()),
+        ] {
+            let mut invalid = binary.clone();
+            invalid[offset..offset + 8].copy_from_slice(&bytes);
+            assert!(!valid_elf_update(&invalid));
+        }
+        for (offset, value) in [(4, 1), (5, 2), (7, 6), (18, 3), (54, 55), (68, 4)] {
+            let mut invalid = binary.clone();
+            invalid[offset] = value;
+            assert!(!valid_elf_update(&invalid));
+        }
+        if let Some(path) = std::env::var_os("NEO_TEST_LINUX_BINARY") {
+            assert!(valid_elf_update(&std::fs::read(path).unwrap()));
+        }
+    }
+
+    #[test]
+    fn staged_update_commits_when_the_response_connection_is_lost() {
+        struct LostConnection(io::Cursor<Vec<u8>>);
+        impl Read for LostConnection {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.0.read(buffer)
+            }
+        }
+        impl Write for LostConnection {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut frame = Vec::new();
+        write_request(
+            &mut frame,
+            42,
+            &Request::Update {
+                binary: std::fs::read(std::env::current_exe().unwrap()).unwrap(),
+            },
+        )
+        .unwrap();
+        let mut prepared = false;
+        let result = handle_connection(
+            &mut LostConnection(io::Cursor::new(frame)),
+            &mut |_| {
+                prepared = true;
+                Ok(())
+            },
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        assert!(result);
+        assert!(prepared);
+    }
+
+    #[test]
+    fn capture_drains_excess_bytes_and_retries_interrupted_reads() {
+        struct OutputStream {
+            remaining: usize,
+            interrupted: bool,
+        }
+        impl Read for OutputStream {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                assert!(buffer.len() <= 16 * 1024);
+                let count = self.remaining.min(buffer.len());
+                buffer[..count].fill(0x5a);
+                self.remaining -= count;
+                Ok(count)
+            }
+        }
+        let mut stream = OutputStream {
+            remaining: 32 * 1024 * 1024 + 17,
+            interrupted: false,
+        };
+        let bytes = capture_stream(&mut stream).unwrap();
+        assert_eq!(bytes.len(), 16 * 1024 * 1024);
+        assert!(bytes.iter().all(|byte| *byte == 0x5a));
+        assert_eq!(stream.remaining, 0);
+    }
+
+    #[test]
+    fn capture_preserves_read_errors() {
+        struct FailedStream;
+        impl Read for FailedStream {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        assert_eq!(
+            capture_stream(&mut FailedStream).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn execution_preserves_both_streams_and_the_process_exit_code() {
+        #[cfg(target_os = "windows")]
+        let arguments = [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo output & echo error 1>&2 & exit /b 7",
+        ];
+        #[cfg(not(target_os = "windows"))]
+        let arguments = ["sh", "-c", "printf output; printf error >&2; exit 7"];
+        let response = execute(arguments.into_iter().map(str::to_string).collect());
+        assert!(!response.success);
+        assert_eq!(response.exit_code, Some(7));
+        assert_eq!(String::from_utf8(response.stdout).unwrap().trim(), "output");
+        assert_eq!(String::from_utf8(response.stderr).unwrap().trim(), "error");
+    }
+}
+
+mod server_concurrency {
+    use crate::server::protocol::{Request, Response, read_response, write_request};
+    use crate::server::{ServerExit, serve};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    fn start_server(
+        prepare: impl FnMut(&[u8]) -> Result<(), String> + Send + 'static,
+        telemetry: impl FnMut(u32, u32) -> Result<String, String> + Send + 'static,
+    ) -> (SocketAddr, JoinHandle<Result<ServerExit, String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let server = thread::spawn(move || serve(&address.to_string(), prepare, telemetry));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err() {
+            assert!(Instant::now() < deadline, "server did not bind");
+            thread::sleep(Duration::from_millis(10));
+        }
+        (address, server)
+    }
+
+    fn connect(address: SocketAddr) -> TcpStream {
+        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+    }
+
+    fn transact(address: SocketAddr, request: Request) -> Response {
+        let mut stream = connect(address);
+        write_request(&mut stream, 42, &request).unwrap();
+        let (request_id, response) = read_response(&mut stream).unwrap();
+        assert_eq!(request_id, 42);
+        response
+    }
+
+    fn update() -> Request {
+        let binary = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        Request::Update { binary }
+    }
+
+    #[test]
+    fn idle_connection_does_not_block_ping_or_status() {
+        let (address, server) = start_server(|_| Ok(()), |_, _| Ok("telemetry".into()));
+        let idle = connect(address);
+        assert!(transact(address, Request::Ping).success);
+        assert!(transact(address, Request::Status).success);
+        drop(idle);
+        assert!(transact(address, update()).success);
+        assert!(matches!(
+            server.join().unwrap().unwrap(),
+            ServerExit::Update
+        ));
+    }
+
+    #[test]
+    fn slow_telemetry_does_not_block_ping() {
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (address, server) = start_server(
+            |_| Ok(()),
+            move |_, _| {
+                entered_sender.send(()).unwrap();
+                release_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                Ok("telemetry".into())
+            },
+        );
+        let telemetry = thread::spawn(move || {
+            transact(
+                address,
+                Request::Telemetry {
+                    mode: 0,
+                    control: 0,
+                },
+            )
+        });
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(transact(address, Request::Ping).success);
+        release_sender.send(()).unwrap();
+        assert!(telemetry.join().unwrap().success);
+        assert!(transact(address, update()).success);
+        assert!(matches!(
+            server.join().unwrap().unwrap(),
+            ServerExit::Update
+        ));
+    }
+
+    #[test]
+    fn concurrent_updates_cannot_overwrite_a_committed_binary() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&count);
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let (address, server) = start_server(
+            move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                entered_sender.send(()).unwrap();
+                release_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                Ok(())
+            },
+            |_, _| Ok("telemetry".into()),
+        );
+        let first = thread::spawn(move || transact(address, update()));
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let second = transact(address, update());
+        assert!(!second.success);
+        assert!(second.message.contains("already pending"));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        release_sender.send(()).unwrap();
+        assert!(first.join().unwrap().success);
+        assert!(matches!(
+            server.join().unwrap().unwrap(),
+            ServerExit::Update
+        ));
+    }
+
+    #[test]
+    fn failed_update_releases_the_pending_gate_for_a_retry() {
+        let mut calls = 0;
+        let (address, server) = start_server(
+            move |_| {
+                calls += 1;
+                if calls == 1 {
+                    Err("staging failed".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _| Ok("telemetry".into()),
+        );
+        let failure = transact(address, update());
+        assert!(!failure.success);
+        assert_eq!(failure.message, "staging failed");
+        assert!(transact(address, Request::Ping).success);
+        assert!(transact(address, update()).success);
+        assert!(matches!(
+            server.join().unwrap().unwrap(),
+            ServerExit::Update
+        ));
+    }
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
@@ -38,7 +483,12 @@ mod control_trace {
         fields[8] = 0xffff_8000_1000_0000;
         fields[9] = fields[8] + layout.stack_bytes as u64;
         fields[2] = fields[9] - 32;
-        for (chunk, value) in bytes[..layout.stack_offset].chunks_exact_mut(8).zip(fields) {
+        for (chunk, value) in bytes[..layout.stack_offset]
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(fields)
+        {
             chunk.copy_from_slice(&value.to_le_bytes());
         }
         for (index, byte) in bytes[layout.stack_offset..].iter_mut().enumerate() {

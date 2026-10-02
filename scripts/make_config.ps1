@@ -28,6 +28,11 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $OutputPath = Join-Path $ProjectRoot 'builds\MatrixConfig.bin'
 }
 $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
+$BuildRoot = [System.IO.Path]::GetFullPath('D:\Projetos\MatrixHV\builds')
+$BuildRootPrefix = $BuildRoot.TrimEnd('\') + '\'
+if (-not $OutputPath.StartsWith($BuildRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Configuration output must be under $BuildRoot"
+}
 
 $CurrentCpuidPresence = $false
 $CurrentLogger = $true

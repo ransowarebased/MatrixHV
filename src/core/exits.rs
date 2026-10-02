@@ -1,6 +1,10 @@
 use super::vmcs::{
-    self, EXIT_QUALIFICATION, GUEST_CR3, GUEST_RIP, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_REASON,
-    VmcsError,
+    self, EXIT_QUALIFICATION, GUEST_CR0, GUEST_CR3, GUEST_CR4, GUEST_CS_AR_BYTES,
+    GUEST_FS_BASE, GUEST_GS_BASE, GUEST_IA32_DEBUGCTL, GUEST_IA32_EFER, GUEST_IA32_PAT,
+    GUEST_INTERRUPTIBILITY_INFO, GUEST_PENDING_DBG_EXCEPTIONS, GUEST_RFLAGS, GUEST_RIP,
+    GUEST_SS_AR_BYTES, GUEST_SYSENTER_CS, GUEST_SYSENTER_EIP, GUEST_SYSENTER_ESP,
+    VM_ENTRY_EXCEPTION_ERROR_CODE, VM_ENTRY_INTR_INFO_FIELD, VM_EXIT_INSTRUCTION_LEN,
+    VM_EXIT_REASON, VmcsError,
 };
 use crate::arch;
 use crate::runtime;
@@ -45,6 +49,9 @@ const DISPATCH_FAILURE_CPUID_LENGTH: u32 = 4;
 const DISPATCH_FAILURE_VMCALL_LENGTH: u32 = 5;
 const DISPATCH_FAILURE_RIP_ADVANCE: u32 = 6;
 const DISPATCH_FAILURE_EXIT_LIMIT: u32 = 7;
+const DISPATCH_FAILURE_RDMSR_LENGTH: u32 = 8;
+const DISPATCH_FAILURE_WRMSR_LENGTH: u32 = 9;
+const DISPATCH_FAILURE_MSR_VMCS: u32 = 10;
 const MAX_DISPATCH_EXITS: u32 = 4096;
 const MAX_BOOT_DISPATCH_EXITS: u32 = 65536;
 
@@ -237,6 +244,9 @@ pub fn failure_name(code: u32) -> &'static str {
         DISPATCH_FAILURE_VMCALL_LENGTH => "invalid_vmcall_length",
         DISPATCH_FAILURE_RIP_ADVANCE => "guest_rip_advance_failed",
         DISPATCH_FAILURE_EXIT_LIMIT => "exit_limit_exceeded",
+        DISPATCH_FAILURE_RDMSR_LENGTH => "invalid_rdmsr_length",
+        DISPATCH_FAILURE_WRMSR_LENGTH => "invalid_wrmsr_length",
+        DISPATCH_FAILURE_MSR_VMCS => "msr_guest_state_failed",
         _ => "unknown",
     }
 }
@@ -271,6 +281,9 @@ pub extern "efiapi" fn matrixhv_vmexit_dispatch(
 
     let basic_code = basic_reason(raw_reason);
     let exit_index = EXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    LAST_REASON.store(raw_reason, Ordering::Relaxed);
+    LAST_INSTRUCTION_LENGTH.store(instruction_length, Ordering::Relaxed);
+    LAST_QUALIFICATION.store(qualification, Ordering::Relaxed);
     if exit_index > context.exit_limit {
         FAILURE_CODE.store(DISPATCH_FAILURE_EXIT_LIMIT, Ordering::Relaxed);
         runtime::error(format_args!(
@@ -280,9 +293,6 @@ pub extern "efiapi" fn matrixhv_vmexit_dispatch(
         runtime::phase("vmx.dispatch.exit_limit_exceeded");
         return DispatchAction::Stop as u64;
     }
-    LAST_REASON.store(raw_reason, Ordering::Relaxed);
-    LAST_INSTRUCTION_LENGTH.store(instruction_length, Ordering::Relaxed);
-    LAST_QUALIFICATION.store(qualification, Ordering::Relaxed);
     let trace_exit = context.trace_every_exit || exit_index <= 16 || exit_index.is_power_of_two();
 
     if trace_exit {
@@ -334,12 +344,21 @@ fn dispatch_rdmsr(
     if trace_exit {
         runtime::phase("vmx.dispatch.rdmsr.start");
     }
-    if instruction_length != 2 {
-        FAILURE_CODE.store(DISPATCH_FAILURE_UNEXPECTED_EXIT, Ordering::Relaxed);
+    if !valid_instruction_length(instruction_length) {
+        FAILURE_CODE.store(DISPATCH_FAILURE_RDMSR_LENGTH, Ordering::Relaxed);
         return DispatchAction::Stop as u64;
     }
+    match guest_is_privileged() {
+        Ok(true) => {}
+        Ok(false) => return inject_guest_gp(),
+        Err(error) => return fail_guest_msr(error),
+    }
     let index = registers.rcx as u32;
-    let value = unsafe { arch::read_msr(index) };
+    let value = match read_guest_msr(index) {
+        Ok(Some(value)) => value,
+        Ok(None) => return inject_guest_gp(),
+        Err(error) => return fail_guest_msr(error),
+    };
     registers.rax = u64::from(value as u32);
     registers.rdx = u64::from((value >> 32) as u32);
 
@@ -370,14 +389,21 @@ fn dispatch_wrmsr(
     if trace_exit {
         runtime::phase("vmx.dispatch.wrmsr.start");
     }
-    if instruction_length != 2 {
-        FAILURE_CODE.store(DISPATCH_FAILURE_UNEXPECTED_EXIT, Ordering::Relaxed);
+    if !valid_instruction_length(instruction_length) {
+        FAILURE_CODE.store(DISPATCH_FAILURE_WRMSR_LENGTH, Ordering::Relaxed);
         return DispatchAction::Stop as u64;
+    }
+    match guest_is_privileged() {
+        Ok(true) => {}
+        Ok(false) => return inject_guest_gp(),
+        Err(error) => return fail_guest_msr(error),
     }
     let index = registers.rcx as u32;
     let value = ((registers.rdx as u32 as u64) << 32) | u64::from(registers.rax as u32);
-    unsafe {
-        arch::write_msr(index, value);
+    match write_guest_msr(index, value) {
+        Ok(true) => {}
+        Ok(false) => return inject_guest_gp(),
+        Err(error) => return fail_guest_msr(error),
     }
     if advance_guest_rip(guest_rip, instruction_length).is_err() {
         FAILURE_CODE.store(DISPATCH_FAILURE_RIP_ADVANCE, Ordering::Relaxed);
@@ -406,7 +432,7 @@ fn dispatch_cpuid(
     if trace_exit {
         runtime::phase("vmx.dispatch.cpuid.start");
     }
-    if instruction_length != 2 {
+    if !valid_instruction_length(instruction_length) {
         FAILURE_CODE.store(DISPATCH_FAILURE_CPUID_LENGTH, Ordering::Relaxed);
         return DispatchAction::Stop as u64;
     }
@@ -453,7 +479,7 @@ fn dispatch_cpuid(
 
 fn dispatch_vmcall(registers: &GuestRegisters, guest_rip: u64, instruction_length: u32) -> u64 {
     runtime::phase("vmx.dispatch.vmcall.start");
-    if instruction_length != 3 {
+    if !valid_instruction_length(instruction_length) {
         FAILURE_CODE.store(DISPATCH_FAILURE_VMCALL_LENGTH, Ordering::Relaxed);
         return DispatchAction::Stop as u64;
     }
@@ -473,6 +499,106 @@ fn dispatch_vmcall(registers: &GuestRegisters, guest_rip: u64, instruction_lengt
     DispatchAction::Stop as u64
 }
 
+fn valid_instruction_length(instruction_length: u32) -> bool {
+    (1..=15).contains(&instruction_length)
+}
+
+fn guest_is_privileged() -> Result<bool, VmcsError> {
+    if vmcs::vmread(GUEST_CR0)? & 1 == 0 {
+        return Ok(true);
+    }
+    if vmcs::vmread(GUEST_RFLAGS)? & (1 << 17) != 0 {
+        return Ok(false);
+    }
+    Ok((vmcs::vmread(GUEST_SS_AR_BYTES)? >> 5) & 3 == 0)
+}
+
+fn guest_msr_field(index: u32) -> Option<u64> {
+    match index {
+        arch::IA32_SYSENTER_CS => Some(GUEST_SYSENTER_CS),
+        arch::IA32_SYSENTER_ESP => Some(GUEST_SYSENTER_ESP),
+        arch::IA32_SYSENTER_EIP => Some(GUEST_SYSENTER_EIP),
+        arch::IA32_PAT => Some(GUEST_IA32_PAT),
+        arch::IA32_EFER => Some(GUEST_IA32_EFER),
+        arch::IA32_FS_BASE => Some(GUEST_FS_BASE),
+        arch::IA32_GS_BASE => Some(GUEST_GS_BASE),
+        arch::IA32_DEBUGCTL => Some(GUEST_IA32_DEBUGCTL),
+        _ => None,
+    }
+}
+
+fn read_guest_msr(index: u32) -> Result<Option<u64>, VmcsError> {
+    match guest_msr_field(index) {
+        Some(field) => vmcs::vmread(field).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn write_guest_msr(index: u32, mut value: u64) -> Result<bool, VmcsError> {
+    let Some(field) = guest_msr_field(index) else {
+        return Ok(false);
+    };
+    let valid = match index {
+        arch::IA32_SYSENTER_CS => value <= u32::MAX as u64,
+        arch::IA32_SYSENTER_ESP | arch::IA32_SYSENTER_EIP | arch::IA32_FS_BASE
+        | arch::IA32_GS_BASE => {
+            let cr4 = vmcs::vmread(GUEST_CR4)?;
+            is_canonical(value, if cr4 & (1 << 12) != 0 { 57 } else { 48 })
+        }
+        arch::IA32_PAT => (0..8).all(|entry| {
+            let byte = (value >> (entry * 8)) & 0xff;
+            byte <= 7 && !matches!(byte, 2 | 3)
+        }),
+        arch::IA32_EFER => {
+            let old = vmcs::vmread(GUEST_IA32_EFER)?;
+            let cr0 = vmcs::vmread(GUEST_CR0)?;
+            let cpuid = arch::leaf(0x8000_0001).edx;
+            // WRMSR ignores source LMA; only architectural mode transitions change it.
+            value = (value & !(1 << 10)) | (old & (1 << 10));
+            value & !0xd01 == 0
+                && (cr0 & (1 << 31) == 0 || value & (1 << 8) == old & (1 << 8))
+                && (value & 1 == 0 || cpuid & (1 << 11) != 0)
+                && (value & (1 << 11) == 0 || cpuid & (1 << 20) != 0)
+        }
+        arch::IA32_DEBUGCTL => {
+            let old = vmcs::vmread(GUEST_IA32_DEBUGCTL)?;
+            (value ^ old) & !0x3 == 0
+        }
+        _ => false,
+    };
+    if !valid {
+        return Ok(false);
+    }
+    vmcs::vmwrite(field, value)?;
+    Ok(true)
+}
+
+fn is_canonical(value: u64, width: u32) -> bool {
+    ((value as i64) << (64 - width) >> (64 - width)) as u64 == value
+}
+
+fn fail_guest_msr(error: VmcsError) -> u64 {
+    FAILURE_CODE.store(DISPATCH_FAILURE_MSR_VMCS, Ordering::Relaxed);
+    runtime::error(format_args!("vmexit guest_msr_state error={error:?}"));
+    DispatchAction::Stop as u64
+}
+
+fn inject_guest_gp() -> u64 {
+    let result = (|| {
+        let protected_mode = vmcs::vmread(GUEST_CR0)? & 1 != 0;
+        vmcs::vmwrite(VM_ENTRY_EXCEPTION_ERROR_CODE, 0)?;
+        let error_code_bit = if protected_mode { 1 << 11 } else { 0 };
+        vmcs::vmwrite(VM_ENTRY_INTR_INFO_FIELD, 0x8000_030d | error_code_bit)
+    })();
+    match result {
+        Ok(()) => {
+            RESUME_COUNT.fetch_add(1, Ordering::Relaxed);
+            DispatchAction::Resume as u64
+        }
+        Err(error) => fail_guest_msr(error),
+    }
+}
+
 fn read_exit_state() -> Result<(u32, u64, u32, u64, u64), VmcsError> {
     Ok((
         vmcs::vmread(VM_EXIT_REASON)? as u32,
@@ -484,10 +610,26 @@ fn read_exit_state() -> Result<(u32, u64, u32, u64, u64), VmcsError> {
 }
 
 fn advance_guest_rip(guest_rip: u64, instruction_length: u32) -> Result<(), VmcsError> {
-    vmcs::vmwrite(
-        GUEST_RIP,
-        guest_rip.wrapping_add(u64::from(instruction_length)),
-    )
+    let cs_access_rights = vmcs::vmread(GUEST_CS_AR_BYTES)?;
+    let rflags = vmcs::vmread(GUEST_RFLAGS)?;
+    let debugctl = vmcs::vmread(GUEST_IA32_DEBUGCTL)?;
+    let interruptibility = vmcs::vmread(GUEST_INTERRUPTIBILITY_INFO)?;
+    let pending_debug = vmcs::vmread(GUEST_PENDING_DBG_EXCEPTIONS)?;
+    let address_mask =
+        if cs_access_rights & (1 << 13) != 0 && vmcs::vmread(GUEST_IA32_EFER)? & (1 << 10) != 0 {
+            u64::MAX
+        } else {
+            u32::MAX as u64
+        };
+    let next_rip = guest_rip.wrapping_add(u64::from(instruction_length)) & address_mask;
+    let next_pending_debug = if rflags & (1 << 8) != 0 && debugctl & (1 << 1) == 0 {
+        pending_debug | (1 << 14)
+    } else {
+        pending_debug
+    };
+    vmcs::vmwrite(GUEST_PENDING_DBG_EXCEPTIONS, next_pending_debug)?;
+    vmcs::vmwrite(GUEST_INTERRUPTIBILITY_INFO, interruptibility & !3)?;
+    vmcs::vmwrite(GUEST_RIP, next_rip)
 }
 
 pub(crate) const VMCALL_EXIT_REASON: u64 = 18;
@@ -504,8 +646,10 @@ pub(crate) const VM_ENTRY_FAILURE_MSR_LOADING_EXIT_REASON: u64 = 34;
 pub(crate) enum ResidentRunError {
     VmlaunchVmFailInvalid,
     VmlaunchVmFailValid(u64),
-    HostRspVmwrite,
-    HostRipVmwrite,
+    HostRspVmwriteVmFailValid(u64),
+    HostRspVmwriteVmFailInvalid,
+    HostRipVmwriteVmFailValid(u64),
+    HostRipVmwriteVmFailInvalid,
     UnexpectedRunPath(u64),
 }
 pub(crate) fn validate_resident_run_path(
@@ -516,8 +660,10 @@ pub(crate) fn validate_resident_run_path(
         0 => Ok(()),
         1 => Err(ResidentRunError::VmlaunchVmFailInvalid),
         2 => Err(ResidentRunError::VmlaunchVmFailValid(vm_instruction_error)),
-        3 => Err(ResidentRunError::HostRspVmwrite),
-        4 => Err(ResidentRunError::HostRipVmwrite),
+        3 => Err(ResidentRunError::HostRspVmwriteVmFailValid(vm_instruction_error)),
+        4 => Err(ResidentRunError::HostRipVmwriteVmFailValid(vm_instruction_error)),
+        7 => Err(ResidentRunError::HostRspVmwriteVmFailInvalid),
+        8 => Err(ResidentRunError::HostRipVmwriteVmFailInvalid),
         other => Err(ResidentRunError::UnexpectedRunPath(other)),
     }
 }

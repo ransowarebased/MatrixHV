@@ -135,24 +135,36 @@ mod boot_order {
 
         pub(crate) fn image_file_path(&self) -> Option<Vec<u16>> {
             let mut offset = 0;
+            let mut path = Vec::new();
+            let separator = u16::from(b'\\');
             while offset < self.image_path.len() {
                 let node_size =
                     u16::from_le_bytes([self.image_path[offset + 2], self.image_path[offset + 3]])
                         as usize;
                 let node = &self.image_path[offset..offset + node_size];
+                if node[0] == DEVICE_PATH_END_TYPE {
+                    break;
+                }
                 if node[0] == DEVICE_PATH_MEDIA_TYPE && node[1] == DEVICE_PATH_FILE_SUBTYPE {
-                    let path: Vec<u16> = node[DEVICE_PATH_HEADER_SIZE..]
+                    let mut characters = node[DEVICE_PATH_HEADER_SIZE..]
                         .as_chunks::<2>()
                         .0
                         .iter()
                         .map(|character| u16::from_le_bytes([character[0], character[1]]))
                         .take_while(|character| *character != 0)
-                        .collect();
-                    return Some(path);
+                        .peekable();
+                    if let Some(first) = characters.peek().copied() {
+                        if path.last() == Some(&separator) && first == separator {
+                            characters.next();
+                        } else if path.last() != Some(&separator) && first != separator {
+                            path.push(separator);
+                        }
+                        path.extend(characters);
+                    }
                 }
                 offset += node_size;
             }
-            None
+            (!path.is_empty()).then_some(path)
         }
 
         pub(crate) fn image_file_path_matches(&self, expected: &str) -> bool {
@@ -468,10 +480,19 @@ pub(crate) fn load_veracrypt_boot_option(
 }
 
 fn same_hd_partition(original: &[u8], candidate: &[u8]) -> bool {
-    original.len() == 38
-        && candidate.len() == 38
-        && original[..4] == candidate[..4]
-        && original[20..38] == candidate[20..38]
+    if original.len() != 38
+        || candidate.len() != 38
+        || original[..4] != candidate[..4]
+        || original[36..38] != candidate[36..38]
+    {
+        return false;
+    }
+    match original[37] {
+        0 => original[4..20] == candidate[4..20],
+        1 => original[20..24] == candidate[20..24],
+        2 => original[20..36] == candidate[20..36],
+        _ => false,
+    }
 }
 
 pub fn initialize_boot_environment() -> Result<(), Status> {
@@ -789,7 +810,7 @@ fn install_control_bridge(code: &VariableBridge, context: u64) -> Result<(), Sta
         (code.original_get_variable_slot as *mut u64).write(original_get as usize as u64);
         (code.original_set_variable_slot as *mut u64).write(original_set as usize as u64);
         (code.convert_pointer_slot as *mut u64).write(runtime.convert_pointer as usize as u64);
-        (code.bridge_context_slot as *mut u64).write(context as u64);
+        (code.bridge_context_slot as *mut u64).write(context);
         (code.runtime_get_variable_slot as *mut u64).write(code.get_variable_bridge);
         (code.runtime_set_variable_slot as *mut u64).write(code.set_variable_bridge);
         runtime.get_variable = core::mem::transmute::<
@@ -859,4 +880,141 @@ fn verify_control_bridge(
         return Err(Status::DEVICE_ERROR);
     }
     Ok(())
+}
+pub(crate) fn calibrate_reference_tsc() -> u64 {
+    use uefi::table::cfg::ConfigTableEntry;
+
+    let root = uefi::system::with_config_table(|entries| {
+        entries
+            .iter()
+            .find(|entry| entry.guid == ConfigTableEntry::ACPI2_GUID)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| entry.guid == ConfigTableEntry::ACPI_GUID)
+            })
+            .map(|entry| entry.address as usize)
+    });
+    let Some((port, mask)) = root.and_then(|address| unsafe { acpi_pm_timer(address) }) else {
+        return 0;
+    };
+    crate::hyperv::calibrated_tsc_hz(|| {
+        let read_timer = || {
+            let value: u32;
+            unsafe {
+                core::arch::asm!("in eax, dx", in("dx") port, out("eax") value,
+                    options(nomem, nostack, preserves_flags));
+            }
+            value & mask
+        };
+        let read_tsc = || unsafe {
+            core::arch::x86_64::_mm_lfence();
+            core::arch::x86_64::_rdtsc()
+        };
+        let start_pm = read_timer();
+        let start_tsc = read_tsc();
+        for _ in 0..1_000_000 {
+            let pm_ticks = read_timer().wrapping_sub(start_pm) & mask;
+            let tsc_ticks = read_tsc().wrapping_sub(start_tsc);
+            if pm_ticks >= 35_795 {
+                return Some((tsc_ticks, pm_ticks));
+            }
+            core::hint::spin_loop();
+        }
+        None
+    })
+}
+
+// Only firmware-installed ACPI pointers are dereferenced, before VMXON/EBS.
+unsafe fn acpi_pm_timer(address: usize) -> Option<(u16, u32)> {
+    if address == 0 {
+        return None;
+    }
+    let root = unsafe { core::slice::from_raw_parts(address as *const u8, 20) };
+    let checksum = |bytes: &[u8]| bytes.iter().fold(0_u8, |sum, byte| sum.wrapping_add(*byte)) == 0;
+    if &root[..8] != b"RSD PTR " || !checksum(root) {
+        return None;
+    }
+    let mut table_address = u32::from_le_bytes(root[16..20].try_into().ok()?) as usize;
+    let mut stride = 4;
+    if root[15] >= 2 {
+        let extended = unsafe { core::slice::from_raw_parts(address as *const u8, 36) };
+        let length = u32::from_le_bytes(extended[20..24].try_into().ok()?) as usize;
+        if !(36..=4096).contains(&length)
+            || !checksum(unsafe { core::slice::from_raw_parts(address as *const u8, length) })
+        {
+            return None;
+        }
+        let xsdt = u64::from_le_bytes(extended[24..32].try_into().ok()?) as usize;
+        if xsdt != 0 {
+            table_address = xsdt;
+            stride = 8;
+        }
+    }
+    let table = unsafe { acpi_table(table_address) }?;
+    if &table[..4] != if stride == 8 { b"XSDT" } else { b"RSDT" } {
+        return None;
+    }
+    if !(table.len() - 36).is_multiple_of(stride) {
+        return None;
+    }
+    for entry in table[36..].chunks_exact(stride) {
+        let mut bytes = [0_u8; 8];
+        bytes[..stride].copy_from_slice(entry);
+        let Some(child) = (unsafe { acpi_table(u64::from_le_bytes(bytes) as usize) }) else {
+            continue;
+        };
+        if &child[..4] == b"FACP" {
+            return acpi_pm_timer_register(child);
+        }
+    }
+    None
+}
+
+unsafe fn acpi_table(address: usize) -> Option<&'static [u8]> {
+    if address == 0 {
+        return None;
+    }
+    let header = unsafe { core::slice::from_raw_parts(address as *const u8, 36) };
+    let length = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+    if !(36..=1_048_576).contains(&length) {
+        return None;
+    }
+    let table = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
+    (table.iter().fold(0_u8, |sum, byte| sum.wrapping_add(*byte)) == 0).then_some(table)
+}
+
+fn acpi_pm_timer_register(fadt: &[u8]) -> Option<(u16, u32)> {
+    if fadt.len() < 116 || fadt[91] != 4 {
+        return None;
+    }
+    let flags = u32::from_le_bytes(fadt[112..116].try_into().ok()?);
+    if flags & (1 << 20) != 0 {
+        return None;
+    }
+    let mut port = u64::from(u32::from_le_bytes(fadt[76..80].try_into().ok()?));
+    if fadt.len() >= 220 {
+        let extended = u64::from_le_bytes(fadt[212..220].try_into().ok()?);
+        if extended != 0 {
+            if fadt[208] != 1
+                || ![24, 32].contains(&fadt[209])
+                || fadt[210] != 0
+                || ![0, 3].contains(&fadt[211])
+            {
+                return None;
+            }
+            port = extended;
+        }
+    }
+    if port == 0 || port > u64::from(u16::MAX) {
+        return None;
+    }
+    Some((
+        port as u16,
+        if flags & (1 << 8) != 0 {
+            u32::MAX
+        } else {
+            0xff_ffff
+        },
+    ))
 }

@@ -46,7 +46,7 @@ fn review_loader_contract_survives_capability_filtering() {
             };
             let mut guest = nested::NestedVmxCapabilities::from_host(host);
             guest.vmx_procbased_ctls2 =
-                crate::hyperv::restrict_evmcs_controls(guest.vmx_procbased_ctls2, evmcs);
+                crate::hyperv::restrict_evmcs_secondary_capability(guest.vmx_procbased_ctls2, evmcs);
             let guest_controls = [
                 guest.vmx_true_pinbased_ctls,
                 guest.vmx_true_procbased_ctls,

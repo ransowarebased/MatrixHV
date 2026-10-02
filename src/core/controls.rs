@@ -21,11 +21,13 @@ const SECONDARY_UNRESTRICTED_GUEST: u32 = 1 << 7;
 const SECONDARY_ENABLE_INVPCID: u32 = 1 << 12;
 const SECONDARY_ENABLE_XSAVES: u32 = 1 << 20;
 const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
+const VM_EXIT_SAVE_DEBUG_CONTROLS: u32 = 1 << 2;
 const VM_EXIT_SAVE_IA32_PAT: u32 = 1 << 18;
 const VM_EXIT_LOAD_IA32_PAT: u32 = 1 << 19;
 const VM_EXIT_SAVE_IA32_EFER: u32 = 1 << 20;
 const VM_EXIT_LOAD_IA32_EFER: u32 = 1 << 21;
 const VM_ENTRY_IA32E_MODE_GUEST: u32 = 1 << 9;
+const VM_ENTRY_LOAD_DEBUG_CONTROLS: u32 = 1 << 2;
 const VM_ENTRY_LOAD_IA32_PAT: u32 = 1 << 14;
 const VM_ENTRY_LOAD_IA32_EFER: u32 = 1 << 15;
 
@@ -53,6 +55,7 @@ pub enum VmxControlsError {
     XsavesUnavailable,
     PatControlsUnavailable,
     EferControlsUnavailable,
+    DebugControlsUnavailable,
     VpidInvalidationFailed,
     VirtualNmisUnavailable,
     VmcsShadowingUnexpectedlyRequired,
@@ -80,8 +83,14 @@ pub fn configure() -> Result<VmxControls, VmxControlsError> {
         pin_based: PIN_BASED_NMI_EXITING,
         primary_processor_based: 0,
         secondary_processor_based: 0,
-        vm_exit: 0,
-        vm_entry: 0,
+        vm_exit: VM_EXIT_SAVE_DEBUG_CONTROLS
+            | VM_EXIT_SAVE_IA32_PAT
+            | VM_EXIT_LOAD_IA32_PAT
+            | VM_EXIT_SAVE_IA32_EFER
+            | VM_EXIT_LOAD_IA32_EFER,
+        vm_entry: VM_ENTRY_LOAD_DEBUG_CONTROLS
+            | VM_ENTRY_LOAD_IA32_PAT
+            | VM_ENTRY_LOAD_IA32_EFER,
         exception_bitmap: 1 << 6,
         msr_bitmap: None,
         ept_pointer: None,
@@ -109,15 +118,20 @@ pub fn configure_resident_boot(
             | CPU_BASED_USE_MSR_BITMAPS
             | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
         secondary_processor_based: secondary,
-        vm_exit: VM_EXIT_SAVE_IA32_PAT
+        vm_exit: VM_EXIT_SAVE_DEBUG_CONTROLS
+            | VM_EXIT_SAVE_IA32_PAT
             | VM_EXIT_LOAD_IA32_PAT
             | VM_EXIT_SAVE_IA32_EFER
             | VM_EXIT_LOAD_IA32_EFER,
-        vm_entry: VM_ENTRY_LOAD_IA32_PAT | VM_ENTRY_LOAD_IA32_EFER,
+        vm_entry: VM_ENTRY_LOAD_DEBUG_CONTROLS
+            | VM_ENTRY_LOAD_IA32_PAT
+            | VM_ENTRY_LOAD_IA32_EFER,
         exception_bitmap: 1 << 6,
         msr_bitmap: Some(msr_bitmap),
         ept_pointer: Some(ept_pointer),
     })?;
+    // Reference time uses the root TSC domain; L1 starts with an identity transform.
+    vmwrite(TSC_OFFSET, 0)?;
     vmwrite(CR0_GUEST_HOST_MASK, (1 << 30) | (1 << 29))?;
     vmwrite(CR0_READ_SHADOW, crate::arch::read_cr0())?;
     Ok(controls)
@@ -364,6 +378,13 @@ fn configure_internal(requested: RequestedControls) -> Result<VmxControls, VmxCo
         || vm_entry & desired_efer_entry != desired_efer_entry
     {
         return Err(VmxControlsError::EferControlsUnavailable);
+    }
+    if requested.vm_exit & VM_EXIT_SAVE_DEBUG_CONTROLS != 0
+        && vm_exit & VM_EXIT_SAVE_DEBUG_CONTROLS == 0
+        || requested.vm_entry & VM_ENTRY_LOAD_DEBUG_CONTROLS != 0
+            && vm_entry & VM_ENTRY_LOAD_DEBUG_CONTROLS == 0
+    {
+        return Err(VmxControlsError::DebugControlsUnavailable);
     }
 
     vmwrite(PIN_BASED_VM_EXEC_CONTROL, u64::from(pin_based))?;

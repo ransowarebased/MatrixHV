@@ -6,6 +6,7 @@
 // exits.S; this component calls its .Lap_flush_guest_tlb helper after reset.
 .macro matrixhv_resident_ap_startup
 .Lresident_ap_ready:
+    mov qword ptr [r12 + {b_telemetry_probe_active}], 0
     mov qword ptr [r12 + {b_ap_started}], 1
     call .Lresident_advance_guest_rip
     jmp .Lresident_dispatch_resume

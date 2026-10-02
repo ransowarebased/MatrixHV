@@ -1141,6 +1141,7 @@ ja .Lresident_control_on_entry_vmcs_preserved
 mov qword ptr [r13 + {control_cpu_stage}], 134
 lock bts qword ptr [r15 + {event_control_failed_mask}], r14
 .Lresident_control_on_entry_vmcs_preserved:
+mov qword ptr [r12 + {b_root_vmx_active}], 0
 vmxoff
 mov rdx, qword ptr [r13 + {control_cpu_on_native_cr3}]
 mov r11, qword ptr [r13 + {control_cpu_on_native_cr0}]

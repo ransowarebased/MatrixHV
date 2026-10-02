@@ -24,6 +24,7 @@ pub(crate) enum NestedHardwareError {
     Vmcs(VmcsError),
     Controls(controls::VmxControlsError),
     Ept(EptError),
+    InvalidEptPoolUsage,
 }
 impl From<VmcsError> for NestedHardwareError {
     fn from(value: VmcsError) -> Self {
@@ -250,7 +251,7 @@ pub(crate) fn nested_vmx_capabilities(
     ));
     capabilities.expose_vmx = options.vt_nested;
     capabilities.vmx_procbased_ctls2 =
-        hyperv::restrict_evmcs_controls(capabilities.vmx_procbased_ctls2, options.vt_evmcs);
+        hyperv::restrict_evmcs_secondary_capability(capabilities.vmx_procbased_ctls2, options.vt_evmcs);
     debug_assert_eq!(
         capabilities.vmx_msr(IA32_VMX_BASIC_MSR),
         Some(capabilities.vmx_basic)
@@ -345,7 +346,9 @@ pub(crate) fn prepare_cpu_state(
         alternate_composed_hpa: configuration.alternate.host_physical_address,
         alternate_permissions: configuration.alternate.permissions,
     });
-    nested_state.configure_ept02_table_pools(configuration.ept02_table_pools);
+    if !nested_state.configure_ept02_table_pools(configuration.ept02_table_pools) {
+        return Err(NestedHardwareError::InvalidEptPoolUsage);
+    }
     nested_state.eptp_shadow_list = configuration.eptp_list;
     nested_state.eptp_table_pool = configuration.eptp_tables;
     nested_state.eptp_table_pages = configuration.eptp_pages;

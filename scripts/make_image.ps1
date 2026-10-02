@@ -331,6 +331,12 @@ if (-not [string]::IsNullOrWhiteSpace($VeraCryptEfiSource)) {
     }
 }
 
+foreach ($ImageFile in $ImageFiles) {
+    if ($ImagePath.Equals($ImageFile.SourcePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Image output cannot replace an input file: $ImagePath"
+    }
+}
+
 $BytesPerSector = [UInt32]512
 $SectorsPerCluster = [UInt32]1
 $ReservedSectors = [UInt32]32
@@ -339,14 +345,12 @@ $PartitionStart = [UInt32]2048
 $TotalSectors = [UInt32](($ImageSizeMiB * 1MB) / $BytesPerSector)
 $PartitionSectors = [UInt32]($TotalSectors - $PartitionStart)
 
-$FatSectors = [UInt32]1
-do {
-    $DataSectors = [UInt32]($PartitionSectors - $ReservedSectors - ($FatCount * $FatSectors))
-    $ClusterCount = [UInt32][Math]::Floor($DataSectors / [double]$SectorsPerCluster)
-    $RequiredFatSectors = [UInt32][Math]::Ceiling((($ClusterCount + 2) * 4) / [double]$BytesPerSector)
-    $Changed = $RequiredFatSectors -ne $FatSectors
-    $FatSectors = $RequiredFatSectors
-} while ($Changed)
+# Solve the FAT capacity inequality directly; fixed-point iteration can alternate forever.
+$FatEntriesPerSector = $BytesPerSector / 4
+$FatSectors = [UInt32][Math]::Ceiling(
+    ($PartitionSectors - $ReservedSectors + (2 * $SectorsPerCluster)) /
+    [double](($FatEntriesPerSector * $SectorsPerCluster) + $FatCount)
+)
 
 $DataSectors = [UInt32]($PartitionSectors - $ReservedSectors - ($FatCount * $FatSectors))
 $ClusterCount = [UInt32][Math]::Floor($DataSectors / [double]$SectorsPerCluster)
@@ -376,7 +380,9 @@ $ImageDirectory = Split-Path -Parent $ImagePath
 New-Item -ItemType Directory -Path $ImageDirectory -Force | Out-Null
 
 $ImageLength = [Int64]$TotalSectors * $BytesPerSector
-$Stream = [System.IO.File]::Open($ImagePath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+$TemporaryImagePath = "$ImagePath.$([Guid]::NewGuid().ToString('N')).tmp"
+$Stream = [System.IO.File]::Open($TemporaryImagePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+$ImageReady = $false
 try {
     $Stream.SetLength($ImageLength)
 
@@ -512,9 +518,26 @@ try {
         $Stream.Write($ImageFile.Bytes, 0, $ImageFile.Bytes.Length)
     }
     $Stream.Flush()
+    $ImageReady = $true
 }
 finally {
     $Stream.Dispose()
+    if (-not $ImageReady -and (Test-Path -LiteralPath $TemporaryImagePath)) {
+        Remove-Item -LiteralPath $TemporaryImagePath -Force
+    }
+}
+try {
+    if (Test-Path -LiteralPath $ImagePath -PathType Leaf) {
+        [System.IO.File]::Replace($TemporaryImagePath, $ImagePath, [System.Management.Automation.Language.NullString]::Value)
+    }
+    else {
+        [System.IO.File]::Move($TemporaryImagePath, $ImagePath)
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $TemporaryImagePath) {
+        Remove-Item -LiteralPath $TemporaryImagePath -Force
+    }
 }
 
 Write-Host "Created UEFI FAT32 image: $ImagePath"

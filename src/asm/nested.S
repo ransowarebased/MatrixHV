@@ -214,11 +214,26 @@ mov qword ptr [r12 + {b_nested_vmcs12_guest_rflags}], r11
 cmp qword ptr [r12 + {b_nested_l2_msr_gp_pending}], 0
 je .Lresident_nested_l2_capture_exit_interrupt
 mov qword ptr [r12 + {b_nested_l2_msr_gp_pending}], 0
-mov r11d, 0x80000b0d
+mov r11d, 0x8000030d
+mov eax, {guest_cr0}
+vmread r10, rax
+jna .Lresident_dispatch_vmread_failed
+test r10b, 1
+jz .Lresident_nested_l2_msr_gp_info_ready
+or r11d, 0x800
+.Lresident_nested_l2_msr_gp_info_ready:
 mov qword ptr [r12 + {b_nested_vmcs12_vm_exit_intr_info}], r11
 mov qword ptr [r12 + {b_nested_vmcs12_vm_exit_intr_error}], 0
 jmp .Lresident_nested_l2_exit_interrupt_ready
 .Lresident_nested_l2_capture_exit_interrupt:
+cmp qword ptr [r12 + {b_nested_l2_nmi_exit_pending}], 0
+je .Lresident_nested_l2_capture_native_exit_interrupt
+mov qword ptr [r12 + {b_nested_l2_nmi_exit_pending}], 0
+mov r11d, 0x80000202
+mov qword ptr [r12 + {b_nested_vmcs12_vm_exit_intr_info}], r11
+mov qword ptr [r12 + {b_nested_vmcs12_vm_exit_intr_error}], 0
+jmp .Lresident_nested_l2_exit_interrupt_ready
+.Lresident_nested_l2_capture_native_exit_interrupt:
 mov rax, {exit_intr_info}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
@@ -704,7 +719,12 @@ test r11b, 0x80
 jz .Lresident_nested_translate_legacy_4k
 bt r13, 4
 jnc .Lresident_nested_translate_failure
+// PSE-36 places physical address bits 39:32 in PDE bits 20:13.
+mov eax, r11d
+and eax, 0x1fe000
+shl rax, 19
 and r11d, 0xffc00000
+or r11, rax
 mov r10d, edi
 and r10d, 0x3fffff
 or r10, r11
@@ -1869,6 +1889,13 @@ mov edx, dword ptr [r11]
 and edx, 0x7fffffff
 cmp rdx, qword ptr [r12 + {b_nested_vmcs12_revision_id}]
 jne .Lresident_nested_vmptrld_bad_revision
+// Architectural VMPTRLD must not reinterpret the active enlightened page.
+cmp qword ptr [r12 + {b_nested_evmcs_active}], 0
+je .Lresident_nested_vmptrld_ordinary
+mov rax, qword ptr [r12 + {b_nested_last_operand}]
+cmp rax, qword ptr [r12 + {b_nested_current_vmcs}]
+je .Lresident_nested_vmptrld_bad_revision
+.Lresident_nested_vmptrld_ordinary:
 bt dword ptr [r11], 31
 jc .Lresident_nested_vmptrld_shadow
 mov rax, qword ptr [r12 + {b_nested_last_operand}]
@@ -2030,6 +2057,11 @@ or r11, rsi
 .Lresident_nested_vmwrite_extended_full:
 mov esi, r10d
 and esi, 0x6000
+test esi, esi
+jnz .Lresident_nested_vmwrite_extended_not_sixteen_bit
+movzx r11d, r11w
+jmp .Lresident_nested_vmwrite_extended_width_ready
+.Lresident_nested_vmwrite_extended_not_sixteen_bit:
 cmp esi, 0x4000
 jne .Lresident_nested_vmwrite_extended_width_ready
 mov r11d, r11d
@@ -2668,6 +2700,8 @@ cmp edx, 7
 jne .Lresident_nested_entry_event_check_nmi
 test ecx, ecx
 jnz .Lresident_nested_entry_event_invalid
+bt qword ptr [r12 + {b_nested_vmx_procbased_ctls}], 59
+jnc .Lresident_nested_entry_event_invalid
 .Lresident_nested_entry_event_check_nmi:
 cmp edx, 2
 jne .Lresident_nested_entry_event_check_exception
@@ -2678,6 +2712,9 @@ cmp edx, 3
 jne .Lresident_nested_entry_event_check_error_code
 cmp ecx, 31
 ja .Lresident_nested_entry_event_invalid
+// Real-address event delivery never pushes an exception error code.
+test byte ptr [r12 + {b_nested_vmcs12_guest_cr0}], 1
+jz .Lresident_nested_entry_event_without_error_code
 cmp ecx, 8
 je .Lresident_nested_entry_event_requires_error_code
 cmp ecx, 10
@@ -2692,6 +2729,7 @@ cmp ecx, 14
 je .Lresident_nested_entry_event_requires_error_code
 cmp ecx, 17
 je .Lresident_nested_entry_event_requires_error_code
+.Lresident_nested_entry_event_without_error_code:
 test eax, 0x800
 jnz .Lresident_nested_entry_event_invalid
 jmp .Lresident_nested_entry_event_check_instruction_length
@@ -2715,6 +2753,10 @@ jne .Lresident_nested_entry_event_valid
 .Lresident_nested_entry_event_validate_instruction_length:
 cmp dword ptr [r12 + {b_nested_vmcs12_vm_entry_instruction_len}], 15
 ja .Lresident_nested_entry_event_invalid
+cmp dword ptr [r12 + {b_nested_vmcs12_vm_entry_instruction_len}], 0
+jne .Lresident_nested_entry_event_valid
+bt qword ptr [r12 + {b_nested_vmx_misc}], 30
+jnc .Lresident_nested_entry_event_invalid
 .Lresident_nested_entry_event_valid:
 mov eax, 1
 ret
@@ -2958,8 +3000,7 @@ bt dword ptr [r12 + {b_nested_vmcs01_secondary_controls}], 5
 jnc .Lresident_nested_vpid02_ready
 test r10d, r10d
 jz .Lresident_nested_vpid02_disabled
-// Hardware tag 1 belongs to L1. Tags 2 and 3 retain two virtual L2 contexts,
-// avoiding a full TLB invalidation on every VTL0/VTL1 transition.
+// Hardware tag 1 belongs to L1; tags 2 and 3 identify virtual L2 contexts.
 cmp r10w, word ptr [r12 + {b_nested_vmcs02_vpid_cache}]
 je .Lresident_nested_vpid02_select_first
 cmp r10w, word ptr [r12 + {b_nested_vmcs02_vpid_cache} + 2]
@@ -2972,12 +3013,10 @@ je .Lresident_nested_vpid02_replace_second
 .Lresident_nested_vpid02_replace_first:
 mov word ptr [r12 + {b_nested_vmcs02_vpid_cache}], r10w
 mov r11d, 2
-call .Lresident_nested_flush_vpid02_tag
 jmp .Lresident_nested_vpid02_write_tag
 .Lresident_nested_vpid02_replace_second:
 mov word ptr [r12 + {b_nested_vmcs02_vpid_cache} + 2], r10w
 mov r11d, 3
-call .Lresident_nested_flush_vpid02_tag
 jmp .Lresident_nested_vpid02_write_tag
 .Lresident_nested_vpid02_select_first:
 mov r11d, 2
@@ -2985,6 +3024,8 @@ jmp .Lresident_nested_vpid02_write_tag
 .Lresident_nested_vpid02_select_second:
 mov r11d, 3
 .Lresident_nested_vpid02_write_tag:
+// Revalidate translations when entering L2, including reused virtual tags.
+call .Lresident_nested_flush_vpid02_tag
 mov rax, {virtual_processor_id}
 call .Lresident_nested_write_vmcs02_control
 jmp .Lresident_nested_vpid02_ready
@@ -3832,6 +3873,7 @@ push rax
 pushfq
 mov r12, qword ptr [rsp + 128]
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
+call .Lresident_flight_record_entry_failure
 call .Lresident_nested_restore_root_spec_ctrl
 mov r10, qword ptr [rsp]
 add rsp, 8
@@ -3874,51 +3916,7 @@ call .Lresident_nested_write_vmcs02_control
 ret
 .Lresident_nested_l2_resume_ept:
 call .Lresident_nested_restore_internal_msr_entry
-// Internal EPT exits retry interrupted delivery, not an already delivered entry event.
-mov rax, {idt_vectoring_info_field}
-vmread r10, rax
-jna .Lresident_dispatch_vmread_failed
-bt r10d, 31
-jc .Lresident_nested_l2_retry_event
-xor r10d, r10d
-jmp .Lresident_nested_l2_retry_event_ready
-.Lresident_nested_l2_retry_event:
-and r10d, 0x80000fff
-bt r10d, 11
-jnc .Lresident_nested_l2_retry_event_type
-mov rax, {idt_vectoring_error_code}
-vmread r11, rax
-jna .Lresident_dispatch_vmread_failed
-mov rax, {vm_entry_exception_error_code}
-vmwrite rax, r11
-jna .Lresident_dispatch_vmwrite_failed
-.Lresident_nested_l2_retry_event_type:
-mov edx, r10d
-and edx, 0x700
-cmp edx, 0x200
-jne .Lresident_nested_l2_retry_software_event
-mov rax, {guest_interruptibility_info}
-vmread r11, rax
-jna .Lresident_dispatch_vmread_failed
-btr r11, 3
-vmwrite rax, r11
-jna .Lresident_dispatch_vmwrite_failed
-jmp .Lresident_nested_l2_retry_event_ready
-.Lresident_nested_l2_retry_software_event:
-cmp edx, 0x400
-jb .Lresident_nested_l2_retry_event_ready
-cmp edx, 0x600
-ja .Lresident_nested_l2_retry_event_ready
-mov rax, {exit_instruction_len}
-vmread r11, rax
-jna .Lresident_dispatch_vmread_failed
-mov rax, {vm_entry_instruction_len}
-vmwrite rax, r11
-jna .Lresident_dispatch_vmwrite_failed
-.Lresident_nested_l2_retry_event_ready:
-mov rax, {vm_entry_intr_info_field}
-vmwrite rax, r10
-jna .Lresident_dispatch_vmwrite_failed
+call .Lresident_retry_ept_event
 .Lresident_nested_l2_resume:
 cmp qword ptr [r12 + {b_nested_vmcs02_launched}], 0
 je .Lresident_nested_l2_launch_registers
@@ -3965,6 +3963,7 @@ push rax
 pushfq
 mov r12, qword ptr [rsp + 128]
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
+call .Lresident_flight_record_entry_failure
 call .Lresident_nested_restore_root_spec_ctrl
 mov r10, qword ptr [rsp]
 add rsp, 8
@@ -4093,6 +4092,20 @@ vmwrite rax, r11
 jna .Lresident_dispatch_vmwrite_failed
 cmp qword ptr [r12 + {b_nested_l2_active}], 0
 je .Lresident_boot_timer_retry_event
+cmp qword ptr [r12 + {b_nmi_pending}], 0
+je .Lresident_dispatch_nmi_window_internal
+bt qword ptr [r12 + {b_nested_vmcs12_pin_based_control}], 3
+jnc .Lresident_dispatch_nmi_window_internal
+xor eax, eax
+xchg qword ptr [r12 + {b_nmi_pending}], rax
+mov qword ptr [r12 + {b_nested_l2_nmi_exit_pending}], 1
+mov qword ptr [r12 + {b_nested_vmcs02_launched}], 1
+mov qword ptr [r12 + {b_last_reason}], 0
+mov qword ptr [r12 + {b_last_qualification}], 0
+mov qword ptr [r12 + {b_last_instruction_len}], 0
+xor r10d, r10d
+jmp .Lresident_nested_l2_reflect_generic
+.Lresident_dispatch_nmi_window_internal:
 mov qword ptr [r12 + {b_nested_vmcs02_launched}], 1
 mov qword ptr [r12 + {b_nested_vmcs02_control_cache_valid}], 0
 mov qword ptr [r12 + {b_nested_vmcs02_control_cache_valid} + 8], 0

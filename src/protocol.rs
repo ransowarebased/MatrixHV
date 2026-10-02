@@ -96,6 +96,10 @@ pub const MATRIXHV_STATUS_SIGNATURE_EAX: u32 = 0x4d48_5631;
 pub const MATRIXHV_STATUS_SIGNATURE_EBX: u32 = u32::from_le_bytes(*b"MATR");
 pub const MATRIXHV_STATUS_SIGNATURE_ECX: u32 = u32::from_le_bytes(*b"IXHV");
 pub const MATRIXHV_STATUS_PROTOCOL: u32 = 7;
+// The resident L1 contract excludes legacy hardware task switching and SMX.
+// Query this subleaf before booting a guest that requires either facility.
+pub const MATRIXHV_GUEST_CONTRACT_SUBLEAF: u32 = 54;
+pub const MATRIXHV_GUEST_CONTRACT_UNSUPPORTED: u32 = (1 << 0) | (1 << 1);
 
 // Version-three control buffers use the same C layout in UEFI and Neo.
 const _: () = assert!(core::mem::size_of::<ControlRequest>() == 32);

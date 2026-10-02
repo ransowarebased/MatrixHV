@@ -20,6 +20,8 @@ popfq
 .macro matrixhv_island_observation
 // Diagnostic subleaves expose bounded snapshots, never guest-selected memory.
 .Lresident_dispatch_cpuid_diagnostic:
+cmp ecx, {guest_contract_subleaf}
+je .Lresident_dispatch_cpuid_guest_contract
 xor eax, eax
 xor ebx, ebx
 xor edx, edx
@@ -333,6 +335,12 @@ mov qword ptr [r8 + {b_telemetry_enabled}], 0
 mov qword ptr [r8 + {b_watchdog_deadline}], 0
 .Lresident_dispatch_cpuid_telemetry_state:
 mov eax, dword ptr [r8 + {b_telemetry_enabled}]
+xor ecx, ecx
+xor edx, edx
+jmp .Lresident_dispatch_cpuid_diagnostic_store
+.Lresident_dispatch_cpuid_guest_contract:
+mov eax, 1
+mov ebx, {guest_contract_unsupported}
 xor ecx, ecx
 xor edx, edx
 jmp .Lresident_dispatch_cpuid_diagnostic_store
@@ -1332,6 +1340,8 @@ matrixhv_resident_nested_entry_failure_message
 .Lvmresume_failed_message:
 .ascii "[MATRIXHV][RESIDENT] HV:VMRESUME_FAILED error=0x"
 .Lvmresume_failed_message_end:
+.Lvmresume_status_flags_message:
+.ascii " vmx_status_flags=0x"
 .Lept_test_violation_message:
 .ascii "[MATRIXHV][RESIDENT] HV:EPT_VIOLATION_TEST gpa=0x"
 .Lept_test_violation_message_end:
@@ -1918,9 +1928,14 @@ call .Lresident_serial_hex64
 call .Lresident_serial_state
 .endm
 
-// Failed VMRESUME observation: R12=context, saved guest frame at RSP. Read instruction-error detail, retain it in stop_result and render bounded post-EBS output. Scratch GPRs/flags change; VMCS failure remains terminal, caller owns the halt branch.
+// Read instruction-error detail only for the saved VMfailValid status. An
+// unchanged field after VMfailInvalid is not a diagnostic for this operation.
 .macro matrixhv_diagnostic_vmresume_failure
 resident_diagnostic_message .Lvmresume_failed_message, {vmresume_failed_message_len}
+bt qword ptr [r12 + {b_vmresume_status_flags}], 0
+jc .Lresident_dispatch_vmresume_error_unknown
+bt qword ptr [r12 + {b_vmresume_status_flags}], 6
+jnc .Lresident_dispatch_vmresume_error_unknown
 mov rax, {vm_instruction_error}
 vmread r11, rax
 jc .Lresident_dispatch_vmresume_error_unknown
@@ -1941,6 +1956,10 @@ call .Lresident_paint_byte
 .Lresident_dispatch_vmresume_error_drawn:
 mov rax, qword ptr [r12 + {b_stop_result}]
 call .Lresident_serial_hex64
+resident_diagnostic_message .Lvmresume_status_flags_message, {vmresume_status_flags_message_len}
+mov rax, qword ptr [r12 + {b_vmresume_status_flags}]
+and eax, 0x41
+call .Lresident_serial_hex64
 call .Lresident_serial_state
 .endm
 
@@ -1949,4 +1968,118 @@ call .Lresident_serial_state
 cmp qword ptr [r12 + {b_telemetry_active}], 0
 je .Lresident_dispatch_cpuid_advance
 mov qword ptr [r12 + {b_cpuid_leaf1_ecx}], r10
+.endm
+.macro matrixhv_island_flight_recorder
+// Single writer per vCPU. Commit the sequence last so stopped-machine readers
+// can reject a partially overwritten slot. No allocation, locks or UART I/O.
+.Lresident_flight_record_exit:
+pushfq
+cmp qword ptr [r12 + {b_telemetry_active}], 0
+jne .Lresident_flight_record_save
+cmp byte ptr [rip + matrixhv_resident_island_log_backend], 0
+je .Lresident_flight_record_disabled
+.Lresident_flight_record_save:
+push rax
+push rcx
+push rdx
+push r8
+push r9
+push r10
+push r11
+xor r10d, r10d
+jmp .Lresident_flight_record
+.Lresident_flight_record_entry_failure:
+pushfq
+push rax
+push rcx
+push rdx
+push r8
+push r9
+push r10
+push r11
+mov r10d, 1
+.Lresident_flight_record:
+cmp qword ptr [r12 + {b_flight_frozen}], 0
+jne .Lresident_flight_record_done
+mov r8, qword ptr [r12 + {b_flight_sequence}]
+mov r9, r8
+and r9d, {flight_capacity_mask}
+imul r9, r9, {flight_record_bytes}
+lea r9, [r12 + r9 + {b_flight_records}]
+mov qword ptr [r9], 0
+rdtsc
+shl rdx, 32
+or rax, rdx
+mov qword ptr [r9 + 8], rax
+mov rax, qword ptr [r12 + {b_last_reason}]
+mov qword ptr [r9 + 16], rax
+mov rcx, qword ptr [r12 + {b_last_guest_rip}]
+mov qword ptr [r9 + 24], rcx
+mov rcx, qword ptr [r12 + {b_last_qualification}]
+mov qword ptr [r9 + 32], rcx
+xor r11d, r11d
+and eax, 0xffff
+cmp eax, {ept_violation_reason}
+je .Lresident_flight_record_gpa
+cmp eax, {ept_misconfiguration_reason}
+jne .Lresident_flight_record_gpa_done
+.Lresident_flight_record_gpa:
+test r10d, r10d
+jnz .Lresident_flight_record_gpa_done
+mov eax, {guest_physical_address}
+vmread r11, rax
+ja .Lresident_flight_record_gpa_done
+xor r11d, r11d
+.Lresident_flight_record_gpa_done:
+mov qword ptr [r9 + 40], r11
+mov rax, qword ptr [r12 + {b_processor_number}]
+mov qword ptr [r9 + 48], rax
+mov rax, qword ptr [r12 + {b_nested_active}]
+mov rcx, qword ptr [r12 + {b_nested_l2_active}]
+shl rcx, 1
+or rax, rcx
+mov ecx, r10d
+shl rcx, 32
+or rax, rcx
+mov qword ptr [r9 + 56], rax
+mov rax, qword ptr [r12 + {b_nested_current_vmcs}]
+mov qword ptr [r9 + 64], rax
+xor r11d, r11d
+test r10d, r10d
+jz .Lresident_flight_record_msr_detail
+// VMfailInvalid leaves VM_INSTRUCTION_ERROR unchanged. Do not publish a
+// successful VMREAD of a previous operation as the current entry failure.
+bt qword ptr [rsp + 56], 0
+jc .Lresident_flight_record_error_unknown
+mov eax, {vm_instruction_error}
+vmread r11, rax
+ja .Lresident_flight_record_error_done
+.Lresident_flight_record_error_unknown:
+mov r11, -1
+jmp .Lresident_flight_record_error_done
+.Lresident_flight_record_msr_detail:
+mov eax, dword ptr [r12 + {b_last_reason}]
+and eax, 0xffff
+sub eax, 31
+cmp eax, 1
+ja .Lresident_flight_record_error_done
+// Eight saved qwords and the return address precede the guest GPR frame.
+mov r11d, dword ptr [rsp + 80]
+bts qword ptr [r9 + 56], 33
+.Lresident_flight_record_error_done:
+mov qword ptr [r9 + 72], r11
+inc r8
+mov qword ptr [r9], r8
+mov qword ptr [r12 + {b_flight_sequence}], r8
+.Lresident_flight_record_done:
+pop r11
+pop r10
+pop r9
+pop r8
+pop rdx
+pop rcx
+pop rax
+.Lresident_flight_record_disabled:
+popfq
+ret
 .endm

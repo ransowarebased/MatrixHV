@@ -54,6 +54,80 @@ mod order {
     }
 
     #[test]
+    fn boot_file_paths_join_all_nodes_with_one_separator() {
+        let image_offset = 6 + ("VeraCrypt".len() + 1) * 2;
+        for (directory, file) in [
+            (r"\EFI\VeraCrypt", "DcsBoot.efi"),
+            (r"\EFI\VeraCrypt\", r"\DcsBoot.efi"),
+            (r"EFI\VeraCrypt", r"\DcsBoot.efi"),
+        ] {
+            let mut option = load_option(directory, &[0xaa]);
+            let suffix = load_option(file, &[]);
+            let file_node = &suffix[image_offset + 42..suffix.len() - 4];
+            let end_offset = option.len() - 5;
+            option.splice(end_offset..end_offset, file_node.iter().copied());
+            let path_size = u16::from_le_bytes(option[4..6].try_into().unwrap());
+            option[4..6].copy_from_slice(&(path_size + file_node.len() as u16).to_le_bytes());
+            let parsed = parse_boot_option(&option).unwrap();
+            assert!(parsed.image_file_path_matches(r"\EFI\VeraCrypt\DcsBoot.efi"));
+            assert_eq!(parsed.optional_data, [0xaa]);
+        }
+    }
+
+    #[test]
+    fn boot_file_path_does_not_join_separate_device_instances() {
+        let image_offset = 6 + ("VeraCrypt".len() + 1) * 2;
+        let mut option = load_option(r"\EFI\VeraCrypt", &[]);
+        let end_offset = option.len() - 4;
+        option[end_offset + 1] = 1;
+        let suffix = load_option("DcsBoot.efi", &[]);
+        option.extend_from_slice(&suffix[image_offset..]);
+        let path_size = (option.len() - image_offset) as u16;
+        option[4..6].copy_from_slice(&path_size.to_le_bytes());
+        let parsed = parse_boot_option(&option).unwrap();
+        assert!(!parsed.image_file_path_matches(r"\EFI\VeraCrypt\DcsBoot.efi"));
+    }
+
+    #[test]
+    fn unsigned_partitions_require_matching_geometry() {
+        let mut original = [0_u8; 38];
+        original[..4].copy_from_slice(&1_u32.to_le_bytes());
+        original[4..12].copy_from_slice(&2048_u64.to_le_bytes());
+        original[12..20].copy_from_slice(&4096_u64.to_le_bytes());
+        original[36] = 1;
+        assert!(same_hd_partition(&original, &original));
+        for offset in [0, 4, 12, 36, 37] {
+            let mut candidate = original;
+            candidate[offset] ^= 1;
+            assert!(!same_hd_partition(&original, &candidate));
+        }
+        assert!(!same_hd_partition(&original[..37], &original));
+    }
+
+    #[test]
+    fn signed_partition_matching_uses_only_the_declared_signature() {
+        for signature_type in [1, 2] {
+            let mut original = [0_u8; 38];
+            original[0] = 1;
+            original[20] = 0x5a;
+            original[36] = signature_type;
+            original[37] = signature_type;
+            let mut candidate = original;
+            candidate[4] = 0x80;
+            candidate[12] = 0x40;
+            assert!(same_hd_partition(&original, &candidate));
+            candidate[20] ^= 1;
+            assert!(!same_hd_partition(&original, &candidate));
+            candidate = original;
+            candidate[24] ^= 1;
+            assert_eq!(same_hd_partition(&original, &candidate), signature_type == 1);
+        }
+        let mut reserved = [0_u8; 38];
+        reserved[37] = 3;
+        assert!(!same_hd_partition(&reserved, &reserved));
+    }
+
+    #[test]
     fn rejects_truncated_or_ambiguous_binary_paths() {
         let valid = load_option(r"\EFI\VeraCrypt\DcsBoot.efi", &[]);
         let mut truncated = valid.clone();

@@ -218,12 +218,12 @@ pub fn run_boot_loader(
             guest.cr3,
             event_context,
             ept_test_page.physical_address(),
-            ept_probe_fault_rip,
-            ept_probe_resume_rip,
+            (ept_probe_fault_rip, ept_probe_resume_rip),
             nested_state,
             options.cpuid_presence,
         ));
         (*context).diagnostic_interval_tsc = diagnostic_interval_tsc;
+        (*context).telemetry_probe_active = u64::from(options.vmx_test);
         (*context).watchdog_tsc_hz = watchdog_tsc_hz;
         let shared = event_context as *mut ResidentEventContext;
         (*context).hyperv_timing_supported = u64::from(hyperv::timing_supported(

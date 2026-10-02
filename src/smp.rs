@@ -25,9 +25,26 @@ pub(crate) struct TopologyReport {
     pub(crate) first_enabled_ap: Option<usize>,
 }
 
-pub(crate) fn enumerate() -> Result<TopologyReport, Status> {
+fn open_mp_services() -> Result<boot::ScopedProtocol<MpServices>, Status> {
     let handle = boot::get_handle_for_protocol::<MpServices>().map_err(|error| error.status())?;
-    let mp = boot::open_protocol_exclusive::<MpServices>(handle).map_err(|error| error.status())?;
+    // SAFETY: MP Services is a firmware-owned boot-time interface. Callers use
+    // shared methods and neither unload/disconnect its provider nor exit boot
+    // services while this borrow (including blocking AP callbacks) is live.
+    unsafe {
+        boot::open_protocol::<MpServices>(
+            boot::OpenProtocolParams {
+                handle,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            boot::OpenProtocolAttributes::GetProtocol,
+        )
+    }
+    .map_err(|error| error.status())
+}
+
+pub(crate) fn enumerate() -> Result<TopologyReport, Status> {
+    let mp = open_mp_services()?;
     let count = mp
         .get_number_of_processors()
         .map_err(|error| error.status())?;
@@ -77,8 +94,7 @@ pub(crate) fn enabled_application_processors() -> Result<Vec<usize>, Status> {
         return Err(Status::UNSUPPORTED);
     }
     let mut ap_resources = Vec::new();
-    let handle = boot::get_handle_for_protocol::<MpServices>().map_err(|error| error.status())?;
-    let mp = boot::open_protocol_exclusive::<MpServices>(handle).map_err(|error| error.status())?;
+    let mp = open_mp_services()?;
     for processor_number in 0..topology.total_processors {
         let info = mp
             .get_processor_info(processor_number)
@@ -182,10 +198,7 @@ struct ApProbeContext {
 pub(crate) fn prove_application_processor_vmx(
     processor_number: usize,
 ) -> Result<ApplicationProcessorVmxProofReport, ApplicationProcessorVmxProofError> {
-    let handle = boot::get_handle_for_protocol::<MpServices>()
-        .map_err(|error| ApplicationProcessorVmxProofError::Uefi(error.status()))?;
-    let mp = boot::open_protocol_exclusive::<MpServices>(handle)
-        .map_err(|error| ApplicationProcessorVmxProofError::Uefi(error.status()))?;
+    let mp = open_mp_services().map_err(ApplicationProcessorVmxProofError::Uefi)?;
     let processor_info = mp
         .get_processor_info(processor_number)
         .map_err(|error| ApplicationProcessorVmxProofError::Uefi(error.status()))?;
@@ -312,6 +325,7 @@ fn resources_alias(
 struct ApBatchEntry {
     processor_number: usize,
     launch: *mut c_void,
+    invoked: AtomicBool,
 }
 
 struct ApBatchContext {
@@ -322,18 +336,38 @@ struct ApBatchContext {
 }
 
 pub(crate) fn launch_all(launches: &mut [ResidentApLaunch<'_>]) -> Result<(), ResidentProbeError> {
+    let mp = open_mp_services().map_err(ResidentProbeError::Allocation)?;
+    let count = mp
+        .get_number_of_processors()
+        .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
+    let mut enabled_ap_count = 0;
+    // Reject mismatched batches before any AP can acquire resident resources.
+    for processor_number in 0..count.total {
+        let info = mp
+            .get_processor_info(processor_number)
+            .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
+        let expected = usize::from(info.is_enabled() && !info.is_bsp());
+        let supplied = launches
+            .iter()
+            .filter(|launch| launch.processor_number == processor_number)
+            .count();
+        if supplied != expected {
+            return Err(ResidentProbeError::Allocation(Status::INVALID_PARAMETER));
+        }
+        enabled_ap_count += expected;
+    }
+    if launches.len() != enabled_ap_count {
+        return Err(ResidentProbeError::Allocation(Status::INVALID_PARAMETER));
+    }
     if launches.is_empty() {
         return Ok(());
     }
-    let handle = boot::get_handle_for_protocol::<MpServices>()
-        .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
-    let mp = boot::open_protocol_exclusive::<MpServices>(handle)
-        .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
     let entries: Vec<_> = launches
         .iter_mut()
         .map(|launch| ApBatchEntry {
             processor_number: launch.processor_number,
             launch: (launch as *mut ResidentApLaunch<'_>).cast(),
+            invoked: AtomicBool::new(false),
         })
         .collect();
     let context = ApBatchContext {
@@ -351,7 +385,11 @@ pub(crate) fn launch_all(launches: &mut [ResidentApLaunch<'_>]) -> Result<(), Re
         Some(Duration::from_secs(10)),
     )
     .map_err(|error| ResidentProbeError::Allocation(error.status()))?;
-    if context.callback_failed.load(Ordering::Acquire) {
+    if context.callback_failed.load(Ordering::Acquire)
+        || entries
+            .iter()
+            .any(|entry| !entry.invoked.load(Ordering::Acquire))
+    {
         return Err(ResidentProbeError::Allocation(Status::DEVICE_ERROR));
     }
     Ok(())
@@ -372,7 +410,13 @@ extern "efiapi" fn callback(argument: *mut c_void) {
         context.callback_failed.store(true, Ordering::Release);
         return;
     };
-    unsafe {
-        matrixhv_ap_launch_asm(entry.launch);
+    // Each launch contains a unique mutable resource borrow, so even an
+    // unexpected duplicate firmware callback must not enter it twice.
+    if entry.invoked.swap(true, Ordering::AcqRel) {
+        context.callback_failed.store(true, Ordering::Release);
+        return;
+    }
+    if unsafe { matrixhv_ap_launch_asm(entry.launch) } != 1 {
+        context.callback_failed.store(true, Ordering::Release);
     }
 }

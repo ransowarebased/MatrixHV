@@ -182,7 +182,7 @@ impl NativeSnapshotLayout {
             || layout.stack_bytes == 0
             || layout.stack_bytes > 65536
             || layout.snapshot_bytes != layout.stack_offset + layout.stack_bytes
-            || layout.snapshot_bytes % 16 != 0
+            || !layout.snapshot_bytes.is_multiple_of(16)
             || layout.capacity == 0
             || leaf_limit > 0x10000
         {
@@ -220,10 +220,12 @@ impl NativeSnapshotLayout {
         }
         let first_leaf = 0x4000 + frame_index as u32 * (self.snapshot_bytes / 16) as u32;
         let mut bytes = vec![0; self.snapshot_bytes];
-        for (index, chunk) in bytes.chunks_exact_mut(16).enumerate() {
+        for (index, chunk) in bytes.as_chunks_mut::<16>().0.iter_mut().enumerate() {
             let result = query(first_leaf + index as u32);
             for (word, value) in chunk
-                .chunks_exact_mut(4)
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
                 .zip([result.eax, result.ebx, result.ecx, result.edx])
             {
                 word.copy_from_slice(&value.to_le_bytes());
@@ -231,13 +233,20 @@ impl NativeSnapshotLayout {
         }
         // Published frames are immutable until the next activation resets the count.
         // Recheck both the header and publication state before accepting the stack.
-        for (index, chunk) in bytes[..self.stack_offset].chunks_exact(16).enumerate() {
+        for (index, chunk) in bytes[..self.stack_offset]
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let result = query(first_leaf + index as u32);
             for (word, value) in chunk
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .zip([result.eax, result.ebx, result.ecx, result.edx])
             {
-                if word != value.to_le_bytes() {
+                if *word != value.to_le_bytes() {
                     return Ok(None);
                 }
             }
@@ -754,12 +763,12 @@ fn append_nested_failure_trace(text: &mut String, cpu: u32, extended_invept: boo
         } else {
             None
         };
-        if let Some((name, required_control)) = nested_vmcs_field_details(vmcs_field) {
-            if matches!(exit_reason & 0xffff, 23 | 25) {
-                writeln!(text, "{entry}.vmcs_field_name={name}").unwrap();
-                if let Some(required_control) = required_control {
-                    writeln!(text, "{entry}.required_control={required_control}").unwrap();
-                }
+        if let Some((name, required_control)) = nested_vmcs_field_details(vmcs_field)
+            && matches!(exit_reason & 0xffff, 23 | 25)
+        {
+            writeln!(text, "{entry}.vmcs_field_name={name}").unwrap();
+            if let Some(required_control) = required_control {
+                writeln!(text, "{entry}.required_control={required_control}").unwrap();
             }
         }
         if capability_field.is_some() {

@@ -9,8 +9,13 @@ import sys
 import traceback
 
 import ida_dbg
+import ida_bytes
+import ida_ida
 import ida_idd
+import ida_idp
 import ida_pro
+import ida_segment
+import ida_ua
 import idc
 
 
@@ -54,9 +59,12 @@ def append_u64_fields(source, prefix):
             size = 8 if element == "u64" else 4
             offset = (offset + size - 1) // size * size
             count = int(length) if length.isdecimal() else int(
-                re.search(r"const " + re.escape(length) + r": usize = (\d+)", nested)[1]
+                re.search(r"const " + re.escape(length) + r": usize = (\d+)", resident + nested)[1]
             )
             for index in range(count):
+                if name == "flight_recorder_records" and index not in (0, count - 1):
+                    offset += size
+                    continue
                 fields[f"{prefix}{name}.{index}"] = offset
                 formats[f"{prefix}{name}.{index}"] = "<Q" if element == "u64" else "<I"
                 offset += size
@@ -71,12 +79,22 @@ reference_serial = os.environ.get("MATRIXHV_REFERENCE_SERIAL")
 serial_path = Path(reference_serial) if reference_serial else output / "serial.log"
 result = {"cpus": [], "contexts": []}
 exit_code = 1
+attached = False
 try:
+    if not ida_idp.set_processor_type("metapc", ida_idp.SETPROC_LOADER):
+        raise RuntimeError("Intel x86 processor module unavailable")
+    ida_ida.inf_set_app_bitness(64)
     if not ida_dbg.load_debugger("gdb", True):
         raise RuntimeError("GDB debugger unavailable")
     ida_dbg.set_remote_debugger("127.0.0.1", "", 8864)
     print("START", ida_dbg.start_process("", "", ""))
-    print("EVENT", ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, 10))
+    event = ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, 10)
+    print("EVENT", event)
+    attached = ida_dbg.get_process_state() != ida_dbg.DSTATE_NOTASK
+    if event <= 0 or ida_dbg.get_process_state() != ida_dbg.DSTATE_SUSP:
+        raise RuntimeError("Debugger did not suspend the VM")
+    if ida_dbg.get_thread_qty() == 0:
+        raise RuntimeError("Debugger returned no CPUs")
     names = [descriptor[0].upper() for descriptor in ida_idd.dbg_get_registers()]
     for index in range(ida_dbg.get_thread_qty()):
         thread = ida_dbg.getn_thread(index)
@@ -84,6 +102,8 @@ try:
         registers = dict(zip(names, (value.ival for value in ida_dbg.get_reg_vals(thread))))
         rip = registers["RIP"]
         instructions = idc.get_bytes(rip, 32, True)
+        if instructions is None or len(instructions) != 32:
+            raise RuntimeError(f"Cannot read instruction bytes for CPU {thread}")
         cpu = {"thread": thread, "registers": registers,
                "cr3": idc.send_dbg_command("r cr3"),
                "rip_bytes": instructions.hex() if instructions else None}
@@ -148,6 +168,21 @@ try:
         values = {name: struct.unpack_from(formats[name], data, field_offset)[0]
                   for name, field_offset in fields.items()}
         (output / f"{sample}-context-{address:x}.bin").write_bytes(data)
+        recorder_offset = fields["flight_recorder_records.0"]
+        sequence = values["flight_recorder_sequence"]
+        records = []
+        for index in range(2048):
+            record = struct.unpack_from("<10Q", data, recorder_offset + index * 80)
+            if max(0, sequence - 2048) < record[0] <= sequence:
+                entry = dict(zip(("sequence", "tsc", "reason", "rip", "qualification", "gpa", "vcpu", "flags", "vmcs", "detail"), record))
+                entry["instruction_error"] = entry["detail"] if entry["flags"] & (1 << 32) else None
+                entry["msr"] = entry["detail"] if entry["flags"] & (1 << 33) else None
+                records.append(entry)
+        records.sort(key=lambda record: record["sequence"])
+        (output / f"{sample}-flight-{address:x}.json").write_text(json.dumps({
+            "context": address, "sequence": sequence,
+            "frozen": values["flight_recorder_frozen"], "records": records,
+        }, indent=2))
         if values["canary_start"] != 0x4856424F4F544331 or values["canary_end"] != 0x4856424F4F544332:
             raise RuntimeError("Resident context layout or canaries are invalid")
         event_address = values["event_context"]
@@ -187,12 +222,48 @@ try:
     (output / f"{sample}-state.json").write_text(json.dumps(result, indent=2))
     exit_code = 0
 except Exception:
+    result["error"] = traceback.format_exc()
     (output / f"{sample}-state.json").write_text(json.dumps(result, indent=2))
     traceback.print_exc()
 finally:
     try:
-        print("VIRTUAL", idc.send_dbg_command("virt"))
-        print("RESUME", ida_dbg.continue_process())
-        print("DETACH", ida_dbg.detach_process())
+        if attached:
+            print("VIRTUAL", idc.send_dbg_command("virt"))
+            print("DETACH", ida_dbg.detach_process())
+            ida_dbg.wait_for_next_event(ida_dbg.WFNE_ANY, 10)
+        if exit_code == 0:
+            if ida_dbg.get_process_state() != ida_dbg.DSTATE_NOTASK:
+                raise RuntimeError("Debugger remained attached after capture")
+            # Decode only after detaching; copied bytes belong to this empty IDB.
+            for cpu in result["cpus"]:
+                rip = cpu["registers"]["RIP"]
+                code = bytes.fromhex(cpu["rip_bytes"])
+                start = rip & ~0xFFF
+                end = (rip + len(code) + 0xFFF) & ~0xFFF
+                if not ida_segment.get_segment_info(None, rip):
+                    if not ida_segment.add_segm(0, start, end, "VM_SNAPSHOT", "CODE"):
+                        raise RuntimeError(f"Cannot create snapshot segment at {start:#x}")
+                if not ida_segment.set_segment_addressing(rip, 2):
+                    raise RuntimeError("Cannot select 64-bit snapshot addressing")
+                ida_bytes.put_bytes(rip, code)
+                cpu["disassembly"] = []
+                cursor = rip
+                while cursor < rip + len(code) and len(cpu["disassembly"]) < 8:
+                    instruction = ida_ua.insn_t()
+                    size = ida_ua.decode_insn(instruction, cursor)
+                    if size == 0 or cursor + size > rip + len(code):
+                        break
+                    idc.create_insn(cursor)
+                    cpu["disassembly"].append({"address": cursor, "size": size,
+                                               "text": idc.generate_disasm_line(cursor, 0)})
+                    cursor += size
+                if not cpu["disassembly"]:
+                    raise RuntimeError(f"Cannot decode CPU {cpu['thread']} instruction bytes")
+            (output / f"{sample}-state.json").write_text(json.dumps(result, indent=2))
+    except Exception:
+        result["error"] = traceback.format_exc()
+        (output / f"{sample}-state.json").write_text(json.dumps(result, indent=2))
+        traceback.print_exc()
+        exit_code = 1
     finally:
         ida_pro.qexit(exit_code)

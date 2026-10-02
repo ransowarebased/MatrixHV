@@ -348,6 +348,7 @@ mod control {
 
 #[cfg(test_harness = "hyperv_time")]
 mod hyperv_time {
+    include!("hyperv_time_regressions.rs");
     include!("../builds/hyperv-time-tests/definitions.rs");
     core::arch::global_asm!(include_str!("../builds/hyperv-time-tests/handlers.S"));
 
@@ -361,7 +362,7 @@ mod hyperv_time {
     }
 
     struct Scenario {
-        context: [u64; 8],
+        context: [u64; 11],
         shared: Box<[u64; 10]>,
         page: Box<Page>,
         tables: Box<[Page; 4]>,
@@ -395,6 +396,9 @@ mod hyperv_time {
                 2_496_000_000,
                 tables[0].0.as_ptr() as u64,
                 1,
+                0,
+                0,
+                0,
                 0,
                 0,
                 0,
@@ -480,7 +484,7 @@ mod hyperv_time {
         scenario.context[1] = 0;
         scenario.shared[8] = u64::from(native_hyperv_invariant_tsc(cpuid));
         assert_eq!(scenario.shared[8], 1);
-        assert_eq!(native_hyperv_reference_tsc(cpuid, 12345), (0, 0));
+        assert_ne!(native_hyperv_reference_tsc(cpuid, 12345, || 0).0, 0);
         assert_eq!(scenario.msr(9, 1), (1, 1));
         assert_eq!(scenario.msr(8, 0), (1, 1));
     }
@@ -503,7 +507,7 @@ mod hyperv_time {
     }
 
     #[test]
-    fn invariant_tsc_access_depends_on_native_support_without_changing_advertised_features() {
+    fn invariant_tsc_access_and_advertisement_follow_native_support() {
         let mut scenario = Scenario::new();
         for (timing, evmcs, features) in [(1, 1, 0x272), (1, 0, 0x262), (0, 1, 0x70)] {
             scenario.context[1] = timing;
@@ -513,7 +517,7 @@ mod hyperv_time {
             assert_eq!(scenario.msr(8, 0).0, 0);
             assert_eq!(scenario.msr(9, 1).0, 0);
             scenario.shared[8] = 1;
-            assert_eq!(scenario.features(0x4000_0003), [features, 0, 0, 0]);
+            assert_eq!(scenario.features(0x4000_0003), [features | (1 << 15), 0, 0, 0]);
             assert_eq!(scenario.msr(8, 0), (1, 0));
             assert_eq!(scenario.msr(9, 0).0, 1);
         }
@@ -661,7 +665,7 @@ mod hyperv_time {
                 assert_eq!(scenario.msr(2, 0).0, 1);
                 assert_eq!(translated.0[0], 0);
             } else {
-                assert_eq!(translated.0[0] & 0xffffffffffff, 0xc300000002b8);
+                assert_eq!(translated.0[0] as u32, 0xc3c1010f);
             }
         }
     }
@@ -673,9 +677,9 @@ mod hyperv_time {
         assert_eq!(scenario.msr(2, address | 1).0, 1);
         scenario.tables[3].0[((address >> 12) & 511) as usize] &= !2;
         let before = scenario.page.0;
-        assert_eq!(scenario.msr(2, 0).0, 1);
+        assert_eq!(scenario.msr(2, 0).0, 0);
         assert_eq!(scenario.page.0, before);
-        assert_eq!(scenario.msr(1, 0), (1, 0));
+        assert_eq!(scenario.msr(1, 0), (1, address | 1));
         assert_eq!(scenario.shared[3], 0);
     }
 
@@ -698,6 +702,7 @@ mod hyperv_time {
     fn unsupported_reference_time_defers_to_the_parent_hypervisor() {
         let mut scenario = Scenario::new();
         scenario.context[1] = 0;
+        scenario.context[4] = 0;
         for operation in 0..4 {
             assert_eq!(scenario.msr(operation, 1).0, 2);
         }
@@ -739,7 +744,7 @@ mod hyperv_time {
             1
         );
         assert_eq!(scenario.msr(5, 0), (1, address | 1));
-        assert_eq!(scenario.page.0[0] & 0xffffffffffff, 0xc300000002b8);
+        assert_eq!(scenario.page.0[0] as u32, 0xc3c1010f);
         assert_eq!(scenario.shared[6], 0);
         assert_eq!(scenario.msr(6, 0).0, 1);
         registers = [0; 2];
@@ -823,7 +828,7 @@ mod hyperv_time {
         let mut scenario = Scenario::new();
         let address = scenario.page.0.as_ptr() as u64;
         assert_eq!(scenario.msr(6, 1).0, 1);
-        assert_eq!(scenario.msr(7, address | 7).0, 0);
+        assert_eq!(scenario.msr(7, (address + 4096) | 3).0, 0);
         assert_eq!(scenario.shared[6], 0);
         scenario.tables[3].0[((address >> 12) & 511) as usize] &= !2;
         assert_eq!(scenario.msr(7, address | 3).0, 0);
@@ -865,6 +870,11 @@ mod hyperv_time {
 }
 
 #[cfg(test_harness = "msr")]
+mod cr_access {
+    include!("resident_cr_tests.rs");
+}
+
+#[cfg(test_harness = "msr")]
 mod msr {
     include!("../builds/resident-msr-tests/definitions.rs");
 
@@ -873,9 +883,73 @@ mod msr {
     global_asm!(include_str!(
         "../builds/resident-msr-tests/resident-hyperv-apic.S"
     ));
+    global_asm!(include_str!(
+        "../builds/resident-msr-tests/resident-hyperv-parent.S"
+    ));
+    global_asm!(include_str!(
+        "../builds/resident-msr-tests/resident-private-vmcall.S"
+    ));
 
     unsafe extern "C" {
         fn test_hyperv_apic(context: *mut u64, registers: *mut u64, write: u32) -> u32;
+        fn test_parent_msr_access(context: *const u64, index: u32) -> u32;
+        fn test_private_vmcall(context: *const u64, code: u64) -> u32;
+    }
+
+    #[test]
+    fn synthetic_msr_passthrough_requires_the_parent_to_own_the_interface() {
+        for timing in [false, true] {
+            for evmcs in [false, true] {
+                let context = [u64::from(timing), u64::from(evmcs)];
+                for index in [0x4000_0000, 0x4000_0002, 0x4000_0083, 0x4000_0fff] {
+                    assert_eq!(
+                        unsafe { test_parent_msr_access(context.as_ptr(), index) },
+                        u32::from(!timing && !evmcs),
+                        "timing={timing} evmcs={evmcs} index={index:#x}"
+                    );
+                }
+                for index in [0, 0x808, 0x3fff_ffff, 0x4000_1000, 0xc000_0080, u32::MAX] {
+                    assert_eq!(unsafe { test_parent_msr_access(context.as_ptr(), index) }, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn private_lifecycle_vmcalls_reject_unprivileged_callers_before_dispatch() {
+        for denied in [false, true] {
+            let context = [u64::from(denied), 1];
+            for code in [
+                0x4856_4150_5245_4144,
+                0x4856_5354_4152_5421,
+                0x4d41_5452_4958_5042,
+                0x4d41_5452_4958_4f50,
+                0x4d41_5452_4958_4f43,
+                0x4856_5354_4f50_2121,
+                0x4856_4e56_4d46_4149,
+            ] {
+                assert_eq!(
+                    unsafe { test_private_vmcall(context.as_ptr(), code) },
+                    u32::from(!denied),
+                    "denied={denied} code={code:#x}"
+                );
+            }
+            for code in [0, 8, u64::MAX] {
+                assert_eq!(unsafe { test_private_vmcall(context.as_ptr(), code) }, 2);
+            }
+            assert_eq!(unsafe { test_private_vmcall(context.as_ptr(), 0x564d_5868) }, 3);
+        }
+    }
+
+    #[test]
+    fn probe_failure_vmcall_is_disabled_outside_the_startup_probe() {
+        for denied in [false, true] {
+            let context = [u64::from(denied), 0];
+            assert_eq!(
+                unsafe { test_private_vmcall(context.as_ptr(), 0x4856_4e56_4d46_4149) },
+                0
+            );
+        }
     }
 
     #[test]
@@ -885,7 +959,7 @@ mod msr {
             (0x4000_0071, 0x830),
             (0x4000_0072, 0x808),
         ] {
-            let mut context = [1, 0xfee0_0c00, 0, 0];
+            let mut context = [1, 0xfee0_0c00, 0, 0, 0];
             let mut registers = [0, synthetic_msr, 0];
             assert_eq!(
                 unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
@@ -908,7 +982,7 @@ mod msr {
                     1
                 );
                 let expected = if synthetic_msr == 0x4000_0071 {
-                    0x1200_0000_0000_0034
+                    0x0000_0012_0000_0034
                 } else {
                     0x34
                 };
@@ -916,12 +990,11 @@ mod msr {
             }
         }
         for (msr, low, high) in [
-            (0x4000_0070, 1, 0),
             (0x4000_0070, 0, 1),
             (0x4000_0072, 0x100, 0),
             (0x4000_0072, 0, 1),
         ] {
-            let mut context = [1, 0xfee0_0c00, 0, 0];
+            let mut context = [1, 0xfee0_0c00, 0, 0, 0];
             let mut registers = [low, msr, high];
             assert_eq!(
                 unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
@@ -936,7 +1009,7 @@ mod msr {
         #[repr(C, align(4096))]
         struct ApicPage([u32; 1024]);
         let mut page = ApicPage([0; 1024]);
-        let mut context = [1, page.0.as_mut_ptr() as u64 | 0x800, 0, 0];
+        let mut context = [1, page.0.as_mut_ptr() as u64 | 0x800, 0, 0, 0];
         let mut registers = [0x45, 0x4000_0071, 0x1200_0000];
         assert_eq!(
             unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
@@ -965,9 +1038,9 @@ mod msr {
     }
 
     #[test]
-    fn hyperv_icr_translates_x2apic_destination_and_broadcast() {
-        for (destination, native_destination) in [(0x1200_0000, 0x12), (0xff00_0000, 0xffff_ffff)] {
-            let mut context = [1, 0xfee0_0c00, 0, 0];
+    fn hyperv_icr_preserves_full_x2apic_destinations_and_broadcast() {
+        for (destination, native_destination) in [(0x12, 0x12), (0xffff_ffff, 0xffff_ffff), (0x1234_00a5, 0x1234_00a5)] {
+            let mut context = [1, 0xfee0_0c00, 0, 0, 0];
             let mut registers = [0x45, 0x4000_0071, destination];
             assert_eq!(
                 unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
@@ -977,6 +1050,36 @@ mod msr {
             assert_eq!(context[3], (native_destination << 32) | 0x45);
             assert_eq!(registers, [0x45, 0x4000_0071, destination]);
         }
+    }
+
+    #[test]
+    fn hyperv_eoi_accepts_low_values_and_normalizes_the_native_x2apic_write() {
+        for value in [1, 0xff, u32::MAX as u64] {
+            let mut context = [1, 0xfee0_0c00, 0, u64::MAX, 0];
+            let mut registers = [value, 0x4000_0070, 0];
+            assert_eq!(unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) }, 1);
+            assert_eq!(&context[2..4], &[0x80b, 0]);
+        }
+    }
+
+    #[test]
+    fn hyperv_xapic_denies_unmapped_bases_including_zero_without_native_msr_access() {
+        for base in [0, 0x1234_5000] {
+            for write in [0, 1] {
+                let mut context = [1, base | 0x800, 0, 0, base];
+                let mut registers = [0, 0x4000_0072, 0];
+                assert_eq!(unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), write) }, 0);
+                assert_eq!(context[2], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn hyperv_x2apic_logical_icr_keeps_cluster_and_processor_mask() {
+        let mut context = [1, 0xfee0_0c00, 0, 0, 0];
+        let mut registers = [0x845, 0x4000_0071, 0x1234_a005];
+        assert_eq!(unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) }, 1);
+        assert_eq!(context[3], 0x1234_a005_0000_0845);
     }
 
     struct ResidentPages {
@@ -1432,7 +1535,7 @@ mod msr {
         l2_active: u64,
         l1_pin: u64,
         control_cache: [u64; 2],
-        vmcs: [u64; 4],
+        vmcs: [u64; 5],
     }
 
     global_asm!(
@@ -1446,6 +1549,7 @@ mod msr {
         guest_interruptibility_info = const 1,
         guest_activity_state = const 2,
         cpu_based_vm_exec_control = const 3,
+        guest_pending_dbg_exceptions = const 4,
     );
 
     unsafe extern "C" {
@@ -1457,7 +1561,7 @@ mod msr {
         for (event, blocking) in [(0x8000030e, 0), (0, 1), (0, 2), (0, 8)] {
             let mut context = NmiContext {
                 pending: 1,
-                vmcs: [event, blocking, 0, 0],
+                vmcs: [event, blocking, 0, 0, 0],
                 ..Default::default()
             };
             unsafe { test_deliver_nmi(&mut context) };
@@ -1468,33 +1572,50 @@ mod msr {
     }
 
     #[test]
+    fn pending_debug_trap_precedes_physical_nmi_delivery() {
+        for pending_debug in [1 << 12, 1 << 14, (1 << 12) | (1 << 14)] {
+            let mut context = NmiContext {
+                pending: 1,
+                vmcs: [0, 0, 0, 0, pending_debug],
+                ..Default::default()
+            };
+            unsafe { test_deliver_nmi(&mut context) };
+            assert_eq!(context.pending, 1);
+            assert_eq!(context.vmcs[0], 0);
+            assert_eq!(context.vmcs[3], 1 << 22);
+        }
+    }
+
+    #[test]
     fn nmi_delivery_wakes_halted_guests_and_respects_wait_for_sipi() {
         let mut context = NmiContext {
             pending: 1,
-            vmcs: [0, 0, 1, 0],
+            vmcs: [0, 0, 1, 0, 0],
             ..Default::default()
         };
         unsafe { test_deliver_nmi(&mut context) };
         assert_eq!(context.pending, 0);
-        assert_eq!(context.vmcs, [0x80000202, 0, 0, 0]);
+        assert_eq!(context.vmcs, [0x80000202, 0, 0, 0, 0]);
         context.pending = 1;
-        context.vmcs = [0, 0, 3, 0];
+        context.vmcs = [0, 0, 3, 0, 0];
         unsafe { test_deliver_nmi(&mut context) };
         assert_eq!(context.pending, 1);
-        assert_eq!(context.vmcs, [0, 0, 3, 0]);
+        assert_eq!(context.vmcs, [0, 0, 3, 0, 0]);
     }
 
     #[test]
-    fn root_nmi_waits_for_l1_when_l1_owns_nmi_exits() {
+    fn root_nmi_arms_l2_window_when_l1_owns_nmi_exits() {
         let mut context = NmiContext {
             pending: 1,
             l2_active: 1,
             l1_pin: 8,
+            control_cache: [u64::MAX; 2],
             ..Default::default()
         };
         unsafe { test_deliver_nmi(&mut context) };
         assert_eq!(context.pending, 1);
-        assert_eq!(context.vmcs, [0; 4]);
+        assert_eq!(context.vmcs, [0, 0, 0, 1 << 22, 0]);
+        assert_eq!(context.control_cache, [0; 2]);
         context.l2_active = 0;
         unsafe { test_deliver_nmi(&mut context) };
         assert_eq!(context.pending, 0);
@@ -1682,6 +1803,13 @@ mod telemetry {
             );
         }
         result
+    }
+
+    #[test]
+    fn l1_contract_explicitly_excludes_hardware_task_switching_and_smx() {
+        let mut context = [0; 1024];
+        let mut shared = [0; 1024];
+        assert_eq!(diagnostic(&mut context, &mut shared, 54), [1, 3, 0, 0]);
     }
 
     #[test]
@@ -2202,6 +2330,10 @@ mod visual {
         runtime_set_variable: u64,
         runtime_context: u64,
         native_storage_runtime: [u64; 64],
+        primary_controls: u64,
+        nested_l2_active: u64,
+        vmcs02_control_cache_valid: [u64; 2],
+        root_vmx_active: u64,
     }
 
     #[repr(C)]
@@ -2230,6 +2362,11 @@ mod visual {
         b_nested_eptp_sync_nmi = const core::mem::offset_of!(EventContext, sync_nmi),
         b_nmi_count = const core::mem::offset_of!(EventContext, nmi_count),
         b_telemetry_enabled = const core::mem::offset_of!(EventContext, telemetry_enabled),
+        b_nested_l2_active = const core::mem::offset_of!(EventContext, nested_l2_active),
+        b_nested_vmcs02_control_cache_valid = const core::mem::offset_of!(EventContext, vmcs02_control_cache_valid),
+        b_root_vmx_active = const core::mem::offset_of!(EventContext, root_vmx_active),
+        cpu_based_vm_exec_control = const 0x4002,
+        test_primary_controls = const core::mem::offset_of!(EventContext, primary_controls),
         visual_marker_step_bytes = const MARKER_STEP * 4,
         visual_marker_row_step = const MARKER_ROW_STEP,
         visual_marker_side = const MARKER_SIDE,
@@ -2563,6 +2700,10 @@ mod visual {
             runtime_set_variable: 0,
             runtime_context: 0,
             native_storage_runtime: [0; 64],
+            primary_controls: 0,
+            nested_l2_active: 0,
+            vmcs02_control_cache_valid: [0; 2],
+            root_vmx_active: 1,
             visual_base: pixels.as_mut_ptr().wrapping_add(WIDTH * 16 + 16) as u64,
             visual_stride_bytes: (WIDTH * 4) as u64,
             host_fault_vector: 0,
@@ -2727,6 +2868,10 @@ mod visual {
             runtime_set_variable: 0,
             runtime_context: 0,
             native_storage_runtime: [0; 64],
+            primary_controls: 0,
+            nested_l2_active: 0,
+            vmcs02_control_cache_valid: [0; 2],
+            root_vmx_active: 1,
             visual_base: 0,
             visual_stride_bytes: (WIDTH * 4) as u64,
             host_fault_vector: 0,
@@ -2868,12 +3013,18 @@ mod visual {
         let mut event_context = context(&mut pixels);
         for vector in 0..32 {
             event_context.diagnostic_halted = 0;
+            if vector == 2 {
+                event_context.nested_l2_active = 1;
+                event_context.vmcs02_control_cache_valid = [1, 1];
+            }
             let has_error_code = [8, 10, 11, 12, 13, 14, 17, 21, 29, 30].contains(&vector);
             let fault_rip = 0x1234_5678_90ab_cdef;
             unsafe { test_exception_frame(vector, &mut event_context, 0x55, fault_rip) };
             if vector == 2 {
                 assert_eq!(event_context.nmi_pending, 1);
                 assert_eq!(event_context.nmi_count, 1);
+                assert_ne!(event_context.primary_controls & (1 << 22), 0);
+                assert_eq!(event_context.vmcs02_control_cache_valid, [0, 0]);
                 assert_eq!(event_context.diagnostic_halted, 0);
                 continue;
             }

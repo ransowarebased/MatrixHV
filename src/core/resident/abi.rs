@@ -14,6 +14,9 @@ pub const CONTEXT_CANARY_END: u64 = 0x4856_5245_5349_4432;
 pub const CONTEXT_CANARY_START: u64 = 0x4856_5245_5349_4431;
 pub const BOOT_CONTEXT_CANARY_END: u64 = 0x4856_424f_4f54_4332;
 pub const BOOT_CONTEXT_CANARY_START: u64 = 0x4856_424f_4f54_4331;
+pub const FLIGHT_RECORDER_CAPACITY: usize = 2048;
+pub const FLIGHT_RECORDER_RECORD_BYTES: usize = 80;
+pub const FLIGHT_RECORDER_WORD_COUNT: usize = 20480;
 use crate::hv_core::bridge::ControlCpuState;
 use crate::memory::PAGE_SIZE;
 use crate::nested::{NestedVmcs12State, NestedVmxState};
@@ -152,6 +155,7 @@ pub struct ResidentBootContext {
     pub entry_failure_state: u64,
     pub entry_failure_exit: u64,
     pub entry_failure_tsc: u64,
+    pub vmresume_status_flags: u64,
     pub entry_failure: WatchdogGuestState,
     pub last_before: WatchdogGuestState,
     pub last_after_handler: WatchdogGuestState,
@@ -164,10 +168,14 @@ pub struct ResidentBootContext {
     pub mtf_exits: u64,
     pub invept_exits: u64,
     pub preemption_timer_exits: u64,
+    pub flight_recorder_sequence: u64,
+    pub flight_recorder_frozen: u64,
+    pub flight_recorder_records: [u64; FLIGHT_RECORDER_WORD_COUNT],
     pub nested: NestedVmxState,
     pub original_gdtr: [u8; 10],
     pub original_idtr: [u8; 10],
     pub root_fx_state: RootFxState,
+    pub root_vmx_active: u64,
 }
 
 pub const RESIDENT_BOOT_CONTEXT_PAGES: usize = size_of::<ResidentBootContext>().div_ceil(PAGE_SIZE);
@@ -178,8 +186,7 @@ impl ResidentBootContext {
         initial_guest_cr3: u64,
         event_context: u64,
         ept_test_gpa: u64,
-        ept_probe_fault_rip: u64,
-        ept_probe_resume_rip: u64,
+        (ept_probe_fault_rip, ept_probe_resume_rip): (u64, u64),
         nested: NestedVmxState,
         cpuid_presence: bool,
     ) -> Self {
@@ -259,6 +266,7 @@ impl ResidentBootContext {
             entry_failure_state: 0,
             entry_failure_exit: 0,
             entry_failure_tsc: 0,
+            vmresume_status_flags: 0,
             entry_failure: WatchdogGuestState {
                 rip: 0,
                 rsp: 0,
@@ -303,10 +311,14 @@ impl ResidentBootContext {
             mtf_exits: 0,
             invept_exits: 0,
             preemption_timer_exits: 0,
+            flight_recorder_sequence: 0,
+            flight_recorder_frozen: 0,
+            flight_recorder_records: [0; FLIGHT_RECORDER_WORD_COUNT],
             nested,
             original_gdtr: [0; 10],
             original_idtr: [0; 10],
             root_fx_state: RootFxState([0; 512]),
+            root_vmx_active: 0,
         }
     }
 }

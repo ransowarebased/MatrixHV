@@ -11,6 +11,10 @@ resident_telemetry_counter inc, {b_rdmsr_count}, {b_telemetry_active}
 call .Lresident_guest_privilege
 jc .Lresident_dispatch_inject_gp
 mov ecx, dword ptr [rsp + 8]
+mov eax, ecx
+sub eax, {hv_msr_base}
+cmp eax, {hv_msr_range_span}
+ja .Lresident_dispatch_rdmsr_apic_checked
 matrixhv_resident_hyperv_rdmsr_route
 .Lresident_dispatch_rdmsr_apic_checked:
 cmp ecx, {platform_id_msr}
@@ -113,6 +117,8 @@ jz .Lresident_dispatch_inject_gp
 mov ecx, r10d
 jmp .Lresident_dispatch_rdmsr_passthrough
 .Lresident_dispatch_rdmsr_passthrough:
+call .Lresident_hyperv_require_parent_msr
+jc .Lresident_dispatch_inject_gp
 call .Lresident_guarded_rdmsr
 jc .Lresident_dispatch_inject_gp
 mov qword ptr [rsp + 0], rax
@@ -173,6 +179,10 @@ resident_telemetry_counter inc, {b_wrmsr_count}, {b_telemetry_active}
 call .Lresident_guest_privilege
 jc .Lresident_dispatch_inject_gp
 mov ecx, dword ptr [rsp + 8]
+mov eax, ecx
+sub eax, {hv_msr_base}
+cmp eax, {hv_msr_range_span}
+ja .Lresident_dispatch_wrmsr_apic_checked
 matrixhv_resident_hyperv_wrmsr_route
 .Lresident_dispatch_wrmsr_apic_checked:
 cmp ecx, {apic_base_msr}
@@ -344,6 +354,8 @@ call .Lresident_update_dirty_mtrrs
 call .Lresident_advance_guest_rip
 jmp .Lresident_dispatch_resume
 .Lresident_dispatch_wrmsr_passthrough:
+call .Lresident_hyperv_require_parent_msr
+jc .Lresident_dispatch_inject_gp
 mov eax, dword ptr [rsp + 0]
 mov edx, dword ptr [rsp + 16]
 call .Lresident_guarded_wrmsr

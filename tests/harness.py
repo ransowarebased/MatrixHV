@@ -76,7 +76,13 @@ def read_resident_assembly(project: Path) -> str:
                 if count < 1 or (name.startswith("matrixhv_") and count != 1):
                     expected = "one" if name.startswith("matrixhv_") else "at least one"
                     raise ValueError(f"Expected {expected} resident expansion for {name}, found {count}")
-            return "\n".join(helpers) + island
+            result = "\n".join(helpers) + island
+            hyperv = (project / "src/hyperv.rs").read_text(encoding="utf-8")
+            values = {name: int(value.replace("_", ""), 0) for name, value in re.findall(
+                r"pub const (HYPERV\w*): u32 = (0x[0-9a-fA-F_]+|[0-9_]+);", hyperv)}
+            aliases = {"vendor_leaf": "HYPERVISOR_LEAF_START", "msr_base": "HYPERV_GUEST_OS_ID_MSR"}
+            return re.sub(r"\{hv_(\w+)\}", lambda match: str(values[
+                aliases.get(match[1], "HYPERV_" + match[1].upper())]), result)
     raise ValueError("Cyclic resident assembly macro composition")
 
 
@@ -87,6 +93,9 @@ def prepare_boot_order(project: Path):
     start = source.index("mod boot_order {")
     end = source.index("\npub(crate) mod memory_map {", start)
     parser = source[start:end]
+    start = source.index("fn same_hd_partition(")
+    end = source.index("\npub fn initialize_boot_environment(", start)
+    parser += "\n" + source[start:end]
     (output / "definitions.rs").write_text(parser, encoding="utf-8")
 
 
@@ -245,6 +254,31 @@ def prepare_evmcs(project: Path):
     output = project / "builds" / "evmcs-tests"
     output.mkdir(parents=True, exist_ok=True)
     source = read_resident_assembly(project)
+    nested_rust = (project / 'src/nested.rs').read_text(encoding='utf-8')
+    width_start = nested_rust.index('        let physical_address_bits =')
+    width_end = nested_rust.index('        Self {', width_start)
+    width = nested_rust[width_start:width_end].replace('__cpuid', 'cpuid')
+    (output / 'physical-width.rs').write_text(
+        'fn test_physical_width(cpuid: impl Fn(u32) -> core::arch::x86_64::CpuidResult) -> u32 {\n'
+        + width + '\nphysical_address_bits\n}\n', encoding='utf-8')
+    event = source[source.index('.Lresident_nested_entry_event_is_valid:'):
+                   source.index('.Lresident_nested_value_is_canonical:')]
+    tsc_start = source.index('mov rax, {tsc_offset}\nmov r11, qword ptr [r12 + {b_nested_inherited_l1_tsc_offset}]')
+    tsc = source[tsc_start:source.index('call .Lresident_nested_write_vmcs02_control', tsc_start)]
+    validation = '''
+    .text
+    .globl test_entry_event
+    test_entry_event:
+        push r12
+        mov r12, rcx
+        call .Lresident_nested_entry_event_is_valid
+        pop r12
+        ret
+    .globl test_tsc_composition
+    test_tsc_composition:
+        push r12
+        mov r12, rcx
+    ''' + tsc + '\nmov rax, r11\npop r12\nret\n' + event
     completion = source.split('call .Lresident_nested_complete_vmcs02_msr_exit\n', 1)[1].split(
         'mov qword ptr [r12 + {b_nested_l2_active}], 0', 1)[0]
     completion = '.Ltest_complete_evmcs_exit:\n' + completion + 'ret\n'
@@ -259,6 +293,15 @@ def prepare_evmcs(project: Path):
                      source.index('.Lresident_dispatch_vmlaunch:')]
     vmclear = vmclear.replace('vmread r11, rax', 'xor r11d, r11d\ncmp r12, 0')
     vmclear = re.sub(r'^vmclear .*$', 'cmp r12, 0', vmclear, flags=re.MULTILINE)
+    vmptrld = source[source.index('.Lresident_dispatch_vmptrld:'):
+                     source.index('.Lresident_dispatch_vmptrst:')]
+    vmptrld = vmptrld.replace('vmread r11, rax', 'xor r11d, r11d\ncmp r12, 0')
+    vmptrld = re.sub(r'^resident_telemetry_counter .*$', '', vmptrld, flags=re.MULTILINE)
+    vmptrld = vmptrld.replace('call .Lresident_nested_load_vmcs12_backing', 'call .Ltest_load_backing')
+    vmptrld += source[source.index('.Lresident_nested_load_vmcs12_backing:'):
+                      source.index('.Lresident_hyperv_evmcs_select:')].replace(
+                          '.Lresident_nested_load_vmcs12_backing:', '.Ltest_load_backing:')
+    vmptrld += '\n.Lresident_nested_shadow_sync:\nret\n'
     backing = source[source.index('.Lresident_nested_initialize_vmcs12_backing:'):
                      source.index('.Lresident_nested_load_vmcs12_backing:')]
     entry_mode = source[source.index('.Lresident_nested_capture_vmcs02_guest_state:'):
@@ -280,17 +323,22 @@ def prepare_evmcs(project: Path):
                           island.index('.Lresident_dispatch_wrmsr_hyperv_apic:')]
     cpuid = island[island.index('.Lresident_dispatch_cpuid_evmcs:'):
                    island.index('.Lresident_dispatch_cpuid_matrixhv:')]
+    cpuid = cpuid.replace('{hyperv_features_leaf}', '0x40000003')
     cpuid = cpuid.replace('{b_nested_evmcs_enabled}', '8').replace('{b_hyperv_timing_supported}', '0')
+    cpuid = cpuid.replace('{b_event_context}', '16').replace('{event_hyperv_tsc_invariant_supported}', '0')
     cpuid_wrapper = """
     .text
     .globl test_evmcs_cpuid
     test_evmcs_cpuid:
         push rsi
         push r12
-        sub rsp, 48
+        sub rsp, 64
         lea r12, [rsp + 32]
         mov qword ptr [r12], 0
         mov qword ptr [r12 + 8], 1
+        lea rax, [rsp + 56]
+        mov [r12 + 16], rax
+        mov qword ptr [rax], 0
         mov rsi, rdx
         mov r8d, ecx
         jmp .Lresident_dispatch_cpuid_evmcs
@@ -303,7 +351,7 @@ def prepare_evmcs(project: Path):
         mov [rsi + 8], eax
         mov rax, [rsp + 16]
         mov [rsi + 12], eax
-        add rsp, 48
+        add rsp, 64
         pop r12
         pop rsi
         ret
@@ -349,6 +397,7 @@ def prepare_evmcs(project: Path):
         push rsi
         push rdi
         mov r12, rcx
+        mov qword ptr [r12 + {b_nested_failure_count}], 0
         call .Lresident_hyperv_evmcs_store
         pop rdi
         pop rsi
@@ -408,6 +457,19 @@ def prepare_evmcs(project: Path):
         mov r12, rcx
         mov [rsp], rdx
         jmp .Lresident_dispatch_vmclear
+    .globl test_load_vmcs
+    test_load_vmcs:
+        push rbx
+        push r12
+        push r13
+        push r14
+        push r15
+        push rsi
+        push rdi
+        sub rsp, 32
+        mov r12, rcx
+        mov [rsp], rdx
+        jmp .Lresident_dispatch_vmptrld
     .Lresident_nested_decode_memory_operand:
         lea r10, [rsp + 8]
         mov [r12 + {b_nested_operand_linear_address}], r10
@@ -443,6 +505,9 @@ def prepare_evmcs(project: Path):
     .Lresident_dispatch_halt:
     .Lresident_dispatch_vmread_failed:
         ud2
+    .Ltest_evmcs_store_failed:
+        inc qword ptr [r12 + {b_nested_failure_count}]
+        ret
     .globl test_capture_evmcs_entry_mode
     test_capture_evmcs_entry_mode:
         push r12
@@ -466,7 +531,7 @@ def prepare_evmcs(project: Path):
         ret
     """
     (output / "handlers.S").write_text(
-        wrapper + routing + completion + handlers + vmclear + backing + entry_mode + assist_write
+        wrapper + validation + routing + completion + handlers.replace('jz .Lresident_dispatch_halt', 'jz .Ltest_evmcs_store_failed') + vmclear + vmptrld + backing + entry_mode + assist_write
         + translation + shadow_intercept + cpuid_wrapper + cpuid + ".balign 8\n" + field_map,
         encoding="utf-8",
     )
@@ -1015,7 +1080,7 @@ def prepare_nested_regressions(project: Path):
     assembly = assembly.replace('vmread r13, rax', 'call .Ltest_regression_vmread\nmov r13, r11')
     assembly = assembly.replace('vmwrite rax, r11', 'call .Lresident_nested_write_vmcs02_control')
     assembly = assembly.replace('vmwrite rax, r10', 'mov [r12 + {test_controls} + rax * 8], r10\ncmp r12, 0')
-    for register in ['r8', 'r9']:
+    for register in ['r8', 'r9', 'r10']:
         assembly = assembly.replace(f'vmread {register}, rax', f'mov {register}, [r12 + {{test_vmcs}} + rax * 8]\ncmp r12, 0')
     constants = {
         'host_page_address_mask': 0x000ffffffffff000,
@@ -1799,22 +1864,24 @@ def prepare_hyperv_time(project: Path):
     output.mkdir(parents=True, exist_ok=True)
     source = (project / 'src/hyperv.rs').read_text(encoding='utf-8')
     scale = source[source.index('pub fn hyperv_reference_tsc_scale('):source.index('pub fn native_hyperv_reference_tsc(')]
-    native = source[source.index('pub fn native_hyperv_reference_tsc('):source.index('pub fn restrict_evmcs_controls(')]
-    native = native.replace('pub fn native_hyperv_reference_tsc()',
-                            'fn native_hyperv_reference_tsc(cpuid: impl Fn(u32) -> core::arch::x86_64::CpuidResult, epoch: u64)')
+    native = source[source.index('pub fn native_hyperv_reference_tsc('):source.index('pub fn restrict_evmcs_secondary_capability(')]
+    native = native.replace('pub fn native_hyperv_reference_tsc(calibrate: impl FnOnce() -> u64)',
+                            'fn native_hyperv_reference_tsc(cpuid: impl Fn(u32) -> core::arch::x86_64::CpuidResult, epoch: u64, calibrate: impl FnOnce() -> u64)')
     native = native.replace('pub fn native_hyperv_invariant_tsc()',
                             'fn native_hyperv_invariant_tsc(cpuid: impl Fn(u32) -> core::arch::x86_64::CpuidResult)')
     native = native.replace('    let cpuid = core::arch::x86_64::__cpuid;\n', '')
     native = native.replace('native_hyperv_invariant_tsc()', 'native_hyperv_invariant_tsc(&cpuid)')
     native = native.replace('    let epoch = unsafe { core::arch::x86_64::_rdtsc() };\n', '')
     scale += '\n' + re.search(r'pub const CPUID_HYPERVISOR_PRESENT_BIT: u32 = [^;]+;', source)[0] + '\n' + native
+    firmware = (project / 'src/firmware.rs').read_text(encoding='utf-8')
+    scale += '\n' + firmware[firmware.index('unsafe fn acpi_pm_timer('):]
     (output / 'definitions.rs').write_text(scale, encoding='utf-8')
     source = read_resident_assembly(project)
     read = source[source.index('.Lresident_dispatch_rdmsr_reference_count:'):source.index('.Lresident_dispatch_rdmsr_zero:')]
     write = source[source.index('.Lresident_dispatch_wrmsr_reference_count:'):source.index('.Lresident_dispatch_xsetbv:')]
     read += source[source.index('.Lresident_dispatch_rdmsr_guest_os_id:'):source.index('.Lresident_dispatch_rdmsr_vp_index:')]
     write += source[source.index('.Lresident_dispatch_wrmsr_guest_os_id:'):source.index('.Lresident_dispatch_wrmsr_reference_count:')]
-    cpuid = source[source.index('.Lresident_dispatch_cpuid_evmcs:'):source.index('.Lresident_dispatch_cpuid_matrixhv:')]
+    cpuid = source[source.index('.Lresident_dispatch_cpuid_hypervisor_present:'):source.index('.Lresident_dispatch_cpuid_matrixhv:')]
     route_start = source.index('cmp ecx, {hyperv_tsc_invariant_control_msr}')
     read_route = source[route_start:source.index('cmp ecx, {hyperv_reference_count_msr}', route_start)]
     route_start = source.index('cmp ecx, {hyperv_tsc_invariant_control_msr}', route_start + len(read_route))
@@ -1822,7 +1889,11 @@ def prepare_hyperv_time(project: Path):
     routes = '.Ltest_time_rdmsr_route:\n' + read_route + 'jmp .Lresident_dispatch_rdmsr_passthrough\n'
     routes += '.Ltest_time_wrmsr_route:\n' + write_route + 'jmp .Lresident_dispatch_wrmsr_passthrough\n'
     assembly = read + write + cpuid + routes
-    offsets = {'b_event_context': 0, 'b_hyperv_timing_supported': 8, 'b_cache_ept_pointer': 24,
+    offsets = {'hyperv_features_leaf': 0x40000003, 'b_nested_expose_vmx': 64,
+               'b_telemetry_active': 72, 'b_cpuid_hypervisor_eax': 80,
+               'hyperv_guest_idle_access_mask': 0xfffffbff,
+               'hyperv_guest_idle_feature_mask': 0xffffffdf,
+               'b_event_context': 0, 'b_hyperv_timing_supported': 8, 'b_cache_ept_pointer': 24,
                'b_nested_evmcs_enabled': 32, 'event_hyperv_tsc_scale': 0,
                'event_hyperv_tsc_offset': 8, 'event_hyperv_reference_tsc_msr': 16,
                'event_hyperv_reference_tsc_lock': 24, 'event_hyperv_guest_os_id': 32,
@@ -1917,7 +1988,15 @@ def prepare_hyperv_time(project: Path):
         sub rsp, 32
         mov r12, rcx
         mov r13, rdx
-        jmp .Lresident_dispatch_cpuid_evmcs
+        mov eax, [rdx]
+        mov [rsp], rax
+        mov eax, [rdx + 4]
+        mov [rsp + 24], rax
+        mov eax, [rdx + 8]
+        mov [rsp + 8], rax
+        mov eax, [rdx + 12]
+        mov [rsp + 16], rax
+        jmp .Lresident_dispatch_cpuid_hypervisor_present
     .Lresident_dispatch_cpuid_advance:
         mov rax, [rsp]
         mov [r13], eax
@@ -1933,6 +2012,81 @@ def prepare_hyperv_time(project: Path):
         ret
     """
     (output / 'handlers.S').write_text(wrappers + assembly, encoding='utf-8')
+    hypercall = source[source.index('.Lresident_dispatch_hyperv_hypercall:'):
+                       source.index('.Lresident_dispatch_vmware_hypercall:', source.index('.Lresident_dispatch_hyperv_hypercall:'))]
+    hypercall += source[source.index('.Lresident_ept01_page_is_readable:'):
+                        source.index('.Lresident_dispatch_xsetbv:')]
+    hypercall_offsets = dict(offsets, guest_cr0=0x6800, guest_cs_ar_bytes=0x4816, guest_efer=0x2806)
+    hypercall = re.sub(r'\{(\w+)\}', lambda match: str(hypercall_offsets[match[1]]), hypercall)
+    hypercall = hypercall.replace('vmread r11, rax', 'call .Ltest_hypercall_vmread')
+    hypercall_wrapper = """
+    .text
+    .globl test_hypercall
+    test_hypercall:
+        push r12
+        push r13
+        push r14
+        sub rsp, 32
+        mov r12, rcx
+        mov r14, rdx
+        mov rax, [rdx]
+        mov [rsp], rax
+        mov rax, [rdx + 8]
+        mov [rsp + 8], rax
+        mov rax, [rdx + 16]
+        mov [rsp + 16], rax
+        mov rax, [rdx + 24]
+        mov [rsp + 24], rax
+        jmp .Lresident_dispatch_hyperv_hypercall
+    .Ltest_hypercall_vmread:
+        mov r11, [r12 + 64]
+        cmp eax, 0x6800
+        je .Ltest_hypercall_vmread_done
+        mov r11, [r12 + 72]
+        cmp eax, 0x4816
+        je .Ltest_hypercall_vmread_done
+        mov r11, [r12 + 80]
+    .Ltest_hypercall_vmread_done:
+        cmp r12, 0
+        ret
+    .Lresident_guest_privilege:
+        cmp qword ptr [r12 + 88], 1
+        cmc
+        ret
+    .Lresident_dispatch_resume:
+        mov eax, 1
+        jmp .Ltest_hypercall_done
+    .Lresident_dispatch_inject_ud:
+        xor eax, eax
+        jmp .Ltest_hypercall_done
+    .Lresident_dispatch_unsupported:
+        mov eax, 2
+    .Ltest_hypercall_done:
+        mov rdx, [rsp]
+        mov [r14], rdx
+        mov rdx, [rsp + 8]
+        mov [r14 + 8], rdx
+        mov rdx, [rsp + 16]
+        mov [r14 + 16], rdx
+        mov rdx, [rsp + 24]
+        mov [r14 + 24], rdx
+        add rsp, 32
+        pop r14
+        pop r13
+        pop r12
+        ret
+    .Lresident_dispatch_vmread_failed:
+        ud2
+    .Lresident_advance_guest_rip:
+    .Lresident_nested_eptp_before_root_write:
+        ret
+    .Lresident_ept01_host_page_is_mapped:
+        xor eax, eax
+        cmp r11, [r12 + 40]
+        setne al
+        ret
+    """
+    (output / 'hypercall.S').write_text((hypercall_wrapper + hypercall).replace('.Lresident_', '.Lhypercall_'), encoding='utf-8')
 
 
 def prepare_resident_msr(project: Path):
@@ -1940,6 +2094,97 @@ def prepare_resident_msr(project: Path):
     output.mkdir(parents=True, exist_ok=True)
     source = read_resident_rust(project)
     assembly_source = read_resident_assembly(project)
+    cr_source = (project / 'src/asm/exits.S').read_text(encoding='utf-8')
+    cr_start = cr_source.index('.Lresident_ap_cr_access:')
+    cr_end = cr_source.index('.endm', cr_start)
+    cr_access = cr_source[cr_start:cr_end].strip()
+    cr_constants = {
+        'b_last_qualification': 0, 'b_nested_l1_cr4': 8,
+        'b_nested_vmx_cr0_fixed0': 16, 'b_nested_vmx_cr0_fixed1': 24,
+        'b_nested_vmx_cr4_fixed0': 32, 'b_nested_vmx_cr4_fixed1': 40,
+        'b_nested_active': 48,
+        'guest_rsp': 0, 'cr0_read_shadow': 1, 'guest_cr0': 2,
+        'guest_cr4': 3, 'cr4_read_shadow': 4, 'cr0_guest_host_mask': 5,
+        'cr4_guest_host_mask': 6, 'guest_efer': 7, 'vm_entry_controls': 8,
+        'secondary_vm_exec_control': 9, 'virtual_processor_id': 10,
+        'guest_cs_ar_bytes': 11, 'guest_cr3': 12, 'guest_tr_ar_bytes': 13,
+        'guest_pdptr0': 14, 'b_nested_physical_address_bits': 104,
+    }
+    cr_access = re.sub(r'\{(\w+)\}', lambda match: str(cr_constants[match[1]]), cr_access)
+    cr_access = re.sub(r'vmread (r\w+), rax',
+        r'mov \1, [r12 + 128 + rax * 8]\ncmp r12, 0', cr_access)
+    cr_access = re.sub(r'vmwrite rax, (r\w+)',
+        r'mov [r12 + 128 + rax * 8], \1\ninc qword ptr [r12 + 56]\ncmp r12, 0', cr_access)
+    cr_access = cr_access.replace('invvpid rax, xmmword ptr [rsp]', '''
+        inc qword ptr [r12 + 64]
+        mov rax, [rsp]
+        mov [r12 + 88], rax
+        mov rax, [rsp + 8]
+        mov [r12 + 96], rax
+        cmp r12, 0
+    ''')
+    cr_wrapper = """
+    .text
+    .globl test_write_cr
+    test_write_cr:
+        push rbx
+        push rbp
+        push rsi
+        push rdi
+        push r12
+        push r13
+        push r14
+        push r15
+        sub rsp, 128
+        mov r12, rcx
+        mov rsi, rdx
+        mov rdi, rsp
+        mov ecx, 15
+        rep movsq
+        jmp .Lresident_ap_cr_access
+    .Lresident_update_dirty_mtrrs:
+        inc qword ptr [r12 + 80]
+        ret
+    .Lresident_advance_guest_rip:
+        inc qword ptr [r12 + 72]
+        ret
+    .Lresident_ept01_page_is_readable:
+        xor eax, eax
+        cmp r11, 0x4000
+        jne .Ltest_cr_pdpte_unmapped
+        mov r11, [r12 + 312]
+        test r11, r11
+        jz .Ltest_cr_pdpte_unmapped
+        mov eax, 1
+    .Ltest_cr_pdpte_unmapped:
+        ret
+    .Lresident_dispatch_resume:
+        mov eax, 1
+        jmp .Ltest_write_cr_done
+    .Lresident_dispatch_inject_gp:
+        xor eax, eax
+        jmp .Ltest_write_cr_done
+    .Lresident_dispatch_unsupported:
+        mov eax, 2
+        jmp .Ltest_write_cr_done
+    .Lresident_dispatch_vmread_failed:
+    .Lresident_dispatch_vmwrite_failed:
+    .Lresident_dispatch_halt:
+        mov eax, 3
+    .Ltest_write_cr_done:
+        add rsp, 128
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop rdi
+        pop rsi
+        pop rbp
+        pop rbx
+        ret
+    """
+    (output / 'resident-cr.S').write_text(
+        (cr_wrapper + cr_access).replace('.Lresident_', '.Ltest_cr_'), encoding='utf-8')
     apic = assembly_source[assembly_source.index('.Lresident_dispatch_rdmsr_hyperv_apic:'):
                            assembly_source.index('.Lresident_dispatch_rdmsr_guest_os_id:')]
     apic += assembly_source[assembly_source.index('.Lresident_dispatch_wrmsr_hyperv_apic:'):
@@ -1976,6 +2221,11 @@ def prepare_resident_msr(project: Path):
         shr rdx, 32
         mov eax, eax
         clc
+        ret
+    .Lresident_ept01_host_page_is_mapped:
+        xor eax, eax
+        cmp r11, [r12 + 32]
+        setne al
         ret
     .Lresident_guarded_wrmsr:
         mov [r12 + 16], rcx
@@ -2017,6 +2267,83 @@ def prepare_resident_msr(project: Path):
     """
     (output / 'resident-hyperv-apic.S').write_text(
         (apic_wrapper + apic).replace('.Lresident_', '.Ltest_apic_'), encoding='utf-8')
+    parent_start = assembly_source.index('.Lresident_hyperv_require_parent_msr:')
+    parent_end = assembly_source.index('.Lresident_dispatch_rdmsr_zero:', parent_start)
+    parent_policy = assembly_source[parent_start:parent_end]
+    parent_policy = parent_policy.replace('{b_hyperv_timing_supported}', '0')
+    parent_policy = parent_policy.replace('{b_nested_evmcs_enabled}', '8')
+    parent_wrapper = """
+    .text
+    .globl test_parent_msr_access
+    test_parent_msr_access:
+        push r12
+        mov r12, rcx
+        mov ecx, edx
+        call .Lresident_hyperv_require_parent_msr
+        setnc al
+        movzx eax, al
+        pop r12
+        ret
+    """
+    (output / 'resident-hyperv-parent.S').write_text(parent_wrapper + parent_policy, encoding='utf-8')
+    vmcall_start = assembly_source.index('.Lresident_dispatch_vmcall:')
+    vmcall_end = assembly_source.index('.Lresident_dispatch_hyperv_hypercall:', vmcall_start)
+    vmcall = assembly_source[vmcall_start:vmcall_end]
+    vmcall = re.sub(r'^resident_telemetry_counter[^\n]*\n', '', vmcall, flags=re.MULTILINE)
+    private_start = assembly_source.index('.macro resident_private_vmcall ')
+    private_end = assembly_source.index('.endm', private_start) + len('.endm')
+    vmcall = assembly_source[private_start:private_end] + '\n' + vmcall
+    vmcall_constants = {
+        'start_checkpoint_magic': 'RESIDENT_VMCALL_START_CHECKPOINT',
+        'stop_magic': 'RESIDENT_VMCALL_STOP',
+        'nested_probe_failed_magic': 'RESIDENT_VMCALL_NESTED_PROBE_FAILED',
+        'bridge_probe_vmcall': 'CONTROL_PROBE_VMCALL',
+        'bridge_off_prepare_vmcall': 'CONTROL_OFF_PREPARE_VMCALL',
+        'bridge_off_commit_vmcall': 'CONTROL_OFF_COMMIT_VMCALL',
+        'vmware_hypervisor_magic': 'VMWARE_HYPERVISOR_MAGIC',
+    }
+    vmcall_values = {
+        name: int(re.search(rf'const {constant}: u(?:32|64) = (0x[0-9a-fA-F_]+);', source)[1].replace('_', ''), 0)
+        for name, constant in vmcall_constants.items()
+    }
+    vmcall_values['b_telemetry_probe_active'] = 8
+    vmcall = re.sub(r'\{(\w+)\}', lambda match: str(vmcall_values[match[1]]), vmcall)
+    vmcall_wrapper = """
+    .text
+    .globl test_private_vmcall
+    test_private_vmcall:
+        push r12
+        sub rsp, 32
+        mov r12, rcx
+        mov [rsp], rdx
+        jmp .Lresident_dispatch_vmcall
+    .Lresident_guest_privilege:
+        bt qword ptr [r12], 0
+        ret
+    .Lresident_ap_ready:
+    .Lresident_dispatch_start_checkpoint:
+    .Lresident_dispatch_control_probe:
+    .Lresident_dispatch_control_off_prepare:
+    .Lresident_dispatch_control_off_unexpected:
+    .Lresident_dispatch_stop:
+    .Lresident_dispatch_nested_probe_failed:
+        mov eax, 1
+        jmp .Ltest_private_vmcall_done
+    .Lresident_dispatch_inject_gp:
+        xor eax, eax
+        jmp .Ltest_private_vmcall_done
+    .Lresident_dispatch_hyperv_hypercall:
+        mov eax, 2
+        jmp .Ltest_private_vmcall_done
+    .Lresident_dispatch_vmware_hypercall:
+        mov eax, 3
+    .Ltest_private_vmcall_done:
+        add rsp, 32
+        pop r12
+        ret
+    """
+    (output / 'resident-private-vmcall.S').write_text(
+        (vmcall_wrapper + vmcall).replace('.Lresident_', '.Ltest_private_'), encoding='utf-8')
     start = assembly_source.index('.Lresident_nested_complete_vmcs02_msr_exit:')
     end = assembly_source.index('.Lresident_nested_activate_vmcs01_msr_entry:', start)
     assembly = assembly_source[start:end].strip()
@@ -2205,6 +2532,7 @@ def prepare_resident_telemetry(project: Path):
         )
     constants = {
         "cpuid_reason": 10, "matrixhv_status_leaf": 0x4D485652,
+        "guest_contract_subleaf": 54, "guest_contract_unsupported": 3,
         "ept_violation_reason": 48, "invept_reason": 50, "preemption_timer_reason": 52,
         "vmread_reason": 23, "vmwrite_reason": 25, "vmlaunch_reason": 20, "vmresume_reason": 24,
         "log_serial_sink": 1,
@@ -2396,6 +2724,13 @@ def prepare_resident_visual(project: Path):
     )
     assembly += "\njmp .Ltest_exception_return"
     assembly = assembly.replace("rdtsc", "mov rax, qword ptr [rip + test_visual_tsc]\nmov rdx, rax\nshr rdx, 32")
+    assembly = assembly.replace(
+        "vmread rdx, rax",
+        "mov rdx, qword ptr [rcx + {test_primary_controls}]\ncmp rcx, 0",
+    ).replace(
+        "vmwrite rax, rdx",
+        "mov qword ptr [rcx + {test_primary_controls}], rdx\ncmp rcx, 0",
+    )
     screen = (project / "src/diagnostics.rs").read_text(encoding="utf-8")
     def marker_constant(name):
         return int(re.search(rf"const {name}: usize = (\d+);", screen).group(1))
@@ -2668,12 +3003,46 @@ def prepare_boot_state(project: Path):
     print(f"Verified {len(expected)} resident fields, including nested structs and mixed-width arrays.")
 
 
+def prepare_smp(project: Path):
+    output = project / "builds/smp-tests"
+    output.mkdir(parents=True, exist_ok=True)
+    source = (project / "src/smp.rs").read_text(encoding="utf-8")
+    opening = source[source.index("fn open_mp_services("):source.index("pub(crate) fn enumerate(")]
+    batch = source[source.index("struct ApBatchEntry {"):]
+    vcpu = (project / "src/core/vcpu.rs").read_text(encoding="utf-8")
+    start = vcpu.rindex("#[unsafe(no_mangle)]", 0, vcpu.index("unsafe extern \"efiapi\" fn matrixhv_ap_prepare("))
+    end = vcpu.index("#[unsafe(no_mangle)]", vcpu.index("pub(crate) fn matrixhv_ap_launch_asm(", start))
+    definitions = """use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
+use uefi::{Status, boot};
+use uefi::proto::pi::mp::MpServices;
+""" + opening + batch + vcpu[start:end]
+    (output / "definitions.rs").write_text(definitions, encoding="utf-8")
+    assembly = (project / "src/asm/ap_launch.S").read_text(encoding="utf-8")
+    # Execute the production save/prepare/restore paths with only privileged
+    # instructions and the resident guest probe replaced by host equivalents.
+    assembly = assembly.replace("    cli\n", "    nop\n")
+    assembly = assembly.replace("    vmlaunch\n", "    jmp .Lap_guest_return\n")
+    guest = """.macro matrixhv_ap_guest_probe
+.Lap_guest_return:
+    mov rax, 0x123456789abcdef0
+    jmp .Lap_restore
+.endm
+"""
+    (output / "ap-launch.S").write_text(guest + assembly, encoding="utf-8")
+
+
 COMPONENTS = {
     "boot": {
         "order": prepare_boot_order,
         "config": None,
     },
+    "smp": {
+        "batch": prepare_smp,
+    },
     "ept": {
+        "core_audit": None,
         "cache": prepare_ept_cache,
         "high": prepare_ept_cache,
         "pci_bar": prepare_pci_bar,

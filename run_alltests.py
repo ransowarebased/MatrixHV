@@ -40,6 +40,13 @@ def run_component(project, component, release=False):
     if component == "resident":
         print("\n  resident::boot_state_layout", flush=True)
         prepare_boot_state(project)
+        execute([sys.executable, str(project / "tests/run_flight_recorder_tests.py")], project)
+        execute([sys.executable, str(project / "tests/run_exit_guard_tests.py")], project)
+        execute([sys.executable, str(project / "tests/run_exit_event_tests.py")], project)
+        proof_binary = project / "builds/tests/resident/proof_exit_regressions.exe"
+        execute(["rustc", "--edition=2024", "-Dwarnings", "--test",
+                 str(project / "tests/proof_exit_regressions.rs"), "-o", str(proof_binary)], project)
+        execute([str(proof_binary)], project)
 
 
 def run_neo(project, release=False):
@@ -91,6 +98,10 @@ def main():
                 run_neo(project, arguments.release)
             else:
                 run_component(project, component, arguments.release)
+            if component == "boot" and sys.platform == "win32":
+                print("\n  boot::build_scripts", flush=True)
+                execute(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                         "-File", str(project / "tests/build_scripts_tests.ps1")], project)
         except (OSError, subprocess.CalledProcessError, ValueError, AssertionError) as error:
             print(f"Suite failed: {error}", flush=True)
             passed = False

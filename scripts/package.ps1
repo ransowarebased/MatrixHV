@@ -19,7 +19,10 @@ $ImagePath = Join-Path $OutputRoot 'MatrixHV.img'
 $WindowsNeoPath = Join-Path $OutputRoot 'neo.exe'
 $LinuxNeoPath = Join-Path $OutputRoot 'neo'
 $PackageRoot = Join-Path $BuildRoot 'packages'
-$StagingRoot = Join-Path $BuildRoot ".package\$ConfigurationName"
+$StagingRoot = [System.IO.Path]::GetFullPath((Join-Path $BuildRoot ".package\$ConfigurationName"))
+if (-not $StagingRoot.StartsWith($BuildRoot.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Refusing to use package staging outside the build directory: $StagingRoot"
+}
 $ArchivePath = Join-Path $PackageRoot "MatrixHV-$ConfigurationName.zip"
 $HashPath = "$ArchivePath.sha256"
 

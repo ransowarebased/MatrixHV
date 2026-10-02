@@ -2,6 +2,35 @@ pub const CPUID_HYPERVISOR_PRESENT_BIT: u32 = 1 << 31;
 pub const HYPERVISOR_LEAF_START: u32 = 0x4000_0000;
 pub const HYPERVISOR_LEAF_END: u32 = 0x4fff_ffff;
 pub const HYPERV_FEATURES_LEAF: u32 = 0x4000_0003;
+pub const HYPERV_INTERFACE_LEAF: u32 = 0x4000_0001;
+pub const HYPERV_IDENTITY_LEAF: u32 = 0x4000_0002;
+pub const HYPERV_RECOMMENDATIONS_LEAF: u32 = 0x4000_0004;
+pub const HYPERV_LIMITS_LEAF: u32 = 0x4000_0005;
+pub const HYPERV_HARDWARE_LEAF: u32 = 0x4000_0006;
+pub const HYPERV_NESTED_FEATURES_LEAF: u32 = 0x4000_000a;
+pub const HYPERV_VENDOR_EBX: u32 = 0x7263_694d;
+pub const HYPERV_VENDOR_ECX: u32 = 0x666f_736f;
+pub const HYPERV_VENDOR_EDX: u32 = 0x7648_2074;
+pub const HYPERV_INTERFACE_SIGNATURE: u32 = 0x3123_7648;
+pub const HYPERV_BASE_ACCESS: u32 = 0x60;
+pub const HYPERV_APIC_ACCESS: u32 = 0x10;
+pub const HYPERV_TIME_ACCESS: u32 = 0x202;
+pub const HYPERV_INVARIANT_TSC_ACCESS: u32 = 0x8000;
+pub const HYPERV_EVMCS_RECOMMENDATION: u32 = 0x4000;
+pub const HYPERV_EVMCS_VERSIONS: u32 = 0x101;
+pub const HYPERV_PROCESSOR_LIMIT: u32 = 64;
+pub const HYPERV_BUILD_NUMBER: u32 = 1;
+pub const HYPERV_PRODUCT_VERSION: u32 = 1;
+pub const HYPERV_HARDWARE_IN_USE: u32 = 0xa;
+pub const HYPERV_MSR_RANGE_SPAN: u32 = 0xfff;
+pub const HYPERV_EOI_MSR: u32 = 0x4000_0070;
+pub const HYPERV_ICR_MSR: u32 = 0x4000_0071;
+pub const HYPERV_TPR_MSR: u32 = 0x4000_0072;
+pub const HYPERV_NOTIFY_LONG_SPIN_WAIT: u32 = 8;
+pub const HYPERV_INVALID_HYPERCALL_CODE: u32 = 2;
+pub const HYPERV_INVALID_HYPERCALL_INPUT: u32 = 3;
+pub const HYPERV_INVALID_ALIGNMENT: u32 = 4;
+pub const HYPERV_INVALID_PARAMETER: u32 = 5;
 pub const HYPERV_GUEST_IDLE_ACCESS_MASK: u32 = !(1 << 10);
 pub const HYPERV_GUEST_IDLE_FEATURE_MASK: u32 = !(1 << 5);
 pub const HYPERV_GUEST_OS_ID_MSR: u32 = 0x4000_0000;
@@ -23,26 +52,61 @@ pub fn hyperv_reference_tsc_scale(denominator: u32, numerator: u32, crystal_hz: 
     if denominator == 0 || numerator == 0 || crystal_hz == 0 {
         return 0;
     }
-    let tsc_hz = u64::from(crystal_hz) * u64::from(numerator) / u64::from(denominator);
+    let tsc_rate = u128::from(crystal_hz) * u128::from(numerator);
+    let reference_rate = 10_000_000_u128 * u128::from(denominator);
+    if tsc_rate <= reference_rate {
+        return 0;
+    }
+    ((reference_rate << 64) / tsc_rate) as u64
+}
+
+pub fn hyperv_reference_tsc_scale_from_hz(tsc_hz: u64) -> u64 {
     if tsc_hz <= 10_000_000 {
         return 0;
     }
     ((10_000_000_u128 << 64) / u128::from(tsc_hz)) as u64
 }
 
-pub fn native_hyperv_reference_tsc() -> (u64, u64) {
+pub fn native_hyperv_reference_tsc(calibrate: impl FnOnce() -> u64) -> (u64, u64) {
     let cpuid = core::arch::x86_64::__cpuid;
-    if cpuid(0).eax < 0x15
-        || cpuid(1).ecx & CPUID_HYPERVISOR_PRESENT_BIT != 0
-        || !native_hyperv_invariant_tsc()
-    {
+    if !native_hyperv_invariant_tsc() {
         return (0, 0);
     }
-    let frequency = cpuid(0x15);
-    let scale = hyperv_reference_tsc_scale(frequency.eax, frequency.ebx, frequency.ecx);
+    let mut scale = 0;
+    if cpuid(0).eax >= 0x15 {
+        let frequency = cpuid(0x15);
+        scale = hyperv_reference_tsc_scale(frequency.eax, frequency.ebx, frequency.ecx);
+    }
+    if scale == 0 {
+        scale = hyperv_reference_tsc_scale_from_hz(calibrate());
+    }
     let epoch = unsafe { core::arch::x86_64::_rdtsc() };
     let offset = ((u128::from(epoch) * u128::from(scale)) >> 64) as u64;
     (scale, offset.wrapping_neg())
+}
+
+pub fn calibrated_tsc_hz(mut sample: impl FnMut() -> Option<(u64, u32)>) -> u64 {
+    let mut frequencies = [0_u64; 5];
+    for frequency in &mut frequencies {
+        let Some((tsc_ticks, pm_ticks)) = sample() else {
+            return 0;
+        };
+        if !(35_795..0x80_0000).contains(&pm_ticks) {
+            return 0;
+        }
+        let hz = u128::from(tsc_ticks) * 3_579_545 / u128::from(pm_ticks);
+        if !(10_000_001..=100_000_000_000).contains(&hz) {
+            return 0;
+        }
+        *frequency = hz as u64;
+    }
+    frequencies.sort_unstable();
+    // Ignore one outlier on each side but require the middle samples to agree
+    // within 0.5%. The reference is the fixed ACPI clock, never CPUID.16.
+    if frequencies[3] - frequencies[1] > frequencies[2] / 200 {
+        return 0;
+    }
+    frequencies[2]
 }
 
 pub fn native_hyperv_invariant_tsc() -> bool {
@@ -52,7 +116,7 @@ pub fn native_hyperv_invariant_tsc() -> bool {
     cpuid(0x8000_0000).eax >= 0x8000_0007 && cpuid(0x8000_0007).edx & (1 << 8) != 0
 }
 
-pub fn restrict_evmcs_controls(secondary_controls: u64, vt_evmcs: bool) -> u64 {
+pub fn restrict_evmcs_secondary_capability(secondary_controls: u64, vt_evmcs: bool) -> u64 {
     if vt_evmcs {
         secondary_controls
             & !(u64::from(
@@ -74,7 +138,7 @@ pub const EVMCS_PAGE_SIZE: usize = 4096;
 pub const VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET: usize = 40;
 pub const VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET: usize = 48;
 
-#[repr(C, packed)]
+#[repr(C)]
 pub struct EnlightenedVmcs {
     pub version_number: u32,
     pub abort_indicator: u32,
@@ -238,6 +302,7 @@ pub struct EnlightenedVmcs {
 }
 
 const _: () = assert!(core::mem::size_of::<EnlightenedVmcs>() == 1024);
+const _: () = assert!(core::mem::align_of::<EnlightenedVmcs>() == 8);
 const _: () = assert!(core::mem::size_of::<EnlightenedVmcs>() <= EVMCS_PAGE_SIZE);
 const _: () = assert!(core::mem::offset_of!(EnlightenedVmcs, host_pat) == 24);
 const _: () = assert!(core::mem::offset_of!(EnlightenedVmcs, host_rsp) == 616);

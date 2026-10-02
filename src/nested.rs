@@ -341,7 +341,7 @@ impl NestedVmxCapabilities {
             restrict_control(
                 host.entry_ctls,
                 entry_supported,
-                VMX_LEGACY_ENTRY_DEFAULT1 | VM_ENTRY_IA32E_MODE_GUEST,
+                VMX_LEGACY_ENTRY_DEFAULT1,
             )
         };
 
@@ -358,8 +358,10 @@ impl NestedVmxCapabilities {
             vmx_entry_ctls: entry_ctls,
             host_procbased_ctls2: host.procbased_ctls2,
             host_misc: host.misc,
-            // Native shadow VMCS accesses must observe the same read-only-write capability.
-            vmx_misc: (host.misc & !((0x1ff_u64 << 16) | (7_u64 << 25)))
+            // Preserve native activity states, EFER.LMA capture, shadow write
+            // semantics and zero-length event injection. PT and dual-monitor
+            // SMM are not virtualized; CR3 targets and MSR lists have local limits.
+            vmx_misc: (host.misc & (0x1ff | (1_u64 << 29) | (1_u64 << 30)))
                 | (VMX_CR3_TARGET_COUNT << 16)
                 | (((VMX_MSR_LIST_CAPACITY / 512 - 1) as u64) << 25),
             vmx_cr0_fixed0: host.cr0_fixed0,
@@ -1411,6 +1413,22 @@ pub const INVALID_VMCS_POINTER: u64 = u64::MAX;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NestedVmxState {
+    // Keep entry/exit routing and validity flags in the first two cache lines.
+    pub current_vmcs: u64,
+    pub current_vmcs_hpa: u64,
+    pub evmcs_active: u64,
+    pub l2_active: u64,
+    pub active: u64,
+    pub expose_vmx: u64,
+    pub evmcs_enabled: u64,
+    pub vp_assist_msr: u64,
+    pub current_vmcs_is_shadow: u64,
+    pub vmcs02_guest_cache_valid: u64,
+    pub vmcs02_control_cache_valid: [u64; 2],
+    pub vmcs02_launched: u64,
+    pub physical_address_bits: u32,
+    pub vmcs02_vpid_cache: u32,
+    pub ept01_pointer: u64,
     pub host_procbased_ctls2: u64,
     pub host_misc: u64,
     pub feature_control: u64,
@@ -1431,25 +1449,20 @@ pub struct NestedVmxState {
     pub vmx_true_procbased_ctls: u64,
     pub vmx_true_exit_ctls: u64,
     pub vmx_true_entry_ctls: u64,
-    pub expose_vmx: u64,
     pub l1_cr4: u64,
     pub vmxon_operand: u64,
     pub vmxon_region: u64,
-    pub current_vmcs: u64,
-    pub current_vmcs_is_shadow: u64,
     pub last_operand: u64,
     pub last_vmcs_field: u64,
     pub vmxon_count: u64,
     pub vmxoff_count: u64,
     pub failure_count: u64,
-    pub active: u64,
     pub probe_complete: u64,
     pub vmcs12: NestedVmcs12State,
     pub vmcs01_region: u64,
     pub vmcs02_region: u64,
     pub shadow_vmcs_region: u64,
     pub shadow_vmread_bitmap: u64,
-    pub l2_active: u64,
     pub l2_entry_was_resume: u64,
     pub l2_entry_count: u64,
     pub l2_exit_count: u64,
@@ -1518,9 +1531,7 @@ pub struct NestedVmxState {
     pub ept02_table_pool: u64,
     pub ept02_table_pool_pages: u64,
     pub ept02_table_pool_used: u64,
-    pub ept01_pointer: u64,
     pub ept02_invalidation_count: u64,
-    pub vmcs02_launched: u64,
     pub ept02_cache_initialized: u64,
     pub ept02_cached_ept12_pointer: u64,
     pub ept02_cached_pointer: u64,
@@ -1528,17 +1539,14 @@ pub struct NestedVmxState {
     pub ept02_cached_table_pool_pages: u64,
     pub ept02_cached_table_pool_used: u64,
     pub ept02_mbec: u64,
-    pub vmcs02_guest_cache_valid: u64,
-    pub vmcs02_control_cache_valid: [u64; 2],
     pub vmcs02_field_cache: [u64; VMCS12_EXTENDED_FIELD_COUNT],
     pub vmcs02_last_vpid: u64,
     pub ept02_cached_mbec: u64,
     pub exit_started_tsc: u64,
     pub exit_handler_cycles: [u64; 4],
     pub reflected_exit_counts: [u32; 44],
-    pub vmcs02_vpid_cache: u32,
-    pub physical_address_bits: u32,
     pub host_mapping_cache: [u64; 4],
+    pub evmcs_page_cache: [u64; 24],
     pub vmcs02_rare_state_pending: [u64; 2],
     pub ept02_recycle_count: u64,
     pub ept02_eviction_cursor: u64,
@@ -1557,15 +1565,12 @@ pub struct NestedVmxState {
     pub eptp_table_pages: u64,
     pub eptp_table_used: u64,
     pub exit_reason_counts: [u64; 128],
-    pub evmcs_enabled: u64,
-    pub vp_assist_msr: u64,
-    pub evmcs_active: u64,
-    pub current_vmcs_hpa: u64,
     pub captured_msr_store_count: u64,
     pub entry_msr_prefix_count: u64,
     pub l2_msr_gp_pending: u64,
     pub operand_linear_address: u64,
     pub operand_data: [u64; 2],
+    pub l2_nmi_exit_pending: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1608,7 +1613,7 @@ impl NestedVmxState {
         let physical_address_bits = if __cpuid(0x8000_0000).eax >= 0x8000_0008 {
             __cpuid(0x8000_0008).eax & 0xff
         } else {
-            0
+            36
         };
         Self {
             host_procbased_ctls2: capabilities.host_procbased_ctls2,
@@ -1739,6 +1744,7 @@ impl NestedVmxState {
             vmcs02_vpid_cache: 0,
             physical_address_bits,
             host_mapping_cache: [0; 4],
+            evmcs_page_cache: [0; 24],
             vmcs02_rare_state_pending: [0; 2],
             ept02_recycle_count: 0,
             ept02_eviction_cursor: 0,
@@ -1766,6 +1772,7 @@ impl NestedVmxState {
             l2_msr_gp_pending: 0,
             operand_linear_address: 0,
             operand_data: [0; 2],
+            l2_nmi_exit_pending: 0,
         }
     }
 
@@ -1779,7 +1786,10 @@ impl NestedVmxState {
         self.vmcs01_entry_msr_list = composition.vmcs01_entry_msr_list;
     }
 
-    pub fn configure_ept02_table_pools(&mut self, pools: [(u64, usize, usize); 2]) {
+    pub fn configure_ept02_table_pools(&mut self, pools: [(u64, usize, usize); 2]) -> bool {
+        if pools.iter().any(|(_, pages, used_pages)| used_pages > pages) {
+            return false;
+        }
         let [
             (base, pages, used_pages),
             (cached_base, cached_pages, cached_used_pages),
@@ -1790,6 +1800,7 @@ impl NestedVmxState {
         self.ept02_cached_table_pool = cached_base;
         self.ept02_cached_table_pool_pages = cached_pages as u64;
         self.ept02_cached_table_pool_used = cached_used_pages as u64;
+        true
     }
 
     pub fn configure_ept(&mut self, configuration: NestedEptConfiguration) {

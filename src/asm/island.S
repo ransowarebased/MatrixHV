@@ -26,11 +26,11 @@ sgdt [rcx + {p_original_gdtr}]
 sidt [rcx + {p_original_idtr}]
 mov rax, {host_rsp}
 vmwrite rax, rdx
-jc 3f
+jc 6f
 jz 3f
 mov rax, {host_rip}
 vmwrite rax, r8
-jc 4f
+jc 7f
 jz 4f
 vmlaunch
 jc 1f
@@ -48,6 +48,12 @@ mov eax, 3
 jmp 8f
 4:
 mov eax, 4
+jmp 8f
+6:
+mov eax, 7
+jmp 8f
+7:
+mov eax, 8
 jmp 8f
 9:
 lgdt [r10 + {p_original_gdtr}]
@@ -81,11 +87,11 @@ sidt [rcx + {b_idtr}]
 fxsave64 [rcx + {b_fx}]
 mov rax, {host_rsp}
 vmwrite rax, rdx
-jc .Lresident_boot_rsp_fail
+jc .Lresident_boot_rsp_fail_invalid
 jz .Lresident_boot_rsp_fail
 mov rax, {host_rip}
 vmwrite rax, r8
-jc .Lresident_boot_rip_fail
+jc .Lresident_boot_rip_fail_invalid
 jz .Lresident_boot_rip_fail
 mov rax, qword ptr [rcx + {b_nested_vmxon_operand}]
 vmlaunch
@@ -104,6 +110,12 @@ mov eax, 3
 jmp .Lresident_boot_failure_restore
 .Lresident_boot_rip_fail:
 mov eax, 4
+jmp .Lresident_boot_failure_restore
+.Lresident_boot_rsp_fail_invalid:
+mov eax, 7
+jmp .Lresident_boot_failure_restore
+.Lresident_boot_rip_fail_invalid:
+mov eax, 8
 .Lresident_boot_failure_restore:
 fxrstor64 [rcx + {b_fx}]
 jmp .Lresident_boot_pop
@@ -176,5 +188,6 @@ matrixhv_island_slots
 .globl matrixhv_resident_island_end
 matrixhv_resident_ept_cache
 matrixhv_resident_eptp_switch
+matrixhv_island_flight_recorder
 matrixhv_resident_island_end:
 .text

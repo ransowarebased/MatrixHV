@@ -1,3 +1,6 @@
+#[cfg(test_harness = "core_audit")]
+include!("core_audit_tests.rs");
+
 #[cfg(test_harness = "cache")]
 mod cache {
     include!("../builds/ept-cache-tests/definitions.rs");
