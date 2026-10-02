@@ -362,7 +362,7 @@ mod hyperv_time {
 
     struct Scenario {
         context: [u64; 8],
-        shared: Box<[u64; 8]>,
+        shared: Box<[u64; 10]>,
         page: Box<Page>,
         tables: Box<[Page; 4]>,
     }
@@ -372,6 +372,8 @@ mod hyperv_time {
             let mut shared = Box::new([
                 hyperv_reference_tsc_scale(2, 208, 24_000_000),
                 0_u64.wrapping_sub(1_000_000),
+                0,
+                0,
                 0,
                 0,
                 0,
@@ -449,6 +451,121 @@ mod hyperv_time {
         assert_eq!(scenario.features(0x4000_0003), [0x262, 0, 0, 0]);
         assert_eq!(scenario.features(0x4000_0004), [0, u32::MAX, 0, 0]);
         assert_eq!(scenario.features(0x4000_000a), [0; 4]);
+    }
+
+    #[test]
+    fn invariant_tsc_control_remains_available_under_an_outer_hypervisor() {
+        let cpuid = |leaf| {
+            let mut result = core::arch::x86_64::CpuidResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            };
+            match leaf {
+                0 => result.eax = 0x16,
+                1 => result.ecx = CPUID_HYPERVISOR_PRESENT_BIT,
+                0x15 => {
+                    result.eax = 2;
+                    result.ebx = 208;
+                    result.ecx = 24_000_000;
+                }
+                0x8000_0000 => result.eax = 0x8000_0007,
+                0x8000_0007 => result.edx = 1 << 8,
+                _ => {}
+            }
+            result
+        };
+        let mut scenario = Scenario::new();
+        scenario.context[1] = 0;
+        scenario.shared[8] = u64::from(native_hyperv_invariant_tsc(cpuid));
+        assert_eq!(scenario.shared[8], 1);
+        assert_eq!(native_hyperv_reference_tsc(cpuid, 12345), (0, 0));
+        assert_eq!(scenario.msr(9, 1), (1, 1));
+        assert_eq!(scenario.msr(8, 0), (1, 1));
+    }
+
+    #[test]
+    fn invariant_tsc_support_requires_the_advertised_extended_leaf_and_bit() {
+        for (maximum, features, expected) in [
+            (0x8000_0006, 1 << 8, false),
+            (0x8000_0007, 0, false),
+            (0x8000_0007, 1 << 8, true),
+        ] {
+            let cpuid = |leaf| core::arch::x86_64::CpuidResult {
+                eax: if leaf == 0x8000_0000 { maximum } else { 0 },
+                ebx: 0,
+                ecx: CPUID_HYPERVISOR_PRESENT_BIT,
+                edx: if leaf == 0x8000_0007 { features } else { 0 },
+            };
+            assert_eq!(native_hyperv_invariant_tsc(cpuid), expected);
+        }
+    }
+
+    #[test]
+    fn invariant_tsc_access_depends_on_native_support_without_changing_advertised_features() {
+        let mut scenario = Scenario::new();
+        for (timing, evmcs, features) in [(1, 1, 0x272), (1, 0, 0x262), (0, 1, 0x70)] {
+            scenario.context[1] = timing;
+            scenario.context[4] = evmcs;
+            scenario.shared[8] = 0;
+            assert_eq!(scenario.features(0x4000_0003), [features, 0, 0, 0]);
+            assert_eq!(scenario.msr(8, 0).0, 0);
+            assert_eq!(scenario.msr(9, 1).0, 0);
+            scenario.shared[8] = 1;
+            assert_eq!(scenario.features(0x4000_0003), [features, 0, 0, 0]);
+            assert_eq!(scenario.msr(8, 0), (1, 0));
+            assert_eq!(scenario.msr(9, 0).0, 1);
+        }
+        assert_eq!(scenario.shared[9], 0);
+    }
+
+    #[test]
+    fn invariant_tsc_enable_is_shared_and_cannot_be_cleared_by_another_processor() {
+        let mut scenario = Scenario::new();
+        scenario.shared[8] = 1;
+        assert_eq!(scenario.msr(8, 0), (1, 0));
+        assert_eq!(scenario.msr(9, 1).0, 1);
+        let mut other = scenario.context;
+        let mut registers = [0; 2];
+        assert_eq!(
+            unsafe { test_time_msr(other.as_mut_ptr(), registers.as_mut_ptr(), 8) },
+            1
+        );
+        assert_eq!(registers, [1, 0]);
+        registers = [0; 2];
+        assert_eq!(
+            unsafe { test_time_msr(other.as_mut_ptr(), registers.as_mut_ptr(), 9) },
+            0
+        );
+        assert_eq!(scenario.msr(9, 1).0, 1);
+        assert_eq!(scenario.msr(8, 0), (1, 1));
+    }
+
+    #[test]
+    fn invariant_tsc_rejects_reserved_bits_without_modifying_partition_state() {
+        let mut scenario = Scenario::new();
+        scenario.shared[8] = 1;
+        for enabled in [0, 1] {
+            assert_eq!(scenario.msr(9, enabled).0, 1);
+            for value in [2, 3, 1 << 31, 1 << 32, 1 << 63, u64::MAX] {
+                assert_eq!(scenario.msr(9, value).0, 0);
+                assert_eq!(scenario.msr(8, 0), (1, enabled));
+            }
+        }
+    }
+
+    #[test]
+    fn invariant_tsc_defers_to_the_parent_when_matrixhv_does_not_own_the_interface() {
+        let mut scenario = Scenario::new();
+        scenario.context[1] = 0;
+        scenario.context[4] = 0;
+        for supported in [0, 1] {
+            scenario.shared[8] = supported;
+            assert_eq!(scenario.msr(8, 0).0, 2);
+            assert_eq!(scenario.msr(9, 1).0, 2);
+        }
+        assert_eq!(scenario.shared[9], 0);
     }
 
     #[test]

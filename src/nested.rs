@@ -263,10 +263,7 @@ impl NestedVmxCapabilities {
             restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_INVPCID, 0);
         let secondary_xsaves =
             restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_XSAVES, 0);
-        let secondary_mbec = if host.ept_vpid_cap
-            & (VMX_EPT_EXECUTE_ONLY | VMX_EPT_ADVANCED_EXIT_INFO)
-            == (VMX_EPT_EXECUTE_ONLY | VMX_EPT_ADVANCED_EXIT_INFO)
-        {
+        let secondary_mbec = if host.ept_vpid_cap & VMX_EPT_ADVANCED_EXIT_INFO != 0 {
             restrict_control(host.procbased_ctls2, VMX_SECONDARY_MODE_BASED_EXECUTE, 0)
         } else {
             0
@@ -298,7 +295,11 @@ impl NestedVmxCapabilities {
             0
         };
         let true_exit_ctls = if has_true_controls {
-            restrict_emulated_control(host.true_exit_ctls, exit_supported, 0)
+            restrict_emulated_control(
+                host.true_exit_ctls,
+                exit_supported,
+                VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
+            )
         } else {
             0
         };

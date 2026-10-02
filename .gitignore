@@ -9,3 +9,7 @@
 *.ilk
 *.log
 *.pyc
+*.efi
+*.dll
+*.exe
+/tools/

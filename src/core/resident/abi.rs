@@ -68,6 +68,8 @@ pub struct ResidentEventContext {
     pub hyperv_guest_os_id: AtomicU64,
     pub hyperv_hypercall_msr: AtomicU64,
     pub hyperv_hypercall_lock: AtomicU64,
+    pub hyperv_tsc_invariant_supported: u64,
+    pub hyperv_tsc_invariant_control: AtomicU64,
 }
 
 #[repr(C, align(16))]

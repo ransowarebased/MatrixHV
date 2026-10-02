@@ -9,6 +9,7 @@ pub const HYPERV_HYPERCALL_MSR: u32 = 0x4000_0001;
 pub const HYPERV_VP_INDEX_MSR: u32 = 0x4000_0002;
 pub const HYPERV_REFERENCE_COUNT_MSR: u32 = 0x4000_0020;
 pub const HYPERV_REFERENCE_TSC_MSR: u32 = 0x4000_0021;
+pub const HYPERV_TSC_INVARIANT_CONTROL_MSR: u32 = 0x4000_0118;
 pub const HYPERV_APIC_FREQUENCY_MSR: u32 = 0x4000_0023;
 pub const HYPERV_REFERENCE_TIME_MSR_SPAN: u32 =
     HYPERV_APIC_FREQUENCY_MSR - HYPERV_REFERENCE_TSC_MSR;
@@ -33,8 +34,7 @@ pub fn native_hyperv_reference_tsc() -> (u64, u64) {
     let cpuid = core::arch::x86_64::__cpuid;
     if cpuid(0).eax < 0x15
         || cpuid(1).ecx & CPUID_HYPERVISOR_PRESENT_BIT != 0
-        || cpuid(0x8000_0000).eax < 0x8000_0007
-        || cpuid(0x8000_0007).edx & (1 << 8) == 0
+        || !native_hyperv_invariant_tsc()
     {
         return (0, 0);
     }
@@ -43,6 +43,13 @@ pub fn native_hyperv_reference_tsc() -> (u64, u64) {
     let epoch = unsafe { core::arch::x86_64::_rdtsc() };
     let offset = ((u128::from(epoch) * u128::from(scale)) >> 64) as u64;
     (scale, offset.wrapping_neg())
+}
+
+pub fn native_hyperv_invariant_tsc() -> bool {
+    let cpuid = core::arch::x86_64::__cpuid;
+    // The synthetic control acknowledges the invariant-TSC bit visible to L1,
+    // including when an outer hypervisor supplies that architectural guarantee.
+    cpuid(0x8000_0000).eax >= 0x8000_0007 && cpuid(0x8000_0007).edx & (1 << 8) != 0
 }
 
 pub fn restrict_evmcs_controls(secondary_controls: u64, vt_evmcs: bool) -> u64 {

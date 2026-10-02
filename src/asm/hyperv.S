@@ -198,6 +198,17 @@ je .Lresident_dispatch_rdmsr_passthrough
 mov r9, qword ptr [r12 + {b_event_context}]
 mov r11, qword ptr [r9 + {event_hyperv_reference_tsc_msr}]
 jmp .Lresident_dispatch_rdmsr_nested_value
+.Lresident_dispatch_rdmsr_tsc_invariant:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+jne .Lresident_dispatch_rdmsr_tsc_invariant_value
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_rdmsr_passthrough
+.Lresident_dispatch_rdmsr_tsc_invariant_value:
+mov r9, qword ptr [r12 + {b_event_context}]
+cmp qword ptr [r9 + {event_hyperv_tsc_invariant_supported}], 0
+je .Lresident_dispatch_inject_gp
+mov r11, qword ptr [r9 + {event_hyperv_tsc_invariant_control}]
+jmp .Lresident_dispatch_rdmsr_nested_value
 .endm
 
 .macro matrixhv_resident_hyperv_wrmsr
@@ -369,6 +380,32 @@ pause
 jmp .Lresident_hypercall_state_lock_retry
 .Lresident_hypercall_state_locked:
 ret
+.Lresident_dispatch_wrmsr_tsc_invariant:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+jne .Lresident_dispatch_wrmsr_tsc_invariant_value
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_wrmsr_passthrough
+.Lresident_dispatch_wrmsr_tsc_invariant_value:
+mov r9, qword ptr [r12 + {b_event_context}]
+cmp qword ptr [r9 + {event_hyperv_tsc_invariant_supported}], 0
+je .Lresident_dispatch_inject_gp
+cmp dword ptr [rsp + 16], 0
+jne .Lresident_dispatch_inject_gp
+test dword ptr [rsp], -2
+jnz .Lresident_dispatch_inject_gp
+test byte ptr [rsp], 1
+jz .Lresident_dispatch_wrmsr_tsc_invariant_zero
+// The native invariant-TSC CPUID bit is already visible to L1. Latch this
+// partition-wide acknowledgement without issuing a synthetic MSR on hardware.
+lock or qword ptr [r9 + {event_hyperv_tsc_invariant_control}], 1
+jmp .Lresident_dispatch_wrmsr_tsc_invariant_done
+.Lresident_dispatch_wrmsr_tsc_invariant_zero:
+// Once enabled, the guest cannot revoke the invariant-TSC guarantee.
+cmp qword ptr [r9 + {event_hyperv_tsc_invariant_control}], 0
+jne .Lresident_dispatch_inject_gp
+.Lresident_dispatch_wrmsr_tsc_invariant_done:
+call .Lresident_advance_guest_rip
+jmp .Lresident_dispatch_resume
 .Lresident_dispatch_wrmsr_reference_count:
 cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
 je .Lresident_dispatch_wrmsr_passthrough
@@ -449,6 +486,8 @@ matrixhv_ept01_page_translation
 .endm
 
 .macro matrixhv_resident_hyperv_rdmsr_route
+cmp ecx, {hyperv_tsc_invariant_control_msr}
+je .Lresident_dispatch_rdmsr_tsc_invariant
 cmp ecx, {hyperv_reference_count_msr}
 je .Lresident_dispatch_rdmsr_reference_count
 cmp ecx, {hyperv_reference_tsc_msr}
@@ -468,6 +507,8 @@ jbe .Lresident_dispatch_rdmsr_hyperv_apic
 .endm
 
 .macro matrixhv_resident_hyperv_wrmsr_route
+cmp ecx, {hyperv_tsc_invariant_control_msr}
+je .Lresident_dispatch_wrmsr_tsc_invariant
 cmp ecx, {hyperv_reference_count_msr}
 je .Lresident_dispatch_wrmsr_reference_count
 cmp ecx, {hyperv_reference_tsc_msr}
@@ -685,7 +726,19 @@ test eax, eax
 jz .Lresident_nested_vmclear_invalid_address
 mov edx, dword ptr [r11]
 cmp edx, {evmcs_version}
-je .Lresident_hyperv_evmcs_vmclear_version_ready
+jne .Lresident_hyperv_evmcs_vmclear_revision_check
+// A native revision of one shares the eVMCS header. Require an established
+// enlightened selection or the VP Assist handshake before treating it as eVMCS.
+cmp edx, dword ptr [r12 + {b_nested_vmcs12_revision_id}]
+jne .Lresident_hyperv_evmcs_vmclear_version_ready
+// Previously initialized ordinary backing remains identifiable across selections.
+mov rax, {vmcs12_backing_magic}
+cmp qword ptr [r11 + {vmcs12_backing_magic_offset}], rax
+je .Lresident_nested_vmclear_ordinary
+cmp qword ptr [r12 + {b_nested_evmcs_active}], 0
+jne .Lresident_hyperv_evmcs_vmclear_version_ready
+jmp .Lresident_hyperv_evmcs_vmclear_check_assist
+.Lresident_hyperv_evmcs_vmclear_revision_check:
 cmp edx, dword ptr [r12 + {b_nested_vmcs12_revision_id}]
 jne .Lresident_nested_vmclear_ordinary
 cmp qword ptr [r12 + {b_nested_evmcs_active}], 0

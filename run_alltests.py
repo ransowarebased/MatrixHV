@@ -16,7 +16,7 @@ def execute(command, project, env=None):
     subprocess.run(command, cwd=project, env=env, check=True)
 
 
-def run_component(project, component):
+def run_component(project, component, release=False):
     prepared = set()
     for name, prepare in COMPONENTS[component].items():
         print(f"\n  {component}::{name}", flush=True)
@@ -30,6 +30,7 @@ def run_component(project, component):
             [
                 "rustc", "--edition=2024", "--test",
                 "--cfg", f'test_harness="{name}"',
+                *(["-C", "opt-level=3"] if release else []),
                 str(project / "tests" / f"{component}_tests.rs"),
                 "-o", str(binary),
             ],
@@ -41,7 +42,7 @@ def run_component(project, component):
         prepare_boot_state(project)
 
 
-def run_neo(project):
+def run_neo(project, release=False):
     version = subprocess.run(
         ["rustc", "-vV"], cwd=project, check=True, capture_output=True, text=True
     )
@@ -55,16 +56,19 @@ def run_neo(project):
         "--manifest-path", str(project / "src/road/Cargo.toml"),
         "--target", host_target, "--target-dir", str(output), "--bin", "neo",
     ]
+    if release:
+        options.append("--release")
     execute(["cargo", "build", *options], project)
     env = os.environ.copy()
     env["NEO_TEST_BINARY"] = str(
-        output / host_target / "debug" / ("neo.exe" if sys.platform == "win32" else "neo")
+        output / host_target / ("release" if release else "debug") / ("neo.exe" if sys.platform == "win32" else "neo")
     )
     execute(["cargo", "test", *options], project, env)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--release", action="store_true", help="Build optimized host tests and the ROAD agent in Release mode")
     parser.add_argument(
         "components", nargs="*", metavar="COMPONENT",
         help=f"Optional component filter: {', '.join([*COMPONENTS, 'neo'])}",
@@ -84,9 +88,9 @@ def main():
         passed = True
         try:
             if component == "neo":
-                run_neo(project)
+                run_neo(project, arguments.release)
             else:
-                run_component(project, component)
+                run_component(project, component, arguments.release)
         except (OSError, subprocess.CalledProcessError, ValueError, AssertionError) as error:
             print(f"Suite failed: {error}", flush=True)
             passed = False

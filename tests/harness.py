@@ -549,7 +549,11 @@ def prepare_native_shadow(project: Path):
         begin = source.index(start)
         return source[begin:source.index(end, begin)]
     assembly = block(".Lresident_nested_translate_current_vmcs:", ".Lresident_dispatch_vmread:")
-    assembly += block(".Lresident_nested_validate_shadow_controls:", ".Lresident_nested_msr_list_is_valid:")
+    assembly += block(".Lresident_nested_validate_entry:", ".Lresident_vmcs12_field_index:")
+    switch_source = (project / "src/asm/eptp_switch.S").read_text()
+    start = switch_source.index(".Lresident_nested_validate_vm_functions:")
+    assembly += switch_source[start:switch_source.index(".Lresident_nested_prepare_ept02:", start)]
+    assembly += "\n.Lresident_nested_vmfunc_failed:\nxor eax, eax\nret\n"
     assembly += block(".Lresident_nested_physical_address_is_valid:", ".Lresident_nested_resolve_ept02_violation:")
     assembly += block(".Lresident_dispatch_vmptrld:", ".Lresident_dispatch_vmptrst:")
     assembly += block(".Lresident_nested_vmclear_ordinary:", ".Lresident_nested_vmclear_software:")
@@ -587,6 +591,7 @@ def prepare_native_shadow(project: Path):
         "resume": "vmresume_vmcs_ready",
         "field": "shadow_field_available",
         "software_write": "vmwrite_operands_ready",
+        "entry": "validate_entry",
     }
     for name, label in entries.items():
         target = ".Lresident_" + label if name == "load" else ".Lresident_nested_" + label
@@ -603,6 +608,7 @@ def prepare_native_shadow(project: Path):
             mov r10, rdx
             mov r11, r8
             call {target}
+            {"mov eax, r10d" if name == "entry" else ""}
             pop r14
             pop r13
             pop r12
@@ -630,7 +636,9 @@ def prepare_native_shadow(project: Path):
     .Ltest_read_vmcs01_done:
         test r12, r12
         ret
+    .Lresident_ept01_page_is_readable:
     .Lresident_ept01_page_is_writable:
+        add r11, [r12 + {test_translation_delta}]
     .Lresident_ept01_host_page_is_mapped:
         mov rax, [r12 + {test_mapped}]
         ret
@@ -703,6 +711,9 @@ def prepare_native_shadow(project: Path):
         "vmcs_field_exit_reason": 0x4402, "vmcs_field_exit_instruction_len": 0x440c,
         "vmcs_field_exit_qualification": 0x6400,
         "vmcs_shadow_read_byte_offset": 0xd82, "vmcs_shadow_read_bypass_mask": 0x50,
+        "nested_guest_msr_list_capacity": 512,
+        "vm_entry_invalid_control_fields_error": 7,
+        "vm_entry_invalid_host_state_field_error": 8,
     }
     fields = sorted(set(re.findall(r"\{((?:b_|test_)\w+)\}", assembly)))
     offsets = {}
@@ -733,7 +744,7 @@ def prepare_nested_ept(project: Path):
     )
     (output / "resident-exit-msrs.S").write_text(exit_msr_assembly + "ret\n")
     start = source.index('.Lresident_nested_resolve_ept02_violation:')
-    end = source.index('.Lresident_nested_host_msr_list_is_mapped:')
+    end = source.index('.Lresident_nested_guest_msr_list_is_mapped:')
     prepare_start = switch_source.index('.Lresident_nested_prepare_ept02:')
     prepare_end = switch_source.index('.Lresident_nested_activate_vmcs02_ept:')
     invept_start = source.index('.Lresident_nested_invalidate_ept12_context:')
@@ -869,7 +880,7 @@ def prepare_nested_ept(project: Path):
     (output / "resident-vpid.S").write_text(vpid_assembly)
     msr_start = source.index('.Lresident_nested_complete_vmcs02_msr_exit:')
     msr_end = source.index('.Lresident_nested_restore_l1_host_state:')
-    mapped_start = source.index('.Lresident_nested_host_msr_list_is_mapped:')
+    mapped_start = source.index('.Lresident_nested_guest_msr_list_is_mapped:')
     mapped_end = source.index('.Lresident_nested_msr_requires_hardware_store:')
     msr_assembly = (source[msr_start:msr_end] + source[mapped_start:mapped_end]).strip()
     select_start = source.index(".Lresident_nested_select_msr_entry_list:")
@@ -879,7 +890,7 @@ def prepare_nested_ept(project: Path):
         'call .Lresident_nested_eptp_before_root_write',
         'call .Ltest_msr_root_write',
     )
-    msr_assembly += '\n.Ltest_msr_root_write:\nret\n'
+    msr_assembly += '\n.Ltest_msr_root_write:\nret\n.Lresident_ept01_page_translate:\njmp .Lresident_ept01_host_page_is_mapped\n'
     msr_assembly = msr_assembly.replace(
         "vmwrite rax, r11",
         "inc qword ptr [r12 + {test_writes}]\n"
@@ -932,27 +943,40 @@ def prepare_nested_ept(project: Path):
         ".Lresident_nested_write_vmcs02_control", ".Ltest_capture_vmcs02_control"
     )
     merge_assembly = merge_assembly.replace("mov rax, 0x2026", "mov rax, 3").replace("mov rax, 0x2028", "mov rax, 4")
-    merge_assembly = merge_assembly.replace(".Lresident_nested_eptp_before_root_write", ".Ltest_shadow_root_write")
+    merge_assembly = merge_assembly.replace(".Lresident_nested_eptp_before_root_write", ".Ltest_shadow_root_write").replace(".Lresident_ept01_page_is_readable", ".Ltest_shadow_translate")
     merge_assembly += (
         "\nret\n.Ltest_capture_vmcs02_control:\n"
         "mov qword ptr [r12 + {test_hardware} + rax * 8], r11\nret\n"
-        ".Ltest_shadow_root_write:\nret\n"
+        ".Ltest_shadow_root_write:\nret\n.Ltest_shadow_translate:\nmov eax, 1\nret\n"
     )
     (output / "resident-intercepts.S").write_text(merge_assembly)
     policy_start = source.index('bt dword ptr [r12 + {b_nested_vmcs12_primary_control}], 28', merge_start)
     policy_end = source.index('.Lresident_nested_merge_msr_bitmap_done:', policy_start)
     policy_assembly = source[policy_start:policy_end].replace(
-        '.Lresident_ept01_host_page_is_mapped', '.Ltest_msr_policy_host_page_is_mapped'
+        '.Lresident_ept01_page_is_readable', '.Ltest_msr_policy_host_page_is_mapped'
     ).replace(
         '.Lresident_nested_', '.Ltest_msr_policy_'
     )
     policy_assembly += (
         '\nret\n.Ltest_msr_policy_host_page_is_mapped:\n'
+        'mov r11, qword ptr [r12 + {test_translated}]\n'
         'mov eax, dword ptr [r12 + {test_mapped}]\nret\n'
         '.Ltest_msr_policy_write_vmcs02_control:\n'
         'mov qword ptr [r12 + {test_selected}], r11\nret\n'
     )
     (output / "resident-msr-policy.S").write_text(policy_assembly)
+    io_start = source.index("bt r11, 21", merge_start)
+    io_end = source.index(".Lresident_nested_merge_io_bitmaps_done:", io_start)
+    io = source[io_start:io_end].replace(".Lresident_nested_merge_io_bitmaps_done", ".Ltest_io_done")
+    io = io.replace(".Lresident_nested_write_vmcs02_control", ".Ltest_io_write")
+    translation_start = switch_source.index(".Lresident_ept01_page_is_readable:")
+    translation_end = switch_source.index(".endm", translation_start)
+    io += "\n.Ltest_io_done:\nret\n" + switch_source[translation_start:translation_end]
+    io += "\n.Ltest_io_write:\nmov [r12 + {review_hardware} + rax * 8], r11\nret\n"
+    io += ".Lresident_ept01_host_page_is_mapped:\nmov eax, 1\nret\n"
+    io += ".Lresident_nested_eptp_before_root_write:\nret\n.Lresident_dispatch_halt:\nud2\n"
+    wrapper = ".text\n.globl review_edge_merge_io\nreview_edge_merge_io:\npush r12\nmov r12, rcx\nmov r11, [r12 + {b_nested_vmcs12_primary_control}]\ncall .Ltest_io_merge\npop r12\nret\n.Ltest_io_merge:\n"
+    (output / "resident-io.S").write_text((wrapper + io).replace(".Lresident_", ".Ltest_io_"))
 
 
 def prepare_nested_regressions(project: Path):
@@ -966,7 +990,7 @@ def prepare_nested_regressions(project: Path):
         block('.Lresident_nested_msr_exit_requested:', '.Lresident_nested_read_gpr:'),
         block('.Lresident_nested_operand_width:', '.Lresident_nested_physical_address_is_valid:'),
         block('.Lresident_ept01_page_is_readable:', '.Lresident_dispatch_xsetbv:'),
-        block('.Lresident_nested_msr_requires_hardware_store:', '.Lresident_nested_store_current_vmcs12:'),
+        block('.Lresident_nested_guest_msr_list_is_mapped:', '.Lresident_nested_store_current_vmcs12:'),
         block('.Lresident_nested_select_msr_entry_list:', '.Lresident_nested_compose_vmcs02_msr_lists:'),
         block('.Lresident_nested_restore_internal_msr_entry:', '.Lresident_nested_l2_resume_ept:'),
         block('.Lresident_nested_l2_probe_reflection:', '.Lresident_nested_l2_probe_non_msr:'),
@@ -982,6 +1006,11 @@ def prepare_nested_regressions(project: Path):
         block('.Lresident_nested_msr_list_is_valid:', '.Lresident_nested_entry_event_is_valid:'),
         block('.Lresident_nested_physical_address_is_valid:', '.Lresident_nested_resolve_ept02_violation:'),
     ])
+    fault = block('.Lresident_nested_inject_pf_write:', '.Lresident_nested_inject_ud:')
+    fault = re.sub(r'^resident_telemetry_counter .*\n', '', fault, flags=re.MULTILINE)
+    fault = fault.replace('mov cr2, r10', 'mov [r12 + {test_fault_address}], r10')
+    fault = fault.replace('jmp .Lresident_dispatch_resume', 'xor eax, eax\njmp .Ltest_regression_return')
+    assembly += fault + '\n.Lresident_diagnostic_nested_record_failure:\nret\n'
     assembly = assembly.replace('vmread r11, rax', 'call .Ltest_regression_vmread')
     assembly = assembly.replace('vmread r13, rax', 'call .Ltest_regression_vmread\nmov r13, r11')
     assembly = assembly.replace('vmwrite rax, r11', 'call .Lresident_nested_write_vmcs02_control')
@@ -1048,10 +1077,12 @@ def prepare_nested_regressions(project: Path):
     .Ltest_regression_read:
         mov ecx, r8d
         call .Lresident_nested_read_operand_range
+        jc .Lresident_nested_inject_pf_read
         jmp .Ltest_regression_carry_result
     .Ltest_regression_write:
         mov ecx, r8d
         call .Lresident_nested_write_operand_range
+        jc .Lresident_nested_inject_pf_write
     .Ltest_regression_carry_result:
         setnc al
         movzx eax, al
@@ -1154,7 +1185,6 @@ def prepare_nested_regressions(project: Path):
         cmp r12, 0
         ret
     .Lresident_ept01_host_page_is_mapped:
-    .Lresident_nested_host_msr_list_is_mapped:
         mov eax, 1
         ret
     .Lresident_nested_eptp_before_root_write:
@@ -1240,6 +1270,8 @@ def prepare_nested_logging(project: Path):
     assembly = assembly.replace("vmread r11, rax", "call .Ltest_vmread")
     assembly = assembly.replace("vmwrite rax, r11", "call .Ltest_vmwrite")
     constants = {"guest_cs_selector": 0, "guest_rflags": 1, "exception_bitmap": 2,
+                 "guest_cr0": 3, "cr0_read_shadow": 4, "cr0_guest_host_mask": 5,
+                 "guest_cr4": 6,
                  "vmxon_in_vmx_root_error": 15, "vmx_status_flags_clear_mask": ~0x8d5,
                  "vmcs_shadow_read_byte_offset": 0xd82,
                  "vmcs_shadow_read_bypass_mask": 0x50}
@@ -1279,6 +1311,18 @@ def prepare_nested_logging(project: Path):
         pop rbx
         ret
     .Ltest_vmread:
+        mov r11, [r12 + {b_test_cr4}]
+        cmp eax, 6
+        je .Ltest_vmread_ready
+        mov r11, [r12 + {b_test_cr0}]
+        cmp eax, 3
+        je .Ltest_vmread_ready
+        mov r11, [r12 + {b_test_cr0_shadow}]
+        cmp eax, 4
+        je .Ltest_vmread_ready
+        mov r11, [r12 + {b_test_cr0_mask}]
+        cmp eax, 5
+        je .Ltest_vmread_ready
         xor r11d, r11d
         cmp eax, 1
         jne .Ltest_vmread_ready
@@ -1324,11 +1368,18 @@ def prepare_nested_logging(project: Path):
         xor eax, eax
         ret
     .Lresident_nested_inject_ud:
+        mov qword ptr [r12 + {b_test_exception}], 6
+        mov eax, 1
+        ret
     .Lresident_nested_inject_gp:
+        mov qword ptr [r12 + {b_test_exception}], 13
+        mov eax, 1
+        ret
     .Lresident_nested_inject_pf_read:
     .Lresident_nested_vmfail_invalid_vmxon_address:
     .Lresident_nested_vmfail_invalid_vmxon_revision:
     .Lresident_nested_vmfail_with_error:
+        mov [r12 + {b_test_vmx_error}], r10
     .Lresident_dispatch_vmread_failed:
     .Lresident_dispatch_vmwrite_failed:
         mov eax, 1
@@ -1748,6 +1799,15 @@ def prepare_hyperv_time(project: Path):
     output.mkdir(parents=True, exist_ok=True)
     source = (project / 'src/hyperv.rs').read_text(encoding='utf-8')
     scale = source[source.index('pub fn hyperv_reference_tsc_scale('):source.index('pub fn native_hyperv_reference_tsc(')]
+    native = source[source.index('pub fn native_hyperv_reference_tsc('):source.index('pub fn restrict_evmcs_controls(')]
+    native = native.replace('pub fn native_hyperv_reference_tsc()',
+                            'fn native_hyperv_reference_tsc(cpuid: impl Fn(u32) -> core::arch::x86_64::CpuidResult, epoch: u64)')
+    native = native.replace('pub fn native_hyperv_invariant_tsc()',
+                            'fn native_hyperv_invariant_tsc(cpuid: impl Fn(u32) -> core::arch::x86_64::CpuidResult)')
+    native = native.replace('    let cpuid = core::arch::x86_64::__cpuid;\n', '')
+    native = native.replace('native_hyperv_invariant_tsc()', 'native_hyperv_invariant_tsc(&cpuid)')
+    native = native.replace('    let epoch = unsafe { core::arch::x86_64::_rdtsc() };\n', '')
+    scale += '\n' + re.search(r'pub const CPUID_HYPERVISOR_PRESENT_BIT: u32 = [^;]+;', source)[0] + '\n' + native
     (output / 'definitions.rs').write_text(scale, encoding='utf-8')
     source = read_resident_assembly(project)
     read = source[source.index('.Lresident_dispatch_rdmsr_reference_count:'):source.index('.Lresident_dispatch_rdmsr_zero:')]
@@ -1755,13 +1815,22 @@ def prepare_hyperv_time(project: Path):
     read += source[source.index('.Lresident_dispatch_rdmsr_guest_os_id:'):source.index('.Lresident_dispatch_rdmsr_vp_index:')]
     write += source[source.index('.Lresident_dispatch_wrmsr_guest_os_id:'):source.index('.Lresident_dispatch_wrmsr_reference_count:')]
     cpuid = source[source.index('.Lresident_dispatch_cpuid_evmcs:'):source.index('.Lresident_dispatch_cpuid_matrixhv:')]
-    assembly = read + write + cpuid
+    route_start = source.index('cmp ecx, {hyperv_tsc_invariant_control_msr}')
+    read_route = source[route_start:source.index('cmp ecx, {hyperv_reference_count_msr}', route_start)]
+    route_start = source.index('cmp ecx, {hyperv_tsc_invariant_control_msr}', route_start + len(read_route))
+    write_route = source[route_start:source.index('cmp ecx, {hyperv_reference_count_msr}', route_start)]
+    routes = '.Ltest_time_rdmsr_route:\n' + read_route + 'jmp .Lresident_dispatch_rdmsr_passthrough\n'
+    routes += '.Ltest_time_wrmsr_route:\n' + write_route + 'jmp .Lresident_dispatch_wrmsr_passthrough\n'
+    assembly = read + write + cpuid + routes
     offsets = {'b_event_context': 0, 'b_hyperv_timing_supported': 8, 'b_cache_ept_pointer': 24,
                'b_nested_evmcs_enabled': 32, 'event_hyperv_tsc_scale': 0,
                'event_hyperv_tsc_offset': 8, 'event_hyperv_reference_tsc_msr': 16,
                'event_hyperv_reference_tsc_lock': 24, 'event_hyperv_guest_os_id': 32,
                'event_hyperv_hypercall_msr': 40, 'event_hyperv_hypercall_lock': 48,
                'event_hyperv_reference_tsc_sequence': 56,
+               'event_hyperv_tsc_invariant_supported': 64,
+               'event_hyperv_tsc_invariant_control': 72,
+               'hyperv_tsc_invariant_control_msr': 0x40000118,
                'host_page_address_mask': 0x000ffffffffff000}
     assembly = re.sub(r'\{(\w+)\}', lambda match: str(offsets[match[1]]), assembly)
     assembly = re.sub(r'^rdtsc$', 'mov rax, [r12 + 16]\nmov rdx, rax\nshr rdx, 32\nmov eax, eax', assembly, flags=re.MULTILINE)
@@ -1797,6 +1866,11 @@ def prepare_hyperv_time(project: Path):
         je .Lresident_dispatch_rdmsr_hypercall
         cmp r8d, 6
         je .Lresident_dispatch_wrmsr_guest_os_id
+        mov ecx, 0x40000118
+        cmp r8d, 8
+        je .Ltest_time_rdmsr_route
+        cmp r8d, 9
+        je .Ltest_time_wrmsr_route
         jmp .Lresident_dispatch_wrmsr_hypercall
     .Lresident_dispatch_rdmsr_nested_value:
         mov eax, r11d
@@ -1990,8 +2064,14 @@ def prepare_resident_msr(project: Path):
         pop r12
         pop rbx
         ret
-    .Lresident_nested_host_msr_list_is_mapped:
+    .Lresident_nested_msr_entry_is_writable:
+    .Lresident_nested_guest_msr_list_is_mapped:
         mov eax, 1
+        ret
+    .Lresident_nested_copy_guest_msr_list:
+        mov ecx, r10d
+        shl ecx, 1
+        rep movsq
         ret
     .data
     .balign 8

@@ -35,7 +35,8 @@ use crate::hyperv::{
     HYPERV_GUEST_IDLE_FEATURE_MASK, HYPERV_GUEST_OS_ID_MSR, HYPERV_HYPERCALL_MSR,
     HYPERV_REFERENCE_COUNT_MSR, HYPERV_REFERENCE_TIME_MSR_SPAN, HYPERV_REFERENCE_TSC_MSR,
     HYPERV_SIMP_MSR, HYPERV_SINT3_MSR, HYPERV_STIMER0_CONFIG_MSR, HYPERV_STIMER0_COUNT_MSR,
-    HYPERV_VP_ASSIST_MSR, HYPERV_VP_INDEX_MSR, HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START,
+    HYPERV_TSC_INVARIANT_CONTROL_MSR, HYPERV_VP_ASSIST_MSR, HYPERV_VP_INDEX_MSR,
+    HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START, native_hyperv_invariant_tsc,
     native_hyperv_reference_tsc,
 };
 use crate::memory::{
@@ -408,6 +409,8 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
             hyperv_guest_os_id: AtomicU64::new(0),
             hyperv_hypercall_msr: AtomicU64::new(0),
             hyperv_hypercall_lock: AtomicU64::new(0),
+            hyperv_tsc_invariant_supported: u64::from(native_hyperv_invariant_tsc()),
+            hyperv_tsc_invariant_control: AtomicU64::new(0),
         });
         for (index, state) in (*context).control_cpu_states.iter_mut().enumerate() {
             let address = native_storage_pages.physical_address()
@@ -749,6 +752,7 @@ global_asm!(
     hyperv_stimer0_count_msr = const HYPERV_STIMER0_COUNT_MSR,
     hyperv_reference_tsc_msr = const HYPERV_REFERENCE_TSC_MSR,
     hyperv_reference_count_msr = const HYPERV_REFERENCE_COUNT_MSR,
+    hyperv_tsc_invariant_control_msr = const HYPERV_TSC_INVARIANT_CONTROL_MSR,
     hyperv_reference_time_msr_span = const HYPERV_REFERENCE_TIME_MSR_SPAN,
     hyperv_vp_assist_msr = const HYPERV_VP_ASSIST_MSR,
     efer_msr = const IA32_EFER_MSR,
@@ -917,6 +921,8 @@ global_asm!(
     event_hyperv_guest_os_id = const core::mem::offset_of!(ResidentEventContext, hyperv_guest_os_id),
     event_hyperv_hypercall_msr = const core::mem::offset_of!(ResidentEventContext, hyperv_hypercall_msr),
     event_hyperv_hypercall_lock = const core::mem::offset_of!(ResidentEventContext, hyperv_hypercall_lock),
+    event_hyperv_tsc_invariant_supported = const core::mem::offset_of!(ResidentEventContext, hyperv_tsc_invariant_supported),
+    event_hyperv_tsc_invariant_control = const core::mem::offset_of!(ResidentEventContext, hyperv_tsc_invariant_control),
     evmcs_version = const crate::hyperv::EVMCS_VERSION,
     evmcs_guest_rip = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, guest_rip),
     evmcs_guest_rsp = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, guest_rsp),

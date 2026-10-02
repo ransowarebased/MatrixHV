@@ -433,7 +433,7 @@ vmread r11, rax
 add r14, r11
 mov qword ptr [r12 + {b_nested_operand_linear_address}], r14
 mov r10, r14
-call .Lresident_nested_translate_linear_address
+clc
 ret
 .Lresident_nested_operand_width:
 mov eax, {guest_cs_ar_bytes}
@@ -477,6 +477,7 @@ jz .Lresident_nested_operand_range_ready
 mov r10, qword ptr [rsp + 16]
 add r10, qword ptr [rsp + 24]
 mov qword ptr [rsp + 16], r10
+mov edx, dword ptr [rsp + 8]
 call .Lresident_nested_translate_linear_address
 jc .Lresident_nested_operand_range_failed
 mov r11, r10
@@ -553,9 +554,21 @@ pop rsi
 stc
 ret
 .Lresident_nested_translate_linear_address:
+// VMX operands are supervisor accesses. Track R/W across every paging level;
+// EAX returns the page-fault P bit, and R10 retains the faulting linear address.
+push rbx
+mov ebx, edx
+and ebx, 2
 mov rdi, r10
 mov rax, {guest_cr0}
 vmread r11, rax
+bt r11, 16
+jc .Lresident_nested_translate_wp_ready
+xor ebx, ebx
+.Lresident_nested_translate_wp_ready:
+// EBX[2] requires writable pages; EBX[1] accumulates their R/W bits.
+shl ebx, 1
+or ebx, 2
 bt r11, 31
 jnc .Lresident_nested_translate_identity
 mov rdx, {host_page_address_mask}
@@ -577,9 +590,15 @@ and r11, rdx
 mov rax, rdi
 shr rax, cl
 and eax, 0x1ff
-mov r11, qword ptr [r11 + rax * 8]
+lea r11, [r11 + rax * 8]
+call .Lresident_nested_map_operand_table_entry
+jz .Lresident_nested_translate_failure
+mov r11, qword ptr [r11]
 test r11b, 1
 jz .Lresident_nested_translate_failure
+mov eax, r11d
+or eax, -3
+and ebx, eax
 cmp ecx, 30
 je .Lresident_nested_translate_long_1g
 cmp ecx, 21
@@ -598,8 +617,7 @@ and r10, rax
 mov eax, edi
 and eax, 0x3fffffff
 or r10, rax
-clc
-ret
+jmp .Lresident_nested_translate_success
 .Lresident_nested_translate_long_2m:
 test r11b, 0x80
 jz .Lresident_nested_translate_long_next
@@ -609,8 +627,7 @@ and r10, rax
 mov eax, edi
 and eax, 0x1fffff
 or r10, rax
-clc
-ret
+jmp .Lresident_nested_translate_success
 .Lresident_nested_translate_long_next:
 and r11, rdx
 sub ecx, 9
@@ -620,8 +637,7 @@ and r11, rdx
 mov r10, rdi
 and r10d, 0xfff
 or r10, r11
-clc
-ret
+jmp .Lresident_nested_translate_success
 .Lresident_nested_translate_legacy:
 mov rax, {guest_cr4}
 vmread r13, rax
@@ -632,26 +648,42 @@ vmread r11, rax
 and r11, -32
 mov eax, edi
 shr eax, 30
+// Legacy PAE PDPTEs do not contribute R/W permissions.
 and eax, 3
-mov r11, qword ptr [r11 + rax * 8]
+lea r11, [r11 + rax * 8]
+call .Lresident_nested_map_operand_table_entry
+jz .Lresident_nested_translate_failure
+mov r11, qword ptr [r11]
 test r11b, 1
 jz .Lresident_nested_translate_failure
 and r11, rdx
 mov eax, edi
 shr eax, 21
 and eax, 0x1ff
-mov r11, qword ptr [r11 + rax * 8]
+lea r11, [r11 + rax * 8]
+call .Lresident_nested_map_operand_table_entry
+jz .Lresident_nested_translate_failure
+mov r11, qword ptr [r11]
 test r11b, 1
 jz .Lresident_nested_translate_failure
+mov eax, r11d
+or eax, -3
+and ebx, eax
 test r11b, 0x80
 jnz .Lresident_nested_translate_long_2m
 and r11, rdx
 mov eax, edi
 shr eax, 12
 and eax, 0x1ff
-mov r11, qword ptr [r11 + rax * 8]
+lea r11, [r11 + rax * 8]
+call .Lresident_nested_map_operand_table_entry
+jz .Lresident_nested_translate_failure
+mov r11, qword ptr [r11]
 test r11b, 1
 jz .Lresident_nested_translate_failure
+mov eax, r11d
+or eax, -3
+and ebx, eax
 jmp .Lresident_nested_translate_long_4k
 .Lresident_nested_translate_legacy_32:
 mov rax, {guest_cr3}
@@ -659,9 +691,15 @@ vmread r11, rax
 and r11d, 0xfffff000
 mov eax, edi
 shr eax, 22
-mov r11d, dword ptr [r11 + rax * 4]
+lea r11, [r11 + rax * 4]
+call .Lresident_nested_map_operand_table_entry
+jz .Lresident_nested_translate_failure
+mov r11d, dword ptr [r11]
 test r11b, 1
 jz .Lresident_nested_translate_failure
+mov eax, r11d
+or eax, -3
+and ebx, eax
 test r11b, 0x80
 jz .Lresident_nested_translate_legacy_4k
 bt r13, 4
@@ -670,29 +708,67 @@ and r11d, 0xffc00000
 mov r10d, edi
 and r10d, 0x3fffff
 or r10, r11
-clc
-ret
+jmp .Lresident_nested_translate_success
 .Lresident_nested_translate_legacy_4k:
 and r11d, 0xfffff000
 mov eax, edi
 shr eax, 12
 and eax, 0x3ff
-mov r11d, dword ptr [r11 + rax * 4]
+lea r11, [r11 + rax * 4]
+call .Lresident_nested_map_operand_table_entry
+jz .Lresident_nested_translate_failure
+mov r11d, dword ptr [r11]
 test r11b, 1
 jz .Lresident_nested_translate_failure
+mov eax, r11d
+or eax, -3
+and ebx, eax
 and r11d, 0xfffff000
 mov r10d, edi
 and r10d, 0xfff
 or r10, r11
-clc
-ret
+jmp .Lresident_nested_translate_success
 .Lresident_nested_translate_identity:
 mov r10, rdi
-clc
-ret
+jmp .Lresident_nested_translate_success
 .Lresident_nested_translate_failure:
 mov r10, rdi
+xor eax, eax
+pop rbx
 stc
+ret
+.Lresident_nested_translate_success:
+test bl, 4
+jz .Lresident_nested_translate_allowed
+test bl, 2
+jz .Lresident_nested_translate_protection
+.Lresident_nested_translate_allowed:
+xor eax, eax
+pop rbx
+clc
+ret
+.Lresident_nested_translate_protection:
+mov r10, rdi
+mov eax, 1
+pop rbx
+stc
+ret
+// Translate the entry GPA, including the CR3 root, before reading host memory.
+// Preserve the linear walk's level, address mask and operand-range registers.
+.Lresident_nested_map_operand_table_entry:
+push rcx
+push rdx
+push r8
+push r9
+push r10
+mov edx, 1
+call .Lresident_ept01_page_translate
+pop r10
+pop r9
+pop r8
+pop rdx
+pop rcx
+test eax, eax
 ret
 .Lresident_nested_physical_address_is_valid:
 test r11, 0xfff
@@ -813,7 +889,7 @@ and r9, rdx
 mov rcx, r8
 shr rcx, 12
 and ecx, 0x1ff
-and r15d, 0x338
+and r15d, 0x378
 jmp .Lresident_nested_ept02_install_leaf
 .Lresident_nested_ept02_install_large_leaf:
 and r13, -2097152
@@ -857,7 +933,7 @@ or r10, rax
 mov qword ptr [r12 + {b_last_qualification}], r10
 xor eax, eax
 ret
-.macro resident_nested_ept12_permissions
+.macro resident_nested_ept12_permissions level
 mov ecx, dword ptr [r12 + {b_nested_ept02_mbec}]
 shl ecx, 10
 or ecx, 7
@@ -871,6 +947,40 @@ jz .Lresident_nested_translate_ept02_failed
 and eax, 3
 cmp eax, 2
 je .Lresident_nested_translate_ept02_misconfigured
+test r10b, 1
+jnz 991f
+bt qword ptr [r12 + {b_nested_vmx_ept_vpid_cap}], 0
+jnc .Lresident_nested_translate_ept02_misconfigured
+991:
+// Check the original address before masking; bits above 51 are ignored.
+mov rax, 0x000ffffffffff000
+and rax, r10
+mov ecx, dword ptr [r12 + {b_nested_physical_address_bits}]
+shr rax, cl
+test rax, rax
+jnz .Lresident_nested_translate_ept02_misconfigured
+.if \level == 4
+test r10b, 0xf8
+jnz .Lresident_nested_translate_ept02_misconfigured
+.elseif \level != 1
+test r10b, 0x80
+jnz 992f
+test r10b, 0x78
+jnz .Lresident_nested_translate_ept02_misconfigured
+jmp 993f
+992:
+.if \level == 3
+bt qword ptr [r12 + {b_nested_vmx_ept_vpid_cap}], 17
+jnc .Lresident_nested_translate_ept02_misconfigured
+test r10d, 0x3ffff000
+.else
+bt qword ptr [r12 + {b_nested_vmx_ept_vpid_cap}], 16
+jnc .Lresident_nested_translate_ept02_misconfigured
+test r10d, 0x1ff000
+.endif
+jnz .Lresident_nested_translate_ept02_misconfigured
+993:
+.endif
 .endm
 .Lresident_nested_translate_ept02:
 mov rbp, r9
@@ -891,7 +1001,7 @@ shr rcx, 39
 and ecx, 0x1ff
 lea rsi, [r9 + rcx * 8]
 mov r10, qword ptr [rsi]
-resident_nested_ept12_permissions
+resident_nested_ept12_permissions 4
 call .Lresident_nested_track_ept12_access
 test eax, eax
 jz .Lresident_nested_translate_ept02_failed
@@ -906,7 +1016,7 @@ shr rcx, 30
 and ecx, 0x1ff
 lea rsi, [r9 + rcx * 8]
 mov r10, qword ptr [rsi]
-resident_nested_ept12_permissions
+resident_nested_ept12_permissions 3
 call .Lresident_nested_track_ept12_access
 test eax, eax
 jz .Lresident_nested_translate_ept02_failed
@@ -923,7 +1033,7 @@ shr rcx, 21
 and ecx, 0x1ff
 lea rsi, [r9 + rcx * 8]
 mov r10, qword ptr [rsi]
-resident_nested_ept12_permissions
+resident_nested_ept12_permissions 2
 call .Lresident_nested_track_ept12_access
 test eax, eax
 jz .Lresident_nested_translate_ept02_failed
@@ -940,7 +1050,7 @@ shr rcx, 12
 and ecx, 0x1ff
 lea rsi, [r9 + rcx * 8]
 mov r10, qword ptr [rsi]
-resident_nested_ept12_permissions
+resident_nested_ept12_permissions 1
 call .Lresident_nested_track_ept12_access
 test eax, eax
 jz .Lresident_nested_translate_ept02_failed
@@ -973,6 +1083,16 @@ add r13, rax
 .Lresident_nested_ept12_translation_ready:
 mov ebx, r10d
 and ebx, 0x38
+// Reserved leaf memory types must fault before a composed mapping is installed.
+cmp ebx, 0x10
+je .Lresident_nested_translate_ept02_misconfigured
+cmp ebx, 0x18
+je .Lresident_nested_translate_ept02_misconfigured
+cmp ebx, 0x38
+je .Lresident_nested_translate_ept02_misconfigured
+mov eax, r10d
+and eax, 0x40
+or r15d, eax
 and r13, -4096
 // Large composed leaves require uniform permissions and translations in both EPTs.
 mov r9, qword ptr [r12 + {b_nested_ept01_pointer}]
@@ -1040,7 +1160,8 @@ or eax, ecx
 and r14, rax
 test eax, eax
 jz .Lresident_nested_translate_ept02_failed
-xor r15d, r15d
+// A small EPT01 leaf forces 4 KiB composition without changing ignore-PAT.
+and r15d, -129
 mov eax, r13d
 and eax, 0xfff
 mov r13, r10
@@ -1371,7 +1492,7 @@ jz .Lresident_nested_revalidate_ept02_remove
 and r13, -2097152
 jmp .Lresident_nested_revalidate_ept02_write
 .Lresident_nested_revalidate_ept02_small_leaf:
-and r15d, 0x338
+and r15d, 0x378
 .Lresident_nested_revalidate_ept02_write:
 or r13, r14
 or r13, r15
@@ -1391,31 +1512,73 @@ jne .Lresident_nested_revalidate_ept02_entry
 add rsp, 48
 ret
 matrixhv_ept01_host_mapping_validation
-.Lresident_nested_host_msr_list_is_mapped:
+.Lresident_nested_guest_msr_list_is_mapped:
 test r10d, r10d
-jz .Lresident_nested_host_msr_list_is_mapped_success
+jz .Lresident_nested_guest_msr_list_is_mapped_success
 mov r8, r11
 mov r9d, r10d
 shl r9, 4
 add r9, r8
-jc .Lresident_nested_host_msr_list_is_unmapped
+jc .Lresident_nested_guest_msr_list_is_unmapped
 dec r9
 and r8, -4096
 and r9, -4096
-.Lresident_nested_host_msr_list_page_loop:
+.Lresident_nested_guest_msr_list_page_loop:
 mov r11, r8
-call .Lresident_ept01_host_page_is_mapped
+call .Lresident_nested_msr_entry_is_readable
 test eax, eax
-jz .Lresident_nested_host_msr_list_is_unmapped
+jz .Lresident_nested_guest_msr_list_is_unmapped
 cmp r8, r9
-je .Lresident_nested_host_msr_list_is_mapped_success
+je .Lresident_nested_guest_msr_list_is_mapped_success
 add r8, 4096
-jmp .Lresident_nested_host_msr_list_page_loop
-.Lresident_nested_host_msr_list_is_mapped_success:
+jmp .Lresident_nested_guest_msr_list_page_loop
+.Lresident_nested_guest_msr_list_is_mapped_success:
 mov eax, 1
 ret
-.Lresident_nested_host_msr_list_is_unmapped:
+.Lresident_nested_guest_msr_list_is_unmapped:
 xor eax, eax
+ret
+// MSR entries are 16-byte aligned and never straddle a page. Keep each GPA
+// cursor intact while accessing its translated page; adjacent HPAs may differ.
+.Lresident_nested_copy_guest_msr_list:
+push r10
+.Lresident_nested_copy_guest_msr_list_next:
+test r10d, r10d
+jz .Lresident_nested_copy_guest_msr_list_done
+mov r11, rsi
+call .Lresident_nested_msr_entry_is_readable
+test eax, eax
+jz .Lresident_dispatch_halt
+mov rax, qword ptr [r11]
+mov qword ptr [rdi], rax
+mov rax, qword ptr [r11 + 8]
+mov qword ptr [rdi + 8], rax
+add rsi, 16
+add rdi, 16
+dec r10d
+jmp .Lresident_nested_copy_guest_msr_list_next
+.Lresident_nested_copy_guest_msr_list_done:
+pop r10
+ret
+.Lresident_nested_msr_entry_is_readable:
+push rdx
+mov edx, 1
+jmp .Lresident_nested_msr_entry_translate
+.Lresident_nested_msr_entry_is_writable:
+call .Lresident_nested_eptp_before_root_write
+push rdx
+mov edx, 3
+.Lresident_nested_msr_entry_translate:
+push rcx
+push r8
+push r9
+push r10
+call .Lresident_ept01_page_translate
+pop r10
+pop r9
+pop r8
+pop rcx
+pop rdx
 ret
 // Capture root-switched and time-sensitive MSRs before restoring host state.
 // Other entries are read from the saved guest VMCS or with a guarded RDMSR.
@@ -2022,9 +2185,15 @@ test dword ptr [r12 + {b_last_reason}], 0x80000000
 jnz .Lresident_nested_flush_l1_shadow_done
 bt dword ptr [r12 + {b_nested_last_merged_secondary_controls}], 14
 jnc .Lresident_nested_flush_l1_shadow_done
-cmp qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 23 * 8], -1
+mov r11, qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 23 * 8]
+cmp r11, -1
 je .Lresident_nested_flush_l1_shadow_done
-vmclear [r12 + {b_nested_vmcs12_extended_fields} + 23 * 8]
+call .Lresident_ept01_page_is_writable
+test eax, eax
+jz .Lresident_dispatch_halt
+push r11
+vmclear [rsp]
+pop r11
 jna .Lresident_dispatch_halt
 .Lresident_nested_flush_l1_shadow_done:
 ret
@@ -2222,6 +2391,17 @@ call .Lresident_nested_control_is_valid
 test eax, eax
 jz .Lresident_nested_validate_invalid_controls
 .Lresident_nested_validate_neutral_controls:
+bt dword ptr [r12 + {b_nested_vmcs12_pin_based_control}], 5
+jnc .Lresident_nested_validate_virtual_nmi_disabled
+bt dword ptr [r12 + {b_nested_vmcs12_pin_based_control}], 3
+jnc .Lresident_nested_validate_invalid_controls
+jmp .Lresident_nested_validate_nmi_dependencies_done
+.Lresident_nested_validate_virtual_nmi_disabled:
+bt dword ptr [r12 + {b_nested_vmcs12_primary_control}], 22
+jc .Lresident_nested_validate_invalid_controls
+.Lresident_nested_validate_nmi_dependencies_done:
+bt dword ptr [r12 + {b_nested_vmcs12_vm_exit_controls}], 9
+jnc .Lresident_nested_validate_invalid_controls
 call .Lresident_nested_validate_shadow_controls
 test eax, eax
 jz .Lresident_nested_validate_invalid_controls
@@ -2233,8 +2413,14 @@ mov r11, qword ptr [r12 + {b_nested_vmcs12_io_bitmap_a}]
 call .Lresident_nested_physical_address_is_valid
 test eax, eax
 jz .Lresident_nested_validate_invalid_controls
+call .Lresident_ept01_page_is_readable
+test eax, eax
+jz .Lresident_nested_validate_invalid_controls
 mov r11, qword ptr [r12 + {b_nested_vmcs12_io_bitmap_b}]
 call .Lresident_nested_physical_address_is_valid
+test eax, eax
+jz .Lresident_nested_validate_invalid_controls
+call .Lresident_ept01_page_is_readable
 test eax, eax
 jz .Lresident_nested_validate_invalid_controls
 .Lresident_nested_validate_io_bitmaps_done:
@@ -2251,6 +2437,9 @@ cmp dword ptr [r12 + {b_nested_vmcs12_tpr_threshold}], 15
 ja .Lresident_nested_validate_invalid_controls
 mov r11, qword ptr [r12 + {b_nested_vmcs12_virtual_apic_page}]
 call .Lresident_nested_physical_address_is_valid
+test eax, eax
+jz .Lresident_nested_validate_invalid_controls
+call .Lresident_ept01_page_is_writable
 test eax, eax
 jz .Lresident_nested_validate_invalid_controls
 .Lresident_nested_validate_tpr_shadow_done:
@@ -2283,6 +2472,11 @@ jnc .Lresident_nested_validate_mbec_done
 bt dword ptr [r12 + {b_nested_vmcs12_secondary_control}], 1
 jnc .Lresident_nested_validate_invalid_controls
 .Lresident_nested_validate_mbec_done:
+bt dword ptr [r12 + {b_nested_vmcs12_secondary_control}], 7
+jnc .Lresident_nested_validate_unrestricted_done
+bt dword ptr [r12 + {b_nested_vmcs12_secondary_control}], 1
+jnc .Lresident_nested_validate_invalid_controls
+.Lresident_nested_validate_unrestricted_done:
 bt dword ptr [r12 + {b_nested_vmcs12_secondary_control}], 1
 jnc .Lresident_nested_validate_vpid
 mov r11, qword ptr [r12 + {b_nested_vmcs12_ept_pointer}]
@@ -2413,14 +2607,14 @@ mov r11, qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 120 * 8]
 call .Lresident_nested_physical_address_is_valid
 test eax, eax
 jz .Lresident_nested_shadow_controls_done
-call .Lresident_ept01_host_page_is_mapped
+call .Lresident_ept01_page_is_readable
 test eax, eax
 jz .Lresident_nested_shadow_controls_done
 mov r11, qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 121 * 8]
 call .Lresident_nested_physical_address_is_valid
 test eax, eax
 jz .Lresident_nested_shadow_controls_done
-call .Lresident_ept01_host_page_is_mapped
+call .Lresident_ept01_page_is_readable
 test eax, eax
 jz .Lresident_nested_shadow_controls_done
 mov r11, qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 23 * 8]
@@ -2428,7 +2622,7 @@ cmp r11, -1
 je .Lresident_nested_shadow_controls_valid
 // Hardware checks alignment, revision, and shadow type as guest-state checks.
 // Unmapped addresses must never be passed through to a hardware VMCS link.
-call .Lresident_ept01_host_page_is_mapped
+call .Lresident_ept01_page_is_writable
 ret
 .Lresident_nested_shadow_controls_valid:
 mov eax, 1
@@ -2596,8 +2790,11 @@ or r11d, edx
 call .Lresident_nested_write_vmcs02_control
 bt r11, 21
 jnc .Lresident_nested_merge_tpr_shadow_done
-mov rax, {virtual_apic_page_addr}
 mov r11, qword ptr [r12 + {b_nested_vmcs12_virtual_apic_page}]
+call .Lresident_ept01_page_is_writable
+test eax, eax
+jz .Lresident_dispatch_halt
+mov rax, {virtual_apic_page_addr}
 call .Lresident_nested_write_vmcs02_control
 mov rax, {tpr_threshold}
 mov r11, qword ptr [r12 + {b_nested_vmcs12_tpr_threshold}]
@@ -2605,23 +2802,29 @@ call .Lresident_nested_write_vmcs02_control
 .Lresident_nested_merge_tpr_shadow_done:
 bt dword ptr [r12 + {b_nested_vmcs12_primary_control}], 25
 jnc .Lresident_nested_merge_io_bitmaps_done
-mov rax, {io_bitmap_a}
 mov r11, qword ptr [r12 + {b_nested_vmcs12_io_bitmap_a}]
+call .Lresident_ept01_page_is_readable
+test eax, eax
+jz .Lresident_dispatch_halt
+mov rax, {io_bitmap_a}
 call .Lresident_nested_write_vmcs02_control
-mov rax, {io_bitmap_b}
 mov r11, qword ptr [r12 + {b_nested_vmcs12_io_bitmap_b}]
+call .Lresident_ept01_page_is_readable
+test eax, eax
+jz .Lresident_dispatch_halt
+mov rax, {io_bitmap_b}
 call .Lresident_nested_write_vmcs02_control
 .Lresident_nested_merge_io_bitmaps_done:
 bt dword ptr [r12 + {b_nested_vmcs12_primary_control}], 28
 // Clearing "use MSR bitmaps" requests unconditional RDMSR and WRMSR exits.
 jnc .Lresident_nested_intercept_unmapped_msr_bitmap
 mov r11, qword ptr [r12 + {b_nested_vmcs12_msr_bitmap}]
-call .Lresident_ept01_host_page_is_mapped
+call .Lresident_ept01_page_is_readable
 test eax, eax
 jz .Lresident_nested_intercept_unmapped_msr_bitmap
 mov rsi, qword ptr [r12 + {b_nested_l0_msr_bitmap}]
 mov rdi, qword ptr [r12 + {b_nested_composed_msr_bitmap}]
-mov rdx, qword ptr [r12 + {b_nested_vmcs12_msr_bitmap}]
+mov rdx, r11
 mov ecx, {nested_msr_bitmap_qword_count}
 .Lresident_nested_merge_msr_bitmap_loop:
 mov r11, qword ptr [rsi]
@@ -2676,11 +2879,17 @@ mov qword ptr [r12 + {b_nested_last_merged_secondary_controls}], r11
 bt r11d, 14
 jnc .Lresident_nested_merge_shadow_done
 call .Lresident_nested_eptp_before_root_write
-mov rax, 0x2026
 mov r11, qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 120 * 8]
+call .Lresident_ept01_page_is_readable
+test eax, eax
+jz .Lresident_dispatch_halt
+mov rax, 0x2026
 call .Lresident_nested_write_vmcs02_control
-mov rax, 0x2028
 mov r11, qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 121 * 8]
+call .Lresident_ept01_page_is_readable
+test eax, eax
+jz .Lresident_dispatch_halt
+mov rax, 0x2028
 call .Lresident_nested_write_vmcs02_control
 .Lresident_nested_merge_shadow_done:
 xor r11d, r11d
@@ -2856,15 +3065,13 @@ rep movsq
 mov rsi, qword ptr [r12 + {b_nested_vmcs12_vm_entry_msr_load_addr}]
 mov r10d, dword ptr [r12 + {b_nested_vmcs12_vm_entry_msr_load_count}]
 mov r11, rsi
-call .Lresident_nested_host_msr_list_is_mapped
+call .Lresident_nested_guest_msr_list_is_mapped
 test eax, eax
 jnz .Lresident_nested_copy_vmcs12_entry_msr_list
 xor r10d, r10d
 jmp .Lresident_nested_copy_vmcs12_entry_msr_list_done
 .Lresident_nested_copy_vmcs12_entry_msr_list:
-mov ecx, r10d
-shl ecx, 1
-rep movsq
+call .Lresident_nested_copy_guest_msr_list
 .Lresident_nested_copy_vmcs12_entry_msr_list_done:
 mov rax, {vm_entry_msr_load_addr}
 mov r11, qword ptr [r12 + {b_nested_vmcs02_entry_msr_list}]
@@ -2890,13 +3097,19 @@ rep movsq
 mov rsi, qword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_store_addr}]
 mov r10d, dword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_store_count}]
 mov r11, rsi
-call .Lresident_nested_host_msr_list_is_mapped
+call .Lresident_nested_guest_msr_list_is_mapped
 mov ebx, dword ptr [rip + matrixhv_resident_island_msr_switch_count]
 test eax, eax
 jz .Lresident_nested_copy_vmcs12_exit_store_msr_list_done
 .Lresident_nested_copy_vmcs12_exit_store_msr_list:
 test r10d, r10d
 jz .Lresident_nested_copy_vmcs12_exit_store_msr_list_done
+mov r11, rsi
+call .Lresident_nested_msr_entry_is_readable
+test eax, eax
+jz .Lresident_dispatch_halt
+push rsi
+mov rsi, r11
 cmp dword ptr [rsi + 4], 0
 jne .Lresident_nested_copy_vmcs12_exit_store_next
 call .Lresident_nested_msr_requires_hardware_store
@@ -2920,6 +3133,7 @@ mov qword ptr [rdi + 8], 0
 add rdi, 16
 inc ebx
 .Lresident_nested_copy_vmcs12_exit_store_next:
+pop rsi
 add rsi, 16
 dec r10d
 jmp .Lresident_nested_copy_vmcs12_exit_store_msr_list
@@ -2988,7 +3202,13 @@ mov r11, -1
 bt dword ptr [r12 + {b_nested_last_merged_secondary_controls}], 14
 jnc .Lresident_nested_vmcs02_link_ready
 mov r11, qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 23 * 8]
+cmp r11, -1
+je .Lresident_nested_vmcs02_link_ready
+call .Lresident_ept01_page_is_writable
+test eax, eax
+jz .Lresident_dispatch_halt
 .Lresident_nested_vmcs02_link_ready:
+mov rax, {vmcs_link_pointer}
 call .Lresident_nested_write_vmcs02_control
 mov rax, {guest_pat}
 mov r11, qword ptr [r12 + {b_nested_inherited_l1_pat}]
@@ -3245,15 +3465,21 @@ mov r10d, dword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_store_count}]
 test r10d, r10d
 jz .Lresident_nested_compose_vmcs01_msr_entry
 mov r11, rdi
-call .Lresident_nested_host_msr_list_is_mapped
+call .Lresident_nested_guest_msr_list_is_mapped
 test eax, eax
 jz .Lresident_nested_compose_vmcs01_msr_entry
 mov ebx, r10d
 call .Lresident_nested_eptp_before_root_write
 .Lresident_nested_copy_l1_msr_store_loop:
+mov r11, rdi
+call .Lresident_nested_msr_entry_is_writable
+test eax, eax
+jz .Lresident_nested_abort_msr_store
+push rdi
+mov rdi, r11
 mov ecx, dword ptr [rdi]
 cmp dword ptr [rdi + 4], 0
-jne .Lresident_nested_abort_msr_store
+jne .Lresident_nested_abort_translated_msr_store
 mov r8, qword ptr [r12 + {b_nested_vmcs02_exit_store_msr_list}]
 mov r9d, dword ptr [r12 + {b_nested_captured_msr_store_count}]
 .Lresident_nested_find_l0_msr_store_loop:
@@ -3268,16 +3494,19 @@ jmp .Lresident_nested_find_l0_msr_store_loop
 push rdi
 call .Lresident_nested_read_saved_msr
 pop rdi
-jc .Lresident_nested_abort_msr_store
+jc .Lresident_nested_abort_translated_msr_store
 jmp .Lresident_nested_write_l1_msr_store
 .Lresident_nested_use_l0_msr_store:
 mov rax, qword ptr [r8 + 8]
 .Lresident_nested_write_l1_msr_store:
 mov qword ptr [rdi + 8], rax
+pop rdi
 add rdi, 16
 dec ebx
 jnz .Lresident_nested_copy_l1_msr_store_loop
 jmp .Lresident_nested_compose_vmcs01_msr_entry
+.Lresident_nested_abort_translated_msr_store:
+pop rdi
 .Lresident_nested_abort_msr_store:
 mov r11, qword ptr [r12 + {b_nested_current_vmcs}]
 call .Lresident_ept01_page_is_writable
@@ -3297,12 +3526,10 @@ rep movsq
 mov rsi, qword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_load_addr}]
 mov r10d, dword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_load_count}]
 mov r11, rsi
-call .Lresident_nested_host_msr_list_is_mapped
+call .Lresident_nested_guest_msr_list_is_mapped
 test eax, eax
 jz .Lresident_nested_compose_vmcs01_msr_entry_done
-mov ecx, r10d
-shl ecx, 1
-rep movsq
+call .Lresident_nested_copy_guest_msr_list
 .Lresident_nested_compose_vmcs01_msr_entry_done:
 ret
 .Lresident_nested_activate_vmcs01_msr_entry:
@@ -3310,7 +3537,7 @@ cmp dword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_load_count}], 0
 je .Lresident_nested_activate_vmcs01_msr_entry_done
 mov r11, qword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_load_addr}]
 mov r10d, dword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_load_count}]
-call .Lresident_nested_host_msr_list_is_mapped
+call .Lresident_nested_guest_msr_list_is_mapped
 test eax, eax
 jnz .Lresident_nested_activate_vmcs01_guest_msr_entry
 xor r10d, r10d
@@ -4123,12 +4350,55 @@ jc .Lresident_dispatch_vmread_failed
 jz .Lresident_dispatch_vmread_failed
 test r11b, 3
 jnz .Lresident_nested_inject_gp
+cmp qword ptr [r12 + {b_nested_active}], 0
+jne .Lresident_nested_vmxon_active
 mov r11, qword ptr [r12 + {b_nested_feature_control}]
 and r11d, 5
 cmp r11d, 5
 jne .Lresident_nested_inject_gp
-cmp qword ptr [r12 + {b_nested_active}], 0
-jne .Lresident_nested_vmxon_active
+mov rax, {guest_cr0}
+vmread r11, rax
+jc .Lresident_dispatch_vmread_failed
+jz .Lresident_dispatch_vmread_failed
+mov rdx, r11
+mov rax, {cr0_read_shadow}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+mov rcx, r11
+mov rax, {cr0_guest_host_mask}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+and rcx, r11
+not r11
+and rdx, r11
+or rdx, rcx
+mov r11, rdx
+mov rax, qword ptr [r12 + {b_nested_vmx_cr0_fixed0}]
+mov rcx, r11
+and rcx, rax
+cmp rcx, rax
+jne .Lresident_nested_inject_gp
+mov rax, qword ptr [r12 + {b_nested_vmx_cr0_fixed1}]
+not rax
+test r11, rax
+jnz .Lresident_nested_inject_gp
+// Only VMXE is intercepted in VMCS01; other CR4 bits can change without an exit.
+mov rax, {guest_cr4}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+and r11, -8193
+mov eax, dword ptr [r12 + {b_nested_l1_cr4}]
+and eax, 0x2000
+or r11, rax
+mov rax, qword ptr [r12 + {b_nested_vmx_cr4_fixed0}]
+mov rcx, r11
+and rcx, rax
+cmp rcx, rax
+jne .Lresident_nested_inject_gp
+mov rax, qword ptr [r12 + {b_nested_vmx_cr4_fixed1}]
+not rax
+test r11, rax
+jnz .Lresident_nested_inject_gp
 call .Lresident_nested_decode_memory_operand
 jc .Lresident_nested_inject_pf_read
 mov ecx, 8
@@ -4257,6 +4527,8 @@ jmp .Lresident_nested_inject_pf
 .Lresident_nested_inject_pf_read:
 xor r11d, r11d
 .Lresident_nested_inject_pf:
+// The range walker distinguishes protection faults from absent translations.
+or r11d, eax
 resident_telemetry_counter inc, {b_nested_failure_count}, {b_telemetry_active}
 mov qword ptr [r12 + {b_nested_last_operand}], r10
 mov r10, r11

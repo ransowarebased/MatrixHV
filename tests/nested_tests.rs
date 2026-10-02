@@ -12,6 +12,9 @@ pub mod hyperv {
 }
 #[cfg(test_harness = "policy")]
 mod policy {
+    #[cfg(matrixhv_review)]
+    include!("review_hv_loader_tests.rs");
+
     use crate::protocol::{
         MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_PROTOCOL, MATRIXHV_STATUS_SIGNATURE_EAX,
         MATRIXHV_STATUS_SIGNATURE_EBX, MATRIXHV_STATUS_SIGNATURE_ECX,
@@ -602,9 +605,12 @@ mod policy {
             | nested::VM_EXIT_LOAD_IA32_PAT
             | nested::VM_EXIT_SAVE_IA32_EFER
             | nested::VM_EXIT_LOAD_IA32_EFER;
-        let true_exit_control = control_capabilities(0, legacy_exit_bits);
-        let legacy_exit_control =
-            control_capabilities(nested::VMX_LEGACY_EXIT_DEFAULT1, legacy_exit_bits);
+        let true_exit_control =
+            control_capabilities(nested::VM_EXIT_HOST_ADDRESS_SPACE_SIZE, legacy_exit_bits);
+        let legacy_exit_control = control_capabilities(
+            nested::VMX_LEGACY_EXIT_DEFAULT1 | nested::VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
+            legacy_exit_bits,
+        );
         let primary_may_be_one = nested::VMX_LEGACY_PROCBASED_DEFAULT1
             | nested::VMX_PRIMARY_KVM_EXITING_CONTROLS
             | nested::VMX_PRIMARY_RDTSC_EXITING
@@ -833,7 +839,10 @@ mod policy {
 
         assert_eq!(capabilities.vmx_true_pinbased_ctls as u32, 0);
         assert_eq!(capabilities.vmx_true_procbased_ctls as u32, 0);
-        assert_eq!(capabilities.vmx_true_exit_ctls as u32, 0);
+        assert_eq!(
+            capabilities.vmx_true_exit_ctls as u32,
+            nested::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+        );
         assert_eq!(capabilities.vmx_true_entry_ctls as u32, 0);
     }
 
@@ -1295,17 +1304,17 @@ mod policy {
             nested::NestedVmxCapabilities::from_host(host).vmx_procbased_ctls2 & mbec,
             0
         );
-        for requirement in [
-            nested::VMX_EPT_EXECUTE_ONLY,
-            nested::VMX_EPT_ADVANCED_EXIT_INFO,
-        ] {
-            let mut missing = host;
-            missing.ept_vpid_cap &= !requirement;
-            assert_eq!(
-                nested::NestedVmxCapabilities::from_host(missing).vmx_procbased_ctls2 & mbec,
-                0
-            );
-        }
+        let mut missing = host;
+        missing.ept_vpid_cap &= !nested::VMX_EPT_EXECUTE_ONLY;
+        assert_ne!(
+            nested::NestedVmxCapabilities::from_host(missing).vmx_procbased_ctls2 & mbec,
+            0
+        );
+        missing.ept_vpid_cap &= !nested::VMX_EPT_ADVANCED_EXIT_INFO;
+        assert_eq!(
+            nested::NestedVmxCapabilities::from_host(missing).vmx_procbased_ctls2 & mbec,
+            0
+        );
         host.procbased_ctls2 &= !mbec;
         assert_eq!(
             nested::NestedVmxCapabilities::from_host(host).vmx_procbased_ctls2 & mbec,
@@ -1609,7 +1618,9 @@ mod policy {
 
     #[test]
     fn vmclear_preserves_non_current_evmcs_pages_and_the_current_selection() {
-        for use_revision in [false, true] {
+        for (use_revision, shared_revision) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let mut assist = Box::new(EvmcsTestPage([0; 4096]));
             let mut first = Box::new(EvmcsTestPage([0xa5; 4096]));
             let mut second = Box::new(EvmcsTestPage([0; 4096]));
@@ -1618,6 +1629,9 @@ mod policy {
             let mut state = nested_state(0);
             state.active = 1;
             state.evmcs_enabled = 1;
+            if shared_revision {
+                state.vmcs12.revision_id = u64::from(crate::hyperv::EVMCS_VERSION);
+            }
             state.vp_assist_msr = assist.0.as_ptr() as u64 | 1;
             let version = if use_revision {
                 state.vmcs12.revision_id as u32
@@ -1742,6 +1756,99 @@ mod policy {
             page_u64(&page, VMCS12_BACKING_MAGIC_OFFSET),
             VMCS12_BACKING_MAGIC
         );
+    }
+
+    #[test]
+    fn vmclear_clears_ordinary_backing_while_another_evmcs_is_selected() {
+        for assist_enabled in [false, true] {
+            let mut assist = Box::new(EvmcsTestPage([0; 4096]));
+            let mut selected = Box::new(EvmcsTestPage([0; 4096]));
+            let mut ordinary = Box::new(EvmcsTestPage([0; 4096]));
+            let ordinary_address = ordinary.0.as_mut_ptr() as u64;
+            let selected_address = selected.0.as_mut_ptr() as u64;
+            let mut state = nested_state(0);
+            state.active = 1;
+            state.evmcs_enabled = 1;
+            state.vmcs12.revision_id = u64::from(crate::hyperv::EVMCS_VERSION);
+            ordinary.0[..4].copy_from_slice(&crate::hyperv::EVMCS_VERSION.to_le_bytes());
+            selected.0[..4].copy_from_slice(&crate::hyperv::EVMCS_VERSION.to_le_bytes());
+            let mut ept = EvmcsTestEpt::new(&mut state);
+            ept.map(ordinary_address, ordinary_address, 7);
+            ept.map(selected_address, selected_address, 7);
+            assert_eq!(unsafe { test_clear_evmcs(&mut state, ordinary_address) }, 1);
+            let launch_offset =
+                VMCS12_BACKING_STATE_OFFSET + offset_of!(NestedVmcs12State, launch_state);
+            write_page_u64(&mut ordinary, launch_offset, 1);
+            state.evmcs_active = 1;
+            state.current_vmcs = selected_address;
+            if assist_enabled {
+                state.vp_assist_msr = assist.0.as_mut_ptr() as u64 | 1;
+                write_page_u64(
+                    &mut assist,
+                    crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET,
+                    1,
+                );
+                write_page_u64(
+                    &mut assist,
+                    crate::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
+                    selected_address,
+                );
+                ept.map(state.vp_assist_msr & !4095, state.vp_assist_msr & !4095, 7);
+            }
+            let before = selected.0;
+            assert_eq!(unsafe { test_clear_evmcs(&mut state, ordinary_address) }, 1);
+            assert_eq!(
+                page_u64(&ordinary, launch_offset),
+                VMCS12_LAUNCH_STATE_CLEAR
+            );
+            assert_eq!(state.current_vmcs, selected_address);
+            assert_eq!(state.evmcs_active, 1);
+            assert_eq!(selected.0, before);
+        }
+    }
+
+    #[test]
+    fn vmclear_initializes_ordinary_vmcs_when_native_revision_matches_evmcs_version() {
+        for assist_enabled in [false, true] {
+            for current in [false, true] {
+                let mut assist = Box::new(EvmcsTestPage([0; 4096]));
+                let mut page = Box::new(EvmcsTestPage([0; 4096]));
+                let address = page.0.as_ptr() as u64;
+                let mut state = nested_state(0);
+                state.active = 1;
+                state.evmcs_enabled = 1;
+                state.vmcs12.revision_id = u64::from(crate::hyperv::EVMCS_VERSION);
+                if current {
+                    state.current_vmcs = address;
+                }
+                if assist_enabled {
+                    state.vp_assist_msr = assist.0.as_mut_ptr() as u64 | 1;
+                }
+                page.0[..4].copy_from_slice(&crate::hyperv::EVMCS_VERSION.to_le_bytes());
+                let mut ept = EvmcsTestEpt::new(&mut state);
+                ept.map(address, address, 7);
+                if assist_enabled {
+                    ept.map(state.vp_assist_msr & !4095, state.vp_assist_msr & !4095, 1);
+                }
+                assert_eq!(unsafe { test_clear_evmcs(&mut state, address) }, 1);
+                assert_eq!(
+                    page_u64(&page, VMCS12_BACKING_MAGIC_OFFSET),
+                    VMCS12_BACKING_MAGIC
+                );
+                assert_eq!(
+                    page_u64(
+                        &page,
+                        VMCS12_BACKING_STATE_OFFSET + offset_of!(NestedVmcs12State, launch_state)
+                    ),
+                    VMCS12_LAUNCH_STATE_CLEAR
+                );
+                assert_eq!(state.current_vmcs, INVALID_VMCS_POINTER);
+                assert_eq!(state.evmcs_active, 0);
+                if current {
+                    assert_eq!(state.vmcs12.launch_state, VMCS12_LAUNCH_STATE_CLEAR);
+                }
+            }
+        }
     }
 
     #[test]
@@ -2138,6 +2245,7 @@ mod ept {
         composed: *mut u8,
         mapped: u64,
         selected: *const u8,
+        translated: *const u8,
     }
 
     core::arch::global_asm!(
@@ -2157,6 +2265,7 @@ mod ept {
         msr_bitmap = const 0,
         test_mapped = const std::mem::offset_of!(MsrPolicyContext, mapped),
         test_selected = const std::mem::offset_of!(MsrPolicyContext, selected),
+        test_translated = const std::mem::offset_of!(MsrPolicyContext, translated),
     );
 
     unsafe extern "win64" {
@@ -2173,10 +2282,11 @@ mod ept {
         let mut context = MsrPolicyContext {
             primary: 0,
             l0: l0.as_ptr(),
-            l1: l1.as_ptr(),
+            l1: 0x800000 as *const u8,
             composed: composed.as_mut_ptr(),
             mapped: 1,
             selected: std::ptr::null(),
+            translated: l1.as_ptr(),
         };
         for primary in [0, 1 << 28, 0] {
             context.primary = primary;
@@ -3116,6 +3226,8 @@ mod ept {
             ept01,
             ept12,
             ept02,
+            physical_address_bits: 52,
+            ept_capabilities: 1 | (1 << 16) | (1 << 17),
             pool,
             pool_pages: 16,
             secondary_control: 2,
@@ -4961,6 +5073,9 @@ mod ept {
         assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
         assert_eq!(state.qualification & 0x60, 0);
     }
+
+    include!("review_hv_ept_tests.rs");
+    include!("review_hv_edge_tests.rs");
 }
 
 #[cfg(test_harness = "native_shadow")]
@@ -4980,6 +5095,7 @@ mod native_shadow {
         fn test_native_shadow_resume(context: *mut u64, field: u64, value: u64) -> u64;
         fn test_native_shadow_field(context: *mut u64, field: u64, value: u64) -> u64;
         fn test_native_shadow_software_write(context: *mut u64, field: u64, value: u64) -> u64;
+        fn test_native_shadow_entry(context: *mut u64, field: u64, value: u64) -> u64;
     }
 
     type Handler = unsafe extern "win64" fn(*mut u64, u64, u64) -> u64;
@@ -5161,6 +5277,55 @@ mod native_shadow {
     }
 
     #[test]
+    fn entry_rejects_unsupported_host_mode_and_control_dependencies() {
+        for true_controls in [false, true] {
+            let mut state = context();
+            for name in [
+                "b_nested_vmx_pinbased_ctls",
+                "b_nested_vmx_procbased_ctls",
+                "b_nested_vmx_exit_ctls",
+                "b_nested_vmx_entry_ctls",
+                "b_nested_vmx_true_pinbased_ctls",
+                "b_nested_vmx_true_procbased_ctls",
+                "b_nested_vmx_true_exit_ctls",
+                "b_nested_vmx_true_entry_ctls",
+                "b_nested_vmx_procbased_ctls2",
+            ] {
+                state[offset(name)] = 0xffff_ffff_0000_0000;
+            }
+            state[offset("b_nested_vmx_basic")] = u64::from(true_controls) << 55;
+            state[offset("b_nested_vmx_cr0_fixed1")] = u64::MAX;
+            state[offset("b_nested_vmx_cr4_fixed1")] = u64::MAX;
+            state[offset("b_nested_vmcs12_host_cr4")] = 0x2020;
+            state[offset("b_nested_vmcs12_ept_pointer")] = 0x101e;
+            let fields = offset("b_nested_vmcs12_extended_fields");
+            state[fields + 44] = 8;
+            state[fields + 49] = 16;
+            for (pin, primary, secondary, exit, expected) in [
+                (0, 0, 0, 1 << 9, 0),
+                (1 << 5, 0, 0, 1 << 9, 7),
+                (0, 1 << 22, 0, 1 << 9, 7),
+                (1 << 3, 1 << 22, 0, 1 << 9, 7),
+                ((1 << 3) | (1 << 5), 1 << 22, 0, 1 << 9, 0),
+                (0, 1 << 31, 1 << 7, 1 << 9, 7),
+                (0, 1 << 31, (1 << 7) | 2, 1 << 9, 0),
+                (0, 0, 1 << 7, 1 << 9, 0),
+                (0, 0, 0, 0, 7),
+            ] {
+                state[offset("b_nested_vmcs12_pin_based_control")] = pin;
+                state[offset("b_nested_vmcs12_primary_control")] = primary;
+                state[offset("b_nested_vmcs12_secondary_control")] = secondary;
+                state[offset("b_nested_vmcs12_vm_exit_controls")] = exit;
+                assert_eq!(
+                    run(&mut state, test_native_shadow_entry, 0, 0),
+                    expected,
+                    "true={true_controls} pin={pin:#x} primary={primary:#x} secondary={secondary:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bitmap_field_availability_includes_high_halves_and_tracks_capability() {
         let mut state = context();
         for supported in [false, true] {
@@ -5183,10 +5348,12 @@ mod native_shadow {
         run(&mut state, test_native_shadow_link, 0, 0);
         assert_eq!(state[offset("test_link")], u64::MAX);
         state[offset("b_nested_last_merged_secondary_controls")] = 1 << 14;
+        state[offset("test_translation_delta")] = 0x5000;
         run(&mut state, test_native_shadow_link, 0, 0);
-        assert_eq!(state[offset("test_link")], 0x3000);
+        assert_eq!(state[offset("test_link")], 0x8000);
         run(&mut state, test_native_shadow_flush, 0, 0);
-        assert_eq!(state[offset("test_cleared")], 0x3000);
+        assert_eq!(state[offset("test_cleared")], 0x8000);
+        assert_eq!(state[fields + 23], 0x3000);
         state[offset("b_last_reason")] = 0x8000_0021;
         run(&mut state, test_native_shadow_flush, 0, 0);
         assert_eq!(state[offset("test_clear_count")], 1);
@@ -5315,6 +5482,8 @@ fn lifecycle(probe_active: bool, telemetry_active: bool) -> u64 {
     vmread_bitmap[shadow_byte] = 0xaf;
     context[offset("b_nested_shadow_vmread_bitmap")] = vmread_bitmap.as_mut_ptr() as u64;
     context[offset("b_nested_l1_cr4")] = 1 << 13;
+    context[offset("b_nested_vmx_cr0_fixed1")] = u64::MAX;
+    context[offset("b_nested_vmx_cr4_fixed1")] = u64::MAX;
     context[offset("b_nested_feature_control")] = 5;
     context[offset("b_nested_vmx_basic")] = revision;
     context[offset("b_test_operand")] = &revision as *const u64 as u64;
@@ -5344,6 +5513,58 @@ fn lifecycle(probe_active: bool, telemetry_active: bool) -> u64 {
         assert_eq!(context[offset(name)], u64::from(telemetry_active));
     }
     context[offset("b_test_serial_bytes")]
+}
+
+#[cfg(test_harness = "logging")]
+#[test]
+fn vmxon_checks_virtual_cr0_cr4_fixed_masks_before_reading_the_operand() {
+    for (cr0, cr4, expected) in [
+        (0x80000021, 0x2020, 0),
+        (0x21, 0x2020, 13),
+        (0x80000001, 0x2020, 13),
+        (0x80000021 | (1 << 63), 0x2020, 13),
+        (0x80000021, 0x2000, 13),
+        (0x80000021, 0x2020 | (1 << 63), 13),
+        (0x80000021, 0x20, 6),
+    ] {
+        let revision = 1_u64;
+        let mut state = [0_u64; 64];
+        state[offset("b_test_cr0")] = cr0;
+        state[offset("b_test_cr4")] = cr4 | (1 << 13);
+        state[offset("b_nested_l1_cr4")] = cr4 & (1 << 13);
+        state[offset("b_nested_vmx_cr0_fixed0")] = 0x80000021;
+        state[offset("b_nested_vmx_cr0_fixed1")] = 0xffff_ffff;
+        state[offset("b_nested_vmx_cr4_fixed0")] = 0x2020;
+        state[offset("b_nested_vmx_cr4_fixed1")] = 0xffff_ffff;
+        state[offset("b_nested_feature_control")] = 5;
+        state[offset("b_nested_vmx_basic")] = revision;
+        state[offset("b_test_operand")] = &revision as *const u64 as u64;
+        state[offset("b_test_rip")] = 0x1000;
+        assert_eq!(
+            unsafe { test_vmx_lifecycle(state.as_mut_ptr(), 0) },
+            u32::from(expected != 0)
+        );
+        assert_eq!(state[offset("b_test_exception")], expected);
+        assert_eq!(state[offset("b_nested_active")], u64::from(expected == 0));
+        assert_eq!(
+            state[offset("b_test_rip")],
+            if expected == 0 { 0x1003 } else { 0x1000 }
+        );
+    }
+    let mut state = [0_u64; 64];
+    state[offset("b_nested_l1_cr4")] = 0x2000;
+    state[offset("b_nested_feature_control")] = 5;
+    state[offset("b_test_cr0")] = 1 << 31;
+    state[offset("b_test_cr0_mask")] = 1 << 31;
+    state[offset("b_nested_vmx_cr0_fixed0")] = 1 << 31;
+    assert_eq!(unsafe { test_vmx_lifecycle(state.as_mut_ptr(), 0) }, 1);
+    assert_eq!(state[offset("b_test_exception")], 13);
+    state[offset("b_test_exception")] = 0;
+    state[offset("b_nested_active")] = 1;
+    state[offset("b_nested_feature_control")] = 0;
+    assert_eq!(unsafe { test_vmx_lifecycle(state.as_mut_ptr(), 0) }, 1);
+    assert_eq!(state[offset("b_test_exception")], 0);
+    assert_eq!(state[offset("b_test_vmx_error")], 15);
 }
 
 #[cfg(test_harness = "logging")]
@@ -5441,6 +5662,10 @@ mod regressions {
         arena.map(root, 0x401000, 0x3000000, 7);
         arena.map(ept, 0x1000000, first, 7);
         arena.map(ept, 0x3000000, second, 7);
+        let table_addresses: Vec<_> = arena.0.iter().map(|page| page.0.as_ptr() as u64).collect();
+        for address in table_addresses {
+            arena.map(ept, address, address, 7);
+        }
         state[offset("b_cache_ept_pointer")] = ept;
         let vmcs = offset("test_vmcs");
         state[vmcs] = 1 << 31;
@@ -5448,6 +5673,183 @@ mod regressions {
         state[vmcs + 3] = 1 << 9;
         state[vmcs + 4] = 1 << 13;
         (state, root, ept)
+    }
+
+    #[test]
+    fn review_vmx_operand_write_honors_guest_page_write_protection() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let mut arena = Arena::new();
+        let first = arena.page();
+        let second = arena.page();
+        let (mut state, root, _) = paging_state(&mut arena, first, second);
+        arena.map(root, 0x400000, 0x1000000, 1);
+        state[offset("test_vmcs")] |= 1 << 16;
+        state[offset("b_nested_operand_linear_address")] = 0x400000;
+        state[offset("b_nested_operand_data")] = u64::MAX;
+        let result = run(&mut state, 1, 8, 0);
+        let written = unsafe { (first as *const u64).read() };
+        assert_eq!((result, written), (0, 0));
+    }
+
+    #[test]
+    fn review_vmx_operand_walk_translates_guest_page_table_addresses() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let mut arena = Arena::new();
+        let first = arena.page();
+        let second = arena.page();
+        let (mut state, root, ept) = paging_state(&mut arena, first, second);
+        let root_gpa = arena.page();
+        let table_addresses: Vec<_> = arena.0.iter().map(|page| page.0.as_ptr() as u64).collect();
+        for address in table_addresses {
+            arena.map(ept, address, address, 7);
+        }
+        arena.map(ept, root_gpa, root, 7);
+        state[offset("test_vmcs") + 2] = root_gpa;
+        state[offset("b_nested_operand_linear_address")] = 0x400000;
+        unsafe { (first as *mut u64).write(0x123456789abcdef0) };
+        let result = run(&mut state, 0, 8, 0);
+        assert_eq!(
+            (result, state[offset("b_nested_operand_data")]),
+            (1, 0x123456789abcdef0)
+        );
+    }
+
+    #[test]
+    fn operand_walk_permissions_and_remapping_cover_all_paging_modes() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        for (mode, levels) in [
+            (0, vec![22, 12]),
+            (1, vec![30, 21, 12]),
+            (2, vec![39, 30, 21, 12]),
+            (3, vec![48, 39, 30, 21, 12]),
+        ] {
+            for leaf_shift in [12, 21, 22, 30] {
+                if !levels.contains(&leaf_shift) || (mode == 1 && leaf_shift == 30) {
+                    continue;
+                }
+                let leaf_level = levels
+                    .iter()
+                    .position(|&shift| shift == leaf_shift)
+                    .unwrap();
+                for denied_level in 0..=leaf_level + 1 {
+                    for wp in [false, true] {
+                        let mut arena = Arena::new();
+                        let ept = arena.page();
+                        let data = arena.page();
+                        let mut state = vec![0; CONTEXT_QWORDS];
+                        let linear = 0x401238_u64;
+                        let root_gpa = 0x900000 + if mode == 1 { 32 } else { 0 };
+                        for (level, &shift) in levels.iter().enumerate().take(leaf_level + 1) {
+                            let table = arena.page();
+                            let table_gpa = 0x900000 + level as u64 * 4096;
+                            arena.map(ept, table_gpa, table, 1);
+                            let index = (linear >> shift) & if mode == 0 { 1023 } else { 511 };
+                            let target = if level == leaf_level {
+                                0x40000000
+                            } else {
+                                table_gpa + 4096
+                            };
+                            let permissions = if level == denied_level || (mode == 1 && level == 0)
+                            {
+                                1
+                            } else {
+                                3
+                            };
+                            let entry = target
+                                | permissions
+                                | if level == leaf_level && shift > 12 {
+                                    0x80
+                                } else {
+                                    0
+                                };
+                            let base = table + if mode == 1 && level == 0 { 32 } else { 0 };
+                            unsafe {
+                                if mode == 0 {
+                                    ((base + index * 4) as *mut u32).write(entry as u32);
+                                } else {
+                                    ((base + index * 8) as *mut u64).write(entry);
+                                }
+                            }
+                        }
+                        let physical = 0x40000000 | (linear & ((1 << leaf_shift) - 1));
+                        arena.map(ept, physical & !4095, data, 7);
+                        state[offset("b_cache_ept_pointer")] = ept;
+                        let vmcs = offset("test_vmcs");
+                        state[vmcs] = (1 << 31) | if wp { 1 << 16 } else { 0 };
+                        state[vmcs + 1] = match mode {
+                            0 => 1 << 4,
+                            1 => 1 << 5,
+                            3 => 1 << 12,
+                            _ => 0,
+                        };
+                        state[vmcs + 2] = root_gpa;
+                        state[vmcs + 3] = if mode >= 2 { 1 << 9 } else { 0 };
+                        state[offset("b_nested_operand_linear_address")] = linear;
+                        assert_eq!(run(&mut state, 0, 8, 0), 1);
+                        state[offset("b_nested_operand_data")] = u64::MAX;
+                        let denied =
+                            wp && denied_level <= leaf_level && !(mode == 1 && denied_level == 0);
+                        assert_eq!(
+                            run(&mut state, 1, 8, 0),
+                            u32::from(!denied),
+                            "mode={mode} leaf={leaf_shift} level={denied_level} wp={wp}"
+                        );
+                        assert_eq!(
+                            unsafe { ((data + (linear & 4095)) as *const u64).read() },
+                            if denied { 0 } else { u64::MAX }
+                        );
+                        if denied {
+                            assert_eq!(state[offset("test_controls") + 14], 3);
+                            assert_eq!(state[offset("test_controls") + 13], 0x80000b0e);
+                            assert_eq!(state[offset("test_fault_address")], linear);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inaccessible_guest_paging_structure_is_rejected_at_every_level() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        for denied_level in 0..4 {
+            let mut arena = Arena::new();
+            let first = arena.page();
+            let second = arena.page();
+            let (mut state, root, ept) = paging_state(&mut arena, first, second);
+            let mut table = root;
+            for shift in [39, 30, 21].into_iter().take(denied_level) {
+                table =
+                    unsafe { (table as *const u64).add((0x400000 >> shift) & 511).read() } & !4095;
+            }
+            arena.map(ept, table, 0, 0);
+            state[offset("b_nested_operand_linear_address")] = 0x400000;
+            state[offset("b_nested_operand_data")] = u64::MAX;
+            assert_eq!(run(&mut state, 0, 8, 0), 0);
+            assert_eq!(state[offset("b_nested_operand_data")], u64::MAX);
+            assert_eq!(state[offset("test_fault_address")], 0x400000);
+            assert_eq!(state[offset("test_controls") + 14], 0);
+        }
+    }
+
+    #[test]
+    fn guest_write_protection_on_second_page_is_atomic_and_reports_protection_fault() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let mut arena = Arena::new();
+        let first = arena.page();
+        let second = arena.page();
+        let (mut state, root, _) = paging_state(&mut arena, first, second);
+        arena.map(root, 0x401000, 0x3000000, 1);
+        state[offset("test_vmcs")] |= 1 << 16;
+        state[offset("b_nested_operand_linear_address")] = 0x400ffc;
+        state[offset("b_nested_operand_data")] = u64::MAX;
+        assert_eq!(run(&mut state, 1, 8, 0), 0);
+        assert_eq!(state[offset("test_fault_address")], 0x401000);
+        assert_eq!(state[offset("test_controls") + 14], 3);
+        unsafe {
+            assert_eq!((first as *const u64).add(511).read(), 0);
+            assert_eq!((second as *const u64).read(), 0);
+        }
     }
 
     #[test]
@@ -5576,6 +5978,7 @@ mod regressions {
         Vec<[u64; 2]>,
         Vec<[u64; 2]>,
         Vec<[u64; 2]>,
+        Arena,
     ) {
         let mut state = vec![0; CONTEXT_QWORDS];
         let mut root = vec![[0x48, 0x11]];
@@ -5589,8 +5992,18 @@ mod regressions {
         state[offset("b_nested_vmcs02_exit_store_msr_list")] = captured.as_mut_ptr() as u64;
         state[offset("b_nested_vmcs12_vm_exit_msr_store_addr")] = l1.as_mut_ptr() as u64;
         state[offset("b_nested_vmcs12_vm_exit_msr_store_count")] = l1.len() as u64;
+        let mut arena = Arena::new();
+        let ept = arena.page();
+        state[offset("b_cache_ept_pointer")] = ept;
+        if !l1.is_empty() {
+            let start = l1.as_ptr() as u64 & !4095;
+            let end = (l1.as_ptr() as u64 + l1.len() as u64 * 16 - 1) & !4095;
+            for page in (start..=end).step_by(4096) {
+                arena.map(ept, page, page, 7);
+            }
+        }
         run(&mut state, 3, 0, root_count);
-        (state, root, entry, captured, l1)
+        (state, root, entry, captured, l1, arena)
     }
 
     #[test]
@@ -5605,7 +6018,8 @@ mod regressions {
                 [0x277, 0xabcd],
                 [0xc0000102, 0xef],
             ];
-            let (mut state, root, _entry, mut captured, l1) = msr_state(root_count, &requested);
+            let (mut state, root, _entry, mut captured, l1, _arena) =
+                msr_state(root_count, &requested);
             assert_eq!(
                 state[offset("b_nested_vmcs12_vm_exit_msr_store_count")],
                 requested.len() as u64
@@ -5640,10 +6054,59 @@ mod regressions {
     }
 
     #[test]
+    fn msr_lists_translate_each_page_for_entry_exit_load_and_exit_store() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (mut state, _root, entry, mut captured, _l1, mut arena) = msr_state(0, &[]);
+        let first = arena.page();
+        let second = arena.page();
+        let ept = state[offset("b_cache_ept_pointer")];
+        arena.map(ept, 0x700000, first, 7);
+        arena.map(ept, 0x701000, second, 7);
+        let records = [(first + 4080) as *mut u64, second as *mut u64];
+        for (index, address) in records.iter().enumerate() {
+            unsafe {
+                address.write([0x48, 0xc0000102][index]);
+                address.add(1).write(0x100 + index as u64);
+            }
+        }
+        for name in [
+            "b_nested_vmcs12_vm_entry_msr_load_addr",
+            "b_nested_vmcs12_vm_exit_msr_load_addr",
+            "b_nested_vmcs12_vm_exit_msr_store_addr",
+        ] {
+            state[offset(name)] = 0x700ff0;
+        }
+        for name in [
+            "b_nested_vmcs12_vm_entry_msr_load_count",
+            "b_nested_vmcs12_vm_exit_msr_load_count",
+            "b_nested_vmcs12_vm_exit_msr_store_count",
+        ] {
+            state[offset(name)] = 2;
+        }
+        assert_eq!(run(&mut state, 3, 0, 0), 1);
+        assert_eq!(&entry[..2], &[[0x48, 0x100], [0xc0000102, 0x101]]);
+        assert_eq!(state[offset("b_nested_captured_msr_store_count")], 2);
+        captured[0][1] = 0x200;
+        captured[1][1] = 0x201;
+        assert_eq!(run(&mut state, 4, 10, 0), 1);
+        assert_eq!(unsafe { records[0].add(1).read() }, 0x200);
+        assert_eq!(unsafe { records[1].add(1).read() }, 0x201);
+        assert_eq!(&entry[..2], &[[0x48, 0x200], [0xc0000102, 0x201]]);
+        assert_eq!(
+            state[offset("b_nested_vmcs12_vm_exit_msr_store_addr")],
+            0x700ff0
+        );
+        arena.map(ept, 0x701000, second, 0);
+        assert_eq!(run(&mut state, 3, 0, 0), 1);
+        assert_eq!(state[offset("test_controls") + 1], 0);
+        assert_eq!(state[offset("b_nested_captured_msr_store_count")], 0);
+    }
+
+    #[test]
     fn pat_only_list_does_not_read_stale_hardware_slots_and_failed_entry_does_not_publish() {
         let _guard = TEST_LOCK.lock().unwrap();
         for root_count in [0, 1] {
-            let (mut state, _root, _entry, captured, l1) =
+            let (mut state, _root, _entry, captured, l1, _arena) =
                 msr_state(root_count, &[[0x277, 0xdeadbeef]]);
             assert_eq!(
                 state[offset("b_nested_captured_msr_store_count")],
@@ -5666,10 +6129,10 @@ mod regressions {
             [[(1 << 32) | 0x277, 0x55]],
             [[0x802, 0x55]],
         ] {
-            let (mut state, _root, _entry, _captured, l1) = msr_state(0, &requested);
+            let (mut state, _root, _entry, _captured, l1, _arena) = msr_state(0, &requested);
             let mut arena = Arena::new();
             let vmcs = arena.page();
-            let ept = arena.page();
+            let ept = state[offset("b_cache_ept_pointer")];
             arena.map(ept, 0x100000, vmcs, 7);
             state[offset("b_cache_ept_pointer")] = ept;
             state[offset("b_nested_current_vmcs")] = 0x100000;
@@ -5684,7 +6147,8 @@ mod regressions {
     fn full_list_software_switch_and_internal_resume_preserve_the_current_spec_ctrl() {
         let _guard = TEST_LOCK.lock().unwrap();
         for root_count in [0, 1] {
-            let (mut state, mut root, _entry, mut captured, _l1) = msr_state(root_count, &[]);
+            let (mut state, mut root, _entry, mut captured, _l1, _arena) =
+                msr_state(root_count, &[]);
             let host = [0x48_u64, 0x99];
             state[offset("b_nested_l0_msr_host_list")] = host.as_ptr() as u64;
             state[offset("test_vmcs") + 1] = 512;
@@ -5722,7 +6186,7 @@ mod regressions {
             (false, true, false, false),
             (true, true, false, false),
         ] {
-            let (mut state, _root, _entry, captured, _l1) = msr_state(1, &[]);
+            let (mut state, _root, _entry, captured, _l1, _arena) = msr_state(1, &[]);
             let mut arena = Arena::new();
             let bitmap = arena.page();
             let ept = arena.page();
@@ -5792,7 +6256,7 @@ mod regressions {
     fn l0_only_debugctl_exits_use_guest_state_and_preserve_root_state() {
         let _guard = TEST_LOCK.lock().unwrap();
         for (write, fault) in [(false, false), (true, false), (true, true)] {
-            let (mut state, _root, _entry, captured, _l1) = msr_state(1, &[]);
+            let (mut state, _root, _entry, captured, _l1, _arena) = msr_state(1, &[]);
             let mut arena = Arena::new();
             let bitmap = arena.page();
             let ept = arena.page();
@@ -5834,7 +6298,8 @@ mod regressions {
         for root_count in [0, 1] {
             for count in [511, 512] {
                 let requested = vec![[0x277, 0x1234]; count];
-                let (mut state, _root, entry, _captured, l1) = msr_state(root_count, &requested);
+                let (mut state, _root, entry, _captured, l1, _arena) =
+                    msr_state(root_count, &requested);
                 state[offset("b_nested_vmcs12_vm_entry_msr_load_addr")] = l1.as_ptr() as u64;
                 state[offset("b_nested_vmcs12_vm_entry_msr_load_count")] = count as u64;
                 state[offset("b_nested_vmcs12_vm_exit_msr_load_addr")] = l1.as_ptr() as u64;

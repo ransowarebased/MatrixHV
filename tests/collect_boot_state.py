@@ -69,12 +69,8 @@ def append_u64_fields(source, prefix):
 append_u64_fields(structure(resident, "ResidentBootContext"), "")
 reference_serial = os.environ.get("MATRIXHV_REFERENCE_SERIAL")
 serial_path = Path(reference_serial) if reference_serial else output / "serial.log"
-serial = serial_path.read_text(errors="replace")
-contexts = re.findall(r"smp resident (?:BSP|processor=\d+).*?context=(0x[0-9a-fA-F]+)", serial)
-if not contexts:
-    raise RuntimeError("No resident contexts in this run's serial log")
-
 result = {"cpus": [], "contexts": []}
+exit_code = 1
 try:
     if not ida_dbg.load_debugger("gdb", True):
         raise RuntimeError("GDB debugger unavailable")
@@ -94,6 +90,30 @@ try:
         result["cpus"].append(cpu)
         print("CPU", json.dumps(cpu))
     print("PHYSICAL", idc.send_dbg_command("phys"))
+    # Read after suspension so a guest reboot during IDA startup cannot leave
+    # stale allocation addresses from an earlier boot in the same serial file.
+    serial = serial_path.read_text(errors="replace")
+    boot_marker = "[MATRIXHV][PHASE] boot.entry"
+    if boot_marker in serial:
+        serial = serial[serial.rfind(boot_marker):]
+    contexts = re.findall(r"smp resident (?:BSP|processor=\d+).*?context=(0x[0-9a-fA-F]+)", serial)
+    if not contexts:
+        # Early probe failures can precede the SMP residency log. R12 still
+        # identifies each halted CPU's root context; verify its canaries below.
+        candidates = [cpu["registers"]["R12"] for cpu in result["cpus"]]
+        candidates.extend(int(address, 16) for address in re.findall(
+            r"(?:residency_context|context)=(0x[0-9a-fA-F]+)", serial))
+        contexts = []
+        signature = struct.pack("<QQ", 0x4856424F4F544331, 0x4856424F4F544332)
+        for address in dict.fromkeys(candidates):
+            if address & 0xFFF:
+                continue
+            canary_address = address + fields["canary_start"]
+            ida_dbg.invalidate_dbgmem_contents(canary_address, len(signature))
+            if idc.get_bytes(canary_address, len(signature), True) == signature:
+                contexts.append(hex(address))
+        if not contexts:
+            raise RuntimeError("No valid resident contexts in registers or serial log")
     if reference_serial:
         # A UART-free run has no serial addresses. Scan only the nearby physical
         # allocation neighborhood from an earlier boot. Canaries, CPU count,
@@ -165,7 +185,9 @@ try:
         result["contexts"].append({"address": address, "values": values})
         print("CONTEXT", address_text, json.dumps(values))
     (output / f"{sample}-state.json").write_text(json.dumps(result, indent=2))
+    exit_code = 0
 except Exception:
+    (output / f"{sample}-state.json").write_text(json.dumps(result, indent=2))
     traceback.print_exc()
 finally:
     try:
@@ -173,4 +195,4 @@ finally:
         print("RESUME", ida_dbg.continue_process())
         print("DETACH", ida_dbg.detach_process())
     finally:
-        ida_pro.qexit(0)
+        ida_pro.qexit(exit_code)
