@@ -58,6 +58,75 @@ event = re.sub(
 )
 assert not re.search(r"(?m)^vm(?:read|write) ", event)
 
+# Execute the leaf-zero selector and handler against the same modeled VMCS as
+# instruction completion. A native CPUID in this path is a test failure.
+cpuid = (
+    section(EXITS, ".Lresident_dispatch_cpuid_leaf0_check:", ".Lresident_dispatch_full:")
+    + section(EXITS, ".Lresident_dispatch_cpuid:", ".endm")
+    + section(EXITS, ".Lresident_dispatch_cpuid_advance:", ".endm")
+)
+cpuid = re.sub(r"(?m)^resident_telemetry_counter[^\n]*", "", cpuid)
+cpuid = cpuid.replace("matrixhv_resident_hyperv_cpuid", "ud2")
+cpuid = re.sub(r"(?m)^cpuid$", "ud2", cpuid)
+cpuid = cpuid.replace("jmp .Lresident_dispatch_resume", "jmp .Ltest_cpuid_completed")
+cpuid = cpuid.replace("[rip + matrixhv_resident_island_log_backend]", "[r12 + 208]")
+cpuid = cpuid.replace("mov rax, cr3", "mov rax, [r12 + 192]")
+cpuid_fields = dict(fields, b_cpuid_leaf0=32, b_nested_l2_active=48,
+                    b_telemetry_active=56, b_expected_host_cr3=200,
+                    cpuid_reason=10, matrixhv_status_leaf=0x4d485652,
+                    matrixhv_status_signature_eax=0, matrixhv_status_signature_ebx=0,
+                    matrixhv_status_signature_ecx=0, matrixhv_status_protocol=0)
+cpuid = re.sub(r"\{(\w+)\}", lambda match: str(cpuid_fields[match[1]]), cpuid)
+cpuid = cpuid.replace("vmread r11, rax",
+                      "inc qword ptr [r12 + 216]\nmov r11, [r12 + 64 + rax * 8]\ncmp r12, 0")
+assert not re.search(r"(?m)^vm(?:read|write) ", cpuid)
+cpuid += """
+.Lresident_dispatch_full:
+xor eax, eax
+jmp .Ltest_cpuid_done
+.Lresident_dispatch_host_cr3_mismatch:
+mov eax, 2
+jmp .Ltest_cpuid_done
+.Lresident_dispatch_cpuid_diagnostic:
+ud2
+.Lresident_dispatch_l1:
+jmp .Lresident_dispatch_cpuid
+.globl test_cpuid_leaf0
+test_cpuid_leaf0:
+push rbx
+push r12
+push r13
+mov r12, rcx
+mov r13, rdx
+sub rsp, 32
+mov rax, [r13]
+mov [rsp], rax
+mov rax, [r13 + 8]
+mov [rsp + 8], rax
+mov rax, [r13 + 16]
+mov [rsp + 16], rax
+mov rax, [r13 + 24]
+mov [rsp + 24], rax
+jmp .Lresident_dispatch_cpuid_leaf0_check
+.Ltest_cpuid_completed:
+mov eax, 1
+jmp .Ltest_cpuid_done
+.Ltest_cpuid_done:
+mov r10, [rsp]
+mov [r13], r10
+mov r10, [rsp + 8]
+mov [r13 + 8], r10
+mov r10, [rsp + 16]
+mov [r13 + 16], r10
+mov r10, [rsp + 24]
+mov [r13 + 24], r10
+add rsp, 32
+pop r13
+pop r12
+pop rbx
+ret
+"""
+
 arm = section(EXITS, ".Lresident_host_arm_nmi_window:", "matrixhv_island_host_fatal")
 arm_fields = {
     "cpu_based_vm_exec_control": 0,
@@ -105,7 +174,7 @@ entry = ""
 for label in (".Lresident_nested_l2_launch_registers:", ".Lresident_nested_l2_resume_registers:"):
     entry += section(NESTED, label, "pop rax") + "ret\n"
 
-assembly = ".text\n" + event + arm + window + delivery + entry + """
+assembly = ".text\n" + event + cpuid + arm + window + delivery + entry + """
 .Lresident_dispatch_vmread_failed:
 .Lresident_dispatch_vmwrite_failed:
 .Lresident_dispatch_event_corrupt:

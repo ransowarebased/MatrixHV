@@ -698,6 +698,7 @@ global_asm!(
     b_mtrr_updates = const core::mem::offset_of!(ResidentBootContext, mtrr_updates),
     b_nmi_pending = const core::mem::offset_of!(ResidentBootContext, nmi_pending),
     b_root_vmx_active = const core::mem::offset_of!(ResidentBootContext, root_vmx_active),
+    b_cpuid_leaf0 = const core::mem::offset_of!(ResidentBootContext, cpuid_leaf0),
     b_nmi_count = const core::mem::offset_of!(ResidentBootContext, nmi_count),
     pin_based_vm_exec_control = const PIN_BASED_VM_EXEC_CONTROL,
     cpu_based_vm_exec_control = const CPU_BASED_VM_EXEC_CONTROL,

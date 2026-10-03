@@ -11,6 +11,10 @@ struct EventContext {
     instruction_len: u64,
     reserved: [u64; 4],
     vmcs: [u64; 16],
+    host_cr3: u64,
+    expected_host_cr3: u64,
+    log_backend: u64,
+    dispatch_vmreads: u64,
 }
 
 #[repr(C)]
@@ -45,12 +49,85 @@ struct WindowContext {
 unsafe extern "C" {
     fn test_event_gp(context: &mut EventContext);
     fn test_event_advance(context: &mut EventContext);
+    fn test_cpuid_leaf0(context: &mut EventContext, registers: &mut [u64; 4]) -> u64;
     fn test_event_retry(context: &mut EventContext);
     fn test_host_arm_nmi_window(context: &mut ArmContext);
     fn test_nested_nmi_window(context: &mut WindowContext);
     fn test_deliver_pending_nmi(context: &mut WindowContext);
     fn test_nested_l2_launch_entry(context: &mut WindowContext);
     fn test_nested_l2_resume_entry(context: &mut WindowContext);
+}
+
+#[test]
+fn leaf_zero_uses_each_processor_cache_and_ignores_subleaf_and_high_halves() {
+    for cache in [[0x20_u32, 0x756e6547, 0x6c65746e, 0x49656e69], [7, 2, 3, 4]] {
+        for subleaf in [0, 1, u64::MAX] {
+            let mut context = EventContext {
+                reason: 10,
+                qualification: u64::MAX,
+                rip: 0x1000,
+                reserved: [
+                    u64::from(cache[0]) | (u64::from(cache[1]) << 32),
+                    u64::from(cache[2]) | (u64::from(cache[3]) << 32),
+                    0,
+                    0,
+                ],
+                ..Default::default()
+            };
+            context.vmcs[6] = 3;
+            context.vmcs[2] = 3;
+            context.vmcs[11] = 0x100;
+            let mut registers = [0xffff_ffff_0000_0000, subleaf, u64::MAX, u64::MAX];
+            assert_eq!(unsafe { test_cpuid_leaf0(&mut context, &mut registers) }, 1);
+            assert_eq!(
+                registers,
+                [cache[0], cache[2], cache[3], cache[1]].map(u64::from)
+            );
+            assert_eq!(context.qualification, 0);
+            assert_eq!(context.dispatch_vmreads, 1);
+            assert_eq!(context.vmcs[14], 0x1003);
+            assert_eq!(context.vmcs[2], 0);
+            assert_eq!(context.vmcs[13], 1 << 14);
+        }
+    }
+}
+
+#[test]
+fn leaf_zero_short_dispatch_excludes_l2_diagnostics_and_other_exits() {
+    for (reason, leaf, l2, telemetry, backend) in [
+        (10, 0, 1, 0, 0),
+        (10, 0, 0, 1, 0),
+        (10, 0, 0, 0, 1),
+        (10, 0, 0, 0, 2),
+        (10, 1, 0, 0, 0),
+        (10, 0x4d485652, 0, 0, 0),
+        (0x8000_000a, 0, 0, 0, 0),
+        (0, 0, 0, 0, 0),
+    ] {
+        let mut context = EventContext {
+            reason,
+            reserved: [0, 0, l2, telemetry],
+            log_backend: backend,
+            ..Default::default()
+        };
+        let mut registers = [leaf, 1, 2, 3];
+        assert_eq!(unsafe { test_cpuid_leaf0(&mut context, &mut registers) }, 0);
+        assert_eq!(registers, [leaf, 1, 2, 3]);
+        assert_eq!(context.dispatch_vmreads, 0);
+    }
+}
+
+#[test]
+fn leaf_zero_short_dispatch_retains_host_cr3_validation() {
+    let mut context = EventContext {
+        reason: 10,
+        host_cr3: 0x1000,
+        expected_host_cr3: 0x2000,
+        ..Default::default()
+    };
+    let mut registers = [0, 1, 2, 3];
+    assert_eq!(unsafe { test_cpuid_leaf0(&mut context, &mut registers) }, 2);
+    assert_eq!(registers, [0, 1, 2, 3]);
 }
 
 #[test]

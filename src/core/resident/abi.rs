@@ -191,6 +191,7 @@ pub struct ResidentBootContext {
     pub original_idtr: [u8; 10],
     pub root_fx_state: RootFxState,
     pub root_vmx_active: u64,
+    pub cpuid_leaf0: [u32; 4],
 }
 
 pub const RESIDENT_BOOT_CONTEXT_PAGES: usize = size_of::<ResidentBootContext>().div_ceil(PAGE_SIZE);
@@ -205,6 +206,8 @@ impl ResidentBootContext {
         nested: NestedVmxState,
         cpuid_presence: bool,
     ) -> Self {
+        // Both BSP and AP callers construct this context on its owning processor.
+        let cpuid_leaf0 = core::arch::x86_64::__cpuid_count(0, 0);
         Self {
             serial_lock: event_context + EVENT_CTX_SERIAL_LOCK as u64,
             root_rsp: 0,
@@ -334,6 +337,12 @@ impl ResidentBootContext {
             original_idtr: [0; 10],
             root_fx_state: RootFxState([0; 512]),
             root_vmx_active: 0,
+            cpuid_leaf0: [
+                cpuid_leaf0.eax,
+                cpuid_leaf0.ebx,
+                cpuid_leaf0.ecx,
+                cpuid_leaf0.edx,
+            ],
         }
     }
 }

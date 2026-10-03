@@ -55,6 +55,8 @@ resident_telemetry_counter inc, {b_cpuid_count}, {b_telemetry_active}
 mov eax, dword ptr [rsp + 0]
 mov ecx, dword ptr [rsp + 8]
 mov r8d, eax
+test eax, eax
+jz .Lresident_dispatch_cpuid_leaf0
 cmp r8d, {matrixhv_status_leaf}
 je .Lresident_dispatch_cpuid_matrixhv
 cpuid
@@ -75,6 +77,17 @@ mov r10d, {matrixhv_status_signature_ecx}
 mov qword ptr [rsp + 8], r10
 mov r10d, {matrixhv_status_protocol}
 mov qword ptr [rsp + 16], r10
+jmp .Lresident_dispatch_cpuid_advance
+.Lresident_dispatch_cpuid_leaf0:
+// Leaf zero ignores ECX; 32-bit loads also clear the guest register high halves.
+mov eax, dword ptr [r12 + {b_cpuid_leaf0}]
+mov qword ptr [rsp + 0], rax
+mov eax, dword ptr [r12 + {b_cpuid_leaf0} + 4]
+mov qword ptr [rsp + 24], rax
+mov eax, dword ptr [r12 + {b_cpuid_leaf0} + 8]
+mov qword ptr [rsp + 8], rax
+mov eax, dword ptr [r12 + {b_cpuid_leaf0} + 12]
+mov qword ptr [rsp + 16], rax
 jmp .Lresident_dispatch_cpuid_advance
 .endm
 
@@ -695,6 +708,29 @@ jz .Lresident_dispatch_vmread_failed
 mov qword ptr [r12 + {b_last_guest_rip}], r11
 mov r10d, dword ptr [rsp]
 call .Lresident_telemetry_begin
+// Keep logged exits and all L2 exits on the complete observation/reflection path.
+.Lresident_dispatch_cpuid_leaf0_check:
+cmp qword ptr [r12 + {b_last_reason}], {cpuid_reason}
+jne .Lresident_dispatch_full
+cmp dword ptr [rsp], 0
+jne .Lresident_dispatch_full
+cmp qword ptr [r12 + {b_nested_l2_active}], 0
+jne .Lresident_dispatch_full
+cmp qword ptr [r12 + {b_telemetry_active}], 0
+jne .Lresident_dispatch_full
+cmp byte ptr [rip + matrixhv_resident_island_log_backend], 0
+jne .Lresident_dispatch_full
+mov rax, {exit_instruction_len}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+mov qword ptr [r12 + {b_last_instruction_len}], r11
+// CPUID has no exit qualification. Preserve the common event and MSR rearm path.
+mov qword ptr [r12 + {b_last_qualification}], 0
+mov rax, cr3
+cmp rax, qword ptr [r12 + {b_expected_host_cr3}]
+jne .Lresident_dispatch_host_cr3_mismatch
+jmp .Lresident_dispatch_l1
+.Lresident_dispatch_full:
 resident_telemetry_counter inc, {b_exit_count}, {b_telemetry_active}
 cmp qword ptr [r12 + {b_telemetry_active}], 0
 je .Lresident_normal_exit_recorded
@@ -748,6 +784,7 @@ jne .Lresident_dispatch_update_l2_reject
 .Lresident_update_l2_checked:
 cmp qword ptr [r12 + {b_nested_l2_active}], 1
 je .Lresident_nested_l2_route
+.Lresident_dispatch_l1:
 matrixhv_resident_nested_l1_msr_rearm
 matrixhv_island_event_observation
 .Lresident_dispatch_reason:
@@ -759,6 +796,8 @@ mov rax, qword ptr [r12 + {b_last_reason}]
 test eax, 0x80000000
 jnz .Lresident_dispatch_unsupported
 and eax, 0xffff
+cmp eax, {cpuid_reason}
+je .Lresident_dispatch_cpuid
 cmp eax, 0
 je .Lresident_dispatch_exception
 cmp eax, 8
@@ -801,8 +840,6 @@ cmp eax, {invept_reason}
 je .Lresident_dispatch_invept
 cmp eax, {invvpid_reason}
 je .Lresident_dispatch_invvpid
-cmp eax, {cpuid_reason}
-je .Lresident_dispatch_cpuid
 cmp eax, {vmcall_reason}
 je .Lresident_dispatch_vmcall
 cmp eax, {rdmsr_reason}
