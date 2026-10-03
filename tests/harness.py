@@ -2530,7 +2530,28 @@ def prepare_resident_msr(project: Path):
         pop rsi
         ret
     """
-    (output / "resident-msr-bitmap.S").write_text(".text\n" + bitmap_merge, encoding="utf-8")
+    policy_start = assembly_source.index('.Lresident_update_apply_msr_policy:')
+    policy_end = assembly_source.index('.Lresident_update_retire_nested:', policy_start)
+    policy = assembly_source[policy_start:policy_end]
+    hwp_index = int(re.search(r'const IA32_HWP_REQUEST_MSR: u32 = (0x[0-9a-f]+);', source)[1], 0)
+    policy_constants = {"update_context_phase": 0, "b_nested_l0_msr_bitmap": 0,
+                        "hwp_request_write_byte": 2048 + (hwp_index >> 3),
+                        "hwp_request_write_mask": 255 ^ (1 << (hwp_index & 7))}
+    policy = re.sub(r'\{(\w+)\}', lambda match: str(policy_constants[match[1]]), policy)
+    policy += """
+    .globl test_update_msr_policy
+    test_update_msr_policy:
+        push r12
+        push r13
+        mov r12, rcx
+        mov r13, rdx
+        mov eax, 0x1234
+        call .Lresident_update_apply_msr_policy
+        pop r13
+        pop r12
+        ret
+    """
+    (output / "resident-msr-bitmap.S").write_text(".text\n" + bitmap_merge + policy, encoding="utf-8")
     start = source.index("            allow_native_msr_reads(bitmap);")
     end = source.index("    // L1 owns the local APIC", start)
     bitmap_policy = "fn clock_bitmap() -> ResidentPages {\nlet mut msr_bitmap = ResidentPages::new();\nlet bitmap = &mut msr_bitmap.bytes;\n"

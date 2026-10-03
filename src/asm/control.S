@@ -162,6 +162,9 @@ mov dword ptr [rsp + 40], 15
 call qword ptr [rip + matrixhv_resident_update_loader]
 fxrstor64 [rsp + 64]
 add rsp, 584
+test eax, eax
+jnz .Lresident_update_return
+call .Lresident_update_apply_msr_policy
 jmp .Lresident_update_return
 .Lresident_update_invalid:
 mov eax, 1
@@ -171,6 +174,18 @@ mov rax, {update_result}
 mov qword ptr [rsp + 16], rax
 call .Lresident_advance_guest_rip
 jmp .Lresident_dispatch_resume
+.Lresident_update_apply_msr_policy:
+// Update banks retain the boot bitmap. Change its policy only after all CPUs
+// have verified the new core, so incomplete activation preserves the old policy.
+cmp dword ptr [r13 + {update_context_phase}], 5
+jne .Lresident_update_msr_policy_done
+mov r11, qword ptr [r12 + {b_nested_l0_msr_bitmap}]
+test r11, r11
+jz .Lresident_update_msr_policy_done
+// VMCS02 still ORs L1 intercepts into its separate composed bitmap.
+lock and byte ptr [r11 + {hwp_request_write_byte}], {hwp_request_write_mask}
+.Lresident_update_msr_policy_done:
+ret
 .Lresident_update_retire_nested:
 push rbx
 push rbp

@@ -1142,6 +1142,42 @@ mod msr {
 
     unsafe extern "C" {
         fn test_merge_msr_bitmaps(l0: *const u8, composed: *mut u8, l1: *const u8);
+        fn test_update_msr_policy(bitmap_slot: *const u64, phase: *const u32) -> u64;
+    }
+
+    #[test]
+    fn hwp_requests_execute_natively_and_preserve_adjacent_intercepts() {
+        let bitmap = clock_bitmap();
+        assert!(!bitmap.intercepts(0x774, false));
+        assert!(!bitmap.intercepts(0x774, true));
+        for index in [0x773, 0x775] {
+            assert!(!bitmap.intercepts(index, false));
+            assert!(bitmap.intercepts(index, true));
+        }
+    }
+
+    #[test]
+    fn completed_update_changes_only_the_hwp_write_bit_and_keeps_l1_policy() {
+        for phase in 0_u32..=8 {
+            let mut l0 = ResidentPages::new();
+            let bitmap_slot = l0.bytes.as_mut_ptr() as u64;
+            assert_eq!(unsafe { test_update_msr_policy(&bitmap_slot, &phase) }, 0x1234);
+            for (offset, byte) in l0.bytes.iter().copied().enumerate() {
+                let expected = if phase == 5 && offset == 0x8ee { 0xef } else { 0xff };
+                assert_eq!(byte, expected, "phase={phase}, bitmap offset={offset:#x}");
+            }
+            for requested in [false, true] {
+                let mut l1 = [0_u8; 4096];
+                if requested { l1[0x8ee] = 1 << 4; }
+                let mut composed = ResidentPages::new();
+                unsafe {
+                    test_merge_msr_bitmaps(l0.bytes.as_ptr(), composed.bytes.as_mut_ptr(), l1.as_ptr());
+                }
+                assert_eq!(composed.intercepts(0x774, true), phase != 5 || requested);
+                assert!(composed.intercepts(0x774, false));
+            }
+        }
+        assert_eq!(unsafe { test_update_msr_policy(&0, &5) }, 0x1234);
     }
 
     #[test]

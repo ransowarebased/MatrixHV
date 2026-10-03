@@ -778,6 +778,9 @@ global_asm!(
     tsc_offset = const TSC_OFFSET,
     ept_pointer = const EPT_POINTER,
     msr_bitmap = const MSR_BITMAP,
+    hwp_request_write_byte = const super::msr::MSR_BITMAP_WRITE_LOW_OFFSET
+        + (super::msr::IA32_HWP_REQUEST_MSR >> 3) as usize,
+    hwp_request_write_mask = const !(1_u8 << (super::msr::IA32_HWP_REQUEST_MSR & 7)),
     guest_cr4 = const GUEST_CR4,
     vm_exit_msr_store_addr = const VM_EXIT_MSR_STORE_ADDR,
     vm_exit_msr_load_addr = const VM_EXIT_MSR_LOAD_ADDR,

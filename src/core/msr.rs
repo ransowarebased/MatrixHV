@@ -6,7 +6,7 @@ use uefi::Status;
 
 const MSR_BITMAP_PAGES: usize = 1;
 const MSR_BITMAP_READ_HIGH_OFFSET: usize = 1024;
-const MSR_BITMAP_WRITE_LOW_OFFSET: usize = 2048;
+pub(crate) const MSR_BITMAP_WRITE_LOW_OFFSET: usize = 2048;
 const MSR_BITMAP_WRITE_HIGH_OFFSET: usize = 3072;
 pub(crate) const IA32_TSC_MSR: u32 = 0x10;
 const IA32_TSC_ADJUST_MSR: u32 = 0x3b;
@@ -43,6 +43,7 @@ pub(crate) const MSR_DRAM_ENERGY_STATUS: u32 = 0x619;
 pub(crate) const MSR_PP0_ENERGY_STATUS: u32 = 0x639;
 pub(crate) const MSR_PP1_ENERGY_STATUS: u32 = 0x641;
 const IA32_TSC_DEADLINE_MSR: u32 = 0x6e0;
+pub(crate) const IA32_HWP_REQUEST_MSR: u32 = 0x774;
 pub(crate) const IA32_XSS_MSR: u32 = 0xda0;
 pub(crate) const AMD_SEV_STATUS_MSR: u32 = 0xc001_0131;
 const MACHINE_CHECK_BANK_MSR_STRIDE: u32 = 4;
@@ -151,6 +152,8 @@ pub(crate) fn allocate_bitmap() -> Result<ResidentPages, Status> {
             allow_low_msr_passthrough(bitmap, IA32_ARCH_CAPABILITIES_MSR);
             allow_low_msr_passthrough(bitmap, IA32_SPEC_CTRL_MSR);
             allow_low_msr_write_passthrough(bitmap, IA32_PRED_CMD_MSR);
+            // HWP requests already pass unchanged to the physical processor in the handler.
+            allow_low_msr_write_passthrough(bitmap, IA32_HWP_REQUEST_MSR);
             allow_low_msr_read_passthrough(bitmap, IA32_MCG_CAP_MSR);
             allow_low_msr_passthrough(bitmap, IA32_MCG_STATUS_MSR);
             allow_low_msr_passthrough(bitmap, IA32_MCG_CTL_MSR);
