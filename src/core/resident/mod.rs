@@ -404,6 +404,8 @@ fn prepare_runtime_update(code: &ResidentCode, event: *mut ResidentEventContext)
         (*event).control_off_native_rip = island_offset(core::ptr::addr_of!(matrixhv_resident_control_off_native) as u64);
         (*event).control_recovery_physical = island_offset(core::ptr::addr_of!(matrixhv_resident_control_recovery_switch) as u64);
         (*event).control_recovery_runtime = island_offset(core::ptr::addr_of!(matrixhv_resident_control_native_restore) as u64);
+        (*event).memory_entry_physical = root_image.physical_address()
+            + crate::access::resident::memory_entry as *const () as u64 - source_base;
         (*event).update_loader_physical = context.bindings[3];
         (*event).update_loader_runtime = native_image.physical_address() + entry_offset;
         (*event).update_context_physical = state_pages.physical_address();
@@ -526,6 +528,10 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
             update_image_bytes: 0,
             update_relocations_start: 0,
             update_relocations_end: 0,
+            memory_entry_physical: 0,
+            memory_kernel_cr3: AtomicU64::new(0),
+            memory_root_sequence: AtomicU64::new(0),
+            memory_root_history: [const { AtomicU64::new(0) }; crate::protocol::memory::ROOT_HISTORY_COUNT],
         });
         for (index, state) in (*context).control_cpu_states.iter_mut().enumerate() {
             let address = native_storage_pages.physical_address()
@@ -962,6 +968,15 @@ global_asm!(
     cpuid_osxsave_clear_mask = const !CPUID_OSXSAVE_BIT,
     cpuid_hypervisor_set_mask = const CPUID_HYPERVISOR_PRESENT_BIT,
     cpuid_hypervisor_clear_mask = const !CPUID_HYPERVISOR_PRESENT_BIT,
+    ia32_lstar = const IA32_LSTAR_MSR,
+    memory_leaf = const crate::protocol::memory::MEMORY_LEAF,
+    memory_signature = const crate::protocol::memory::MEMORY_SIGNATURE,
+    b_memory_scratch = const core::mem::offset_of!(ResidentBootContext, memory_scratch),
+    event_memory_kernel_cr3 = const core::mem::offset_of!(ResidentEventContext, memory_kernel_cr3),
+    event_memory_root_sequence = const core::mem::offset_of!(ResidentEventContext, memory_root_sequence),
+    event_memory_root_history = const core::mem::offset_of!(ResidentEventContext, memory_root_history),
+    memory_root_history_mask = const crate::protocol::memory::ROOT_HISTORY_COUNT - 1,
+    event_memory_entry = const core::mem::offset_of!(ResidentEventContext, memory_entry_physical),
     matrixhv_status_leaf = const MATRIXHV_STATUS_LEAF,
     matrixhv_status_signature_eax = const MATRIXHV_STATUS_SIGNATURE_EAX,
     matrixhv_status_signature_ebx = const MATRIXHV_STATUS_SIGNATURE_EBX,

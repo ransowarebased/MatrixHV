@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod access;
 mod arch;
 mod boot;
 mod config;

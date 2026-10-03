@@ -86,14 +86,16 @@ def plain_layout(source, name, stop=None):
     sizes = {"u8": (1, 1), "u16": (2, 2), "u32": (4, 4),
              "u64": (8, 8), "usize": (8, 8), "AtomicU64": (8, 8)}
     constants = {"BANK_PAGES": 64}
+    constants.update({name: int(value) for name, value in re.findall(
+        r"(?:pub )?const (\w+): usize = (\d+);", source)})
 
     def size_of(kind):
         if kind in sizes:
             return sizes[kind]
-        array = re.fullmatch(r"\[(.*); (\w+)\]", kind)
+        array = re.fullmatch(r"\[(.*); ([\w:]+)\]", kind)
         if array:
             size, alignment = size_of(array[1])
-            count = int(array[2]) if array[2].isdecimal() else constants[array[2]]
+            count = int(array[2]) if array[2].isdecimal() else constants[array[2].split("::")[-1]]
             return size * count, alignment
         _, size, alignment = plain_layout(source, kind)
         return size, alignment

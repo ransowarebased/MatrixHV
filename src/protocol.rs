@@ -113,3 +113,120 @@ const _: () = assert!(core::mem::align_of::<ControlRequest>() == 8);
 const _: () = assert!(core::mem::size_of::<ControlProbeSnapshot>() == 272);
 const _: () = assert!(core::mem::offset_of!(ControlStatus, probe_snapshot) == 344);
 const _: () = assert!(core::mem::size_of::<ControlStatus>() == 1056);
+
+// Memory packet fields are little-endian; offsets refer to the packet buffer.
+pub mod memory {
+    pub const ROOT_HISTORY_COUNT: usize = 16;
+    pub const INFO_BYTES: usize = HEADER_BYTES + ROOT_HISTORY_COUNT * 8;
+    pub const MEMORY_LEAF: u32 = 0x4d48_564d;
+    pub const MEMORY_SIGNATURE: u32 = 0x4d45_4d31;
+    pub const MEMORY_MAGIC: u64 = 0x4d48_564d_454d_3031;
+    pub const MEMORY_VERSION: u32 = 1;
+    pub const BUFFER_BYTES: usize = 65536;
+    pub const MAX_ITEMS: usize = 128;
+    pub const HEADER_BYTES: usize = 160;
+    pub const ITEM_BYTES: usize = 24;
+    pub const INFO: u32 = 0;
+    pub const READ: u32 = 1;
+    pub const WRITE: u32 = 2;
+    pub const ROAD_STATUS_DEMAND_ZERO: u32 = 0xe052_0001;
+
+    #[derive(Clone, Copy, Default)]
+    pub struct SoftPteLayout {
+        pub transition: u64,
+        pub prototype: u64,
+        pub software_protection: u64,
+        pub transition_protection: u64,
+        pub transition_frame: u64,
+        pub prototype_address: u64,
+        pub prototype_read_only: u64,
+        pub pagefile: u64,
+        pub hardware_copy_on_write: u64,
+        pub prototype_protection: u64,
+    }
+
+    impl SoftPteLayout {
+        pub fn fields(self) -> [u64; 10] {
+            [
+                self.transition,
+                self.prototype,
+                self.software_protection,
+                self.transition_protection,
+                self.transition_frame,
+                self.prototype_address,
+                self.prototype_read_only,
+                self.pagefile,
+                self.hardware_copy_on_write,
+                self.prototype_protection,
+            ]
+        }
+
+        pub fn from_packet(bytes: &[u8]) -> Self {
+            Self {
+                transition: quad(bytes, 80),
+                prototype: quad(bytes, 88),
+                software_protection: quad(bytes, 96),
+                transition_protection: quad(bytes, 104),
+                transition_frame: quad(bytes, 112),
+                prototype_address: quad(bytes, 120),
+                prototype_read_only: quad(bytes, 128),
+                pagefile: quad(bytes, 136),
+                hardware_copy_on_write: quad(bytes, 144),
+                prototype_protection: quad(bytes, 152),
+            }
+        }
+
+        pub fn validate(self) -> bool {
+            if self.fields().iter().all(|field| *field == 0) {
+                return true;
+            }
+            let contiguous = |mask: u64| {
+                if mask == 0 {
+                    return false;
+                }
+                let shifted = mask >> mask.trailing_zeros();
+                shifted == u64::MAX || shifted.wrapping_add(1).is_power_of_two()
+            };
+            self.transition.is_power_of_two()
+                && self.prototype.is_power_of_two()
+                && self.transition != self.prototype
+                && (self.transition | self.prototype) & 1 == 0
+                && self.hardware_copy_on_write.is_power_of_two()
+                && self.prototype_read_only.is_power_of_two()
+                && [
+                    self.software_protection,
+                    self.transition_protection,
+                    self.prototype_protection,
+                ]
+                .iter()
+                .all(|mask| contiguous(*mask) && mask.count_ones() == 5)
+                && contiguous(self.transition_frame)
+                && self.transition_frame.trailing_zeros() >= 12
+                && contiguous(self.prototype_address)
+                && self.prototype_address.count_ones() >= 48
+                && self.pagefile != 0
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u32)]
+    pub enum Error {
+        Format = 1,
+        Bounds = 2,
+        Unmapped = 3,
+        Permission = 4,
+        Unsupported = 5,
+        PrototypeUnresolved = 6,
+        PagefileBacked = 7,
+        CopyOnWrite = 8,
+        DemandZeroWrite = 9,
+    }
+
+    pub fn word(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    pub fn quad(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+}

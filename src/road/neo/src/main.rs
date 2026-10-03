@@ -1,5 +1,7 @@
 mod commands;
 mod matrix;
+mod memory;
+mod symbols;
 #[path = "../../../protocol.rs"]
 pub mod protocol;
 mod server;
@@ -33,3 +35,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../../../../tests/update_tests.rs"]
 mod update_tests;
+
+#[cfg(test)]
+#[path = "../../../../tests/memory_tests.rs"]
+mod memory_tests;

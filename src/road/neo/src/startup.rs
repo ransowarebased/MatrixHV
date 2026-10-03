@@ -97,6 +97,8 @@ fn print_help() {
     for line in [
         "  ping                              - Test the Neo agent",
         "  status                            - Query hypervisor state and diagnostics",
+        "  read PID|NAME CR3|auto [ADDRESS SIZE ...] - Read a memory batch or resolve a process",
+        "  write PID|NAME CR3|auto ADDRESS HEX [...] - Write a memory batch",
         "  matrix status                     - Query the Windows runtime bridge",
         "  matrix on | on                    - Enable MatrixHV after Y/N confirmation",
         "  matrix off | off [--cpu INDEX]     - Disable MatrixHV",

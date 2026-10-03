@@ -73,7 +73,7 @@ cpuid = cpuid.replace("[rip + matrixhv_resident_island_log_backend]", "[r12 + 20
 cpuid = cpuid.replace("mov rax, cr3", "mov rax, [r12 + 192]")
 cpuid_fields = dict(fields, b_cpuid_leaf0=32, b_nested_l2_active=48,
                     b_telemetry_active=56, b_expected_host_cr3=200,
-                    cpuid_reason=10, matrixhv_status_leaf=0x4d485652,
+                    cpuid_reason=10, memory_leaf=0x4d48564d, matrixhv_status_leaf=0x4d485652,
                     matrixhv_status_signature_eax=0, matrixhv_status_signature_ebx=0,
                     matrixhv_status_signature_ecx=0, matrixhv_status_protocol=0)
 cpuid = re.sub(r"\{(\w+)\}", lambda match: str(cpuid_fields[match[1]]), cpuid)
@@ -87,6 +87,8 @@ jmp .Ltest_cpuid_done
 .Lresident_dispatch_host_cr3_mismatch:
 mov eax, 2
 jmp .Ltest_cpuid_done
+.Lresident_dispatch_memory:
+ud2
 .Lresident_dispatch_cpuid_diagnostic:
 ud2
 .Lresident_dispatch_l1:

@@ -57,6 +57,8 @@ mov ecx, dword ptr [rsp + 8]
 mov r8d, eax
 test eax, eax
 jz .Lresident_dispatch_cpuid_leaf0
+cmp r8d, {memory_leaf}
+je .Lresident_dispatch_memory
 cmp r8d, {matrixhv_status_leaf}
 je .Lresident_dispatch_cpuid_matrixhv
 cpuid
@@ -748,6 +750,26 @@ je .Lresident_normal_exit_recorded
 mov qword ptr [r12 + {b_last_normal_reason}], rax
 mov qword ptr [r12 + {b_last_normal_rip}], r11
 .Lresident_normal_exit_recorded:
+// Record a kernel-mode root for client-side introspection without OS offsets.
+cmp qword ptr [r12 + {b_nested_l2_active}], 0
+jne .Lresident_memory_root_observed
+mov eax, {guest_cs_ar_bytes}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+test r11b, 0x60
+jnz .Lresident_memory_root_observed
+mov eax, {guest_cr3}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+mov rax, qword ptr [r12 + {b_event_context}]
+cmp qword ptr [rax + {event_memory_kernel_cr3}], r11
+je .Lresident_memory_root_observed
+mov qword ptr [rax + {event_memory_kernel_cr3}], r11
+mov edx, 1
+lock xadd qword ptr [rax + {event_memory_root_sequence}], rdx
+and edx, {memory_root_history_mask}
+mov qword ptr [rax + {event_memory_root_history} + rdx * 8], r11
+.Lresident_memory_root_observed:
 mov rax, {exit_instruction_len}
 vmread r11, rax
 jc .Lresident_dispatch_vmread_failed

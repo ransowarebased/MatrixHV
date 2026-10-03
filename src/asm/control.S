@@ -87,6 +87,78 @@ mov qword ptr [r9 + {control_cpu_stage}], \stage
 call .Lresident_control_capture_native
 .endm
 .macro matrixhv_island_requests
+.Lresident_dispatch_memory:
+// Packet address and byte count are carried in guest RDX and R8.
+cmp qword ptr [r12 + {b_nested_l2_active}], 0
+jne .Lresident_memory_unsupported
+mov eax, {vm_entry_controls}
+vmread rax, rax
+jna .Lresident_dispatch_vmread_failed
+test eax, 512
+jz .Lresident_memory_unsupported
+mov rax, qword ptr [r12 + {b_event_context}]
+mov rax, qword ptr [rax + {event_memory_entry}]
+test rax, rax
+jz .Lresident_memory_unsupported
+mov r13, rax
+mov rdx, qword ptr [rsp + 16]
+mov r8, qword ptr [rsp + 56]
+lea rcx, [r12 + {b_memory_scratch}]
+sub rsp, 616
+fxsave64 [rsp + 96]
+mov eax, {guest_cr3}
+vmread rax, rax
+jna .Lresident_memory_vmread_failed
+mov qword ptr [rsp + 32], rax
+mov eax, {guest_cr4}
+vmread rax, rax
+jna .Lresident_memory_vmread_failed
+mov qword ptr [rsp + 40], rax
+mov rax, qword ptr [r12 + {b_cache_ept_pointer}]
+mov qword ptr [rsp + 48], rax
+mov rax, cr3
+mov qword ptr [rsp + 56], rax
+push rcx
+push rdx
+mov ecx, {ia32_lstar}
+rdmsr
+shl rdx, 32
+or rax, rdx
+pop rdx
+pop rcx
+mov qword ptr [rsp + 64], rax
+mov rax, qword ptr [r12 + {b_event_context}]
+mov rax, qword ptr [rax + {event_memory_kernel_cr3}]
+mov qword ptr [rsp + 72], rax
+mov rax, qword ptr [r12 + {b_event_context}]
+lea rax, [rax + {event_memory_root_history}]
+mov qword ptr [rsp + 88], rax
+push rcx
+push rdx
+mov eax, 0x80000008
+cpuid
+and eax, 255
+pop rdx
+pop rcx
+mov qword ptr [rsp + 80], rax
+lea r9, [rsp + 32]
+call r13
+fxrstor64 [rsp + 96]
+add rsp, 616
+mov qword ptr [rsp + 16], rax
+mov eax, {memory_signature}
+mov qword ptr [rsp], rax
+mov qword ptr [rsp + 8], 0
+mov qword ptr [rsp + 24], 0
+jmp .Lresident_dispatch_cpuid_advance
+.Lresident_memory_vmread_failed:
+fxrstor64 [rsp + 96]
+add rsp, 616
+jmp .Lresident_dispatch_vmread_failed
+.Lresident_memory_unsupported:
+mov qword ptr [rsp], 0
+mov qword ptr [rsp + 16], 5
+jmp .Lresident_dispatch_cpuid_advance
 .Lresident_dispatch_update_l2_reject:
 mov rax, 14
 mov rdi, qword ptr [r12 + {b_event_context}]

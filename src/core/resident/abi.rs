@@ -88,6 +88,10 @@ pub struct ResidentEventContext {
     pub update_image_bytes: u64,
     pub update_relocations_start: u64,
     pub update_relocations_end: u64,
+    pub memory_entry_physical: u64,
+    pub memory_kernel_cr3: AtomicU64,
+    pub memory_root_sequence: AtomicU64,
+    pub memory_root_history: [AtomicU64; crate::protocol::memory::ROOT_HISTORY_COUNT],
 }
 
 #[repr(C, align(16))]
@@ -192,6 +196,7 @@ pub struct ResidentBootContext {
     pub root_fx_state: RootFxState,
     pub root_vmx_active: u64,
     pub cpuid_leaf0: [u32; 4],
+    pub memory_scratch: [u8; crate::protocol::memory::BUFFER_BYTES],
 }
 
 pub const RESIDENT_BOOT_CONTEXT_PAGES: usize = size_of::<ResidentBootContext>().div_ceil(PAGE_SIZE);
@@ -337,6 +342,7 @@ impl ResidentBootContext {
             original_idtr: [0; 10],
             root_fx_state: RootFxState([0; 512]),
             root_vmx_active: 0,
+            memory_scratch: [0; crate::protocol::memory::BUFFER_BYTES],
             cpuid_leaf0: [
                 cpuid_leaf0.eax,
                 cpuid_leaf0.ebx,
