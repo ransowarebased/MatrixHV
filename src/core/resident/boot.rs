@@ -63,6 +63,28 @@ pub fn run_boot_loader(
             .map(|resources| (processor_number, resources))
         })
         .collect::<Result<alloc::vec::Vec<_>, _>>()?;
+    let update = unsafe {
+        &mut *((*(event_context as *const ResidentEventContext)).update_context_physical
+            as *mut crate::update::RuntimeContext)
+    };
+    update.banks[0] = code.pages.physical_address();
+    update.bank_idts[0][0] = cpu_resources.host_tables.idt;
+    for (processor_number, resources) in &ap_resources {
+        update.bank_idts[0][*processor_number] = resources.host_tables.idt;
+    }
+    update.transaction.current_version = super::core_version();
+    update.transaction.current_identity = code.identity;
+    update.transaction.status.previous_version = super::core_version();
+    update.transaction.status.previous_identity = code.identity;
+    update.transaction.status.retained_banks = 1;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            &update.transaction.status,
+            core::ptr::addr_of_mut!((*(event_context as *mut ResidentEventContext)).update_status)
+                .cast::<crate::update::Status>(),
+            1,
+        );
+    }
 
     crate::diagnostics::stage("resident host paging");
     let host_space = host_address_space
@@ -86,6 +108,13 @@ pub fn run_boot_loader(
         }
     }
     let zero_page_physical_address = zero_page.physical_address();
+    protect_update_memory(
+        &mut host_address_space,
+        &mut ept,
+        &code,
+        event_context,
+        zero_page_physical_address,
+    )?;
     ept.conceal_guest_access(
         zero_page_physical_address,
         zero_page.pages(),
@@ -641,4 +670,62 @@ fn resident_startup_halt() -> ! {
         "smp resident startup failed; retaining active CPU resources"
     ));
     unsafe { matrixhv_resident_startup_halt_asm() }
+}
+
+fn protect_update_memory(
+    host: &mut HostAddressSpace,
+    ept: &mut ept::IdentityEpt,
+    code: &ResidentCode,
+    event_context: u64,
+    zero_page: u64,
+) -> Result<(), ResidentProbeError> {
+    use crate::memory::PAGE_SIZE;
+    use crate::update::{BANK_PAGES, EmbeddedImage, MAX_PACKAGE_BYTES, RuntimeContext};
+    let event = unsafe { &*(event_context as *const ResidentEventContext) };
+    let update = unsafe { &mut *(event.update_context_physical as *mut RuntimeContext) };
+    for bank in 0..2 {
+        for page in 0..BANK_PAGES {
+            let flags = if bank == 0 && page * PAGE_SIZE < code.code_bytes {
+                1
+            } else {
+                3 | (1 << 63)
+            };
+            update.bank_ptes[bank][page] = host
+                .protect_page(update.banks[bank] + (page * PAGE_SIZE) as u64, flags)
+                .map_err(ResidentProbeError::Paging)?;
+        }
+        ept.conceal_guest_access(update.banks[bank], BANK_PAGES, zero_page)?;
+    }
+    let root_image_base =
+        event.update_loader_physical - (event.update_loader_runtime - event.update_image_physical);
+    for base in [root_image_base, event.update_image_physical] {
+        let image = EmbeddedImage::parse(unsafe {
+            core::slice::from_raw_parts(base as *const u8, event.update_image_bytes as usize)
+        })
+        .map_err(|_| ResidentProbeError::InvalidCodeLayout)?;
+        for page in 0..image.bytes.len().div_ceil(PAGE_SIZE) {
+            host.protect_page(base + (page * PAGE_SIZE) as u64, image.page_flags(page))
+                .map_err(ResidentProbeError::Paging)?;
+        }
+    }
+    ept.conceal_guest_access(
+        root_image_base,
+        (event.update_image_bytes as usize).div_ceil(PAGE_SIZE),
+        zero_page,
+    )?;
+    for (base, pages) in [
+        (update.staging, MAX_PACKAGE_BYTES.div_ceil(PAGE_SIZE)),
+        (
+            event.update_context_physical,
+            core::mem::size_of::<RuntimeContext>().div_ceil(PAGE_SIZE),
+        ),
+        (update.bank_idts[1][0], 64),
+    ] {
+        for page in 0..pages {
+            host.protect_page(base + (page * PAGE_SIZE) as u64, 3 | (1 << 63))
+                .map_err(ResidentProbeError::Paging)?;
+        }
+        ept.conceal_guest_access(base, pages, zero_page)?;
+    }
+    Ok(())
 }

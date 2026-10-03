@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 colored = "2.1"
+ed25519-dalek = { version = "2.2.0", default-features = false }
+sha2 = { version = "0.10.9", default-features = false }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 shlex = "1.3"

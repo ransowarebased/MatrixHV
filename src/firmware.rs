@@ -516,6 +516,13 @@ pub fn image_residency() -> Result<ImageResidencyReport, Status> {
     })
 }
 
+pub(crate) fn loaded_image_extent() -> Result<(u64, usize), Status> {
+    let image = boot::open_protocol_exclusive::<LoadedImage>(boot::image_handle())
+        .map_err(|error| error.status())?;
+    let (base, size) = image.info();
+    Ok((base as u64, size as usize))
+}
+
 pub fn simple_file_system_count() -> Result<usize, Status> {
     let mut handles: [MaybeUninit<uefi::Handle>; HANDLE_COUNT_CAPACITY] =
         [const { MaybeUninit::uninit() }; HANDLE_COUNT_CAPACITY];

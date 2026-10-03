@@ -1,9 +1,10 @@
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     On,
     Off,
     OffProcessor(u32),
     Status,
+    Update(std::path::PathBuf),
 }
 
 #[cfg(target_os = "windows")]
@@ -14,6 +15,7 @@ pub(crate) mod windows {
         ControlRequest, ControlStatus,
     };
     use crate::server::protocol::{RequestKind, Response, read_response, write_response};
+    use crate::update::{self, Abi, Package, Phase};
     use std::ffi::c_void;
     use std::io::{Read, Write};
     use std::mem::size_of;
@@ -322,6 +324,10 @@ pub(crate) mod windows {
             Command::Off => "off".to_string(),
             Command::OffProcessor(index) => format!("off --cpu {index}"),
             Command::Status => "status".to_string(),
+            Command::Update(path) => format!(
+                "update --binary {}",
+                quote_argument(&path.to_string_lossy())
+            ),
         };
         format!("--runtime-elevated {port} {nonce} matrix {command}")
     }
@@ -351,12 +357,21 @@ pub(crate) mod windows {
                     stream
                         .set_read_timeout(Some(Duration::from_secs(300)))
                         .map_err(|error| error.to_string())?;
-                    let (request_id, response) = read_response(&mut stream)
-                        .map_err(|error| format!("failed to read the UAC result: {error}"))?;
-                    if request_id != 0 || response.request_kind != RequestKind::Status {
-                        return Err("invalid UAC result frame".into());
+                    loop {
+                        let (request_id, response) = read_response(&mut stream)
+                            .map_err(|error| format!("failed to read the UAC result: {error}"))?;
+                        if request_id != 0 {
+                            return Err("invalid UAC result frame".into());
+                        }
+                        if response.request_kind == RequestKind::Status {
+                            return Ok(response);
+                        }
+                        if response.request_kind != RequestKind::Exec || !response.success {
+                            return Err("invalid UAC progress frame".into());
+                        }
+                        println!("{}", response.message);
+                        let _ = std::io::stdout().flush();
                     }
-                    return Ok(response);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(format!("failed to accept the UAC result: {error}")),
@@ -366,6 +381,30 @@ pub(crate) mod windows {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn quote_argument(value: &str) -> String {
+        let mut quoted = String::from("\"");
+        let mut slashes = 0;
+        for character in value.chars() {
+            if character == '\\' {
+                slashes += 1;
+                continue;
+            }
+            quoted.extend(std::iter::repeat_n(
+                '\\',
+                if character == '"' {
+                    slashes * 2 + 1
+                } else {
+                    slashes
+                },
+            ));
+            quoted.push(character);
+            slashes = 0;
+        }
+        quoted.extend(std::iter::repeat_n('\\', slashes * 2));
+        quoted.push('"');
+        quoted
     }
 
     fn run_elevated(command: Command) -> Result<String, String> {
@@ -454,7 +493,13 @@ pub(crate) mod windows {
         stream
             .write_all(&nonce.to_le_bytes())
             .map_err(|error| error.to_string())?;
-        let (response, exit_code) = match execute(command, false) {
+        let (response, exit_code) = match execute(command, false, &mut |message| {
+            let _ = write_response(
+                &mut stream,
+                0,
+                &Response::success(RequestKind::Exec, message),
+            );
+        }) {
             Ok(text) => (Response::success(RequestKind::Status, text), 0),
             Err(error) => (Response::failure(RequestKind::Status, error), 1),
         };
@@ -809,7 +854,308 @@ pub(crate) mod windows {
         })
     }
 
-    pub(super) fn execute(command: Command, allow_elevation: bool) -> Result<String, String> {
+    fn update_status(status: &ControlStatus) -> update::Status {
+        unsafe { (status.update_status.as_ptr() as *const update::Status).read_unaligned() }
+    }
+
+    fn identity_text(identity: &[u8; 32]) -> String {
+        identity.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn update_summary(status: &ControlStatus) -> String {
+        let update = update_status(status);
+        let cpu_errors = update
+            .cpu_errors
+            .iter()
+            .enumerate()
+            .filter(|(_, error)| **error != 0)
+            .map(|(cpu, error)| format!("{cpu}:{}", update::Error::description(*error)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "update transaction={:#x} phase={} error={} previous_version={} next_version={} uploaded={}/{} checked={:#x} verified={:#x} retained_banks={:#x} previous_identity={} next_identity={} cpu_errors=[{cpu_errors}]",
+            update.transaction,
+            update.phase,
+            update::Error::description(update.error),
+            update.previous_version,
+            update.next_version,
+            update.received_bytes,
+            update.total_bytes,
+            update.checked_mask,
+            update.verified_mask,
+            update.retained_banks,
+            identity_text(&update.previous_identity),
+            identity_text(&update.next_identity)
+        )
+    }
+
+    fn update_request(
+        route: ProcessorRoute,
+        reference: &ControlStatus,
+        operation: u32,
+        transaction: u64,
+        offset: usize,
+        total_bytes: usize,
+        payload: &[u8],
+    ) -> Result<ControlStatus, String> {
+        if payload.len() > update::CHUNK_BYTES {
+            return Err("runtime upload block exceeds its bound".into());
+        }
+        with_processor_affinity(route.group, route.number, || {
+            let before = read_status()?;
+            if before.current_apic_id != route.apic_id
+                || before.expected_mask != reference.expected_mask
+                || before.apic_ids != reference.apic_ids
+            {
+                return Err("runtime update CPU route changed".into());
+            }
+            let mut request = vec![0_u8; update::REQUEST_BYTES + payload.len()];
+            request[..8].copy_from_slice(&update::REQUEST_MAGIC.to_le_bytes());
+            request[8..12].copy_from_slice(&update::PACKAGE_VERSION.to_le_bytes());
+            request[12..16].copy_from_slice(&operation.to_le_bytes());
+            request[16..24].copy_from_slice(&transaction.to_le_bytes());
+            request[24..28].copy_from_slice(&route.apic_id.to_le_bytes());
+            request[32..36].copy_from_slice(&(offset as u32).to_le_bytes());
+            request[36..40].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            request[40..44].copy_from_slice(&(total_bytes as u32).to_le_bytes());
+            request[update::REQUEST_BYTES..].copy_from_slice(payload);
+            let accepted = unsafe {
+                set_firmware_environment_variable_ex_w(
+                    wide(VARIABLE_NAME).as_ptr(),
+                    wide(VARIABLE_GUID).as_ptr(),
+                    request.as_ptr().cast(),
+                    request.len() as u32,
+                    VARIABLE_ATTRIBUTES,
+                )
+            };
+            let call_error = if accepted == 0 {
+                Some(win32_error("MatrixHV runtime update"))
+            } else {
+                None
+            };
+            let after = read_status()?;
+            let state = update_status(&after);
+            if let Some(error) = call_error {
+                return Err(format!(
+                    "{error}; operation={operation} cpu={} {}; {}",
+                    route.index,
+                    update::Error::description(state.error),
+                    update_summary(&after)
+                ));
+            }
+            if state.transaction != transaction
+                || state.error != 0
+                || after.current_apic_id != route.apic_id
+            {
+                return Err(format!(
+                    "runtime update acknowledgement mismatch; {}",
+                    update_summary(&after)
+                ));
+            }
+            Ok(after)
+        })
+    }
+
+    fn recover_update(
+        routes: &[ProcessorRoute],
+        reference: &ControlStatus,
+        transaction: u64,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<String, String> {
+        let status = read_status()?;
+        let phase = update_status(&status).phase;
+        let route = *routes.first().ok_or("runtime update has no CPU route")?;
+        if matches!(phase, 1 | 2) {
+            let cancelled =
+                update_request(route, reference, update::CANCEL, transaction, 0, 0, &[])?;
+            return Ok(format!(
+                "cancelled before deactivation; {}",
+                update_summary(&cancelled)
+            ));
+        }
+        if phase == Phase::Complete as u32 {
+            return Err("new core completed; no rollback is needed".into());
+        }
+        if status.failed_mask != 0 {
+            return Err(format!(
+                "host CPU failure prevents recovery; both banks remain reserved; {}",
+                update_summary(&status)
+            ));
+        }
+        progress("Recovering the previous resident core; retaining both banks.");
+        if phase == Phase::Activating as u32 {
+            for &cpu in routes {
+                run_on_route(cpu, reference, 2, transaction)?;
+            }
+        }
+        update_request(route, reference, update::RECOVER, transaction, 0, 0, &[])?;
+        for &cpu in routes {
+            run_on_route(cpu, reference, 1, transaction)?;
+            update_request(cpu, reference, update::PROBE_CPU, transaction, 0, 0, &[])?;
+            with_processor_affinity(cpu.group, cpu.number, || {
+                probe_processor(cpu.apic_id).map(|_| ())
+            })?;
+            progress(&format!(
+                "CPU {}: previous core restored and probed.",
+                cpu.index
+            ));
+        }
+        let restored = update_request(route, reference, update::RECOVERED, transaction, 0, 0, &[])?;
+        if update_status(&restored).phase != Phase::Recovered as u32 {
+            return Err("runtime recovery was not confirmed".into());
+        }
+        Ok(format!(
+            "previous resident core recovered; {}",
+            update_summary(&restored)
+        ))
+    }
+
+    fn run_update(
+        path: &std::path::Path,
+        reference: &ControlStatus,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<String, String> {
+        if reference.capabilities & 4 == 0
+            || reference.active_mask != reference.expected_mask
+            || reference.stopped_mask != 0
+            || reference.failed_mask != 0
+            || reference.exit_boot_services_seen != 1
+            || reference.virtual_address_change_seen != 1
+        {
+            return Err(
+                "runtime update requires a ready bridge and all registered CPUs active".into(),
+            );
+        }
+        let file = std::fs::File::open(path)
+            .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+        let mut bytes = Vec::new();
+        file.take((update::MAX_PACKAGE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("failed to read the resident package: {error}"))?;
+        let abi = Abi {
+            bridge: reference.update_abi[0],
+            boot_bytes: reference.update_abi[1],
+            event_bytes: reference.update_abi[2],
+            nested_bytes: reference.update_abi[3],
+            cpu_bytes: reference.update_abi[4],
+        };
+        if reference.update_abi[5] != update::STATE_ABI {
+            return Err("unsupported resident state ABI".into());
+        }
+        let package =
+            Package::parse(&bytes, abi, &reference.update_public_key).map_err(|error| {
+                format!(
+                    "resident package rejected before off: {}",
+                    update::Error::description(error as u32)
+                )
+            })?;
+        let previous = update_status(reference);
+        let current_version = if previous.phase == Phase::Complete as u32 {
+            previous.next_version
+        } else {
+            previous.previous_version
+        };
+        if package.version <= current_version {
+            return Err(format!(
+                "resident package version {} must exceed {current_version}",
+                package.version
+            ));
+        }
+        let routes = discover_routes(reference)?;
+        let route = *routes.first().ok_or("runtime update has no CPU route")?;
+        let mut random = [0_u8; 8];
+        let random_status =
+            unsafe { bcrypt_gen_random(std::ptr::null_mut(), random.as_mut_ptr(), 8, 2) };
+        let transaction = u64::from_le_bytes(random);
+        if random_status < 0 || transaction == 0 {
+            return Err(format!(
+                "runtime transaction generation failed: NTSTATUS {random_status:#x}"
+            ));
+        }
+        progress(&format!(
+            "Preparing resident update: {current_version} -> {} transaction={transaction:#x} identity={}",
+            package.version,
+            identity_text(&package.identity)
+        ));
+        update_request(
+            route,
+            reference,
+            update::PREPARE,
+            transaction,
+            0,
+            bytes.len(),
+            &[],
+        )?;
+        let result: Result<String, String> = (|| {
+            for (chunk_index, chunk) in bytes.chunks(update::CHUNK_BYTES).enumerate() {
+                update_request(
+                    route,
+                    reference,
+                    update::UPLOAD,
+                    transaction,
+                    chunk_index * update::CHUNK_BYTES,
+                    0,
+                    chunk,
+                )?;
+                if chunk_index % 32 == 0 || (chunk_index + 1) * update::CHUNK_BYTES >= bytes.len() {
+                    progress(&format!(
+                        "Uploading resident package: {}/{} bytes",
+                        ((chunk_index + 1) * update::CHUNK_BYTES).min(bytes.len()),
+                        bytes.len()
+                    ));
+                }
+            }
+            update_request(route, reference, update::VALIDATE, transaction, 0, 0, &[])?;
+            for &cpu in &routes {
+                update_request(cpu, reference, update::CHECK_CPU, transaction, 0, 0, &[])?;
+                progress(&format!("CPU {}: update preflight passed.", cpu.index));
+            }
+            update_request(route, reference, update::BEGIN_OFF, transaction, 0, 0, &[])?;
+            for &cpu in &routes {
+                run_on_route(cpu, reference, 2, transaction)?;
+                progress(&format!("CPU {}: stopped and confirmed.", cpu.index));
+            }
+            update_request(route, reference, update::COMMIT, transaction, 0, 0, &[])?;
+            progress("All CPUs stopped; resident entries and IDTs switched to the new bank.");
+            for &cpu in &routes {
+                run_on_route(cpu, reference, 1, transaction)?;
+                update_request(cpu, reference, update::PROBE_CPU, transaction, 0, 0, &[])?;
+                with_processor_affinity(cpu.group, cpu.number, || {
+                    probe_processor(cpu.apic_id).map(|_| ())
+                })?;
+                progress(&format!(
+                    "CPU {}: new core identity and VM exit probe confirmed.",
+                    cpu.index
+                ));
+            }
+            update_request(route, reference, update::FINISH, transaction, 0, 0, &[])?;
+            let final_status =
+                update_request(route, reference, update::QUERY, transaction, 0, 0, &[])?;
+            if update_status(&final_status).phase != Phase::Complete as u32 {
+                return Err("runtime update did not complete".into());
+            }
+            Ok(format!(
+                "MatrixHV resident update complete: version={} processors={} active={:#x}\n{}\n",
+                package.version,
+                reference.processor_count,
+                final_status.active_mask,
+                update_summary(&final_status)
+            ))
+        })();
+        match result {
+            Ok(summary) => Ok(summary),
+            Err(error) => match recover_update(&routes, reference, transaction, progress) {
+                Ok(recovery) => Err(format!("{error}\n{recovery}")),
+                Err(recovery) => Err(format!("{error}\nRecovery incomplete: {recovery}")),
+            },
+        }
+    }
+
+    pub(super) fn execute(
+        command: Command,
+        allow_elevation: bool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<String, String> {
         if !enable_firmware_privilege()? {
             if allow_elevation {
                 return run_elevated(command);
@@ -818,6 +1164,9 @@ pub(crate) mod windows {
         }
         let _control_mutex = ControlMutex::acquire()?;
         let status = read_status()?;
+        if let Command::Update(path) = &command {
+            return run_update(path, &status, progress);
+        }
         if command == Command::Status {
             let (observed_mask, routes, probe_mask, probe_errors, probe_snapshots) =
                 observe_processors(&status)?;
@@ -830,7 +1179,7 @@ pub(crate) mod windows {
                 .collect::<Vec<_>>()
                 .join(",");
             return Ok(format!(
-                "bridge=present capabilities={:#x} apic_id={} processors={} expected={:#x} observed={:#x} vmexit_probe={:#x} active={:#x} stopped={:#x} failed={:#x} exit_boot_services={} virtual_address_change={} cpu_map={} routes={} probe_errors={} probe_snapshots={}\n",
+                "bridge=present capabilities={:#x} apic_id={} processors={} expected={:#x} observed={:#x} vmexit_probe={:#x} active={:#x} stopped={:#x} failed={:#x} exit_boot_services={} virtual_address_change={} cpu_map={} routes={} probe_errors={} probe_snapshots={}\n{}\n",
                 status.capabilities,
                 status.current_apic_id,
                 status.processor_count,
@@ -846,12 +1195,14 @@ pub(crate) mod windows {
                 routes,
                 probe_errors,
                 probe_snapshots,
+                update_summary(&status),
             ));
         }
         let operation = match command {
             Command::On => 1,
             Command::Off | Command::OffProcessor(_) => 2,
             Command::Status => unreachable!(),
+            Command::Update(_) => unreachable!(),
         };
         if status.capabilities & operation == 0 {
             return Err("MatrixHV runtime bridge does not support this operation".into());
@@ -944,7 +1295,10 @@ pub(crate) mod windows {
 pub fn execute(command: Command) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
-        windows::execute(command, true)
+        windows::execute(command, true, &mut |message| {
+            println!("{message}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        })
     }
     #[cfg(not(target_os = "windows"))]
     {

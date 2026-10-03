@@ -780,6 +780,13 @@ mod elevation {
     }
 
     #[test]
+    fn elevated_update_quotes_spaces_embedded_quotes_and_trailing_backslashes() {
+        let path = std::path::PathBuf::from("C:\\Matrix Updates\\quoted\" name\\");
+        let expected = r#"--runtime-elevated 1234 5678 matrix update --binary "C:\Matrix Updates\quoted\" name\\""#;
+        assert_eq!(elevated_arguments(Command::Update(path), 1234, 5678), expected);
+    }
+
+    #[test]
     fn shell_execute_layout_matches_the_windows_x64_abi() {
         assert_eq!(std::mem::size_of::<ShellExecuteInfo>(), 112);
         assert_eq!(std::mem::offset_of!(ShellExecuteInfo, parameters), 32);

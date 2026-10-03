@@ -5,6 +5,8 @@ pub mod protocol;
 mod server;
 mod startup;
 mod telemetry;
+#[path = "../../../update.rs"]
+pub mod update;
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -28,3 +30,6 @@ fn main() {
 #[cfg(test)]
 #[path = "../../../../tests/neo_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "../../../../tests/update_tests.rs"]
+mod update_tests;

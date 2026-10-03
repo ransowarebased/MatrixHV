@@ -1,5 +1,5 @@
 pub const CONTROL_PROBE_OPERATION: u32 = 3;
-pub const CONTROL_VERSION: u32 = 3;
+pub const CONTROL_VERSION: u32 = 4;
 pub const CONTROL_MAGIC: u64 = 0x4d41_5452_4958_4354;
 #[repr(C)]
 pub struct ControlRequest {
@@ -29,6 +29,9 @@ pub struct ControlStatus {
     pub completion_sequence: u64,
     pub apic_ids: [u32; 64],
     pub probe_snapshot: ControlProbeSnapshot,
+    pub update_status: [u64; 48],
+    pub update_public_key: [u8; 32],
+    pub update_abi: [u32; 6],
 }
 
 impl Default for ControlStatus {
@@ -49,6 +52,9 @@ impl Default for ControlStatus {
             completion_sequence: 0,
             apic_ids: [0; 64],
             probe_snapshot: ControlProbeSnapshot::default(),
+            update_status: [0; 48],
+            update_public_key: [0; 32],
+            update_abi: [0; 6],
         }
     }
 }
@@ -101,9 +107,9 @@ pub const MATRIXHV_STATUS_PROTOCOL: u32 = 7;
 pub const MATRIXHV_GUEST_CONTRACT_SUBLEAF: u32 = 54;
 pub const MATRIXHV_GUEST_CONTRACT_UNSUPPORTED: u32 = (1 << 0) | (1 << 1);
 
-// Version-three control buffers use the same C layout in UEFI and Neo.
+// Version-four control buffers append the runtime transaction and boot trust key.
 const _: () = assert!(core::mem::size_of::<ControlRequest>() == 32);
 const _: () = assert!(core::mem::align_of::<ControlRequest>() == 8);
 const _: () = assert!(core::mem::size_of::<ControlProbeSnapshot>() == 272);
 const _: () = assert!(core::mem::offset_of!(ControlStatus, probe_snapshot) == 344);
-const _: () = assert!(core::mem::size_of::<ControlStatus>() == 616);
+const _: () = assert!(core::mem::size_of::<ControlStatus>() == 1056);

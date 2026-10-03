@@ -414,7 +414,8 @@ pub(crate) fn configure_resident_host(
     vmwrite(HOST_CR3, host_cr3)?;
     vmwrite(HOST_CR4, arch::read_cr4())?;
     vmwrite(HOST_IA32_PAT, arch::ArchitecturalMsr::Pat.read())?;
-    vmwrite(HOST_IA32_EFER, arch::ArchitecturalMsr::Efer.read())?;
+    // Private host mappings use NX even when firmware leaves NXE disabled.
+    vmwrite(HOST_IA32_EFER, arch::ArchitecturalMsr::Efer.read() | (1 << 11))?;
     vmwrite(HOST_FS_BASE, segments.fs.base)?;
     vmwrite(HOST_GS_BASE, tables.tss)?;
     vmwrite(HOST_TR_BASE, tables.tss)?;

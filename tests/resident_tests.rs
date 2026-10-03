@@ -21,7 +21,6 @@ mod control {
     }
 
     unsafe extern "win64" {
-        fn test_control_runtime_base() -> u64;
         fn test_control_restore_address() -> u64;
         fn test_control_off(shared: *mut u64, model: *mut Model, processor: u64) -> u64;
         fn test_control_cleanup(shared: *mut u64, model: *mut Model, processor: u64) -> u64;
@@ -73,8 +72,8 @@ mod control {
             scenario.boot[offset("b_event_context")] = scenario.shared.as_ptr() as u64;
             scenario.boot[offset("b_expected_host_cr3")] = scenario.root.0.as_ptr() as u64;
             scenario.event_set("event_runtime_context", scenario.shared.as_ptr() as u64);
-            scenario.event_set("event_runtime_set_variable", unsafe {
-                test_control_runtime_base()
+            scenario.event_set("event_control_recovery_runtime", unsafe {
+                test_control_restore_address()
             });
             scenario.event_set("event_control_stopped_mask", scenario.bit() | 1);
             scenario.event_set("event_control_active_mask", 1);
@@ -2330,6 +2329,15 @@ mod visual {
         runtime_set_variable: u64,
         runtime_context: u64,
         native_storage_runtime: [u64; 64],
+        control_off_native_rip: u64,
+        control_recovery_runtime: u64,
+        update_loader_runtime: u64,
+        update_context_runtime: u64,
+        update_image_physical: u64,
+        update_image_runtime: u64,
+        update_image_bytes: u64,
+        update_relocations_start: u64,
+        update_relocations_end: u64,
         primary_controls: u64,
         nested_l2_active: u64,
         vmcs02_control_cache_valid: [u64; 2],
@@ -2385,6 +2393,15 @@ mod visual {
         event_control_cpu_states = const core::mem::offset_of!(EventContext, native_storage_runtime),
         control_cpu_state_size = const core::mem::size_of::<u64>(),
         control_cpu_native_storage_runtime = const 0,
+        event_control_off_native_rip = const core::mem::offset_of!(EventContext, control_off_native_rip),
+        event_control_recovery_runtime = const core::mem::offset_of!(EventContext, control_recovery_runtime),
+        event_update_loader_runtime = const core::mem::offset_of!(EventContext, update_loader_runtime),
+        event_update_context_runtime = const core::mem::offset_of!(EventContext, update_context_runtime),
+        event_update_image_physical = const core::mem::offset_of!(EventContext, update_image_physical),
+        event_update_image_runtime = const core::mem::offset_of!(EventContext, update_image_runtime),
+        event_update_image_bytes = const core::mem::offset_of!(EventContext, update_image_bytes),
+        event_update_relocations_start = const core::mem::offset_of!(EventContext, update_relocations_start),
+        event_update_relocations_end = const core::mem::offset_of!(EventContext, update_relocations_end),
         event_tsc_hz = const core::mem::offset_of!(EventContext, tsc_hz),
         event_visual_deadline = const core::mem::offset_of!(EventContext, visual_deadline),
     );
@@ -2700,6 +2717,15 @@ mod visual {
             runtime_set_variable: 0,
             runtime_context: 0,
             native_storage_runtime: [0; 64],
+            control_off_native_rip: 0,
+            control_recovery_runtime: 0,
+            update_loader_runtime: 0,
+            update_context_runtime: 0,
+            update_image_physical: 0,
+            update_image_runtime: 0,
+            update_image_bytes: 0,
+            update_relocations_start: 0,
+            update_relocations_end: 0,
             primary_controls: 0,
             nested_l2_active: 0,
             vmcs02_control_cache_valid: [0; 2],
@@ -2868,6 +2894,15 @@ mod visual {
             runtime_set_variable: 0,
             runtime_context: 0,
             native_storage_runtime: [0; 64],
+            control_off_native_rip: 0,
+            control_recovery_runtime: 0,
+            update_loader_runtime: 0,
+            update_context_runtime: 0,
+            update_image_physical: 0,
+            update_image_runtime: 0,
+            update_image_bytes: 0,
+            update_relocations_start: 0,
+            update_relocations_end: 0,
             primary_controls: 0,
             nested_l2_active: 0,
             vmcs02_control_cache_valid: [0; 2],

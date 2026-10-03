@@ -17,6 +17,7 @@ mod nested;
 mod protocol;
 mod runtime;
 mod smp;
+pub mod update;
 
 use uefi::{Status, entry};
 

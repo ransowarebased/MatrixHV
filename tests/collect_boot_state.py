@@ -80,6 +80,37 @@ serial_path = Path(reference_serial) if reference_serial else output / "serial.l
 result = {"cpus": [], "contexts": []}
 exit_code = 1
 attached = False
+
+
+def plain_layout(source, name, stop=None):
+    sizes = {"u8": (1, 1), "u16": (2, 2), "u32": (4, 4),
+             "u64": (8, 8), "usize": (8, 8), "AtomicU64": (8, 8)}
+    constants = {"BANK_PAGES": 64}
+
+    def size_of(kind):
+        if kind in sizes:
+            return sizes[kind]
+        array = re.fullmatch(r"\[(.*); (\w+)\]", kind)
+        if array:
+            size, alignment = size_of(array[1])
+            count = int(array[2]) if array[2].isdecimal() else constants[array[2]]
+            return size * count, alignment
+        _, size, alignment = plain_layout(source, kind)
+        return size, alignment
+
+    members, cursor, alignment = {}, 0, 1
+    for field, kind in re.findall(r"(?:pub )?(\w+): ([^,\n]+),", structure(source, name)):
+        if field == stop:
+            members[field] = (cursor + 7) & ~7
+            break
+        size, field_alignment = size_of(kind)
+        alignment = max(alignment, field_alignment)
+        cursor = (cursor + field_alignment - 1) // field_alignment * field_alignment
+        members[field] = cursor
+        cursor += size
+    return members, (cursor + alignment - 1) // alignment * alignment, alignment
+
+
 try:
     if not ida_idp.set_processor_type("metapc", ida_idp.SETPROC_LOADER):
         raise RuntimeError("Intel x86 processor module unavailable")
@@ -194,8 +225,50 @@ try:
         values["event.cpu_mask"] = event[7]
         values["event.halted"] = event[8]
         values["event.host_fault_vector"] = event[9]
+        values["event.host_fault_rip"] = event[10]
+        values["event.host_fault_error_code"] = event[11]
+        values["event.host_fault_address"] = event[12]
         values["event.visual_base"] = event[5]
         values["event.visual_stride_bytes"] = event[6]
+        if "update" not in result:
+            layout_source = resident + (project / "src/core/bridge.rs").read_text() + (project / "src/protocol.rs").read_text()
+            event_fields, event_size, _ = plain_layout(layout_source, "ResidentEventContext")
+            cpu_fields, cpu_size, _ = plain_layout(layout_source, "ControlCpuState")
+            update_source = (project / "src/update.rs").read_text()
+            update_fields, update_prefix_size, _ = plain_layout(update_source, "RuntimeContext", "transaction")
+            event_data = idc.get_bytes(event_address, event_size, True)
+            if event_data is None or len(event_data) != event_size:
+                raise RuntimeError("Cannot read resident runtime update state")
+            read_quad = lambda data, offset: struct.unpack_from("<Q", data, offset)[0]
+            update_address = read_quad(event_data, event_fields["update_context_physical"])
+            update_data = idc.get_bytes(update_address, update_prefix_size + 384, True)
+            if update_data is None:
+                raise RuntimeError("Cannot read hidden runtime update context")
+            banks = struct.unpack_from("<2Q", update_data, update_fields["banks"])
+            status_offset = update_fields["transaction"]
+            cpu_states = []
+            for cpu_index in range(read_quad(event_data, event_fields["control_processor_count"])):
+                cpu_offset = event_fields["control_cpu_states"] + cpu_index * cpu_size
+                host = cpu_offset + cpu_fields["host_fields"]
+                host_rip = read_quad(event_data, host + 21 * 8)
+                bank = next((index for index, base in enumerate(banks) if base <= host_rip < base + 256 * 1024), None)
+                cpu_states.append({"cpu": cpu_index, "host_rip": host_rip,
+                                   "host_idt": read_quad(event_data, host + 16 * 8), "bank": bank})
+            ptes = struct.unpack_from("<128Q", update_data, update_fields["bank_ptes"])
+            result["update"] = {
+                "context": update_address, "banks": banks,
+                "transaction": read_quad(update_data, status_offset),
+                "phase": struct.unpack_from("<I", update_data, status_offset + 8)[0],
+                "previous_version": read_quad(update_data, status_offset + 24),
+                "next_version": read_quad(update_data, status_offset + 32),
+                "verified_mask": read_quad(update_data, status_offset + 48),
+                "retained_banks": read_quad(update_data, status_offset + 56),
+                "previous_identity": update_data[status_offset + 64:status_offset + 96].hex(),
+                "next_identity": update_data[status_offset + 96:status_offset + 128].hex(),
+                "cpu_states": cpu_states,
+                "bank_page_permissions": [[read_quad(idc.get_bytes(pointer, 8, True), 0) & ~0x000FFFFFFFFFF000
+                                           for pointer in ptes[index * 64:(index + 1) * 64]] for index in range(2)],
+            }
         if os.environ.get("MATRIXHV_VMFUNC_PROBE") == "1" and values["processor_number"] == 0:
             probe_address = values["nested.vmxon_operand"] + 136
             ida_dbg.invalidate_dbgmem_contents(probe_address, 24)

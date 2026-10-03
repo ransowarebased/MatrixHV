@@ -910,6 +910,9 @@ jne .Lresident_nested_eptp_sync_busy
 xor eax, eax
 xchg qword ptr [r12 + {b_nested_eptp_sync_nmi}], rax
 ret
+.endm
+
+.macro matrixhv_resident_eptp_switch_state
 .balign 8
 .Lresident_eptp_sync_owner:
 .quad 0

@@ -18,6 +18,7 @@ $BootPath = Join-Path $OutputRoot 'EFI\BOOT\BOOTX64.EFI'
 $ImagePath = Join-Path $OutputRoot 'MatrixHV.img'
 $WindowsNeoPath = Join-Path $OutputRoot 'neo.exe'
 $LinuxNeoPath = Join-Path $OutputRoot 'neo'
+$UpdatePath = Join-Path $OutputRoot 'MatrixHV.mxcore'
 $PackageRoot = Join-Path $BuildRoot 'packages'
 $StagingRoot = [System.IO.Path]::GetFullPath((Join-Path $BuildRoot ".package\$ConfigurationName"))
 if (-not $StagingRoot.StartsWith($BuildRoot.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -36,7 +37,7 @@ if (-not (Test-Path -LiteralPath $BootPath -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "Staged MatrixHV configuration not found: $ConfigPath"
 }
-foreach ($RoadPath in @($WindowsNeoPath, $LinuxNeoPath)) {
+foreach ($RoadPath in @($WindowsNeoPath, $LinuxNeoPath, $UpdatePath)) {
     if (-not (Test-Path -LiteralPath $RoadPath -PathType Leaf)) {
         throw "Staged ROAD binary not found: $RoadPath"
     }
@@ -55,6 +56,7 @@ try {
     Copy-Item -LiteralPath $BootPath -Destination (Join-Path $StagingRoot 'EFI\BOOT\BOOTX64.EFI') -Force
     Copy-Item -LiteralPath $WindowsNeoPath -Destination (Join-Path $StagingRoot 'neo.exe') -Force
     Copy-Item -LiteralPath $LinuxNeoPath -Destination (Join-Path $StagingRoot 'neo') -Force
+    Copy-Item -LiteralPath $UpdatePath -Destination (Join-Path $StagingRoot 'MatrixHV.mxcore') -Force
 
     if (Test-Path -LiteralPath $ImagePath -PathType Leaf) {
         Copy-Item -LiteralPath $ImagePath -Destination (Join-Path $StagingRoot (Split-Path -Leaf $ImagePath)) -Force

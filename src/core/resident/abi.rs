@@ -73,6 +73,21 @@ pub struct ResidentEventContext {
     pub hyperv_hypercall_lock: AtomicU64,
     pub hyperv_tsc_invariant_supported: u64,
     pub hyperv_tsc_invariant_control: AtomicU64,
+    pub control_off_native_rip: u64,
+    pub control_recovery_physical: u64,
+    pub control_recovery_runtime: u64,
+    pub update_loader_physical: u64,
+    pub update_loader_runtime: u64,
+    pub update_context_physical: u64,
+    pub update_context_runtime: u64,
+    pub update_status: [u64; 48],
+    pub update_public_key: [u8; 32],
+    pub update_abi: [u32; 6],
+    pub update_image_physical: u64,
+    pub update_image_runtime: u64,
+    pub update_image_bytes: u64,
+    pub update_relocations_start: u64,
+    pub update_relocations_end: u64,
 }
 
 #[repr(C, align(16))]

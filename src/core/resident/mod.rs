@@ -194,6 +194,8 @@ pub(crate) struct ResidentCode {
     pub(crate) virtual_address_change_callback: u64,
     pub(crate) dispatch_entry: u64,
     pub(crate) bridge: VariableBridge,
+    pub(crate) code_bytes: usize,
+    pub(crate) identity: [u8; 32],
 }
 
 impl ResidentCode {
@@ -225,6 +227,7 @@ impl ResidentCode {
         let runtime_set_variable_slot =
             core::ptr::addr_of!(matrixhv_resident_runtime_set_variable) as u64;
         let end = core::ptr::addr_of!(matrixhv_resident_island_end) as u64;
+        let code_end = core::ptr::addr_of!(matrixhv_resident_code_end) as u64;
         if entry < start
             || fatal < start
             || gp_handler < start
@@ -270,11 +273,15 @@ impl ResidentCode {
         let length =
             usize::try_from(end - start).map_err(|_| ResidentProbeError::InvalidCodeLayout)?;
         let pages = ResidentPages::allocate_typed(
-            length.div_ceil(PAGE_SIZE),
+            if event_context == 0 { length.div_ceil(PAGE_SIZE) } else { crate::update::BANK_PAGES },
             AddressConstraint::Any,
             RESIDENT_CODE_MEMORY_TYPE,
         )
         .map_err(ResidentProbeError::Allocation)?;
+        if length > crate::update::BANK_BYTES || code_end <= start || code_end > end {
+            return Err(ResidentProbeError::InvalidCodeLayout);
+        }
+        let identity = unsafe { crate::update::hash(core::slice::from_raw_parts(start as *const u8, length)) };
         unsafe {
             core::ptr::copy_nonoverlapping(start as *const u8, pages.pointer().as_ptr(), length);
             pages
@@ -302,6 +309,17 @@ impl ResidentCode {
                 .add((event_context_slot - start) as usize)
                 .cast::<u64>()
                 .write_unaligned(event_context);
+            for (slot, value) in [
+                (core::ptr::addr_of!(matrixhv_resident_core_version) as u64, core_version()),
+                (core::ptr::addr_of!(matrixhv_resident_update_context) as u64,
+                    if event_context == 0 { 0 } else { (*(event_context as *const ResidentEventContext)).update_context_physical }),
+                (core::ptr::addr_of!(matrixhv_resident_update_loader) as u64,
+                    if event_context == 0 { 0 } else { (*(event_context as *const ResidentEventContext)).update_loader_physical }),
+            ] {
+                pages.pointer().as_ptr().add((slot - start) as usize).cast::<u64>().write_unaligned(value);
+            }
+            core::ptr::copy_nonoverlapping(identity.as_ptr(), pages.pointer().as_ptr()
+                .add((core::ptr::addr_of!(matrixhv_resident_core_identity) as u64 - start) as usize), 32);
         }
         let base = pages.physical_address();
         Ok(Self {
@@ -323,8 +341,86 @@ impl ResidentCode {
                 runtime_set_variable_slot: base + (runtime_set_variable_slot - start),
             },
             pages,
+            code_bytes: (code_end - start) as usize,
+            identity,
         })
     }
+}
+
+pub(crate) const fn core_version() -> u64 {
+    let bytes = env!("MATRIXHV_CORE_VERSION").as_bytes();
+    let mut value = 0;
+    let mut index = 0;
+    while index < bytes.len() { value = value * 10 + (bytes[index] - b'0') as u64; index += 1; }
+    value
+}
+
+fn prepare_runtime_update(code: &ResidentCode, event: *mut ResidentEventContext) -> Result<(), ResidentProbeError> {
+    use crate::update::{Abi, EmbeddedImage, RuntimeContext, BANK_BYTES, MAX_PACKAGE_BYTES, STATE_ABI};
+    let (source_base, source_bytes) = crate::firmware::loaded_image_extent()
+        .map_err(ResidentProbeError::Allocation)?;
+    let source = unsafe { core::slice::from_raw_parts(source_base as *const u8, source_bytes) };
+    let image = EmbeddedImage::parse(source).map_err(|_| ResidentProbeError::InvalidCodeLayout)?;
+    let entry_offset = crate::update::runtime::update_entry as *const () as u64 - source_base;
+    if entry_offset as usize >= source_bytes { return Err(ResidentProbeError::InvalidCodeLayout); }
+    let allocate = |bytes: usize, memory_type| ResidentPages::allocate_typed(bytes.div_ceil(PAGE_SIZE), AddressConstraint::Any, memory_type)
+        .map_err(ResidentProbeError::Allocation);
+    let mut root_image = allocate(source_bytes, RESIDENT_CODE_MEMORY_TYPE)?;
+    let mut native_image = allocate(source_bytes, RESIDENT_CODE_MEMORY_TYPE)?;
+    for pages in [&mut root_image, &mut native_image] {
+        let output = unsafe { core::slice::from_raw_parts_mut(pages.pointer().as_ptr(), pages.byte_len()) };
+        image.copy_relocated(output, source_base, pages.physical_address())
+            .map_err(|_| ResidentProbeError::InvalidCodeLayout)?;
+    }
+    let mut state_pages = allocate(size_of::<RuntimeContext>(), RESIDENT_EVENT_MEMORY_TYPE)?;
+    let mut staging = allocate(MAX_PACKAGE_BYTES, RESIDENT_EVENT_MEMORY_TYPE)?;
+    let mut bank = allocate(BANK_BYTES, RESIDENT_CODE_MEMORY_TYPE)?;
+    let mut idts = allocate(64 * PAGE_SIZE, RESIDENT_EVENT_MEMORY_TYPE)?;
+    let context = unsafe { &mut *state_pages.pointer().as_ptr().cast::<RuntimeContext>() };
+    context.abi = Abi { bridge: CONTROL_VERSION, boot_bytes: size_of::<ResidentBootContext>() as u32,
+        event_bytes: size_of::<ResidentEventContext>() as u32, nested_bytes: size_of::<NestedVmxState>() as u32,
+        cpu_bytes: size_of::<ControlCpuState>() as u32 };
+    context.public_key = *include_bytes!(env!("MATRIXHV_UPDATE_PUBLIC_KEY"));
+    context.staging = staging.physical_address();
+    context.banks[1] = bank.physical_address();
+    context.event_physical = event as u64;
+    context.event_runtime = event as u64;
+    context.status_offset = core::mem::offset_of!(ResidentEventContext, update_status);
+    context.masks_offsets = [core::mem::offset_of!(ResidentEventContext, control_expected_mask),
+        core::mem::offset_of!(ResidentEventContext, control_active_mask),
+        core::mem::offset_of!(ResidentEventContext, control_stopped_mask),
+        core::mem::offset_of!(ResidentEventContext, control_failed_mask),
+        core::mem::offset_of!(ResidentEventContext, control_rearm_mask)];
+    context.cpu_states_offset = core::mem::offset_of!(ResidentEventContext, control_cpu_states);
+    context.host_rip_offset = core::mem::offset_of!(ControlCpuState, host_fields) + 21 * 8;
+    context.bindings = [event as u64, resident_msr_switch_count(), crate::runtime::backend() as u64,
+        root_image.physical_address() + entry_offset, state_pages.physical_address(), core_version()];
+    for (index, address) in context.bank_idts[1].iter_mut().enumerate() {
+        *address = idts.physical_address() + (index * PAGE_SIZE) as u64;
+    }
+    let island_start = core::ptr::addr_of!(matrixhv_resident_island_start) as u64;
+    let island_offset = |symbol| code.pages.physical_address() + symbol - island_start;
+    unsafe {
+        (*event).control_off_native_rip = island_offset(core::ptr::addr_of!(matrixhv_resident_control_off_native) as u64);
+        (*event).control_recovery_physical = island_offset(core::ptr::addr_of!(matrixhv_resident_control_recovery_switch) as u64);
+        (*event).control_recovery_runtime = island_offset(core::ptr::addr_of!(matrixhv_resident_control_native_restore) as u64);
+        (*event).update_loader_physical = context.bindings[3];
+        (*event).update_loader_runtime = native_image.physical_address() + entry_offset;
+        (*event).update_context_physical = state_pages.physical_address();
+        (*event).update_context_runtime = state_pages.physical_address();
+        (*event).update_public_key = context.public_key;
+        (*event).update_abi = [context.abi.bridge, context.abi.boot_bytes, context.abi.event_bytes,
+            context.abi.nested_bytes, context.abi.cpu_bytes, STATE_ABI];
+        (*event).update_image_physical = native_image.physical_address();
+        (*event).update_image_runtime = native_image.physical_address();
+        (*event).update_image_bytes = source_bytes as u64;
+        (*event).update_relocations_start = image.relocations.start as u64;
+        (*event).update_relocations_end = image.relocations.end as u64;
+    }
+    for pages in [&mut root_image, &mut native_image, &mut state_pages, &mut staging, &mut bank, &mut idts] {
+        pages.preserve();
+    }
+    Ok(())
 }
 
 pub fn status_from_error(error: &ResidentProbeError) -> Status {
@@ -415,6 +511,21 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
             hyperv_hypercall_lock: AtomicU64::new(0),
             hyperv_tsc_invariant_supported: u64::from(native_hyperv_invariant_tsc()),
             hyperv_tsc_invariant_control: AtomicU64::new(0),
+            control_off_native_rip: 0,
+            control_recovery_physical: 0,
+            control_recovery_runtime: 0,
+            update_loader_physical: 0,
+            update_loader_runtime: 0,
+            update_context_physical: 0,
+            update_context_runtime: 0,
+            update_status: [0; 48],
+            update_public_key: [0; 32],
+            update_abi: [0; 6],
+            update_image_physical: 0,
+            update_image_runtime: 0,
+            update_image_bytes: 0,
+            update_relocations_start: 0,
+            update_relocations_end: 0,
         });
         for (index, state) in (*context).control_cpu_states.iter_mut().enumerate() {
             let address = native_storage_pages.physical_address()
@@ -424,6 +535,7 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
         }
     }
     let serial_lock_address = context_pages.physical_address() + EVENT_CTX_SERIAL_LOCK as u64;
+    prepare_runtime_update(&code, context)?;
     let (ebs_event, va_event) = unsafe {
         crate::firmware::register_residency_events(
             code.exit_boot_services_callback,
@@ -487,6 +599,14 @@ unsafe extern "C" {
     static matrixhv_resident_runtime_get_variable: u8;
     static matrixhv_resident_runtime_set_variable: u8;
     static matrixhv_resident_island_end: u8;
+    static matrixhv_resident_code_end: u8;
+    static matrixhv_resident_update_loader: u8;
+    static matrixhv_resident_update_context: u8;
+    static matrixhv_resident_core_version: u8;
+    static matrixhv_resident_core_identity: u8;
+    static matrixhv_resident_control_off_native: u8;
+    static matrixhv_resident_control_recovery_switch: u8;
+    static matrixhv_resident_control_native_restore: u8;
 }
 
 global_asm!(
@@ -501,6 +621,37 @@ global_asm!(
     include_str!("../../asm/diagnostics.S"),
     include_str!("../../asm/island.S"),
     p_root_rsp = const core::mem::offset_of!(ResidentContext, root_rsp),
+    boot_context_size = const size_of::<ResidentBootContext>(),
+    event_context_size = const size_of::<ResidentEventContext>(),
+    nested_context_size = const size_of::<NestedVmxState>(),
+    core_version = const core_version(),
+    update_vmcall = const crate::update::UPDATE_VMCALL,
+    update_result = const crate::update::UPDATE_RESULT,
+    update_request_size = const crate::update::REQUEST_BYTES,
+    update_buffer_size = const crate::update::REQUEST_BYTES + crate::update::CHUNK_BYTES,
+    update_context_scratch = const core::mem::offset_of!(crate::update::RuntimeContext, scratch),
+    update_context_phase = const core::mem::offset_of!(crate::update::RuntimeContext, transaction)
+        + core::mem::offset_of!(crate::update::Transaction, status) + core::mem::offset_of!(crate::update::Status, phase),
+    update_context_transaction = const core::mem::offset_of!(crate::update::RuntimeContext, transaction)
+        + core::mem::offset_of!(crate::update::Transaction, status) + core::mem::offset_of!(crate::update::Status, transaction),
+    update_status_qwords = const size_of::<crate::update::Status>() / 8,
+    update_status_error = const core::mem::offset_of!(crate::update::Status, error),
+    event_update_status = const core::mem::offset_of!(ResidentEventContext, update_status),
+    event_update_public_key = const core::mem::offset_of!(ResidentEventContext, update_public_key),
+    event_update_abi = const core::mem::offset_of!(ResidentEventContext, update_abi),
+    event_update_loader_runtime = const core::mem::offset_of!(ResidentEventContext, update_loader_runtime),
+    event_update_context_runtime = const core::mem::offset_of!(ResidentEventContext, update_context_runtime),
+    event_update_image_physical = const core::mem::offset_of!(ResidentEventContext, update_image_physical),
+    event_update_image_runtime = const core::mem::offset_of!(ResidentEventContext, update_image_runtime),
+    event_update_image_bytes = const core::mem::offset_of!(ResidentEventContext, update_image_bytes),
+    event_update_relocations_start = const core::mem::offset_of!(ResidentEventContext, update_relocations_start),
+    event_update_relocations_end = const core::mem::offset_of!(ResidentEventContext, update_relocations_end),
+    event_control_off_native_rip = const core::mem::offset_of!(ResidentEventContext, control_off_native_rip),
+    event_control_recovery_physical = const core::mem::offset_of!(ResidentEventContext, control_recovery_physical),
+    event_control_recovery_runtime = const core::mem::offset_of!(ResidentEventContext, control_recovery_runtime),
+    bridge_status_update = const core::mem::offset_of!(ControlStatus, update_status),
+    bridge_status_public_key = const core::mem::offset_of!(ControlStatus, update_public_key),
+    bridge_status_update_abi = const core::mem::offset_of!(ControlStatus, update_abi),
     p_return_rip = const core::mem::offset_of!(ResidentContext, return_rip),
     p_source_cr3 = const core::mem::offset_of!(ResidentContext, source_cr3),
     p_observed_host_cr3 = const core::mem::offset_of!(ResidentContext, observed_host_cr3),
@@ -1264,6 +1415,7 @@ global_asm!(
     control_cpu_state_size = const size_of::<ControlCpuState>(),
     control_cpu_vmxon_region = const core::mem::offset_of!(ControlCpuState, vmxon_region),
     control_cpu_vmcs_region = const core::mem::offset_of!(ControlCpuState, vmcs_region),
+    control_cpu_vmcs02_region = const core::mem::offset_of!(ControlCpuState, vmcs02_region),
     control_cpu_current_vmcs = const core::mem::offset_of!(ControlCpuState, current_vmcs),
     control_cpu_host_fields = const core::mem::offset_of!(ControlCpuState, host_fields),
     control_cpu_pin_based_controls = const core::mem::offset_of!(ControlCpuState, pin_based_controls),

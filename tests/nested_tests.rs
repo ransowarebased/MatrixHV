@@ -5521,6 +5521,7 @@ include!("../builds/nested-logging-tests/offsets.rs");
 #[cfg(test_harness = "logging")]
 unsafe extern "win64" {
     fn test_vmx_lifecycle(context: *mut u64, vmxoff: u32) -> u32;
+    fn test_update_retire_nested(context: *mut u64) -> u32;
     fn test_resident_display(event: *const u64, hexadecimal: u32);
 }
 
@@ -5616,6 +5617,84 @@ fn vmxon_checks_virtual_cr0_cr4_fixed_masks_before_reading_the_operand() {
     assert_eq!(unsafe { test_vmx_lifecycle(state.as_mut_ptr(), 0) }, 1);
     assert_eq!(state[offset("b_test_exception")], 0);
     assert_eq!(state[offset("b_test_vmx_error")], 15);
+}
+
+#[cfg(test_harness = "logging")]
+#[test]
+fn update_withdraws_a_native_nested_session_and_retires_hardware_and_cached_state() {
+    let mut state = [0_u64; 64];
+    state[offset("b_nested_active")] = 1;
+    state[offset("b_nested_current_vmcs")] = 0x2000;
+    state[offset("b_nested_vmxon_region")] = 0x1000;
+    state[offset("b_nested_vmcs02_region")] = 0x3000;
+    state[offset("b_nested_shadow_vmcs_region")] = 0x4000;
+    state[offset("b_nested_vmcs02_launched")] = 1;
+    state[offset("b_nested_l1_cr4")] = 1 << 13;
+    state[offset("b_test_cr4_shadow")] = 1 << 13;
+    state[offset("b_test_page_writable")] = 1;
+    for name in ["b_nested_vmcs02_rare_state_pending", "b_nested_vmcs02_guest_cache_valid",
+                 "b_nested_vmcs02_control_cache_valid", "b_nested_vmcs02_vpid_cache",
+                 "b_nested_vmcs02_last_vpid"] {
+        state[offset(name)] = u64::MAX;
+    }
+    state[offset("b_nested_vmcs02_vpid_cache")] = u64::from(u32::MAX);
+    assert_eq!(unsafe { test_update_retire_nested(state.as_mut_ptr()) }, 1);
+    assert_eq!(state[offset("b_test_stores")], 1);
+    assert_eq!(state[offset("b_test_clear_count")], 2);
+    assert_eq!(state[offset("b_test_clear_first")], 0x3000);
+    assert_eq!(state[offset("b_test_clear_second")], 0x4000);
+    assert_eq!(state[offset("b_nested_current_vmcs")], u64::MAX);
+    for name in ["b_nested_active", "b_nested_vmxon_region", "b_nested_vmcs02_launched",
+                 "b_nested_l1_cr4", "b_test_cr4_shadow", "b_nested_vmcs02_rare_state_pending",
+                 "b_nested_vmcs02_guest_cache_valid", "b_nested_vmcs02_control_cache_valid",
+                 "b_nested_vmcs02_vpid_cache", "b_nested_vmcs02_last_vpid"] {
+        assert_eq!(state[offset(name)], 0, "{name}");
+    }
+}
+
+#[cfg(test_harness = "logging")]
+#[test]
+fn unsupported_nested_handoffs_and_unwritable_vmcs12_fail_before_retirement() {
+    for blocker in ["b_nested_l2_active", "b_nested_evmcs_active", "b_test_guest_os_id", "b_test_page_writable"] {
+        let mut state = [0_u64; 64];
+        state[offset("b_nested_active")] = 1;
+        state[offset("b_nested_current_vmcs")] = 0x2000;
+        state[offset("b_test_page_writable")] = 1;
+        state[offset(blocker)] = u64::from(blocker != "b_test_page_writable");
+        assert_eq!(unsafe { test_update_retire_nested(state.as_mut_ptr()) }, 0, "{blocker}");
+        assert_eq!(state[offset("b_test_stores")], 0, "{blocker}");
+        assert_eq!(state[offset("b_test_clear_count")], 0, "{blocker}");
+        assert_eq!(state[offset("b_nested_active")], 1, "{blocker}");
+    }
+    let mut state = [0_u64; 64];
+    state[offset("b_nested_current_vmcs")] = u64::MAX;
+    state[offset("b_test_clear_failure")] = 1;
+    state[offset("b_nested_vmcs02_launched")] = 1;
+    assert_eq!(unsafe { test_update_retire_nested(state.as_mut_ptr()) }, 0);
+    assert_eq!(state[offset("b_nested_vmcs02_launched")], 1);
+}
+
+#[cfg(test_harness = "logging")]
+#[test]
+fn runtime_update_freezes_new_nested_sessions_until_completion_or_cancellation() {
+    for phase in 0_u32..=9 {
+        let revision = 1_u64;
+        let mut state = [0_u64; 64];
+        state[offset("b_test_update_context")] = &phase as *const u32 as u64;
+        state[offset("b_nested_l1_cr4")] = 1 << 13;
+        state[offset("b_nested_feature_control")] = 5;
+        state[offset("b_nested_vmx_basic")] = revision;
+        state[offset("b_nested_vmx_cr0_fixed1")] = u64::MAX;
+        state[offset("b_nested_vmx_cr4_fixed1")] = u64::MAX;
+        state[offset("b_test_operand")] = &revision as *const u64 as u64;
+        state[offset("b_test_rflags")] = 0x202;
+        state[offset("b_test_rip")] = 0x1000;
+        let frozen = matches!(phase, 2..=4 | 6);
+        assert_eq!(unsafe { test_vmx_lifecycle(state.as_mut_ptr(), 0) }, 0);
+        assert_eq!(state[offset("b_nested_active")], u64::from(!frozen));
+        assert_eq!(state[offset("b_test_rflags")] & 0x8d5, u64::from(frozen));
+        assert_eq!(state[offset("b_test_rip")], 0x1003);
+    }
 }
 
 #[cfg(test_harness = "logging")]

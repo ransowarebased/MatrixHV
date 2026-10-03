@@ -201,6 +201,9 @@ def prepare_eptp_sync(project: Path):
     start = source.index(".Lresident_nested_eptp_sync_acquire:")
     end = source.index(".endm", start)
     assembly = source[start:end]
+    state_start = source.index(".macro matrixhv_resident_eptp_switch_state")
+    state_start = source.index("\n", state_start) + 1
+    assembly += source[state_start:source.index(".endm", state_start)]
     assert assembly.count("invept rax, xmmword ptr [rsp]") == 1
     assembly = assembly.replace(
         "invept rax, xmmword ptr [rsp]",
@@ -1324,11 +1327,19 @@ def prepare_nested_logging(project: Path):
     source = read_resident_assembly(project)
     start = source.index(".Lresident_dispatch_vmxon:")
     end = source.index(".Lresident_nested_vmfail_with_error:", start)
-    success = source.index(".Lresident_nested_succeed:", end)
+    success = source.index(".Lresident_nested_vmfail_invalid_flags:", end)
     success_end = source.index(".Lresident_nested_inject_pf_write:", success)
     macro = source.index(".macro resident_telemetry_counter ")
     macro_end = source.index(".endm", macro) + len(".endm")
+    gate = source.index(".Lresident_nested_update_gate:")
+    gate_end = source.index(".Lresident_dispatch_control_probe:", gate)
     assembly = source[macro:macro_end] + "\n" + source[start:end] + source[success:success_end]
+    assembly += source[gate:gate_end].replace(
+        "[rip + matrixhv_resident_update_context]", "[r12 + {b_test_update_context}]")
+    retire = source.index(".Lresident_update_retire_nested:")
+    assembly += source[retire:gate].replace(
+        "vmclear qword ptr [r12 + {b_nested_vmcs02_region}]", "mov rax, [r12 + {b_nested_vmcs02_region}]\ncall .Ltest_retire_vmclear").replace(
+        "vmclear qword ptr [r12 + {b_nested_shadow_vmcs_region}]", "mov rax, [r12 + {b_nested_shadow_vmcs_region}]\ncall .Ltest_retire_vmclear")
     shadow_start = source.index(".Lresident_nested_shadow_intercept_reads:")
     shadow_end = source.index(".Lresident_nested_shadow_sync:", shadow_start)
     assembly += source[shadow_start:shadow_end]
@@ -1339,7 +1350,9 @@ def prepare_nested_logging(project: Path):
                  "guest_cr4": 6,
                  "vmxon_in_vmx_root_error": 15, "vmx_status_flags_clear_mask": ~0x8d5,
                  "vmcs_shadow_read_byte_offset": 0xd82,
-                 "vmcs_shadow_read_bypass_mask": 0x50}
+                 "vmcs_shadow_read_bypass_mask": 0x50,
+                 "vmfail_invalid_status": 1, "update_context_phase": 0,
+                 "cr4_read_shadow": 7, "cr4_vmxe": 1 << 13}
     for name in ("nested_vmxon_message", "nested_vmxoff_message", "nested_pointer_message",
                  "state_rip", "state_newline"):
         label = ".L" + name
@@ -1348,6 +1361,39 @@ def prepare_nested_logging(project: Path):
         assembly += f"\n{label}:\n.ascii {literal}\n"
     assembly += textwrap.dedent("""
     .text
+    .globl test_update_retire_nested
+    test_update_retire_nested:
+        push rdi
+        push r12
+        mov r12, rcx
+        mov rdi, rcx
+        call .Lresident_update_retire_nested
+        setnc al
+        movzx eax, al
+        pop r12
+        pop rdi
+        ret
+    .Ltest_retire_vmclear:
+        cmp qword ptr [r12 + {b_test_clear_count}], 0
+        jne .Ltest_retire_vmclear_second
+        mov [r12 + {b_test_clear_first}], rax
+        jmp .Ltest_retire_vmclear_recorded
+    .Ltest_retire_vmclear_second:
+        mov [r12 + {b_test_clear_second}], rax
+    .Ltest_retire_vmclear_recorded:
+        inc qword ptr [r12 + {b_test_clear_count}]
+        mov rax, [r12 + {b_test_clear_count}]
+        cmp rax, [r12 + {b_test_clear_failure}]
+        je .Ltest_retire_vmclear_failed
+        mov eax, 1
+        test eax, eax
+        ret
+    .Ltest_retire_vmclear_failed:
+        stc
+        ret
+    .Lresident_ept01_page_is_writable:
+        mov eax, [r12 + {b_test_page_writable}]
+        ret
     .globl test_vmx_lifecycle
     test_vmx_lifecycle:
         push rbx
@@ -1376,6 +1422,11 @@ def prepare_nested_logging(project: Path):
         pop rbx
         ret
     .Ltest_vmread:
+        cmp eax, 7
+        jne .Ltest_vmread_guest_cr4
+        mov r11, [r12 + {b_test_cr4_shadow}]
+        jmp .Ltest_vmread_ready
+    .Ltest_vmread_guest_cr4:
         mov r11, [r12 + {b_test_cr4}]
         cmp eax, 6
         je .Ltest_vmread_ready
@@ -1393,16 +1444,25 @@ def prepare_nested_logging(project: Path):
         jne .Ltest_vmread_ready
         mov r11, [r12 + {b_test_rflags}]
     .Ltest_vmread_ready:
+        push rax
         mov eax, 1
         test eax, eax
+        pop rax
         ret
     .Ltest_vmwrite:
+        cmp eax, 7
+        jne .Ltest_vmwrite_flags
+        mov [r12 + {b_test_cr4_shadow}], r11
+        jmp .Ltest_vmwrite_ready
+    .Ltest_vmwrite_flags:
         cmp eax, 1
         jne .Ltest_vmwrite_ready
         mov [r12 + {b_test_rflags}], r11
     .Ltest_vmwrite_ready:
+        push rax
         mov eax, 1
         test eax, eax
+        pop rax
         ret
     .Lresident_nested_decode_memory_operand:
         lea r10, [r12 + {b_test_operand}]
@@ -1450,12 +1510,17 @@ def prepare_nested_logging(project: Path):
         mov eax, 1
         ret
     """)
-    names = sorted(set(re.findall(r"\{(b_[a-z0-9_]+)\}", assembly)) | {"b_telemetry_probe_active"})
-    offsets = {name: index * 8 for index, name in enumerate(names)}
+    names = sorted(set(re.findall(r"\{(b_[a-z0-9_]+)\}", assembly)) | {"b_telemetry_probe_active", "b_test_guest_os_id"})
+    offsets, cursor = {}, 0
+    for name in names:
+        offsets[name] = cursor
+        cursor += 16 if name in {"b_nested_vmcs02_rare_state_pending", "b_nested_vmcs02_control_cache_valid"} else 8
+    assert cursor <= 64 * 8
+    constants["event_hyperv_guest_os_id"] = offsets["b_test_guest_os_id"]
     assembly = re.sub(r"\{([a-z0-9_]+)\}", lambda match: str(
         offsets[match[1]] if match[1] in offsets else constants[match[1]]
     ), assembly)
-    (output / "lifecycle.S").write_text(assembly, encoding="utf-8")
+    (output / "lifecycle.S").write_text(".text\n" + assembly, encoding="utf-8")
     mapping = "fn offset(name: &str) -> usize { match name {\n"
     mapping += "\n".join(f'"{name}" => {value // 8},' for name, value in offsets.items())
     mapping += '\n_ => panic!("unknown lifecycle field {name}"),\n} }\n'
@@ -1748,10 +1813,6 @@ def prepare_resident_control(project: Path):
     )
     wrappers = r"""
     .text
-    .globl test_control_runtime_base
-    test_control_runtime_base:
-        lea rax, [rip + matrixhv_resident_set_variable]
-        ret
     .globl test_control_restore_address
     test_control_restore_address:
         lea rax, [rip + .Lresident_control_on_native_restore]
@@ -2307,6 +2368,7 @@ def prepare_resident_msr(project: Path):
         for name, constant in vmcall_constants.items()
     }
     vmcall_values['b_telemetry_probe_active'] = 8
+    vmcall_values['update_vmcall'] = 0x4d41545249585556
     vmcall = re.sub(r'\{(\w+)\}', lambda match: str(vmcall_values[match[1]]), vmcall)
     vmcall_wrapper = """
     .text
@@ -2325,6 +2387,7 @@ def prepare_resident_msr(project: Path):
     .Lresident_dispatch_control_probe:
     .Lresident_dispatch_control_off_prepare:
     .Lresident_dispatch_control_off_unexpected:
+    .Lresident_dispatch_update:
     .Lresident_dispatch_stop:
     .Lresident_dispatch_nested_probe_failed:
         mov eax, 1

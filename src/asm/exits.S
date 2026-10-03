@@ -127,6 +127,7 @@ resident_private_vmcall {start_checkpoint_magic}, .Lresident_dispatch_start_chec
 resident_private_vmcall {bridge_probe_vmcall}, .Lresident_dispatch_control_probe
 resident_private_vmcall {bridge_off_prepare_vmcall}, .Lresident_dispatch_control_off_prepare
 resident_private_vmcall {bridge_off_commit_vmcall}, .Lresident_dispatch_control_off_unexpected
+resident_private_vmcall {update_vmcall}, .Lresident_dispatch_update
 resident_private_vmcall {stop_magic}, .Lresident_dispatch_stop
 mov r11, {nested_probe_failed_magic}
 cmp rax, r11
@@ -735,6 +736,16 @@ mov rax, cr3
 cmp rax, qword ptr [r12 + {b_expected_host_cr3}]
 jne .Lresident_dispatch_host_cr3_mismatch
 matrixhv_island_first_exit_visual
+mov eax, dword ptr [r12 + {b_last_reason}]
+and eax, 0xffff
+cmp eax, {vmcall_reason}
+jne .Lresident_update_l2_checked
+mov rax, {update_vmcall}
+cmp qword ptr [rsp], rax
+jne .Lresident_update_l2_checked
+cmp qword ptr [r12 + {b_nested_l2_active}], 0
+jne .Lresident_dispatch_update_l2_reject
+.Lresident_update_l2_checked:
 cmp qword ptr [r12 + {b_nested_l2_active}], 1
 je .Lresident_nested_l2_route
 matrixhv_resident_nested_l1_msr_rearm

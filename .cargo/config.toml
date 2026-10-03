@@ -4,3 +4,6 @@ target-dir = "builds/.cargo-target"
 
 [env]
 MATRIXHV_BUILD_ROOT = { value = "builds", relative = true }
+
+[target.x86_64-unknown-uefi]
+rustflags = ["--cfg", 'curve25519_dalek_backend="serial"']

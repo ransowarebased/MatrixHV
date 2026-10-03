@@ -181,13 +181,36 @@ matrixhv_resident_msr_validation
 matrixhv_island_host_exceptions
 matrixhv_island_bridge
 matrixhv_island_output
+matrixhv_resident_ept_cache
+matrixhv_resident_eptp_switch
+matrixhv_island_flight_recorder
+.balign 4096
+.globl matrixhv_resident_code_end
+matrixhv_resident_code_end:
+matrixhv_resident_ept_cache_state
+matrixhv_resident_eptp_switch_state
 matrixhv_island_log_slot
 matrixhv_island_switch_slot
 matrixhv_island_visual_slot
 matrixhv_island_slots
+.balign 8
+.globl matrixhv_resident_package_abi
+matrixhv_resident_package_abi:
+.long {bridge_version}, {boot_context_size}, {event_context_size}, {nested_context_size}, {control_cpu_state_size}
+.long 0
+.quad {core_version}
+.globl matrixhv_resident_update_loader
+matrixhv_resident_update_loader:
+.quad 0
+.globl matrixhv_resident_update_context
+matrixhv_resident_update_context:
+.quad 0
+.globl matrixhv_resident_core_version
+matrixhv_resident_core_version:
+.quad 0
+.globl matrixhv_resident_core_identity
+matrixhv_resident_core_identity:
+.zero 32
 .globl matrixhv_resident_island_end
-matrixhv_resident_ept_cache
-matrixhv_resident_eptp_switch
-matrixhv_island_flight_recorder
 matrixhv_resident_island_end:
 .text

@@ -566,8 +566,9 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
     if update && (!positional.is_empty() || apply_update.is_some()) {
         return Err("--update cannot be combined with another command".to_string());
     }
-    if binary.is_some() && !update {
-        return Err("--binary requires --update".to_string());
+    let matrix_update = positional == ["matrix", "update"];
+    if binary.is_some() && !update && !matrix_update {
+        return Err("--binary requires --update or matrix update".to_string());
     }
     if apply_update.is_some() && !positional.is_empty() {
         return Err("--apply-update cannot be combined with another command".to_string());
@@ -586,10 +587,18 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
                         .map(matrix::Command::OffProcessor)
                         .unwrap_or(matrix::Command::Off),
                     "status" => matrix::Command::Status,
+                    "update" => matrix::Command::Update(
+                        binary
+                            .ok_or_else(|| "matrix update requires --binary PACKAGE".to_string())?,
+                    ),
                     value => return Err(format!("unknown matrix command: {value}")),
                 })
             }
-            Some("matrix") => return Err("matrix requires on, off, or status".to_string()),
+            Some("matrix") => {
+                return Err(
+                    "matrix requires on, off, status, or update --binary PACKAGE".to_string(),
+                );
+            }
             Some("serve") if positional.len() == 1 => Action::Serve,
             Some("shell") if positional.len() == 1 => Action::Shell,
             Some("ping") if positional.len() == 1 => Action::Ping,
@@ -701,7 +710,7 @@ fn print_usage() {
         );
     }
     println!(
-        "neo shell\nneo serve [--listen ADDRESS:PORT]\nneo ping | status | install | uninstall\nneo matrix on | off [--cpu INDEX] | status\nneo telemetry enable | disable\nneo telemetry control --cpu INDEX --output FILE [--seconds 1..3600]\nneo telemetry | -t [watchdog | eptdiag] [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nneo --remote ADDRESS:PORT [status | ping | telemetry [enable | disable | watchdog | eptdiag] | -t [watchdog | eptdiag] | exec PROGRAM [ARGUMENT ...]]\nneo --remote ADDRESS:PORT --update [--binary PATH]\n\nCounters and basic records start disabled; use telemetry enable/disable to control collection.\nDisabling collection preserves snapshots and stops watchdog capture.\nWatchdog renews a 15-second lease; its interval must not exceed 5000 ms.\nControl tracing selects a separate observer CPU and saves native context/stack .bin files beside FILE when supported by the EFI.\nThe remote transport is plaintext and unauthenticated."
+        "neo shell\nneo serve [--listen ADDRESS:PORT]\nneo ping | status | install | uninstall\nneo matrix on | off [--cpu INDEX] | status\nneo matrix update --binary PACKAGE\nneo telemetry enable | disable\nneo telemetry control --cpu INDEX --output FILE [--seconds 1..3600]\nneo telemetry | -t [watchdog | eptdiag] [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nneo --remote ADDRESS:PORT [status | ping | telemetry [enable | disable | watchdog | eptdiag] | -t [watchdog | eptdiag] | exec PROGRAM [ARGUMENT ...]]\nneo --remote ADDRESS:PORT --update [--binary PATH]\n\nCounters and basic records start disabled; use telemetry enable/disable to control collection.\nDisabling collection preserves snapshots and stops watchdog capture.\nWatchdog renews a 15-second lease; its interval must not exceed 5000 ms.\nControl tracing selects a separate observer CPU and saves native context/stack .bin files beside FILE when supported by the EFI.\nThe remote transport is plaintext and unauthenticated."
     );
 }
 
@@ -790,6 +799,39 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn resident_update_is_distinct_from_neo_self_update_and_preserves_the_package_path() {
+        let path = std::path::PathBuf::from(r"C:\Matrix Updates\signed.mxcore");
+        let arguments = vec![
+            "matrix".into(),
+            "update".into(),
+            "--binary".into(),
+            path.display().to_string(),
+        ];
+        let options = parse_options(arguments.clone()).unwrap().unwrap();
+        assert!(matches!(options.action, Action::Matrix(Command::Update(value)) if value == path));
+        let own_update = parse_options(vec![
+            "--remote".into(),
+            "127.0.0.1:4040".into(),
+            "--update".into(),
+            "--binary".into(),
+            path.display().to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(matches!(own_update.action, Action::Update(Some(value)) if value == path));
+        assert!(parse_options(vec!["matrix".into(), "update".into()]).is_err());
+        for suffix in [
+            vec!["--cpu".into(), "0".into()],
+            vec!["--update".into()],
+            vec!["--remote".into(), "127.0.0.1:4040".into()],
+        ] {
+            let mut invalid = arguments.clone();
+            invalid.extend(suffix);
+            assert!(parse_options(invalid).is_err());
+        }
     }
 
     #[test]

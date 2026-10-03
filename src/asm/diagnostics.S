@@ -1369,7 +1369,7 @@ matrixhv_resident_nested_messages
 .macro matrixhv_island_log_slot
 .globl matrixhv_resident_island_log_backend
 matrixhv_resident_island_log_backend:
-.byte 0
+.quad 0
 .balign 8
 .endm
 

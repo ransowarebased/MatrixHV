@@ -311,6 +311,9 @@
 .balign 8
 .Lresident_fixed_mtrr_registers:
     .word 0x250, 0x258, 0x259, 0x268, 0x269, 0x26a, 0x26b, 0x26c, 0x26d, 0x26e, 0x26f
+.endm
+
+.macro matrixhv_resident_ept_cache_state
 .balign 8
 .Lresident_cache_lock_word:
     .quad 0

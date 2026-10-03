@@ -87,6 +87,183 @@ mov qword ptr [r9 + {control_cpu_stage}], \stage
 call .Lresident_control_capture_native
 .endm
 .macro matrixhv_island_requests
+.Lresident_dispatch_update_l2_reject:
+mov rax, 14
+mov rdi, qword ptr [r12 + {b_event_context}]
+mov dword ptr [rdi + {event_update_status} + {update_status_error}], eax
+jmp .Lresident_update_return
+.Lresident_dispatch_update:
+mov r13, qword ptr [rip + matrixhv_resident_update_context]
+test r13, r13
+jz .Lresident_update_invalid
+mov r8, qword ptr [r12 + {b_processor_number}]
+cmp r8, 64
+jae .Lresident_update_invalid
+mov r15, qword ptr [rsp + 16]
+cmp r15, {update_request_size}
+jb .Lresident_update_invalid
+cmp r15, {update_buffer_size}
+ja .Lresident_update_invalid
+mov r14, qword ptr [rsp + 8]
+mov rax, r14
+add rax, r15
+jc .Lresident_update_invalid
+imul r8, {update_buffer_size}
+lea rbp, [r13 + r8 + {update_context_scratch}]
+.Lresident_update_copy_page:
+mov r10, r14
+mov edx, 1
+call .Lresident_nested_translate_linear_address
+jc .Lresident_update_invalid
+mov r11, r10
+mov edx, 1
+call .Lresident_ept01_page_translate
+test eax, eax
+jz .Lresident_update_invalid
+mov ebx, r14d
+and ebx, 4095
+neg ebx
+add ebx, 4096
+cmp rbx, r15
+cmova rbx, r15
+mov rcx, rbx
+mov rsi, r11
+mov rdi, rbp
+cld
+rep movsb
+add rbp, rbx
+add r14, rbx
+sub r15, rbx
+jnz .Lresident_update_copy_page
+mov r9, qword ptr [r12 + {b_processor_number}]
+mov rdx, r9
+imul rdx, {update_buffer_size}
+lea rdx, [r13 + rdx + {update_context_scratch}]
+mov rdi, qword ptr [r12 + {b_event_context}]
+mov eax, dword ptr [rdi + {event_control_apic_ids} + r9 * 4]
+cmp eax, dword ptr [rdx + 24]
+jne .Lresident_update_invalid
+mov r8, qword ptr [rsp + 16]
+mov rcx, r13
+sub rsp, 584
+fxsave64 [rsp + 64]
+lea rax, [rip + matrixhv_resident_core_identity]
+mov qword ptr [rsp + 32], rax
+mov dword ptr [rsp + 40], 0
+cmp qword ptr [r12 + {b_nested_evmcs_active}], 0
+jne .Lresident_update_hyperv_blocker
+cmp qword ptr [r12 + {b_nested_active}], 0
+je .Lresident_update_call
+cmp qword ptr [rdi + {event_hyperv_guest_os_id}], 0
+je .Lresident_update_call
+.Lresident_update_hyperv_blocker:
+mov dword ptr [rsp + 40], 15
+.Lresident_update_call:
+call qword ptr [rip + matrixhv_resident_update_loader]
+fxrstor64 [rsp + 64]
+add rsp, 584
+jmp .Lresident_update_return
+.Lresident_update_invalid:
+mov eax, 1
+.Lresident_update_return:
+mov qword ptr [rsp], rax
+mov rax, {update_result}
+mov qword ptr [rsp + 16], rax
+call .Lresident_advance_guest_rip
+jmp .Lresident_dispatch_resume
+.Lresident_update_retire_nested:
+push rbx
+push rbp
+push rsi
+push rdi
+push r13
+push r14
+push r15
+cmp qword ptr [r12 + {b_nested_l2_active}], 0
+jne .Lresident_update_retire_failed
+cmp qword ptr [r12 + {b_nested_evmcs_active}], 0
+jne .Lresident_update_retire_failed
+cmp qword ptr [r12 + {b_nested_active}], 0
+je .Lresident_update_retire_clear
+cmp qword ptr [rdi + {event_hyperv_guest_os_id}], 0
+jne .Lresident_update_retire_failed
+mov r11, qword ptr [r12 + {b_nested_current_vmcs}]
+cmp r11, -1
+je .Lresident_update_retire_store
+call .Lresident_ept01_page_is_writable
+test eax, eax
+jz .Lresident_update_retire_failed
+.Lresident_update_retire_store:
+call .Lresident_nested_store_current_vmcs12
+mov eax, {cr4_read_shadow}
+vmread r11, rax
+jna .Lresident_update_retire_failed
+and r11, ~{cr4_vmxe}
+vmwrite rax, r11
+jna .Lresident_update_retire_failed
+and qword ptr [r12 + {b_nested_l1_cr4}], ~{cr4_vmxe}
+.Lresident_update_retire_clear:
+vmclear qword ptr [r12 + {b_nested_vmcs02_region}]
+jna .Lresident_update_retire_failed
+cmp qword ptr [r12 + {b_nested_shadow_vmcs_region}], 0
+je .Lresident_update_retire_reset
+vmclear qword ptr [r12 + {b_nested_shadow_vmcs_region}]
+jna .Lresident_update_retire_failed
+.Lresident_update_retire_reset:
+mov qword ptr [r12 + {b_nested_active}], 0
+mov qword ptr [r12 + {b_nested_current_vmcs}], -1
+mov qword ptr [r12 + {b_nested_current_vmcs_is_shadow}], 0
+mov qword ptr [r12 + {b_nested_vmxon_region}], 0
+mov qword ptr [r12 + {b_nested_vmcs02_launched}], 0
+mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], 0
+mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending} + 8], 0
+mov qword ptr [r12 + {b_nested_vmcs02_guest_cache_valid}], 0
+mov qword ptr [r12 + {b_nested_vmcs02_control_cache_valid}], 0
+mov qword ptr [r12 + {b_nested_vmcs02_control_cache_valid} + 8], 0
+mov dword ptr [r12 + {b_nested_vmcs02_vpid_cache}], 0
+mov qword ptr [r12 + {b_nested_vmcs02_last_vpid}], 0
+mov eax, {exception_bitmap}
+xor r11d, r11d
+vmwrite rax, r11
+jna .Lresident_update_retire_failed
+resident_hyperv_evmcs_reset
+call .Lresident_nested_shadow_intercept_reads
+pop r15
+pop r14
+pop r13
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+clc
+ret
+.Lresident_update_retire_failed:
+pop r15
+pop r14
+pop r13
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+stc
+ret
+.Lresident_nested_update_gate:
+mov rax, qword ptr [rip + matrixhv_resident_update_context]
+test rax, rax
+jz .Lresident_nested_update_allowed
+mov eax, dword ptr [rax + {update_context_phase}]
+cmp eax, 2
+jb .Lresident_nested_update_allowed
+cmp eax, 4
+jbe .Lresident_nested_update_frozen
+cmp eax, 6
+je .Lresident_nested_update_frozen
+.Lresident_nested_update_allowed:
+clc
+ret
+.Lresident_nested_update_frozen:
+stc
+ret
 .Lresident_dispatch_control_probe:
 mov rdi, qword ptr [r12 + {b_event_context}]
 test rdi, rdi
@@ -204,6 +381,17 @@ cmp qword ptr [rdi + {event_control_va_error}], 0
 jne .Lresident_control_off_failed
 cmp qword ptr [r12 + {b_nested_l2_active}], 0
 jne .Lresident_control_off_failed
+mov r13, qword ptr [rip + matrixhv_resident_update_context]
+test r13, r13
+jz .Lresident_control_off_nested_guard
+cmp dword ptr [r13 + {update_context_phase}], 3
+jne .Lresident_control_off_nested_guard
+mov rax, qword ptr [rsp + 8]
+cmp rax, qword ptr [r13 + {update_context_transaction}]
+jne .Lresident_control_off_failed
+call .Lresident_update_retire_nested
+jc .Lresident_control_off_failed
+.Lresident_control_off_nested_guard:
 cmp qword ptr [r12 + {b_nested_active}], 0
 jne .Lresident_control_off_failed
 cmp qword ptr [r12 + {b_nmi_pending}], 0
@@ -232,6 +420,8 @@ cmp qword ptr [rsi + {control_cpu_vmxon_region}], 0
 je .Lresident_control_off_failed
 cmp qword ptr [rsi + {control_cpu_vmcs_region}], 0
 je .Lresident_control_off_failed
+mov rax, qword ptr [r12 + {b_nested_vmcs02_region}]
+mov qword ptr [rsi + {control_cpu_vmcs02_region}], rax
 vmptrst qword ptr [rsi + {control_cpu_current_vmcs}]
 mov rax, qword ptr [rsi + {control_cpu_current_vmcs}]
 cmp rax, qword ptr [rsi + {control_cpu_vmcs_region}]
@@ -372,10 +562,7 @@ resident_control_off_patch_host {host_sysenter_cs}, {guest_sysenter_cs}
 resident_control_off_patch_host {host_sysenter_esp}, {guest_sysenter_esp}
 resident_control_off_patch_host {host_sysenter_eip}, {guest_sysenter_eip}
 resident_control_off_patch_host {host_rsp}, {guest_rsp}
-lea r11, [rip + .Lresident_control_off_native]
-lea rax, [rip + matrixhv_resident_set_variable]
-sub r11, rax
-add r11, qword ptr [rdi + {event_runtime_set_variable}]
+mov r11, qword ptr [rdi + {event_control_off_native_rip}]
 mov eax, {host_rip}
 vmwrite rax, r11
 jna .Lresident_control_off_restore
@@ -473,7 +660,7 @@ ret
 .globl matrixhv_resident_va_callback
 matrixhv_resident_va_callback:
 push rbx
-sub rsp, 48
+sub rsp, 80
 mov qword ptr [rsp + 40], rdx
 mov qword ptr [rdx + {event_va_seen}], 1
 lea rdx, [rip + matrixhv_resident_original_get_variable]
@@ -502,6 +689,82 @@ call qword ptr [rip + matrixhv_resident_convert_pointer]
 test rax, rax
 jnz .Lresident_va_failed
 mov rbx, qword ptr [rsp + 40]
+lea rdx, [rbx + {event_control_off_native_rip}]
+xor ecx, ecx
+call qword ptr [rip + matrixhv_resident_convert_pointer]
+test rax, rax
+jnz .Lresident_va_failed
+lea rdx, [rbx + {event_control_recovery_runtime}]
+xor ecx, ecx
+call qword ptr [rip + matrixhv_resident_convert_pointer]
+test rax, rax
+jnz .Lresident_va_failed
+lea rdx, [rbx + {event_update_loader_runtime}]
+xor ecx, ecx
+call qword ptr [rip + matrixhv_resident_convert_pointer]
+test rax, rax
+jnz .Lresident_va_failed
+lea rdx, [rbx + {event_update_context_runtime}]
+xor ecx, ecx
+call qword ptr [rip + matrixhv_resident_convert_pointer]
+test rax, rax
+jnz .Lresident_va_failed
+lea rdx, [rbx + {event_update_image_runtime}]
+xor ecx, ecx
+call qword ptr [rip + matrixhv_resident_convert_pointer]
+test rax, rax
+jnz .Lresident_va_failed
+mov rax, qword ptr [rbx + {event_update_relocations_start}]
+add rax, qword ptr [rbx + {event_update_image_physical}]
+mov qword ptr [rsp + 48], rax
+mov rax, qword ptr [rbx + {event_update_relocations_end}]
+add rax, qword ptr [rbx + {event_update_image_physical}]
+mov qword ptr [rsp + 64], rax
+.Lresident_va_image_block:
+mov rdx, qword ptr [rsp + 48]
+cmp rdx, qword ptr [rsp + 64]
+jae .Lresident_va_image_done
+mov eax, dword ptr [rdx]
+mov qword ptr [rsp + 72], rax
+mov eax, dword ptr [rdx + 4]
+cmp eax, 8
+jb .Lresident_va_image_invalid
+test al, 1
+jnz .Lresident_va_image_invalid
+add rax, rdx
+cmp rax, qword ptr [rsp + 64]
+ja .Lresident_va_image_invalid
+mov qword ptr [rsp + 56], rax
+add qword ptr [rsp + 48], 8
+.Lresident_va_image_pointer:
+mov rdx, qword ptr [rsp + 48]
+cmp rdx, qword ptr [rsp + 56]
+jae .Lresident_va_image_block
+movzx eax, word ptr [rdx]
+add qword ptr [rsp + 48], 2
+mov edx, eax
+shr edx, 12
+test edx, edx
+jz .Lresident_va_image_pointer
+cmp edx, 10
+jne .Lresident_va_image_invalid
+and eax, 4095
+add rax, qword ptr [rsp + 72]
+lea rdx, [rax + 8]
+cmp rdx, qword ptr [rbx + {event_update_image_bytes}]
+ja .Lresident_va_image_invalid
+add rax, qword ptr [rbx + {event_update_image_physical}]
+mov rdx, rax
+xor ecx, ecx
+call qword ptr [rip + matrixhv_resident_convert_pointer]
+test rax, rax
+jnz .Lresident_va_failed
+jmp .Lresident_va_image_pointer
+.Lresident_va_image_invalid:
+movabs rax, 0x8000000000000003
+jmp .Lresident_va_failed
+.Lresident_va_image_done:
+mov rbx, qword ptr [rsp + 40]
 mov qword ptr [rsp + 32], 0
 .Lresident_va_native_storage_next:
 mov rdx, qword ptr [rsp + 32]
@@ -526,7 +789,7 @@ mov rax, qword ptr [rip + matrixhv_resident_runtime_set_variable]
 mov qword ptr [rbx + {event_runtime_set_variable}], rax
 mov rax, qword ptr [rip + matrixhv_resident_bridge_context]
 mov qword ptr [rbx + {event_runtime_context}], rax
-add rsp, 48
+add rsp, 80
 pop rbx
 ret
 
@@ -553,7 +816,7 @@ jz .Lresident_bridge_unsupported
 movabs rax, {bridge_magic}
 mov qword ptr [r10 + {bridge_status_magic}], rax
 mov dword ptr [r10 + {bridge_status_version}], {bridge_version}
-mov dword ptr [r10 + {bridge_status_capabilities}], 3
+mov dword ptr [r10 + {bridge_status_capabilities}], 7
 push rbx
 call .Lresident_bridge_apic_id
 pop rbx
@@ -617,6 +880,23 @@ inc r8d
 cmp r8d, {probe_state_qwords}
 jb .Lresident_get_variable_probe_copy
 .Lresident_get_variable_done:
+push rsi
+push rdi
+lea rsi, [r11 + {event_update_status}]
+lea rdi, [r10 + {bridge_status_update}]
+mov ecx, {update_status_qwords}
+cld
+rep movsq
+lea rsi, [r11 + {event_update_public_key}]
+lea rdi, [r10 + {bridge_status_public_key}]
+mov ecx, 4
+rep movsq
+lea rsi, [r11 + {event_update_abi}]
+lea rdi, [r10 + {bridge_status_update_abi}]
+mov ecx, 3
+rep movsq
+pop rdi
+pop rsi
 xor eax, eax
 ret
 .Lresident_get_variable_forward:
@@ -629,6 +909,8 @@ test eax, eax
 jz .Lresident_set_variable_forward
 cmp r8d, 7
 jne .Lresident_bridge_invalid_parameter
+cmp r9, {update_request_size}
+jae .Lresident_set_variable_update
 cmp r9, {bridge_request_size}
 jne .Lresident_bridge_invalid_parameter
 mov r10, qword ptr [rsp + 40]
@@ -682,6 +964,77 @@ cmp rax, r11
 jne .Lresident_bridge_unsupported
 xor eax, eax
 ret
+.Lresident_set_variable_update:
+cmp r9, {update_buffer_size}
+ja .Lresident_bridge_invalid_parameter
+mov r10, qword ptr [rsp + 40]
+test r10, r10
+jz .Lresident_bridge_invalid_parameter
+mov r11, qword ptr [rip + matrixhv_resident_bridge_context]
+test r11, r11
+jz .Lresident_bridge_unsupported
+cmp qword ptr [r11 + {event_ebs_seen}], 1
+jne .Lresident_bridge_unsupported
+cmp qword ptr [r11 + {event_va_seen}], 1
+jne .Lresident_bridge_unsupported
+cmp qword ptr [r11 + {event_control_va_error}], 0
+jne .Lresident_bridge_unsupported
+push rbx
+call .Lresident_bridge_apic_id
+pop rbx
+cmp eax, dword ptr [r10 + 24]
+jne .Lresident_bridge_unsupported
+xor r8d, r8d
+.Lresident_update_bridge_find:
+cmp eax, dword ptr [r11 + {event_control_apic_ids} + r8 * 4]
+je .Lresident_update_bridge_ready
+inc r8d
+cmp r8d, 64
+jb .Lresident_update_bridge_find
+jmp .Lresident_bridge_unsupported
+.Lresident_update_bridge_ready:
+bt qword ptr [r11 + {event_control_failed_mask}], r8
+jc .Lresident_bridge_unsupported
+bt qword ptr [r11 + {event_control_active_mask}], r8
+jnc .Lresident_update_bridge_native
+mov rcx, r10
+mov rdx, r9
+mov rax, {update_vmcall}
+vmcall
+mov r11, {update_result}
+cmp rdx, r11
+jne .Lresident_bridge_unsupported
+test rax, rax
+jnz .Lresident_bridge_unsupported
+ret
+.Lresident_update_bridge_native:
+bt qword ptr [r11 + {event_control_stopped_mask}], r8
+jnc .Lresident_bridge_unsupported
+mov rax, r8
+imul rax, {control_cpu_state_size}
+lea rax, [r11 + rax + {event_control_cpu_states}]
+cmp qword ptr [rax + {control_cpu_phase}], 2
+jne .Lresident_bridge_unsupported
+push r12
+mov r12, rsp
+mov rsp, qword ptr [rax + {control_cpu_native_storage_runtime}]
+add rsp, {native_stack_bytes} - 576
+fxsave64 [rsp + 64]
+mov qword ptr [rsp + 32], r11
+mov qword ptr [rsp + 40], 0
+mov rcx, qword ptr [r11 + {event_update_context_runtime}]
+mov rdx, r10
+mov rax, r9
+mov r9, r8
+bts r9, 63
+mov r8, rax
+call qword ptr [r11 + {event_update_loader_runtime}]
+fxrstor64 [rsp + 64]
+mov rsp, r12
+pop r12
+test rax, rax
+jnz .Lresident_bridge_unsupported
+ret
 .Lresident_set_variable_off:
 xor r8d, r8d
 mov edx, dword ptr [r10 + {bridge_request_apic_id}]
@@ -707,6 +1060,8 @@ vmcall
 popfq
 jmp .Lresident_bridge_unsupported
 .Lresident_control_off_native:
+.globl matrixhv_resident_control_off_native
+matrixhv_resident_control_off_native:
 mov r10, qword ptr [rip + matrixhv_resident_bridge_context]
 mov r11, r8
 imul r11, {control_cpu_state_size}
@@ -811,10 +1166,7 @@ mov rsp, qword ptr [r9 + {control_cpu_native_storage_runtime}]
 add rsp, {native_stack_bytes}
 resident_control_native_checkpoint 1
 // The recovery CR3 must retain the physical bridge while mapping its runtime alias.
-lea rax, [rip + .Lresident_control_on_recovery_switch]
-lea rdx, [rip + matrixhv_resident_dispatch_entry]
-sub rax, rdx
-add rax, qword ptr [r9 + {control_cpu_host_fields} + (21 * 8)]
+mov rax, qword ptr [r10 + {event_control_recovery_physical}]
 lea rdx, [rip + .Lresident_control_on_native_restore]
 xor rax, rdx
 shr rax, 39
@@ -923,6 +1275,15 @@ mfence
 vmxon qword ptr [r9 + {control_cpu_vmxon_region}]
 jna .Lresident_control_on_vmxon_failed
 resident_control_native_checkpoint 4
+cmp qword ptr [r9 + {control_cpu_vmcs02_region}], 0
+je .Lresident_control_on_primary_vmcs
+vmclear qword ptr [r9 + {control_cpu_vmcs02_region}]
+jna .Lresident_control_on_root_failed
+vmptrld qword ptr [r9 + {control_cpu_vmcs02_region}]
+jna .Lresident_control_on_root_failed
+resident_control_on_restore_host {host_rip}, 21
+resident_control_on_restore_host {host_idtr_base}, 16
+.Lresident_control_on_primary_vmcs:
 vmclear qword ptr [r9 + {control_cpu_vmcs_region}]
 jna .Lresident_control_on_root_failed
 resident_control_native_checkpoint 10
@@ -1124,10 +1485,7 @@ mov rdx, {host_page_address_mask}
 and rsi, rdx
 mov ecx, 512
 rep movsq
-lea rax, [rip + .Lresident_control_on_native_restore]
-lea rdx, [rip + matrixhv_resident_set_variable]
-sub rax, rdx
-add rax, qword ptr [r15 + {event_runtime_set_variable}]
+mov rax, qword ptr [r15 + {event_control_recovery_runtime}]
 mov rcx, rax
 shr rcx, 39
 and ecx, 0x1ff
@@ -1168,9 +1526,13 @@ mov r14, qword ptr [rsp + 104]
 mov r15, qword ptr [rsp + 112]
 mov rsp, rcx
 .Lresident_control_on_recovery_switch:
+.globl matrixhv_resident_control_recovery_switch
+matrixhv_resident_control_recovery_switch:
 mov cr3, r11
 jmp rax
 .Lresident_control_on_native_restore:
+.globl matrixhv_resident_control_native_restore
+matrixhv_resident_control_native_restore:
 // Both CR3s map this runtime instruction; the caller's page tables can now take over.
 mov cr3, rdx
 mov r11, r8

@@ -1806,6 +1806,8 @@ jmp .Lresident_nested_vmfail_with_error
 mov r10d, {vmclear_vmxon_pointer_error}
 jmp .Lresident_nested_vmfail_with_error
 .Lresident_dispatch_vmlaunch:
+call .Lresident_nested_update_gate
+jc .Lresident_nested_vmfail_invalid_flags
 resident_telemetry_counter inc, {b_nested_vmlaunch_count}, {b_telemetry_active}
 resident_telemetry_counter inc, {b_nested_entry_rejection_count}, {b_telemetry_active}
 cmp qword ptr [r12 + {b_nested_active}], 1
@@ -3995,6 +3997,8 @@ vmptrld [r12 + {b_nested_vmcs01_region}]
 jna .Lresident_dispatch_halt
 jmp .Lresident_nested_vmfail_invalid_hardware
 .Lresident_dispatch_vmresume:
+call .Lresident_nested_update_gate
+jc .Lresident_nested_vmfail_invalid_flags
 resident_telemetry_counter inc, {b_nested_vmresume_count}, {b_telemetry_active}
 resident_telemetry_counter inc, {b_nested_entry_rejection_count}, {b_telemetry_active}
 cmp qword ptr [r12 + {b_nested_active}], 1
@@ -4353,6 +4357,8 @@ jmp .Lresident_nested_succeed
 mov r10d, {invalid_invalidation_operand_error}
 jmp .Lresident_nested_vmfail_with_error
 .Lresident_dispatch_vmxon:
+call .Lresident_nested_update_gate
+jc .Lresident_nested_vmfail_invalid_flags
 resident_telemetry_counter inc, {b_nested_vmxon_count}, {b_telemetry_active}
 mov r11, qword ptr [r12 + {b_nested_l1_cr4}]
 test r11, 0x2000

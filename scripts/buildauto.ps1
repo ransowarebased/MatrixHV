@@ -61,7 +61,7 @@ if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
 }
 
 $CargoArguments = @(
-    'build',
+    'rustc',
     '--manifest-path', $ManifestPath,
     '--target', $TargetTriple,
     '--target-dir', $CargoTargetRoot,
@@ -71,6 +71,7 @@ $CargoArguments = @(
 if ($Configuration -eq 'Release') {
     $CargoArguments += '--release'
 }
+$CargoArguments += @('--', '-Dwarnings', '--emit=obj,link')
 
 Write-Host "Building $BinaryName ($Configuration) for $TargetTriple..."
 & $CargoCommand.Source @CargoArguments
@@ -92,6 +93,18 @@ if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "MatrixHV configuration was not generated: $ConfigPath"
 }
 Copy-Item -LiteralPath $ConfigPath -Destination $StagedConfig -Force
+
+$ResidentObject = Get-ChildItem -LiteralPath (Join-Path $CargoTargetRoot "$TargetTriple\$CargoProfile\deps") -Filter "$BinaryName-*.o" |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($null -eq $ResidentObject) {
+    throw 'The embedded resident object was not produced.'
+}
+$PythonCommand = Get-Command python -ErrorAction Stop
+$UpdatePackage = Join-Path $OutputRoot 'MatrixHV.mxcore'
+& $PythonCommand.Source (Join-Path $PSScriptRoot 'build_update.py') package --object $ResidentObject.FullName --efi $StagedBinary --output $UpdatePackage
+if ($LASTEXITCODE -ne 0) {
+    throw "Resident package generation failed with exit code $LASTEXITCODE."
+}
 
 Write-Host "Staged UEFI binary: $StagedBinary"
 Write-Host "Staged MatrixHV configuration: $StagedConfig"

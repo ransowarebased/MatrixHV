@@ -36,6 +36,7 @@ pub struct ControlCpuState {
     pub on_native_msrs: [u64; 9],
     pub on_failure_reason: u64,
     pub on_failure_qualification: u64,
+    pub vmcs02_region: u64,
 }
 
 #[repr(C, align(16))]
