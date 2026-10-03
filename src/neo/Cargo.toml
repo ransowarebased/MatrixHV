@@ -1,0 +1,27 @@
+[package]
+name = "neo"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[[test]]
+name = "cli"
+path = "../../tests/neo_cli_tests.rs"
+
+[dependencies]
+pdb = "0.8.0"
+colored = "2.1"
+ed25519-dalek = { version = "2.2.0", default-features = false }
+sha2 = { version = "0.10.9", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ureq = "2.12.1"
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+shlex = "1.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"

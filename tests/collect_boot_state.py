@@ -31,9 +31,10 @@ def structure(source, name):
     return source.split(f"struct {name} {{", 1)[1].split("\n}", 1)[0]
 
 
-resident = "\n".join((project / "src/core" / name).read_text()
+resident = "\n".join((project / "src/vmx" / name).read_text()
                      for name in ("resident/abi.rs",))
-nested = (project / "src/nested.rs").read_text()
+nested = (project / "src/vmx/nested.rs").read_text() + "\n" + (
+    project / "src/vmx/vmcs12.rs").read_text()
 fields = {}
 formats = {}
 offset = 0
@@ -233,7 +234,7 @@ try:
         values["event.visual_base"] = event[5]
         values["event.visual_stride_bytes"] = event[6]
         if "update" not in result:
-            layout_source = resident + (project / "src/core/bridge.rs").read_text() + (project / "src/protocol.rs").read_text()
+            layout_source = resident + (project / "src/vmx/bridge.rs").read_text() + (project / "src/protocol.rs").read_text()
             event_fields, event_size, _ = plain_layout(layout_source, "ResidentEventContext")
             cpu_fields, cpu_size, _ = plain_layout(layout_source, "ControlCpuState")
             update_source = (project / "src/update.rs").read_text()

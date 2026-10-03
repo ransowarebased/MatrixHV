@@ -2,13 +2,21 @@
 #[path = "../src/protocol.rs"]
 pub mod protocol;
 #[cfg(test_harness = "policy")]
-use policy::nested;
+use vmx::{hyperv, nested, vmcs12};
 #[cfg(test_harness = "policy")]
-#[path = "../src/config.rs"]
+#[path = "../src/boot/config.rs"]
 pub mod config;
 #[cfg(test_harness = "policy")]
-pub mod hyperv {
-    include!("../src/hyperv.rs");
+pub mod vmx {
+    pub mod hyperv {
+        include!("../src/vmx/hyperv.rs");
+    }
+    pub mod nested {
+        include!("../src/vmx/nested.rs");
+    }
+    pub mod vmcs12 {
+        include!("../src/vmx/vmcs12.rs");
+    }
 }
 #[cfg(test_harness = "policy")]
 mod policy {
@@ -21,9 +29,7 @@ mod policy {
         MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_PROTOCOL, MATRIXHV_STATUS_SIGNATURE_EAX,
         MATRIXHV_STATUS_SIGNATURE_EBX, MATRIXHV_STATUS_SIGNATURE_ECX,
     };
-    pub(crate) mod nested {
-        include!("../src/nested.rs");
-    }
+    use crate::vmx::{nested, vmcs12};
 
     core::arch::global_asm!(
         include_str!("../builds/evmcs-tests/handlers.S"),
@@ -45,80 +51,80 @@ mod policy {
         b_nested_vmx_procbased_ctls2 = const core::mem::offset_of!(nested::NestedVmxState, vmx_procbased_ctls2),
         b_nested_vmx_procbased_ctls = const core::mem::offset_of!(nested::NestedVmxState, vmx_procbased_ctls),
         b_nested_vmcs12_guest_cr0 = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields) + 29 * 8,
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, extended_fields) + 29 * 8,
         b_nested_vmclear_count = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, vmclear_count),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, vmclear_count),
         b_telemetry_active = const core::mem::offset_of!(nested::NestedVmxState, probe_complete),
         guest_cs_selector = const 0x0802,
         vmclear_invalid_physical_address_error = const nested::VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR,
         vmclear_vmxon_pointer_error = const nested::VMCLEAR_VMXON_POINTER_ERROR,
-        vmcs12_backing_magic = const nested::VMCS12_BACKING_MAGIC,
-        vmcs12_backing_magic_offset = const nested::VMCS12_BACKING_MAGIC_OFFSET,
-        vmcs12_backing_state_offset = const nested::VMCS12_BACKING_STATE_OFFSET,
-        vmcs12_backing_qword_count = const nested::VMCS12_BACKING_QWORD_COUNT,
-        vmcs12_revision_id_offset = const core::mem::offset_of!(nested::NestedVmcs12State, revision_id),
-        vmcs12_launch_state_offset = const core::mem::offset_of!(nested::NestedVmcs12State, launch_state),
-        vmcs12_vmclear_count_offset = const core::mem::offset_of!(nested::NestedVmcs12State, vmclear_count),
-        vmcs12_launch_state_clear = const nested::VMCS12_LAUNCH_STATE_CLEAR,
+        vmcs12_backing_magic = const vmcs12::VMCS12_BACKING_MAGIC,
+        vmcs12_backing_magic_offset = const vmcs12::VMCS12_BACKING_MAGIC_OFFSET,
+        vmcs12_backing_state_offset = const vmcs12::VMCS12_BACKING_STATE_OFFSET,
+        vmcs12_backing_qword_count = const vmcs12::VMCS12_BACKING_QWORD_COUNT,
+        vmcs12_revision_id_offset = const core::mem::offset_of!(vmcs12::NestedVmcs12State, revision_id),
+        vmcs12_launch_state_offset = const core::mem::offset_of!(vmcs12::NestedVmcs12State, launch_state),
+        vmcs12_vmclear_count_offset = const core::mem::offset_of!(vmcs12::NestedVmcs12State, vmclear_count),
+        vmcs12_launch_state_clear = const vmcs12::VMCS12_LAUNCH_STATE_CLEAR,
         b_nested_shadow_vmread_bitmap = const core::mem::offset_of!(nested::NestedVmxState, shadow_vmread_bitmap),
-        vmcs_shadow_read_byte_offset = const nested::VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET,
-        vmcs_shadow_read_bypass_mask = const nested::VMCS_SHADOW_READ_BYPASS_MASK,
+        vmcs_shadow_read_byte_offset = const vmcs12::VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET,
+        vmcs_shadow_read_bypass_mask = const vmcs12::VMCS_SHADOW_READ_BYPASS_MASK,
         b_nested_vmcs02_guest_cache_valid = const core::mem::offset_of!(nested::NestedVmxState, vmcs02_guest_cache_valid),
         b_nested_vmcs02_control_cache_valid = const core::mem::offset_of!(nested::NestedVmxState, vmcs02_control_cache_valid),
         b_nested_vmcs12_extended_fields = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, extended_fields),
         b_nested_vmcs12_revision_id = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, revision_id),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, revision_id),
         b_nested_vmcs12_operand = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, operand),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, operand),
         b_nested_vmcs12_region = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, region),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, region),
         vmptrld_invalid_physical_address_error = const nested::VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR,
         vmptrld_vmxon_pointer_error = const nested::VMPTRLD_VMXON_POINTER_ERROR,
         vmptrld_incorrect_revision_error = const nested::VMPTRLD_INCORRECT_REVISION_ERROR,
         b_nested_vmcs12_guest_rip = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, guest_rip),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, guest_rip),
         b_nested_vmcs12_guest_rsp = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, guest_rsp),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, guest_rsp),
         b_nested_vmcs12_guest_rflags = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, guest_rflags),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, guest_rflags),
         b_nested_vmcs12_host_rip = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, host_rip),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, host_rip),
         b_nested_vmcs12_host_rsp = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, host_rsp),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, host_rsp),
         b_nested_vmcs12_exit_reason = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, exit_reason),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, exit_reason),
         b_nested_vmcs12_vm_entry_intr_info = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields) + 13 * 8,
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, extended_fields) + 13 * 8,
         b_nested_vmcs12_vm_entry_exception_error = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields) + 14 * 8,
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, extended_fields) + 14 * 8,
         b_nested_vmcs12_vm_entry_instruction_len = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields) + 15 * 8,
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, extended_fields) + 15 * 8,
         b_nested_vmcs12_primary_control = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields) + 2 * 8,
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, extended_fields) + 2 * 8,
         b_nested_vmcs12_tsc_offset = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields) + 17 * 8,
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, extended_fields) + 17 * 8,
         b_nested_inherited_l1_tsc_offset = const core::mem::offset_of!(nested::NestedVmxState, inherited_l1_tsc_offset),
         tsc_offset = const 0x2010,
         b_nested_vmcs12_vm_entry_controls = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields) + 11 * 8,
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, extended_fields) + 11 * 8,
         b_nested_vmcs12_vm_exit_controls = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, extended_fields) + 4 * 8,
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, extended_fields) + 4 * 8,
         b_nested_l2_saved_pat = const core::mem::offset_of!(nested::NestedVmxState, l2_saved_pat),
         b_nested_l2_saved_efer = const core::mem::offset_of!(nested::NestedVmxState, l2_saved_efer),
         b_nested_vmx_misc = const core::mem::offset_of!(nested::NestedVmxState, vmx_misc),
         guest_efer = const 0x2806,
         guest_pat = const 0x2804,
         b_nested_vmcs12_launch_state = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, launch_state),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, launch_state),
         b_nested_l2_entry_was_resume = const core::mem::offset_of!(nested::NestedVmxState, l2_entry_was_resume),
         b_nested_vmcs02_launched = const core::mem::offset_of!(nested::NestedVmxState, vmcs02_launched),
         matrixhv_status_leaf = const crate::protocol::MATRIXHV_STATUS_LEAF,
-        vmcs12_launch_state_launched = const nested::VMCS12_LAUNCH_STATE_LAUNCHED,
+        vmcs12_launch_state_launched = const vmcs12::VMCS12_LAUNCH_STATE_LAUNCHED,
         b_nested_vmcs12_exit_instruction_len = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, exit_instruction_len),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, exit_instruction_len),
         b_nested_vmcs12_exit_qualification = const core::mem::offset_of!(nested::NestedVmxState, vmcs12)
-            + core::mem::offset_of!(nested::NestedVmcs12State, exit_qualification),
+            + core::mem::offset_of!(vmcs12::NestedVmcs12State, exit_qualification),
         evmcs_version = const crate::hyperv::EVMCS_VERSION,
         evmcs_guest_rip = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, guest_rip),
         evmcs_guest_rsp = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, guest_rsp),
@@ -129,7 +135,7 @@ mod policy {
         evmcs_exit_instruction_length = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, exit_instruction_length),
         evmcs_exit_qualification = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, exit_qualification),
         evmcs_clean_fields = const core::mem::offset_of!(crate::hyperv::EnlightenedVmcs, clean_fields),
-        nested_extended_field_count = const nested::VMCS12_EXTENDED_FIELD_COUNT,
+        nested_extended_field_count = const vmcs12::VMCS12_EXTENDED_FIELD_COUNT,
         vp_assist_enlighten_vm_entry = const crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET,
         vp_assist_current_nested_vmcs = const crate::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
     );
@@ -223,26 +229,8 @@ mod policy {
         CPUID_HYPERVISOR_PRESENT_BIT, HYPERV_FEATURES_LEAF, HYPERVISOR_LEAF_END,
         HYPERVISOR_LEAF_START,
     };
-    use nested::{
-        CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, HostVmxCapabilities, IA32_FEATURE_CONTROL_LOCKED,
-        IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX, INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR,
-        INVALID_VMCS_POINTER, NestedEptConfiguration, NestedMsrComposition, NestedVmcs12State,
-        NestedVmxCapabilities, NestedVmxState, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR,
-        VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR, VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR,
-        VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
-        VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS, VMCS_FIELD_GUEST_RIP,
-        VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
-        VMCS_FIELD_VM_EXIT_INSTRUCTION_INFO, VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN,
-        VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR,
-        VMCS_UNSUPPORTED_COMPONENT_ERROR, VMCS12_BACKING_MAGIC, VMCS12_BACKING_MAGIC_OFFSET,
-        VMCS12_BACKING_QWORD_COUNT, VMCS12_BACKING_STATE_OFFSET, VMCS12_LAUNCH_STATE_CLEAR,
-        VMCS12_LAUNCH_STATE_LAUNCHED, VMCS12_LAUNCH_STATE_UNINITIALIZED, VMFAIL_INVALID_STATUS,
-        VMFAIL_VALID_STATUS, VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR,
-        VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR, VMPTRLD_VMXON_POINTER_ERROR,
-        VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR,
-        VMX_BASIC_TRUE_CONTROLS, VMX_MEMORY_TYPE_WRITE_BACK, VMX_REGION_SIZE, VMX_STATUS_FLAGS,
-        VMX_STATUS_FLAGS_CLEAR_MASK, VMXON_IN_VMX_ROOT_ERROR,
-    };
+    use nested::{CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, HostVmxCapabilities, IA32_FEATURE_CONTROL_LOCKED, IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX, INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR, INVALID_VMCS_POINTER, NestedEptConfiguration, NestedMsrComposition, NestedVmxCapabilities, NestedVmxState, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR, VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR, VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR, VMCS_UNSUPPORTED_COMPONENT_ERROR, VMFAIL_INVALID_STATUS, VMFAIL_VALID_STATUS, VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_INCORRECT_REVISION_ERROR, VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR, VMPTRLD_VMXON_POINTER_ERROR, VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_READ_ONLY_COMPONENT_ERROR, VMX_BASIC_TRUE_CONTROLS, VMX_MEMORY_TYPE_WRITE_BACK, VMX_REGION_SIZE, VMX_STATUS_FLAGS, VMX_STATUS_FLAGS_CLEAR_MASK, VMXON_IN_VMX_ROOT_ERROR};
+    use vmcs12::{NestedVmcs12State, VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS, VMCS_FIELD_GUEST_RIP, VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP, VMCS_FIELD_VM_EXIT_INSTRUCTION_INFO, VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR, VMCS12_BACKING_MAGIC, VMCS12_BACKING_MAGIC_OFFSET, VMCS12_BACKING_QWORD_COUNT, VMCS12_BACKING_STATE_OFFSET, VMCS12_LAUNCH_STATE_CLEAR, VMCS12_LAUNCH_STATE_LAUNCHED, VMCS12_LAUNCH_STATE_UNINITIALIZED};
 
     const HOST_VMX_BASIC: u64 = 0x00da_0400_0000_1234;
     const VMXON_REGION: u64 = 0x20_0000;
@@ -255,8 +243,8 @@ mod policy {
 
     #[test]
     fn vmcs12_seed_preserves_guest_selectors_and_distinguishes_host_registers() {
-        let segments: [nested::NestedVmcs12SegmentState; 8] =
-            core::array::from_fn(|index| nested::NestedVmcs12SegmentState {
+        let segments: [vmcs12::NestedVmcs12SegmentState; 8] =
+            core::array::from_fn(|index| vmcs12::NestedVmcs12SegmentState {
                 selector: 0x27 + index as u16 * 8,
                 base: 0x1000 * (index as u64 + 1),
                 limit: 0xffff + index as u32,
@@ -265,7 +253,7 @@ mod policy {
         let mut vmcs12 = NestedVmcs12State::new(1, 2, 3, 4);
         vmcs12.extended_fields.fill(0xfeed);
         vmcs12.guest_rip = 0x1234;
-        vmcs12.seed_core_state(nested::NestedVmcs12CoreState {
+        vmcs12.seed_core_state(vmcs12::NestedVmcs12CoreState {
             guest_cr0: 0x8000_0021,
             guest_cr3: 0x1000,
             guest_cr4: 0x20,
@@ -289,7 +277,7 @@ mod policy {
             sysenter_eip: 0xc000,
         });
         let field_value = |encoding| {
-            let field = nested::VMCS12_EXTENDED_FIELDS
+            let field = vmcs12::VMCS12_EXTENDED_FIELDS
                 .iter()
                 .find(|field| field.encoding == encoding)
                 .unwrap();
@@ -361,7 +349,7 @@ mod policy {
         let mut vmcs12 = NestedVmcs12State::new(0x1234, 0x1000, 0x2000, 0x3000);
         vmcs12.guest_rip = 0x4000;
         vmcs12.vmwrite_count = 7;
-        vmcs12.extended_fields[nested::VMCS12_EXTENDED_FIELD_COUNT - 1] = 0x5000;
+        vmcs12.extended_fields[vmcs12::VMCS12_EXTENDED_FIELD_COUNT - 1] = 0x5000;
         vmcs12.seed_backing(page);
         let magic_end = VMCS12_BACKING_MAGIC_OFFSET + core::mem::size_of::<u64>();
         let state_end = VMCS12_BACKING_STATE_OFFSET + core::mem::size_of::<NestedVmcs12State>();
@@ -483,14 +471,14 @@ mod policy {
 
     #[test]
     fn vmcs_shadow_read_bitmap_bypasses_only_selected_host_fields() {
-        let byte = nested::VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET;
-        let bypass = nested::VMCS_SHADOW_READ_BYPASS_MASK;
+        let byte = vmcs12::VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET;
+        let bypass = vmcs12::VMCS_SHADOW_READ_BYPASS_MASK;
         assert!(byte < 4096);
-        assert_eq!(byte, (nested::VMCS_FIELD_HOST_RIP >> 3) as usize);
+        assert_eq!(byte, (vmcs12::VMCS_FIELD_HOST_RIP >> 3) as usize);
         assert_eq!(bypass, 0x50);
-        assert_eq!(nested::VMCS_SHADOW_READ_TRAP_MASK, !bypass);
+        assert_eq!(vmcs12::VMCS_SHADOW_READ_TRAP_MASK, !bypass);
         let mut bitmap = [0xff_u8; 4096];
-        bitmap[byte] &= nested::VMCS_SHADOW_READ_TRAP_MASK;
+        bitmap[byte] &= vmcs12::VMCS_SHADOW_READ_TRAP_MASK;
         assert_eq!(bitmap[byte], 0xaf);
         assert_eq!(bitmap[byte - 1], 0xff);
         assert_eq!(bitmap[byte + 1], 0xff);
@@ -689,7 +677,7 @@ mod policy {
         assert_eq!(capabilities.vmx_cr4_fixed1, host.cr4_fixed1);
         assert_eq!(
             capabilities.vmx_vmcs_enum,
-            nested::VMCS12_MAX_ENUM_INDEX << 1
+            vmcs12::VMCS12_MAX_ENUM_INDEX << 1
         );
         assert_eq!(capabilities.vmx_procbased_ctls2, secondary_control);
         assert_eq!((capabilities.vmx_procbased_ctls2 >> 32) as u32 & 0x26, 0x26);
@@ -998,12 +986,12 @@ mod policy {
 
     #[test]
     fn vmcs_enum_is_bounded_by_host_and_vmcs12_field_indices() {
-        let max_vmcs12_index = nested::VMCS12_EXTENDED_FIELDS
+        let max_vmcs12_index = vmcs12::VMCS12_EXTENDED_FIELDS
             .iter()
             .map(|field| (field.encoding >> 1) & 0x1ff)
             .max()
             .unwrap();
-        assert_eq!(max_vmcs12_index, nested::VMCS12_MAX_ENUM_INDEX);
+        assert_eq!(max_vmcs12_index, vmcs12::VMCS12_MAX_ENUM_INDEX);
 
         let mut host = host_vmx_capabilities();
         host.vmcs_enum = 9 << 1;
@@ -1226,15 +1214,15 @@ mod policy {
         assert_eq!(VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, 0x440c);
         assert_eq!(VMCS_FIELD_VM_EXIT_INSTRUCTION_INFO, 0x440e);
         assert_eq!(VMCS_FIELD_EXIT_QUALIFICATION, 0x6400);
-        assert_eq!(nested::VMCS_FIELD_GUEST_PHYSICAL_ADDRESS, 0x2400);
-        assert_eq!(nested::VMCS_FIELD_GUEST_LINEAR_ADDRESS, 0x640a);
+        assert_eq!(vmcs12::VMCS_FIELD_GUEST_PHYSICAL_ADDRESS, 0x2400);
+        assert_eq!(vmcs12::VMCS_FIELD_GUEST_LINEAR_ADDRESS, 0x640a);
         assert_eq!(VMCS_FIELD_GUEST_RSP, 0x681c);
         assert_eq!(VMCS_FIELD_GUEST_RIP, 0x681e);
         assert_eq!(VMCS_FIELD_GUEST_RFLAGS, 0x6820);
-        assert_eq!(nested::VMCS_FIELD_GUEST_PDPTR0, 0x280a);
-        assert_eq!(nested::VMCS_FIELD_GUEST_PDPTR1, 0x280c);
-        assert_eq!(nested::VMCS_FIELD_GUEST_PDPTR2, 0x280e);
-        assert_eq!(nested::VMCS_FIELD_GUEST_PDPTR3, 0x2810);
+        assert_eq!(vmcs12::VMCS_FIELD_GUEST_PDPTR0, 0x280a);
+        assert_eq!(vmcs12::VMCS_FIELD_GUEST_PDPTR1, 0x280c);
+        assert_eq!(vmcs12::VMCS_FIELD_GUEST_PDPTR2, 0x280e);
+        assert_eq!(vmcs12::VMCS_FIELD_GUEST_PDPTR3, 0x2810);
         assert_eq!(VMCS_FIELD_HOST_RSP, 0x6c14);
         assert_eq!(VMCS_FIELD_HOST_RIP, 0x6c16);
         assert_eq!(VMCS12_LAUNCH_STATE_CLEAR, 0);
@@ -1243,7 +1231,7 @@ mod policy {
 
     #[test]
     fn resident_vmcs12_lookup_matches_the_canonical_field_table() {
-        let source = include_str!("../src/asm/nested.S");
+        let source = include_str!("../src/vmx/asm/nested.S");
         let table = source
             .split(".Lresident_vmcs12_field_index_table:")
             .nth(1)
@@ -1260,9 +1248,9 @@ mod policy {
         assert_eq!(indices.len(), 1024);
         assert_eq!(
             indices.iter().filter(|index| **index != 255).count(),
-            nested::VMCS12_EXTENDED_FIELD_COUNT
+            vmcs12::VMCS12_EXTENDED_FIELD_COUNT
         );
-        for field in nested::VMCS12_EXTENDED_FIELDS {
+        for field in vmcs12::VMCS12_EXTENDED_FIELDS {
             let key = ((field.encoding & 0x6c00) >> 5) | ((field.encoding & 0x3e) >> 1);
             assert_eq!(usize::from(indices[key as usize]), field.index);
         }
@@ -1271,13 +1259,13 @@ mod policy {
     #[test]
     fn extended_vmcs12_fields_are_dense_unique_and_cover_entry_state() {
         assert_eq!(
-            nested::VMCS12_EXTENDED_FIELDS.len(),
-            nested::VMCS12_EXTENDED_FIELD_COUNT
+            vmcs12::VMCS12_EXTENDED_FIELDS.len(),
+            vmcs12::VMCS12_EXTENDED_FIELD_COUNT
         );
-        for (index, field) in nested::VMCS12_EXTENDED_FIELDS.iter().enumerate() {
+        for (index, field) in vmcs12::VMCS12_EXTENDED_FIELDS.iter().enumerate() {
             assert_eq!(field.index, index);
             assert_eq!(
-                nested::VMCS12_EXTENDED_FIELDS
+                vmcs12::VMCS12_EXTENDED_FIELDS
                     .iter()
                     .filter(|candidate| candidate.encoding == field.encoding)
                     .count(),
@@ -1285,45 +1273,45 @@ mod policy {
             );
         }
         assert_eq!(
-            nested::VMCS12_EXTENDED_FIELDS[115].encoding,
+            vmcs12::VMCS12_EXTENDED_FIELDS[115].encoding,
             VMCS_FIELD_VM_EXIT_INSTRUCTION_INFO
         );
         assert_eq!(
-            nested::VMCS12_EXTENDED_FIELDS[116].encoding,
-            nested::VMCS_FIELD_GUEST_LINEAR_ADDRESS
+            vmcs12::VMCS12_EXTENDED_FIELDS[116].encoding,
+            vmcs12::VMCS_FIELD_GUEST_LINEAR_ADDRESS
         );
         assert_eq!(
-            nested::VMCS12_EXTENDED_FIELDS[117].encoding,
-            nested::VMCS_FIELD_EXECUTIVE_VMCS_POINTER
+            vmcs12::VMCS12_EXTENDED_FIELDS[117].encoding,
+            vmcs12::VMCS_FIELD_EXECUTIVE_VMCS_POINTER
         );
         assert!(
-            nested::VMCS12_EXTENDED_FIELDS
+            vmcs12::VMCS12_EXTENDED_FIELDS
                 .iter()
-                .any(|field| field.encoding == nested::VMCS_FIELD_EXCEPTION_BITMAP)
+                .any(|field| field.encoding == vmcs12::VMCS_FIELD_EXCEPTION_BITMAP)
         );
         assert!(
-            nested::VMCS12_EXTENDED_FIELDS
+            vmcs12::VMCS12_EXTENDED_FIELDS
                 .iter()
-                .any(|field| field.encoding == nested::VMCS_FIELD_GUEST_CR3)
+                .any(|field| field.encoding == vmcs12::VMCS_FIELD_GUEST_CR3)
         );
         assert!(
-            nested::VMCS12_EXTENDED_FIELDS
+            vmcs12::VMCS12_EXTENDED_FIELDS
                 .iter()
-                .any(|field| field.encoding == nested::VMCS_FIELD_HOST_CR3)
+                .any(|field| field.encoding == vmcs12::VMCS_FIELD_HOST_CR3)
         );
         assert!(
-            nested::VMCS12_EXTENDED_FIELDS
+            vmcs12::VMCS12_EXTENDED_FIELDS
                 .iter()
-                .any(|field| field.encoding == nested::VMCS_FIELD_GUEST_PHYSICAL_ADDRESS)
+                .any(|field| field.encoding == vmcs12::VMCS_FIELD_GUEST_PHYSICAL_ADDRESS)
         );
         for encoding in [
-            nested::VMCS_FIELD_GUEST_PDPTR0,
-            nested::VMCS_FIELD_GUEST_PDPTR1,
-            nested::VMCS_FIELD_GUEST_PDPTR2,
-            nested::VMCS_FIELD_GUEST_PDPTR3,
+            vmcs12::VMCS_FIELD_GUEST_PDPTR0,
+            vmcs12::VMCS_FIELD_GUEST_PDPTR1,
+            vmcs12::VMCS_FIELD_GUEST_PDPTR2,
+            vmcs12::VMCS_FIELD_GUEST_PDPTR3,
         ] {
             assert!(
-                nested::VMCS12_EXTENDED_FIELDS
+                vmcs12::VMCS12_EXTENDED_FIELDS
                     .iter()
                     .any(|field| field.encoding == encoding)
             );
@@ -1359,7 +1347,7 @@ mod policy {
     use core::mem::{offset_of, size_of};
 
     fn field_map() -> Vec<(usize, u16)> {
-        let assembly = include_str!("../src/asm/hyperv.S");
+        let assembly = include_str!("../src/vmx/asm/hyperv.S");
         let start = assembly.find(".Lresident_evmcs_field_map:").unwrap();
         let end = assembly[start..].find(".endm").unwrap() + start;
         assembly[start..end]
@@ -1382,7 +1370,7 @@ mod policy {
         assert_eq!(crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET, 40);
         assert_eq!(crate::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET, 48);
         assert_eq!(size_of::<EnlightenedVmcs>(), 1024);
-        assert_eq!(fields.len(), nested::VMCS12_EXTENDED_FIELD_COUNT);
+        assert_eq!(fields.len(), vmcs12::VMCS12_EXTENDED_FIELD_COUNT);
         for (offset, flags) in fields.iter().copied() {
             if flags != 0 {
                 assert!([2, 4, 8].contains(&(flags & 15)));
@@ -1931,8 +1919,8 @@ mod policy {
         let mut vmread_bitmap = Box::new(EvmcsTestPage([0xff; 4096]));
         let mut state = nested_state(0);
         let evmcs_address = evmcs.0.as_ptr() as u64;
-        let shadow_byte = nested::VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET;
-        vmread_bitmap.0[shadow_byte] = nested::VMCS_SHADOW_READ_TRAP_MASK;
+        let shadow_byte = vmcs12::VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET;
+        vmread_bitmap.0[shadow_byte] = vmcs12::VMCS_SHADOW_READ_TRAP_MASK;
         state.shadow_vmread_bitmap = vmread_bitmap.0.as_ptr() as u64;
         state.evmcs_enabled = 1;
         state.vp_assist_msr = assist.0.as_ptr() as u64 | 1;
@@ -2997,6 +2985,7 @@ mod ept {
         b_last_reason = const std::mem::offset_of!(Context, exit_reason),
         ept_misconfiguration_reason = const 49,
         b_nested_ept01_pointer = const std::mem::offset_of!(Context, ept01),
+        b_cache_ept_pointer = const std::mem::offset_of!(Context, ept01),
         b_nested_ept02_invalidation_count = const std::mem::offset_of!(Context, invalidations),
         b_invept_exits = const std::mem::offset_of!(Context, native_invept),
         b_nested_ept02_recycle_count = const std::mem::offset_of!(Context, recycles),
@@ -4983,7 +4972,7 @@ mod ept {
     }
     #[test]
     fn vmcs_lookup_rejects_reserved_bits_and_resolves_every_index() {
-        let source = include_str!("../src/asm/nested.S");
+        let source = include_str!("../src/vmx/asm/nested.S");
         let table = source
             .split(".Lresident_vmcs12_field_index_table:")
             .nth(1)

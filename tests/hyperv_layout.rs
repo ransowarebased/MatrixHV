@@ -311,7 +311,7 @@ fn every_evmcs_mapping_matches_its_architectural_encoding_and_clean_group() {
         (0x2028, 0, 0, 0),
     ];
     let actual = field_map();
-    let source = include_str!("../src/asm/hyperv.S");
+    let source = include_str!("../src/vmx/asm/hyperv.S");
     let table = source
         .split(".Lresident_evmcs_field_map:")
         .nth(1)
@@ -328,7 +328,7 @@ fn every_evmcs_mapping_matches_its_architectural_encoding_and_clean_group() {
     assert_eq!(masks.len(), expected.len());
     for (index, (encoding, offset, flags, clean)) in expected.into_iter().enumerate() {
         assert_eq!(
-            nested::VMCS12_EXTENDED_FIELDS[index].encoding,
+            vmcs12::VMCS12_EXTENDED_FIELDS[index].encoding,
             encoding,
             "index {index}"
         );

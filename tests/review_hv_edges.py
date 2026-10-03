@@ -52,7 +52,8 @@ def main():
         print(f"{probe}: {classification}")
     snapshot = {
         str(path.relative_to(PROJECT)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in [PROJECT / "src/asm/nested.S", PROJECT / "src/asm/hyperv.S", PROJECT / "src/nested.rs"]
+        for path in [PROJECT / "src/vmx/asm/nested.S", PROJECT / "src/vmx/asm/hyperv.S",
+                     PROJECT / "src/vmx/nested.rs", PROJECT / "src/vmx/vmcs12.rs"]
     }
     (OUTPUT / "edge-results.json").write_text(json.dumps({
         "method": "Actual resident assembly; VMREAD and hardware invalidation mocked by the existing host harness",

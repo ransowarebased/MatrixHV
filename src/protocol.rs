@@ -129,6 +129,53 @@ pub mod memory {
     pub const INFO: u32 = 0;
     pub const READ: u32 = 1;
     pub const WRITE: u32 = 2;
+    // A/D requests use GPA at 16 and page count at 32, without item descriptors.
+    // Two LSB-first bitmaps follow the header: accessed, then dirty (one bit/4 KiB).
+    // Response flags at 72 identify support and conservative large-page coverage.
+    // Snapshots observe the shared L1 EPT without clearing bits or stopping CPUs.
+    // Only readable identity-mapped WB leaves participate; hidden and MMIO pages are zero.
+    pub const AD_BITMAP: u32 = 3;
+    pub const AD_ENABLED: u32 = 1 << 0;
+    pub const AD_LARGE_PAGE: u32 = 1 << 1;
+    pub const AD_MAX_PAGES: usize = (BUFFER_BYTES - HEADER_BYTES) / 2 * 8;
+    pub const AD_START: u32 = 4;
+    pub const AD_STOP: u32 = 5;
+    pub const AD_FETCH: u32 = 6;
+    pub const AD_RELEASE: u32 = 7;
+    pub const AD_STATUS: u32 = 8;
+    pub const AD_ENUMERATE: u32 = 9;
+    pub const AD_CANCEL: u32 = 10;
+    // Token/T0/T1 occupy 80/88/96; state/count/pool usage occupy 104/108/112.
+    // START carries (CR3, GVA) pairs. FETCH uses the first record index at 64.
+    // ENUMERATE uses CR3 at 64 and GVA cursor at 16; returns the user limit at 72.
+    pub const TRACK_MAX_PAGES: usize = 1024;
+    pub const TRACK_TABLE_PAGES: usize = 2048;
+    pub const TRACK_TARGET_BYTES: usize = 16;
+    // Records: CR3, GVA, initial/current GPA, initial/current PTE fingerprint,
+    // flags/status, initial/final SHA-256, and the frozen 4096-byte dirty page.
+    pub const TRACK_RECORD_BYTES: usize = 4216;
+    pub const TRACK_FETCH_PAGES: usize = (BUFFER_BYTES - HEADER_BYTES) / TRACK_RECORD_BYTES;
+    pub const TRACK_ACCESSED: u32 = 1;
+    pub const TRACK_DIRTY: u32 = 2;
+    pub const TRACK_REMAPPED: u32 = 4;
+    pub const TRACK_DUMP_VALID: u32 = 8;
+    pub const TRACK_HASH_CHANGED: u32 = 16;
+    pub const TRACK_IDLE: u32 = 0;
+    pub const TRACK_ACTIVE: u32 = 1;
+    pub const TRACK_STOPPED: u32 = 2;
+
+    pub fn ad_bitmap_length(start: u64, page_count: usize) -> Result<usize, Error> {
+        if start & 4095 != 0 || page_count == 0 || page_count > AD_MAX_PAGES {
+            return Err(Error::Bounds);
+        }
+        let end = start
+            .checked_add(page_count as u64 * 4096)
+            .ok_or(Error::Bounds)?;
+        if end > 1 << 48 {
+            return Err(Error::Bounds);
+        }
+        Ok(HEADER_BYTES + 2 * page_count.div_ceil(8))
+    }
     pub const ROAD_STATUS_DEMAND_ZERO: u32 = 0xe052_0001;
 
     #[derive(Clone, Copy, Default)]
@@ -220,6 +267,10 @@ pub mod memory {
         PagefileBacked = 7,
         CopyOnWrite = 8,
         DemandZeroWrite = 9,
+        Busy = 10,
+        Session = 11,
+        Capacity = 12,
+        Remapped = 13,
     }
 
     pub fn word(bytes: &[u8], offset: usize) -> u32 {

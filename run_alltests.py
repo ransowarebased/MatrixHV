@@ -60,8 +60,8 @@ def run_neo(project, release=False):
     )
     output = project / "builds" / "neo-tests-target"
     options = [
-        "--manifest-path", str(project / "src/road/Cargo.toml"),
-        "--target", host_target, "--target-dir", str(output), "--bin", "neo",
+        "--manifest-path", str(project / "src/neo/Cargo.toml"),
+        "--target", host_target, "--target-dir", str(output),
     ]
     if release:
         options.append("--release")

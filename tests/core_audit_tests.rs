@@ -79,52 +79,65 @@ mod arch {
 }
 
 mod memory {
-    use std::alloc::{alloc_zeroed, dealloc, Layout};
-    use std::ptr::NonNull;
+    pub mod host {
+        use std::alloc::{Layout, alloc_zeroed, dealloc};
+        use std::ptr::NonNull;
 
-    use crate::Status;
+        use crate::Status;
 
-    pub const PAGE_SIZE: usize = 4096;
+        pub const PAGE_SIZE: usize = 4096;
 
-    pub enum AddressConstraint {
-        Any,
-    }
-
-    pub struct ResidentPages {
-        pointer: NonNull<u8>,
-        layout: Layout,
-    }
-
-    impl ResidentPages {
-        pub fn allocate(pages: usize, _constraint: AddressConstraint) -> Result<Self, Status> {
-            let bytes = pages.checked_mul(PAGE_SIZE).ok_or(Status)?;
-            let layout = Layout::from_size_align(bytes, PAGE_SIZE).map_err(|_| Status)?;
-            let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(Status)?;
-            Ok(Self { pointer, layout })
+        pub enum AddressConstraint {
+            Any,
         }
 
-        pub fn pages(&self) -> usize {
-            self.layout.size() / PAGE_SIZE
+        pub struct ResidentPages {
+            pointer: NonNull<u8>,
+            layout: Layout,
         }
 
-        pub fn physical_address(&self) -> u64 {
-            self.pointer.as_ptr() as u64
+        impl ResidentPages {
+            pub fn allocate(pages: usize, _constraint: AddressConstraint) -> Result<Self, Status> {
+                let bytes = pages.checked_mul(PAGE_SIZE).ok_or(Status)?;
+                let layout = Layout::from_size_align(bytes, PAGE_SIZE).map_err(|_| Status)?;
+                let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(Status)?;
+                Ok(Self { pointer, layout })
+            }
+
+            pub fn pages(&self) -> usize {
+                self.layout.size() / PAGE_SIZE
+            }
+
+            pub fn physical_address(&self) -> u64 {
+                self.pointer.as_ptr() as u64
+            }
+
+            pub fn pointer(&self) -> NonNull<u8> {
+                self.pointer
+            }
         }
 
-        pub fn pointer(&self) -> NonNull<u8> {
-            self.pointer
-        }
-    }
-
-    impl Drop for ResidentPages {
-        fn drop(&mut self) {
-            unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
+        impl Drop for ResidentPages {
+            fn drop(&mut self) {
+                unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
+            }
         }
     }
 }
 
 mod ept {
-    include!("../src/core/ept.rs");
+    include!("../src/vmx/ept.rs");
+
+    #[test]
+    fn accessed_dirty_control_requires_the_hardware_capability() {
+        assert_eq!(ept_pointer_attributes(0), 0x1e);
+        assert_eq!(ept_pointer_attributes(EPT_CAP_ACCESSED_DIRTY), 0x5e);
+        assert_eq!(
+            ept_pointer_attributes(u64::MAX & !EPT_CAP_ACCESSED_DIRTY),
+            0x1e
+        );
+        assert_eq!(ept_pointer_attributes(u64::MAX), 0x5e);
+    }
 
     fn empty(mapped_end: u64) -> IdentityEpt {
         let mut pages = Vec::new();
@@ -186,10 +199,12 @@ mod ept {
     #[test]
     fn cloning_includes_split_and_sparse_pool_tables_and_owns_its_copies() {
         let mut original = one_gb_leaf(EPT_PERMISSIONS | (6 << 3) | (6 << 52));
+        original.ept_pointer |= EPT_ACCESSED_DIRTY_ENABLED;
         original.remap_page(0x1_0000_1000, 0x7000).unwrap();
         original.deny_guest_access(0x1_0000_2000, 1).unwrap();
         let mut clone = original.clone_identity_tables().unwrap();
         assert_ne!(clone.ept_pointer(), original.ept_pointer());
+        assert_ne!(clone.ept_pointer() & EPT_ACCESSED_DIRTY_ENABLED, 0);
         assert_eq!(clone.protection_table_pool().2, 0);
         assert_eq!(clone.pages[0].pages(), original.pages.len() + 2);
         drop(original);
@@ -203,6 +218,7 @@ mod ept {
         );
         clone.remap_page(0x1_0000_1000, 0x8000).unwrap();
         let mut sparse = clone.sparse_shadow().unwrap();
+        assert_ne!(sparse.ept_pointer() & EPT_ACCESSED_DIRTY_ENABLED, 0);
         sparse
             .compose_page(&clone, &empty_identity_page(0x8000), 0x1_0000_1000)
             .unwrap();
@@ -384,7 +400,11 @@ mod ept {
                         (&mut ept01, host_type, 0),
                     ] {
                         let (table, index) = ept.ensure_4k_leaf(address).unwrap();
-                        write_entry(table, index, address | EPT_PERMISSIONS | (memory_type << 3) | pat);
+                        write_entry(
+                            table,
+                            index,
+                            address | EPT_PERMISSIONS | (memory_type << 3) | pat,
+                        );
                     }
                     let expected = if l1_type == host_type || host_type == 6 {
                         l1_type

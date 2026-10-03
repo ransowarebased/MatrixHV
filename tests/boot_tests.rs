@@ -176,7 +176,7 @@ mod order {
 #[cfg(test_harness = "config")]
 mod config {
     pub mod boot {
-        include!("../src/config.rs");
+        include!("../src/boot/config.rs");
     }
 
     #[test]

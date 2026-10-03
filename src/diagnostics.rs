@@ -58,7 +58,7 @@ fn firmware_calls_allowed(rflags: u64, apic_base: u64) -> bool {
 }
 
 fn console_available() -> bool {
-    if crate::firmware::boot_services_exited() {
+    if crate::boot::firmware::boot_services_exited() {
         return false;
     }
     // UEFI protocols run on the BSP with interrupts enabled. In particular,
@@ -77,7 +77,7 @@ fn console_available() -> bool {
 }
 
 pub fn begin() {
-    if !crate::runtime::framebuffer_enabled() || !console_available() {
+    if !crate::logging::framebuffer_enabled() || !console_available() {
         return;
     }
     system::with_stdout(|stdout| {
@@ -88,11 +88,11 @@ pub fn begin() {
 }
 
 pub fn stage(name: &str) {
-    crate::runtime::phase(name);
+    crate::logging::phase(name);
 }
 
 pub fn page(name: &str) {
-    if crate::runtime::framebuffer_enabled() && console_available() {
+    if crate::logging::framebuffer_enabled() && console_available() {
         system::with_stdout(|stdout| {
             let _ = stdout.clear();
             let _ = writeln!(stdout, "MatrixHV resident guest diagnostics");
@@ -102,11 +102,11 @@ pub fn page(name: &str) {
 }
 
 pub fn prepare_resident_visuals() -> bool {
-    if !crate::runtime::framebuffer_enabled() {
+    if !crate::logging::framebuffer_enabled() {
         return false;
     }
     let Ok(handle) = boot::get_handle_for_protocol::<GraphicsOutput>() else {
-        crate::runtime::info(format_args!("resident framebuffer GOP unavailable"));
+        crate::logging::info(format_args!("resident framebuffer GOP unavailable"));
         return false;
     };
     let params = OpenProtocolParams {
@@ -129,7 +129,7 @@ pub fn prepare_resident_visuals() -> bool {
     let mode = graphics.current_mode_info();
     let (width, height) = mode.resolution();
     let stride = mode.stride();
-    crate::runtime::info(format_args!(
+    crate::logging::info(format_args!(
         "resident framebuffer mode={mode_number} resolution={width}x{height} stride={stride} format={:?}",
         mode.pixel_format()
     ));
@@ -173,7 +173,7 @@ pub fn prepare_resident_visuals() -> bool {
     GOP_MODE_NUMBER.store(mode_number as usize, Ordering::Relaxed);
     GOP_PROTOCOL_POINTER.store(protocol_pointer as usize, Ordering::Relaxed);
     FRAMEBUFFER_BASE.store(base, Ordering::Release);
-    crate::runtime::info(format_args!(
+    crate::logging::info(format_args!(
         "resident framebuffer base={base:#x} size={size:#x}"
     ));
     true
@@ -198,11 +198,11 @@ pub extern "efiapi" fn vmexit_diagnostic(
     guest_rip: u64,
     qualification: u64,
 ) -> u64 {
-    if !crate::runtime::framebuffer_enabled() {
+    if !crate::logging::framebuffer_enabled() {
         return 0;
     }
     if halted == 0 {
-        return u64::from(crate::guest::start_image_entered());
+        return u64::from(crate::boot::guest::start_image_entered());
     }
     if !gop_mode_unchanged() {
         return 1;
@@ -234,7 +234,7 @@ fn paint_hex(value: u64, x: usize, y: usize) {
 }
 
 fn gop_mode_unchanged() -> bool {
-    if crate::firmware::boot_services_exited() {
+    if crate::boot::firmware::boot_services_exited() {
         return false;
     }
     let protocol = GOP_PROTOCOL_POINTER.load(Ordering::Acquire) as *const GraphicsOutputProtocol;
@@ -289,7 +289,7 @@ fn paint_square(x: usize, y: usize, side: usize) {
 }
 
 pub fn message(arguments: fmt::Arguments<'_>) {
-    crate::runtime::info(arguments);
+    crate::logging::info(arguments);
 }
 
 pub(crate) fn write_record(message: &str) {
@@ -302,11 +302,11 @@ pub(crate) fn write_record(message: &str) {
 }
 
 pub fn error(arguments: fmt::Arguments<'_>) {
-    crate::runtime::error(arguments);
+    crate::logging::error(arguments);
 }
 
 pub fn hold_on_failure() {
-    if !crate::runtime::enabled() || !console_available() {
+    if !crate::logging::enabled() || !console_available() {
         return;
     }
     message(format_args!("Boot stopped. Press any key to return."));

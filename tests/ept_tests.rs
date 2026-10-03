@@ -541,6 +541,8 @@ mod sync {
         invalidations: AtomicU64,
         swaps: AtomicU64,
         flushes: AtomicU64,
+        cache_ept: u64,
+        flushed_ept: AtomicU64,
     }
 
     impl Context {
@@ -570,6 +572,8 @@ mod sync {
                 invalidations: AtomicU64::new(0),
                 swaps: AtomicU64::new(0),
                 flushes: AtomicU64::new(0),
+                cache_ept: 0x205e,
+                flushed_ept: AtomicU64::new(0),
             }
         }
     }
@@ -639,14 +643,16 @@ mod sync {
         b_nested_eptp_admission = const std::mem::offset_of!(Context, admission),
         b_nested_eptp_shadow_list = const std::mem::offset_of!(Context, shadow_list),
         b_nested_ept02_cache_initialized = const std::mem::offset_of!(Context, initialized),
-        b_nested_ept01_pointer = const std::mem::offset_of!(Context, ept01),
+        b_cache_ept_pointer = const std::mem::offset_of!(Context, cache_ept),
         test_captures = const std::mem::offset_of!(Context, captures),
         test_invalidations = const std::mem::offset_of!(Context, invalidations),
         test_swaps = const std::mem::offset_of!(Context, swaps),
         test_flushes = const std::mem::offset_of!(Context, flushes),
+        test_flushed_ept = const std::mem::offset_of!(Context, flushed_ept),
     );
 
     unsafe extern "win64" {
+        fn tracking_sync(context: *const Context, operation: u64) -> u64;
         fn sync_begin(context: *const Context) -> u64;
         fn sync_acquire(context: *const Context) -> u64;
         fn sync_ready(context: *const Context) -> u64;
@@ -656,6 +662,42 @@ mod sync {
         fn sync_host_nmi(context: *const Context) -> u64;
         fn sync_exit_nmi(context: *const Context) -> u64;
         fn sync_kick(context: *const Context) -> u64;
+    }
+
+    #[test]
+    fn tracking_callback_acquires_flushes_and_releases_the_shared_barrier() {
+        let _serial = SERIAL.lock().unwrap();
+        let mut event = Box::new(Event { cpus: [0; 64] });
+        let owner = Box::new(Context::new(&event, false));
+        let mut peer = Box::new(Context::new(&event, true));
+        peer.ept01 = 0;
+        event.cpus[0] = &*owner as *const Context as u64;
+        event.cpus[1] = &*peer as *const Context as u64;
+        let returned = AtomicU64::new(0);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                assert!(until(|| peer.pending_nmi.load(Ordering::Acquire) != 0));
+                unsafe { sync_poll(&*peer) };
+                returned.store(1, Ordering::Release);
+            });
+            let acquired = unsafe { tracking_sync(&*owner, 0) };
+            let early_return = returned.load(Ordering::Acquire);
+            if acquired == 1 {
+                assert_eq!(unsafe { tracking_sync(&*owner, 1) }, 1);
+                assert_eq!(unsafe { tracking_sync(&*owner, 2) }, 1);
+            }
+            assert_eq!(acquired, 1);
+            assert_eq!(early_return, 0);
+            assert_eq!(owner.flushes.load(Ordering::Acquire), 1);
+        });
+        assert_eq!(returned.load(Ordering::Acquire), 1);
+        assert_eq!(peer.flushes.load(Ordering::Acquire), 1);
+        assert_eq!(peer.invalidations.load(Ordering::Acquire), 2);
+        assert_eq!(owner.flushed_ept.load(Ordering::Acquire), owner.cache_ept);
+        assert_eq!(peer.flushed_ept.load(Ordering::Acquire), peer.cache_ept);
+        event.cpus[1] = 0;
+        assert_eq!(unsafe { tracking_sync(&*owner, 0) }, 1);
+        assert_eq!(unsafe { tracking_sync(&*owner, 2) }, 1);
     }
 
     fn until(mut condition: impl FnMut() -> bool) -> bool {

@@ -7,8 +7,8 @@ import subprocess
 PROJECT = Path(__file__).resolve().parents[1]
 OUTPUT = PROJECT / "builds/exit-event-tests"
 OUTPUT.mkdir(parents=True, exist_ok=True)
-EXITS = (PROJECT / "src/asm/exits.S").read_text(encoding="utf-8")
-NESTED = (PROJECT / "src/asm/nested.S").read_text(encoding="utf-8")
+EXITS = (PROJECT / "src/vmx/asm/exits.S").read_text(encoding="utf-8")
+NESTED = (PROJECT / "src/vmx/asm/nested.S").read_text(encoding="utf-8")
 
 
 def section(source: str, first: str, last: str) -> str:

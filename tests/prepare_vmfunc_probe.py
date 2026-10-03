@@ -21,13 +21,13 @@ shutil.copytree(project / "src", probe / "src", dirs_exist_ok=True)
 configuration = (project / "builds/MatrixConfig.bin").read_text()
 assert "VmxTest=false" in configuration and "VtNested=true" in configuration
 (probe / "builds/MatrixConfig.bin").write_text(configuration)
-guest_rust = probe / "src/guest.rs"
+guest_rust = probe / "src/boot/guest.rs"
 source = guest_rust.read_text()
 old = "u64::from(VMX_TEST_ENABLED.load(Ordering::Acquire))"
 assert source.count(old) == 1
 guest_rust.write_text(source.replace(old, "1"))
 
-resources = probe / "src/core/vcpu.rs"
+resources = probe / "src/vmx/vcpu.rs"
 source = resources.read_text()
 old = "let nested_vmcs12_pages = ResidentPages::allocate(2, AddressConstraint::Any)"
 assert source.count(old) == 1

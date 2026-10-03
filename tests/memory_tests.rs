@@ -1,5 +1,4 @@
-#[path = "../src/access.rs"]
-pub mod access;
+use crate::memory::access;
 
 use crate::memory::{Item, packet, parse_items};
 use crate::protocol::memory::*;
@@ -324,7 +323,7 @@ fn rsds_identity_uses_symbol_server_guid_and_hexadecimal_age() {
 
 #[test]
 fn resident_memory_dispatch_contains_one_call_and_no_guest_lifecycle_transition() {
-    let assembly = include_str!("../src/asm/control.S");
+    let assembly = include_str!("../src/vmx/asm/control.S");
     let handler = assembly
         .split(".Lresident_dispatch_memory:")
         .nth(1)
@@ -515,6 +514,171 @@ struct Machine {
     ept: u64,
 }
 
+fn resident_bitmap(
+    machine: &mut Machine,
+    mut environment: access::resident::Environment,
+    buffer: u64,
+    start: u64,
+    count: usize,
+    enabled: bool,
+) -> Vec<u8> {
+    let request = crate::memory::bitmap_packet(start, count).unwrap();
+    assert!(request.len() <= 4096);
+    unsafe {
+        std::ptr::copy_nonoverlapping(request.as_ptr(), buffer as *mut u8, request.len());
+    }
+    machine.host_map_all();
+    if enabled {
+        environment.ept |= 1 << 6;
+    }
+    let mut scratch = vec![0; BUFFER_BYTES];
+    assert_eq!(
+        unsafe {
+            access::resident::memory_entry(
+                scratch.as_mut_ptr(),
+                0x1000,
+                request.len(),
+                &environment,
+            )
+        },
+        0
+    );
+    unsafe { std::slice::from_raw_parts(buffer as *const u8, request.len()) }.to_vec()
+}
+
+#[test]
+fn resident_ad_bitmap_reads_leaf_bits_and_preserves_hardware_state() {
+    let request = packet(INFO, 0, 0, &[]).unwrap();
+    let (mut machine, environment, buffer, _) = Machine::setup(&request);
+    for (address, flags) in [(0, 0x100), (4096, 0x300), (32768, 0x300)] {
+        machine.map(machine.ept, address, address, 0x37 | flags);
+    }
+    // Parent A bits do not imply that every child page was accessed.
+    unsafe {
+        (*(machine.ept as *mut u64)) |= 0x100;
+    }
+    let response = resident_bitmap(&mut machine, environment, buffer, 0, 9, true);
+    assert_eq!(word(&response, 40), 0);
+    assert_eq!(word(&response, 72), AD_ENABLED);
+    assert_eq!(&response[HEADER_BYTES..], &[3, 1, 2, 1]);
+    let response_again = resident_bitmap(&mut machine, environment, buffer, 0, 9, true);
+    assert_eq!(&response_again[HEADER_BYTES..], &[3, 1, 2, 1]);
+}
+
+#[test]
+fn resident_ad_bitmap_excludes_decoys_mmio_and_absent_pages() {
+    let request = packet(INFO, 0, 0, &[]).unwrap();
+    let (mut machine, environment, buffer, _) = Machine::setup(&request);
+    for (address, physical, flags) in [
+        (0, 4096, 0x337),
+        (4096, 4096, 0x307),
+        (8192, 8192, 0x330),
+        (12288, 12288, 0x337),
+    ] {
+        machine.map(machine.ept, address, physical, flags);
+    }
+    let response = resident_bitmap(&mut machine, environment, buffer, 0, 4, true);
+    assert_eq!(word(&response, 40), 0);
+    assert_eq!(&response[HEADER_BYTES..], &[8, 8]);
+}
+
+#[test]
+fn resident_ad_bitmap_reports_conservative_large_leaf_coverage_across_boundaries() {
+    for shift in [21, 30] {
+        let page_size = 1u64 << shift;
+        let request = packet(INFO, 0, 0, &[]).unwrap();
+        let (mut machine, environment, buffer, _) = Machine::setup(&request);
+        for (address, flags) in [(0, 0x100), (page_size, 0x200)] {
+            machine.map(machine.ept, address, address, 0x37);
+            let mut table = machine.ept;
+            for level in [39, 30, 21] {
+                let pointer = (table + ((address >> level) & 511) * 8) as *mut u64;
+                if level == shift {
+                    unsafe {
+                        pointer.write(address | 0xb7 | flags);
+                    }
+                    break;
+                }
+                table = unsafe { pointer.read() } & 0x000f_ffff_ffff_f000;
+            }
+        }
+        let response =
+            resident_bitmap(&mut machine, environment, buffer, page_size - 4096, 4, true);
+        assert_eq!(word(&response, 40), 0);
+        assert_eq!(word(&response, 72), AD_ENABLED | AD_LARGE_PAGE);
+        assert_eq!(&response[HEADER_BYTES..], &[1, 14]);
+    }
+}
+
+#[test]
+fn resident_ad_bitmap_rejects_unsupported_hardware() {
+    let request = packet(INFO, 0, 0, &[]).unwrap();
+    let (mut machine, environment, buffer, _) = Machine::setup(&request);
+    let response = resident_bitmap(&mut machine, environment, buffer, 0, 1, false);
+    assert_eq!(word(&response, 40), Error::Unsupported as u32);
+    assert_eq!(word(&response, 72), 0);
+}
+
+#[test]
+fn resident_info_ad_capability_matches_the_active_ept_pointer() {
+    for enabled in [false, true] {
+        let request = packet(INFO, 0, 0, &[]).unwrap();
+        let (_machine, mut environment, buffer, _) = Machine::setup(&request);
+        if enabled {
+            environment.ept |= 1 << 6;
+        }
+        let mut scratch = vec![0; BUFFER_BYTES];
+        assert_eq!(
+            unsafe {
+                access::resident::memory_entry(
+                    scratch.as_mut_ptr(),
+                    0x1000,
+                    request.len(),
+                    &environment,
+                )
+            },
+            0
+        );
+        let response = unsafe { std::slice::from_raw_parts(buffer as *const u8, request.len()) };
+        assert_eq!(word(response, 40), 0);
+        assert_eq!(word(response, 72), if enabled { AD_ENABLED } else { 0 });
+    }
+}
+
+#[test]
+fn ad_bitmap_validates_ranges_sizes_and_padding_before_access() {
+    assert_eq!(ad_bitmap_length(0, AD_MAX_PAGES), Ok(BUFFER_BYTES));
+    for (start, count) in [
+        (1, 1),
+        (0, 0),
+        (0, AD_MAX_PAGES + 1),
+        (u64::MAX & !4095, 1),
+        ((1 << 48) - 4096, 2),
+    ] {
+        assert!(crate::memory::bitmap_packet(start, count).is_err());
+    }
+    let mut ram = Ram::default();
+    let mut request = crate::memory::bitmap_packet(0, 9).unwrap();
+    let malformed_length = (request.len() - 1) as u32;
+    request[36..40].copy_from_slice(&malformed_length.to_le_bytes());
+    assert_eq!(
+        execute(&mut ram, &mut request, false, 48),
+        Err(Error::Format)
+    );
+    let mut request = crate::memory::bitmap_packet(0, 9).unwrap();
+    request[32..36].copy_from_slice(&17u32.to_le_bytes());
+    assert_eq!(
+        execute(&mut ram, &mut request, false, 48),
+        Err(Error::Bounds)
+    );
+    let mut request = crate::memory::bitmap_packet(1 << 36, 1).unwrap();
+    assert_eq!(
+        execute(&mut ram, &mut request, false, 36),
+        Err(Error::Bounds)
+    );
+    assert_eq!(ram.writes, 0);
+}
+
 impl Machine {
     fn allocate(&mut self) -> u64 {
         let page = Box::new(Page([0; 4096]));
@@ -586,6 +750,9 @@ impl Machine {
             syscall: 0xffff_f800_1234_0000,
             kernel_cr3: target_root,
             root_history: 0,
+            tracking_session: 0,
+            boot_context: 0,
+            synchronize: 0,
             physical_bits: 52,
         };
         unsafe {
@@ -595,6 +762,110 @@ impl Machine {
                 .write_unaligned(target_root);
         }
         (machine, environment, buffer, target)
+    }
+}
+
+struct TrackingBarrier {
+    operations: Vec<u64>,
+    root: u64,
+    target: u64,
+}
+
+unsafe extern "efiapi" fn tracking_barrier(context: u64, operation: u64) -> u64 {
+    let barrier = unsafe { &mut *(context as *mut TrackingBarrier) };
+    barrier.operations.push(operation);
+    if operation == 1 {
+        let leaf = ept_pointer(barrier.root, barrier.target, 12);
+        assert_eq!(unsafe { leaf.read() } & 0x380, 0);
+    }
+    1
+}
+
+fn ept_pointer(root: u64, address: u64, level: u32) -> *mut u64 {
+    let mut table = root;
+    for shift in [39, 30, 21, 12] {
+        let pointer = (table + ((address >> shift) & 511) * 8) as *mut u64;
+        if shift == level { return pointer; }
+        let entry = unsafe { pointer.read() };
+        assert_eq!(entry & 128, 0);
+        table = entry & 0x000f_ffff_ffff_f000;
+    }
+    panic!("invalid EPT level");
+}
+
+fn native_tracking_request(environment: &access::resident::Environment, buffers: &[u64], request: &[u8]) -> Vec<u8> {
+    for (index, bytes) in request.chunks(4096).enumerate() {
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffers[index] as *mut u8, bytes.len()); }
+    }
+    let mut scratch = vec![0; BUFFER_BYTES];
+    assert_eq!(unsafe {
+        access::resident::memory_entry(scratch.as_mut_ptr(), 0x1000, request.len(), environment)
+    }, 0);
+    let mut response = Vec::with_capacity(request.len());
+    for (index, bytes) in request.chunks(4096).enumerate() {
+        response.extend_from_slice(unsafe { std::slice::from_raw_parts(buffers[index] as *const u8, bytes.len()) });
+    }
+    response
+}
+
+#[test]
+fn resident_tracking_splits_large_ept_leaves_and_captures_exact_dirty_pages() {
+    #[repr(align(4096))]
+    struct Pool([u8; 8192]);
+    for shift in [21, 30] {
+        let request = packet(INFO, 0, 0, &[]).unwrap();
+        let (mut machine, mut environment, buffer, target) = Machine::setup(&request);
+        let second_buffer = machine.allocate();
+        machine.map(environment.caller_cr3, 0x2000, second_buffer, 7);
+        machine.map(machine.ept, second_buffer, second_buffer, 0x37);
+        let pool = Box::new(Pool([0; 8192]));
+        let pool_address = pool.0.as_ptr() as u64;
+        for address in [pool_address, pool_address + 4096] {
+            machine.map(machine.host, address, address, 3);
+        }
+        machine.host_map_all();
+        let attributes = 0x337 | (6 << 52) | (1 << 63);
+        let large = ept_pointer(machine.ept, target, shift);
+        let page_size = 1u64 << shift;
+        unsafe { large.write((target & !(page_size - 1)) | attributes | 128); }
+        let layout = std::alloc::Layout::new::<crate::memory::tracking::Session>();
+        let pointer = unsafe { std::alloc::alloc_zeroed(layout) as *mut crate::memory::tracking::Session };
+        assert!(!pointer.is_null());
+        let mut session = unsafe { Box::from_raw(pointer) };
+        session.initialize(pool_address, 2);
+        let mut barrier = TrackingBarrier { operations: Vec::new(), root: machine.ept, target };
+        environment.ept |= 1 << 6;
+        environment.tracking_session = pointer as u64;
+        environment.boot_context = &mut barrier as *mut TrackingBarrier as u64;
+        environment.synchronize = tracking_barrier as *const () as u64;
+        let mut start = crate::memory::tracking_packet(AD_START, 0, 1).unwrap();
+        start[HEADER_BYTES..HEADER_BYTES + 8].copy_from_slice(&environment.kernel_cr3.to_le_bytes());
+        let started = native_tracking_request(&environment, &[buffer], &start);
+        assert_eq!(word(&started, 40), 0);
+        assert_eq!(barrier.operations, [0, 1, 2]);
+        assert_eq!(session.pool.used, if shift == 21 { 1 } else { 2 });
+        let leaf = ept_pointer(machine.ept, target, 12);
+        assert_eq!(unsafe { leaf.read() }, target | (attributes & !0x300));
+        let neighbor = ept_pointer(machine.ept, target ^ 4096, 12);
+        assert_eq!(unsafe { neighbor.read() }, (target ^ 4096) | attributes);
+        unsafe {
+            (target as *mut u8).add(4095).write(87);
+            *leaf |= 0x300;
+        }
+        let id = quad(&started, 80);
+        let stop = crate::memory::tracking_packet(AD_STOP, id, 0).unwrap();
+        let stopped = native_tracking_request(&environment, &[buffer], &stop);
+        assert_eq!(word(&stopped, 40), 0);
+        assert_eq!(barrier.operations, [0, 1, 2, 0, 2]);
+        let fetch = crate::memory::tracking_packet(AD_FETCH, id, 1).unwrap();
+        let fetched = native_tracking_request(&environment, &[buffer, second_buffer], &fetch);
+        assert_eq!(word(&fetched, 40), 0);
+        let record = &fetched[HEADER_BYTES..];
+        assert_eq!(quad(record, 16), target);
+        assert_eq!(word(record, 48), TRACK_ACCESSED | TRACK_DIRTY | TRACK_DUMP_VALID | TRACK_HASH_CHANGED);
+        assert_eq!(record[120], 101);
+        assert_eq!(record[TRACK_RECORD_BYTES - 1], 87);
+        crate::memory::verify_dump(record).unwrap();
     }
 }
 

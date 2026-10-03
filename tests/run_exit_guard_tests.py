@@ -6,7 +6,7 @@ import subprocess
 project = Path(__file__).resolve().parents[1]
 output = project / "builds/exit-guard-tests"
 output.mkdir(parents=True, exist_ok=True)
-source = (project / "src/asm/exits.S").read_text()
+source = (project / "src/vmx/asm/exits.S").read_text()
 diagnostics = (project / "src/asm/diagnostics.S").read_text()
 
 def macro_body(text, name):

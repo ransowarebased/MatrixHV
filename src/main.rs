@@ -3,43 +3,35 @@
 
 extern crate alloc;
 
-mod access;
 mod arch;
 mod boot;
-mod config;
 mod diagnostics;
-mod firmware;
-mod guest;
-#[path = "core/mod.rs"]
-mod hv_core;
-mod hyperv;
+mod logging;
 mod memory;
-mod nested;
 mod protocol;
-mod runtime;
-mod smp;
 pub mod update;
+mod vmx;
 
 use uefi::{Status, entry};
 
 #[entry]
 fn main() -> Status {
-    crate::runtime::set_enabled(true);
+    crate::logging::set_enabled(true);
     crate::diagnostics::begin();
-    crate::runtime::phase("logger.detect_com1");
-    crate::runtime::initialize();
-    crate::runtime::phase("boot.entry");
-    let active_config = match crate::firmware::load_from_boot_volume() {
+    crate::logging::phase("logger.detect_com1");
+    crate::logging::initialize();
+    crate::logging::phase("boot.entry");
+    let active_config = match crate::boot::firmware::load_from_boot_volume() {
         Ok(config) => config,
         Err(error) => {
-            crate::runtime::error(format_args!("failed to load \\MatrixConfig.bin: {error:?}"));
+            crate::logging::error(format_args!("failed to load \\MatrixConfig.bin: {error:?}"));
             crate::diagnostics::hold_on_failure();
             return Status::ABORTED;
         }
     };
-    crate::guest::configure(active_config);
-    crate::runtime::set_enabled(active_config.logger);
-    crate::runtime::info(format_args!(
+    crate::boot::guest::configure(active_config);
+    crate::logging::set_enabled(active_config.logger);
+    crate::logging::info(format_args!(
         "config cpuidpresence={} logger={} vt_nested={} vt_evmcs={} vmx_test={}",
         active_config.cpuid_presence,
         active_config.logger,
@@ -47,13 +39,13 @@ fn main() -> Status {
         active_config.vt_evmcs,
         active_config.vmx_test
     ));
-    crate::runtime::info(format_args!(
+    crate::logging::info(format_args!(
         "logger backend={:?}",
-        crate::runtime::backend()
+        crate::logging::backend()
     ));
 
     if uefi::helpers::init().is_err() {
-        crate::runtime::error(format_args!("UEFI helper initialization failed"));
+        crate::logging::error(format_args!("UEFI helper initialization failed"));
         crate::diagnostics::hold_on_failure();
         return Status::ABORTED;
     }
@@ -61,7 +53,7 @@ fn main() -> Status {
     match boot::run(active_config) {
         Ok(()) => Status::SUCCESS,
         Err(status) => {
-            crate::runtime::error_status("boot.run", status);
+            crate::logging::error_status("boot.run", status);
             crate::diagnostics::hold_on_failure();
             status
         }

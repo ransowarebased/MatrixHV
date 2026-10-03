@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 include!("../builds/smp-tests/definitions.rs");
 core::arch::global_asm!(include_str!("../builds/smp-tests/ap-launch.S"));
 
-mod runtime {
+mod logging {
     pub fn error(_message: core::fmt::Arguments<'_>) {}
 }
 

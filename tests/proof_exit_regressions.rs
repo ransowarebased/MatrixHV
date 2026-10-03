@@ -38,18 +38,17 @@ mod arch {
     }
 }
 
-mod runtime {
+mod logging {
     pub fn phase(_phase: &str) {}
     pub fn info(_message: core::fmt::Arguments<'_>) {}
     pub fn error(_message: core::fmt::Arguments<'_>) {}
 }
 
-mod nested {
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub struct NestedVmxState;
-}
-
-mod hv_core {
+mod vmx {
+    pub mod nested {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct NestedVmxState;
+    }
     pub mod vmcs {
         use std::cell::RefCell;
         use std::collections::BTreeMap;
@@ -68,12 +67,28 @@ mod hv_core {
         }
 
         fields!(
-            EXIT_QUALIFICATION, GUEST_CR0, GUEST_CR3, GUEST_CR4, GUEST_CS_AR_BYTES,
-            GUEST_FS_BASE, GUEST_GS_BASE, GUEST_IA32_DEBUGCTL, GUEST_IA32_EFER,
-            GUEST_IA32_PAT, GUEST_INTERRUPTIBILITY_INFO, GUEST_PENDING_DBG_EXCEPTIONS,
-            GUEST_RFLAGS, GUEST_RIP, GUEST_SS_AR_BYTES, GUEST_SYSENTER_CS,
-            GUEST_SYSENTER_EIP, GUEST_SYSENTER_ESP, VM_ENTRY_EXCEPTION_ERROR_CODE,
-            VM_ENTRY_INTR_INFO_FIELD, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_REASON,
+            EXIT_QUALIFICATION,
+            GUEST_CR0,
+            GUEST_CR3,
+            GUEST_CR4,
+            GUEST_CS_AR_BYTES,
+            GUEST_FS_BASE,
+            GUEST_GS_BASE,
+            GUEST_IA32_DEBUGCTL,
+            GUEST_IA32_EFER,
+            GUEST_IA32_PAT,
+            GUEST_INTERRUPTIBILITY_INFO,
+            GUEST_PENDING_DBG_EXCEPTIONS,
+            GUEST_RFLAGS,
+            GUEST_RIP,
+            GUEST_SS_AR_BYTES,
+            GUEST_SYSENTER_CS,
+            GUEST_SYSENTER_EIP,
+            GUEST_SYSENTER_ESP,
+            VM_ENTRY_EXCEPTION_ERROR_CODE,
+            VM_ENTRY_INTR_INFO_FIELD,
+            VM_EXIT_INSTRUCTION_LEN,
+            VM_EXIT_REASON,
         );
 
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,12 +132,12 @@ mod hv_core {
     }
 
     pub mod exits {
-        include!("../src/core/exits.rs");
+        include!("../src/vmx/exits.rs");
 
         #[cfg(test)]
         mod regression {
             use super::*;
-            use crate::hv_core::vmcs;
+            use crate::vmx::vmcs;
 
             #[test]
             fn probe_contract_reports_known_exit_reasons() {
@@ -139,7 +154,10 @@ mod hv_core {
                 ];
                 assert_eq!(reason_codes, [18, 10, 31, 32, 55, 48, 49, 52, 34]);
                 assert_eq!(VmRunContext::for_boot_target().exit_limit, 65536);
-                assert_eq!(failure_name(DISPATCH_FAILURE_EXIT_LIMIT), "exit_limit_exceeded");
+                assert_eq!(
+                    failure_name(DISPATCH_FAILURE_EXIT_LIMIT),
+                    "exit_limit_exceeded"
+                );
                 assert!(core::mem::size_of::<ResidentBootReport>() > 0);
             }
 

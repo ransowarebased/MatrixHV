@@ -9,15 +9,16 @@ import textwrap
 
 
 def read_resident_rust(project: Path) -> str:
-    return (project / "src/protocol.rs").read_text(encoding="utf-8") + "\n" + "\n".join((project / "src/core" / name).read_text(encoding="utf-8")
-                     for name in ("resident/mod.rs", "resident/abi.rs", "resident/boot.rs", "state.rs", "msr.rs", "nested.rs", "bridge.rs", "entry.rs", "exits.rs"))
+    return (project / "src/protocol.rs").read_text(encoding="utf-8") + "\n" + "\n".join((project / "src/vmx" / name).read_text(encoding="utf-8")
+                     for name in ("resident/mod.rs", "resident/abi.rs", "resident/boot.rs", "state.rs", "msr.rs", "nested.rs", "vmcs12.rs", "bridge.rs", "entry.rs", "exits.rs"))
 
 
 def read_resident_assembly(project: Path) -> str:
-    assembly = project / "src" / "asm"
+    assembly = project / "src/vmx/asm"
     island = (assembly / "island.S").read_text(encoding="utf-8")
     macros = "\n".join(
-        (assembly / name).read_text(encoding="utf-8")
+        (project / "src/asm" / name if name in ("diagnostics.S", "ap_startup.S")
+         else assembly / name).read_text(encoding="utf-8")
         for name in ("nested.S", "hyperv.S", "exits.S", "msr.S", "control.S", "diagnostics.S", "ept_cache.S", "eptp_switch.S", "ap_startup.S")
     )
     lines = macros.splitlines(keepends=True)
@@ -77,7 +78,7 @@ def read_resident_assembly(project: Path) -> str:
                     expected = "one" if name.startswith("matrixhv_") else "at least one"
                     raise ValueError(f"Expected {expected} resident expansion for {name}, found {count}")
             result = "\n".join(helpers) + island
-            hyperv = (project / "src/hyperv.rs").read_text(encoding="utf-8")
+            hyperv = (project / "src/vmx/hyperv.rs").read_text(encoding="utf-8")
             values = {name: int(value.replace("_", ""), 0) for name, value in re.findall(
                 r"pub const (HYPERV\w*): u32 = (0x[0-9a-fA-F_]+|[0-9_]+);", hyperv)}
             aliases = {"vendor_leaf": "HYPERVISOR_LEAF_START", "msr_base": "HYPERV_GUEST_OS_ID_MSR"}
@@ -89,7 +90,7 @@ def read_resident_assembly(project: Path) -> str:
 def prepare_boot_order(project: Path):
     output = project / "builds/boot-order-tests"
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src" / "firmware.rs").read_text(encoding="utf-8")
+    source = (project / "src/boot/firmware.rs").read_text(encoding="utf-8")
     start = source.index("mod boot_order {")
     end = source.index("\npub(crate) mod memory_map {", start)
     parser = source[start:end]
@@ -104,7 +105,7 @@ def prepare_boot_order(project: Path):
 def prepare_ept_cache(project: Path):
     output = project / "builds" / "ept-cache-tests"
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src/core/ept.rs").read_text(encoding="utf-8")
+    source = (project / "src/vmx/ept.rs").read_text(encoding="utf-8")
     def item(declaration):
         start = source.index(declaration)
         opening = source.index("{", start)
@@ -122,7 +123,7 @@ def prepare_ept_cache(project: Path):
     policy += "\n" + "\n".join(re.findall(
         r"const (?:EPT_GUEST_PHYSICAL_LIMIT|EPT_MINIMUM_MAPPED_END|EPT_2MB_PAGE_SIZE|EPT_1GB_PAGE_SIZE|EPT_512GB_PAGE_SIZE):[^;]+;", source
     ))
-    assembly = (project / "src/asm/ept_cache.S").read_text(encoding="utf-8")
+    assembly = (project / "src/vmx/asm/ept_cache.S").read_text(encoding="utf-8")
     transaction = assembly[assembly.index(".Lresident_update_dirty_mtrrs:"):assembly.index(".Lresident_rebuild_ept_cache:")]
     transaction = transaction.replace("{guest_cr0}", "0").replace("{cr0_read_shadow}", "1")
     transaction = transaction.replace("{b_mtrr_dirty}", "0")
@@ -197,7 +198,7 @@ def prepare_ept_cache(project: Path):
 def prepare_eptp_sync(project: Path):
     output = project / "builds" / "eptp-sync-tests"
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src/asm/eptp_switch.S").read_text()
+    source = (project / "src/vmx/asm/eptp_switch.S").read_text()
     start = source.index(".Lresident_nested_eptp_sync_acquire:")
     end = source.index(".endm", start)
     assembly = source[start:end]
@@ -207,6 +208,7 @@ def prepare_eptp_sync(project: Path):
     assert assembly.count("invept rax, xmmword ptr [rsp]") == 1
     assembly = assembly.replace(
         "invept rax, xmmword ptr [rsp]",
+        "mov qword ptr [r12 + {test_flushed_ept}], r11\n"
         "inc qword ptr [r12 + {test_flushes}]\nmov eax, 1\ntest eax, eax",
     )
     assert assembly.count("vmread r11, rax") == 1
@@ -217,13 +219,18 @@ def prepare_eptp_sync(project: Path):
     )
     assembly = assembly.replace(".balign 8\n.Lresident_eptp_sync_owner:",
                                 ".data\n.balign 8\n.Lresident_eptp_sync_owner:")
+    control = (project / "src/vmx/asm/control.S").read_text()
+    callback_start = control.index(".Lresident_memory_synchronize:")
+    callback_end = control.index(".Lresident_dispatch_update_l2_reject:", callback_start)
+    assembly += "\n.text\n.globl tracking_sync\ntracking_sync:\n"
+    assembly += control[callback_start:callback_end]
     (output / "eptp-sync.S").write_text(assembly + "\n.text\n")
 
 
 def prepare_logger(project: Path):
     output = project / "builds" / "logger-tests"
     output.mkdir(parents=True, exist_ok=True)
-    runtime = (project / "src/runtime.rs").read_text(encoding="utf-8")
+    runtime = (project / "src/logging.rs").read_text(encoding="utf-8")
     screen = (project / "src/diagnostics.rs").read_text(encoding="utf-8")
     def item(source, declaration):
         start = source.index(declaration)
@@ -257,7 +264,7 @@ def prepare_evmcs(project: Path):
     output = project / "builds" / "evmcs-tests"
     output.mkdir(parents=True, exist_ok=True)
     source = read_resident_assembly(project)
-    nested_rust = (project / 'src/nested.rs').read_text(encoding='utf-8')
+    nested_rust = (project / 'src/vmx/nested.rs').read_text(encoding='utf-8')
     width_start = nested_rust.index('        let physical_address_bits =')
     width_end = nested_rust.index('        Self {', width_start)
     width = nested_rust[width_start:width_end].replace('__cpuid', 'cpuid')
@@ -618,7 +625,7 @@ def prepare_native_shadow(project: Path):
         return source[begin:source.index(end, begin)]
     assembly = block(".Lresident_nested_translate_current_vmcs:", ".Lresident_dispatch_vmread:")
     assembly += block(".Lresident_nested_validate_entry:", ".Lresident_vmcs12_field_index:")
-    switch_source = (project / "src/asm/eptp_switch.S").read_text()
+    switch_source = (project / "src/vmx/asm/eptp_switch.S").read_text()
     start = switch_source.index(".Lresident_nested_validate_vm_functions:")
     assembly += switch_source[start:switch_source.index(".Lresident_nested_prepare_ept02:", start)]
     assembly += "\n.Lresident_nested_vmfunc_failed:\nxor eax, eax\nret\n"
@@ -802,7 +809,7 @@ def prepare_nested_ept(project: Path):
     output = project / "builds" / "nested-ept-tests"
     output.mkdir(parents=True, exist_ok=True)
     source = read_resident_assembly(project)
-    switch_source = (project / "src/asm/eptp_switch.S").read_text()
+    switch_source = (project / "src/vmx/asm/eptp_switch.S").read_text()
     exit_msr_start = source.index('.Lresident_nested_capture_vmcs02_guest_state:')
     exit_msr_end = source.index('lea rsi, [rip + .Lresident_nested_guest_state_table]', exit_msr_start)
     exit_msr_assembly = source[exit_msr_start:exit_msr_end].replace(
@@ -1562,7 +1569,7 @@ def prepare_nested_logging(project: Path):
 def prepare_pci_bar(project: Path):
     output = project / "builds/pci-bar-tests"
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src" / "firmware.rs").read_text(encoding="utf-8")
+    source = (project / "src/boot/firmware.rs").read_text(encoding="utf-8")
     start = source.index("fn read_pci_bar_range(")
     opening = source.index("{", start)
     depth, end = 1, opening + 1
@@ -1923,7 +1930,7 @@ def prepare_resident_control(project: Path):
 def prepare_hyperv_time(project: Path):
     output = project / 'builds/hyperv-time-tests'
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / 'src/hyperv.rs').read_text(encoding='utf-8')
+    source = (project / 'src/vmx/hyperv.rs').read_text(encoding='utf-8')
     scale = source[source.index('pub fn hyperv_reference_tsc_scale('):source.index('pub fn native_hyperv_reference_tsc(')]
     native = source[source.index('pub fn native_hyperv_reference_tsc('):source.index('pub fn restrict_evmcs_secondary_capability(')]
     native = native.replace('pub fn native_hyperv_reference_tsc(calibrate: impl FnOnce() -> u64)',
@@ -1934,7 +1941,7 @@ def prepare_hyperv_time(project: Path):
     native = native.replace('native_hyperv_invariant_tsc()', 'native_hyperv_invariant_tsc(&cpuid)')
     native = native.replace('    let epoch = unsafe { core::arch::x86_64::_rdtsc() };\n', '')
     scale += '\n' + re.search(r'pub const CPUID_HYPERVISOR_PRESENT_BIT: u32 = [^;]+;', source)[0] + '\n' + native
-    firmware = (project / 'src/firmware.rs').read_text(encoding='utf-8')
+    firmware = (project / 'src/boot/firmware.rs').read_text(encoding='utf-8')
     scale += '\n' + firmware[firmware.index('unsafe fn acpi_pm_timer('):]
     (output / 'definitions.rs').write_text(scale, encoding='utf-8')
     source = read_resident_assembly(project)
@@ -2155,7 +2162,7 @@ def prepare_resident_msr(project: Path):
     output.mkdir(parents=True, exist_ok=True)
     source = read_resident_rust(project)
     assembly_source = read_resident_assembly(project)
-    cr_source = (project / 'src/asm/exits.S').read_text(encoding='utf-8')
+    cr_source = (project / 'src/vmx/asm/exits.S').read_text(encoding='utf-8')
     cr_start = cr_source.index('.Lresident_ap_cr_access:')
     cr_end = cr_source.index('.endm', cr_start)
     cr_access = cr_source[cr_start:cr_end].strip()
@@ -2569,7 +2576,7 @@ def prepare_resident_msr(project: Path):
 def prepare_resident_pages(project: Path):
     output = project / "builds" / "resident-pages-tests"
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src/memory.rs").read_text(encoding="utf-8")
+    source = (project / "src/memory/host.rs").read_text(encoding="utf-8")
     def item(declaration):
         start = source.index(declaration)
         opening = source.index("{", start)
@@ -2584,7 +2591,8 @@ def prepare_resident_pages(project: Path):
         "impl ResidentPages",
         "impl Drop for ResidentPages",
     ])
-    definitions = definitions.replace("crate::hv_core::", "hv_core::")
+    definitions = definitions.replace("crate::vmx::", "vmx::")
+    definitions = definitions.replace("crate::boot::firmware::", "crate::firmware::")
     (output / "definitions.rs").write_text(definitions, encoding="utf-8")
 
 
@@ -3045,7 +3053,8 @@ def prepare_resident_visual(project: Path):
 
 def prepare_boot_state(project: Path):
     resident = read_resident_rust(project)
-    nested = (project / "src/nested.rs").read_text()
+    nested = (project / "src/vmx/nested.rs").read_text() + "\n" + (
+        project / "src/vmx/vmcs12.rs").read_text()
     collector = ast.parse((project / "tests/collect_boot_state.py").read_text())
     functions = [node for node in collector.body if isinstance(node, ast.FunctionDef)
                  and node.name in ("structure", "append_u64_fields")]
@@ -3057,10 +3066,9 @@ def prepare_boot_state(project: Path):
     output.mkdir(parents=True, exist_ok=True)
     harness = "use std::mem::{offset_of, size_of};\n"
     harness += 'pub mod protocol { include!("../../src/protocol.rs"); }\n'
-    harness += 'pub mod nested { include!("../../src/nested.rs"); }\n'
-    harness += 'pub mod memory { pub const PAGE_SIZE: usize = 4096; }\n'
-    harness += 'pub mod hv_core { pub mod bridge { include!("../../src/core/bridge.rs"); } }\n'
-    harness += 'pub mod abi { include!("../../src/core/resident/abi.rs"); }\n'
+    harness += 'pub mod memory { pub mod host { pub const PAGE_SIZE: usize = 4096; } }\n'
+    harness += 'pub mod vmx { pub mod bridge { include!("../../src/vmx/bridge.rs"); } pub mod nested { include!("../../src/vmx/nested.rs"); } pub mod vmcs12 { include!("../../src/vmx/vmcs12.rs"); } }\n'
+    harness += 'pub mod abi { include!("../../src/vmx/resident/abi.rs"); }\n'
     harness += "use abi::ResidentBootContext;\n"
     harness += "fn main() {\n"
     for name, format_code in namespace["formats"].items():
@@ -3090,10 +3098,10 @@ def prepare_boot_state(project: Path):
 def prepare_smp(project: Path):
     output = project / "builds/smp-tests"
     output.mkdir(parents=True, exist_ok=True)
-    source = (project / "src/smp.rs").read_text(encoding="utf-8")
+    source = (project / "src/boot/smp.rs").read_text(encoding="utf-8")
     opening = source[source.index("fn open_mp_services("):source.index("pub(crate) fn enumerate(")]
     batch = source[source.index("struct ApBatchEntry {"):]
-    vcpu = (project / "src/core/vcpu.rs").read_text(encoding="utf-8")
+    vcpu = (project / "src/vmx/vcpu.rs").read_text(encoding="utf-8")
     start = vcpu.rindex("#[unsafe(no_mangle)]", 0, vcpu.index("unsafe extern \"efiapi\" fn matrixhv_ap_prepare("))
     end = vcpu.index("#[unsafe(no_mangle)]", vcpu.index("pub(crate) fn matrixhv_ap_launch_asm(", start))
     definitions = """use core::ffi::c_void;
@@ -3103,7 +3111,7 @@ use uefi::{Status, boot};
 use uefi::proto::pi::mp::MpServices;
 """ + opening + batch + vcpu[start:end]
     (output / "definitions.rs").write_text(definitions, encoding="utf-8")
-    assembly = (project / "src/asm/ap_launch.S").read_text(encoding="utf-8")
+    assembly = (project / "src/vmx/asm/ap_launch.S").read_text(encoding="utf-8")
     # Execute the production save/prepare/restore paths with only privileged
     # instructions and the resident guest probe replaced by host equivalents.
     assembly = assembly.replace("    cli\n", "    nop\n")
