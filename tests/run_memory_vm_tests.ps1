@@ -2,27 +2,39 @@
 param(
     [Parameter(Mandatory = $true)][string]$Remote,
     [Parameter(Mandatory = $true)][string]$NeoPath,
-    [Parameter(Mandatory = $true)][string]$OutputDirectory
+    [Parameter(Mandatory = $true)][string]$OutputDirectory,
+    [string]$GuestNeoPath = 'C:\Users\Matrix\AppData\Local\MatrixHV\neo.exe'
 )
 
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-$guestNeo = 'C:\Users\Matrix\AppData\Local\MatrixHV\neo.exe'
+$guestNeo = $GuestNeoPath
 $guestDirectory = 'C:\MatrixHVMemoryTests'
 $logPath = Join-Path $OutputDirectory 'neo-memory.log'
+
+function Write-CommandRecord([string]$record) {
+    $stream = [IO.File]::Open($logPath, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($record + "`n")
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally { $stream.Dispose() }
+}
 
 function Invoke-GuestScript([string]$scriptText) {
     $scriptText = "$" + "ProgressPreference = 'SilentlyContinue'; " + $scriptText
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptText))
+    Write-CommandRecord ("BEGIN powershell.exe -NoProfile -EncodedCommand " + $encodedCommand)
     $commandOutput = & $NeoPath --remote $Remote --timeout 30 exec powershell.exe -NoProfile -EncodedCommand $encodedCommand
     if ($LASTEXITCODE -ne 0) { throw "Guest script failed: $commandOutput" }
     return $commandOutput
 }
 
 function Invoke-Memory([string[]]$memoryArguments, [int]$expectedExit = 0) {
+    Write-CommandRecord ("BEGIN " + $guestNeo + ' ' + ($memoryArguments -join ' '))
     $commandOutput = & $NeoPath --remote $Remote --timeout 45 exec $guestNeo @memoryArguments
     $commandExit = $LASTEXITCODE
-    Add-Content -LiteralPath $logPath -Value (($memoryArguments -join ' ') + "`n" + ($commandOutput -join "`n"))
+    Write-CommandRecord (("END exit=" + $commandExit) + "`n" + ($commandOutput -join "`n"))
     Write-Output $commandOutput
     if ($commandExit -ne $expectedExit) { throw "Memory command exit $commandExit, expected $expectedExit" }
 }

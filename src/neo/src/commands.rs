@@ -40,6 +40,9 @@ struct RemoteStatus {
 }
 
 pub fn run(arguments: Vec<String>) -> Result<i32, String> {
+    if matches!(arguments.first().map(String::as_str), Some("hook" | "debug-registers")) {
+        return crate::memory::run_interception(&arguments);
+    }
     if arguments.first().map(String::as_str) == Some("ad-bitmap") {
         return crate::memory::run_bitmap(&arguments);
     }
@@ -449,6 +452,7 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
     let mut interval_ms = None;
     let mut output = None;
     let mut selected_cpu = None;
+    let mut benchmark = false;
     let mut positional = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
@@ -499,6 +503,12 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
                     })?));
             }
             "--update" => update = true,
+            "--benchmark" => {
+                if benchmark {
+                    return Err("--benchmark may be specified only once".to_string());
+                }
+                benchmark = true;
+            }
             "--binary" => {
                 index += 1;
                 binary = Some(PathBuf::from(
@@ -579,7 +589,8 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
     if apply_update.is_some() && !positional.is_empty() {
         return Err("--apply-update cannot be combined with another command".to_string());
     }
-    let telemetry_options_given = seconds.is_some() || interval_ms.is_some() || output.is_some();
+    let telemetry_options_given =
+        seconds.is_some() || interval_ms.is_some() || output.is_some() || benchmark;
     let action = if let Some(target) = apply_update {
         Action::ApplyUpdate(target)
     } else if update {
@@ -639,6 +650,7 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
             }
             Some("telemetry") if positional.len() <= 2 => {
                 let mode = match positional.get(1).map(String::as_str) {
+                    None if benchmark => telemetry::Mode::Benchmark,
                     None => telemetry::Mode::General,
                     Some("watchdog") => telemetry::Mode::Watchdog,
                     Some("eptdiag") => telemetry::Mode::EptDiagnostics,
@@ -662,6 +674,11 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
             None => Action::Serve,
         }
     };
+    if benchmark
+        && !matches!(&action, Action::Telemetry(options) if options.mode == telemetry::Mode::Benchmark)
+    {
+        return Err("--benchmark requires telemetry without another mode or control".to_string());
+    }
     if !matches!(
         &action,
         Action::Telemetry(_) | Action::TelemetryControlTrace(_)
@@ -710,6 +727,10 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
 }
 
 fn print_usage() {
+    println!(
+        "neo telemetry --benchmark [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nBenchmark measures CPUID leaf 0 from guest to guest, including VM exit, handling and reentry.\nIt pins each available registered CPU and reports raw/calibrated TSC ticks, nanoseconds and min/mean/p50/p95/p99/max.\nCollection settings stay unchanged; compare telemetry disabled/enabled in separate runs.\nAn invariant TSC and clock diagnostics are required; release profiles using TSC compensation first.\nWith --remote, the benchmark runs on the remote server.\n"
+    );
+    println!("neo hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo hook add TOKEN ADDRESS HEX [...] | hook remove TOKEN [ID] | hook list TOKEN\nneo hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN\nneo hook renew TOKEN [--lease-ms MS] | hook watch TOKEN [--lease-ms MS] | hook release TOKEN | hook status\nneo debug-registers set CR3 ADDRESS REDIRECT_RIP [...] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo debug-registers clear TOKEN | debug-registers status\nVMFUNC uses EAX=0 and ECX=0 (execute) or 1 (original data) from unhooked code.\nOne profile admits the primary CR3 and validated aliases. Conflicting original writes revoke the profile.\nThe default lease is 30 seconds; watch renews it until the process exits. --no-lease requires explicit release and does not need a VMX preemption timer.\nTSC compensation is CPU-local and requires an invariant TSC without Hyper-V Reference TSC or scaling. Guest CPU migration can expose clock skew.\n");
     if cfg!(target_os = "windows") {
         println!(
             "Launching neo without a command opens the Matrix interactive shell.\nUse install to register automatic startup at Windows sign-in.\n"

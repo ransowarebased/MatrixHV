@@ -17,11 +17,11 @@ pub const BOOT_CONTEXT_CANARY_START: u64 = 0x4856_424f_4f54_4331;
 pub const FLIGHT_RECORDER_CAPACITY: usize = 2048;
 pub const FLIGHT_RECORDER_RECORD_BYTES: usize = 80;
 pub const FLIGHT_RECORDER_WORD_COUNT: usize = 20480;
-use crate::vmx::bridge::ControlCpuState;
 use crate::memory::host::PAGE_SIZE;
-use crate::vmx::nested::{NestedVmxState};
-use crate::vmx::vmcs12::{NestedVmcs12State};
 use crate::protocol::ControlProbeSnapshot;
+use crate::vmx::bridge::ControlCpuState;
+use crate::vmx::nested::NestedVmxState;
+use crate::vmx::vmcs12::NestedVmcs12State;
 use core::mem::size_of;
 use core::sync::atomic::AtomicU64;
 
@@ -94,10 +94,61 @@ pub struct ResidentEventContext {
     pub memory_root_sequence: AtomicU64,
     pub memory_root_history: [AtomicU64; crate::protocol::memory::ROOT_HISTORY_COUNT],
     pub tracking_context_physical: u64,
+    pub interception_context_physical: u64,
+    pub interception_entry_physical: u64,
 }
 
 #[repr(C, align(16))]
 pub struct RootFxState(pub [u8; 512]);
+
+#[repr(C)]
+#[derive(Default)]
+pub struct InterceptionCpuState {
+    pub controls_saved: u64,
+    pub primary_bits: u64,
+    pub exception_bit: u64,
+    pub debug_armed: u64,
+    pub guest_debug: [u64; 6],
+    pub applied_ept: u64,
+    pub debug_targets: [[u64; 2]; 4],
+    pub debug_count: usize,
+    pub debug_token: u64,
+    pub debug_generation: u64,
+    pub exit_ept: u64,
+    pub hook_pages: [u64; crate::protocol::memory::HOOK_MAX_PAGES],
+    pub hook_count: usize,
+    pub hook_token: u64,
+    pub step_active: u64,
+    pub step_cr3: u64,
+    pub exit_step: u64,
+    pub vmfunc_armed: u64,
+    pub vmfunc_saved: u64,
+    pub vmfunc_secondary: u64,
+    pub vmfunc_control: u64,
+    pub vmfunc_list: u64,
+    pub cooperative_data: u64,
+    pub cooperative_cr3: u64,
+    pub exit_vmfunc: u64,
+    pub cr3_target_count: u64,
+    pub timer_saved: u64,
+    pub timer_pin: u64,
+    pub timer_value: u64,
+    pub timer_armed: u64,
+    pub exit_timer: u64,
+    pub data_address: u64,
+    pub data_linear: u64,
+    pub data_qualification: u64,
+    pub hook_generation: u64,
+    pub timing_saved: u64,
+    pub timing_offset: u64,
+    pub timing_start: u64,
+    pub data_pending: u64,
+    pub data_rip: u64,
+    pub refresh_owned: u64,
+    pub split_flush_epoch: AtomicU64,
+    pub runtime_diagnostics: [u64; crate::protocol::memory::INTERCEPT_DIAGNOSTIC_WORDS],
+    pub sync_diagnostics: [u64; crate::protocol::memory::EPT_SYNC_DIAGNOSTIC_WORDS],
+}
 
 #[repr(C, align(16))]
 pub struct ResidentBootContext {
@@ -199,6 +250,7 @@ pub struct ResidentBootContext {
     pub root_vmx_active: u64,
     pub cpuid_leaf0: [u32; 4],
     pub memory_scratch: [u8; crate::protocol::memory::BUFFER_BYTES],
+    pub interception: InterceptionCpuState,
 }
 
 pub const RESIDENT_BOOT_CONTEXT_PAGES: usize = size_of::<ResidentBootContext>().div_ceil(PAGE_SIZE);
@@ -345,6 +397,7 @@ impl ResidentBootContext {
             root_fx_state: RootFxState([0; 512]),
             root_vmx_active: 0,
             memory_scratch: [0; crate::protocol::memory::BUFFER_BYTES],
+            interception: InterceptionCpuState::default(),
             cpuid_leaf0: [
                 cpuid_leaf0.eax,
                 cpuid_leaf0.ebx,

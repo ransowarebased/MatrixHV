@@ -98,6 +98,8 @@ cmp ecx, 52
 je .Lresident_dispatch_cpuid_native_layout
 cmp ecx, 53
 je .Lresident_dispatch_cpuid_control_failure
+cmp ecx, {exit_timing_subleaf}
+je .Lresident_dispatch_cpuid_exit_clock
 cmp ecx, 0x4000
 jae .Lresident_dispatch_cpuid_native_snapshot
 cmp ecx, 0x100
@@ -114,6 +116,17 @@ cmp ecx, 0x202
 je .Lresident_dispatch_cpuid_telemetry_enable
 cmp ecx, 0x203
 je .Lresident_dispatch_cpuid_telemetry_disable
+cmp ecx, {ept_diagnostic_subleaf}
+jb .Lresident_dispatch_cpuid_diagnostic_exit_counts
+cmp ecx, {ept_diagnostic_subleaf} + {ept_runtime_diagnostic_pairs}
+jb .Lresident_dispatch_cpuid_ept_runtime_diagnostics
+cmp ecx, {ept_diagnostic_subleaf} + {ept_runtime_diagnostic_pairs} + {ept_sync_diagnostic_pairs}
+jb .Lresident_dispatch_cpuid_ept_sync_diagnostics
+cmp ecx, {ept_stall_diagnostic_subleaf}
+jb .Lresident_dispatch_cpuid_diagnostic_exit_counts
+cmp ecx, {ept_stall_diagnostic_subleaf} + 4
+jb .Lresident_dispatch_cpuid_ept_stall_diagnostics
+.Lresident_dispatch_cpuid_diagnostic_exit_counts:
 cmp ecx, 0x300
 jb .Lresident_dispatch_cpuid_diagnostic_zero
 cmp ecx, 0x340
@@ -128,6 +141,25 @@ shr rdx, 32
 mov rbx, rax
 shr rbx, 32
 jmp .Lresident_dispatch_cpuid_diagnostic_store
+.Lresident_dispatch_cpuid_ept_sync_diagnostics:
+sub ecx, {ept_diagnostic_subleaf} + {ept_runtime_diagnostic_pairs}
+lea r10, [r8 + {b_interception_sync_diagnostics}]
+jmp .Lresident_dispatch_cpuid_ept_diagnostic_pair
+.Lresident_dispatch_cpuid_ept_stall_diagnostics:
+sub ecx, {ept_stall_diagnostic_subleaf}
+mov r10, qword ptr [r8 + {b_processor_number}]
+shl r10, 6
+lea r9, [rip + .Lresident_interception_stall_records]
+add r10, r9
+jmp .Lresident_dispatch_cpuid_ept_diagnostic_pair
+.Lresident_dispatch_cpuid_ept_runtime_diagnostics:
+sub ecx, {ept_diagnostic_subleaf}
+lea r10, [r8 + {b_interception_runtime_diagnostics}]
+.Lresident_dispatch_cpuid_ept_diagnostic_pair:
+shl ecx, 4
+mov rax, qword ptr [r10 + rcx]
+mov rdx, qword ptr [r10 + rcx + 8]
+jmp .Lresident_dispatch_cpuid_vmx_pair
 .Lresident_dispatch_cpuid_diagnostic_pair:
 sub ecx, 4
 lea r9, [rip + .Lresident_diagnostic_pair_offsets]
@@ -168,6 +200,10 @@ shr rbx, 32
 mov rcx, rdx
 shr rdx, 32
 jmp .Lresident_dispatch_cpuid_diagnostic_store
+.Lresident_dispatch_cpuid_exit_clock:
+mov rax, qword ptr [r8 + {b_interception_timing_saved}]
+mov rdx, qword ptr [r8 + {b_watchdog_tsc_hz}]
+jmp .Lresident_dispatch_cpuid_vmx_pair
 .Lresident_dispatch_cpuid_control_stage:
 mov r10d, dword ptr [r8 + {b_processor_number}]
 imul r10, {control_cpu_state_size}
@@ -282,7 +318,7 @@ mov rbx, rax
 shr rbx, 32
 jmp .Lresident_dispatch_cpuid_diagnostic_store
 .Lresident_dispatch_cpuid_capabilities:
-mov eax, 0xffff
+mov eax, {ept_diagnostic_capabilities}
 mov ebx, dword ptr [r8 + {b_processor_number}]
 mov rcx, qword ptr [r8 + {b_watchdog_deadline}]
 test rcx, rcx
@@ -293,7 +329,7 @@ or rax, rdx
 cmp rax, rcx
 setb cl
 movzx ecx, cl
-mov eax, 0xffff
+mov eax, {ept_diagnostic_capabilities}
 xor edx, edx
 jmp .Lresident_dispatch_cpuid_diagnostic_store
 .Lresident_dispatch_cpuid_capabilities_inactive:
@@ -1598,6 +1634,12 @@ jmp 1b
 // Boot sampling contract: r12 is the boot context, rsp retains the guest frame. Updates deadlines and retires the instrumentation timer when the framebuffer window expires. Clobbers scratch GPRs/flags and branches to the dispatcher event-retry path; it never advances guest RIP.
 .macro matrixhv_island_boot_timer
 .Lresident_dispatch_boot_timer:
+// Periodic interception safe points also exist without a leased Rust timer.
+// Retry event delivery without entering the optional boot-display sampler.
+mov r8, qword ptr [r12 + {b_processor_number}]
+lea r9, [rip + .Lresident_interception_timer_state]
+test qword ptr [r9 + r8 * 8], 8
+jnz .Lresident_boot_timer_retry_event
 cmp qword ptr [r12 + {b_diagnostic_interval}], 0
 je .Lresident_dispatch_unsupported
 rdtsc

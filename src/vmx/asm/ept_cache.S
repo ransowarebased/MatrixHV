@@ -23,6 +23,8 @@
     ret
 
 .Lresident_rebuild_ept_cache:
+mov edx, 2
+call .Lresident_interception_callback
     push rbx
     push rbp
     push rsi

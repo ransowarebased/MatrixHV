@@ -706,6 +706,41 @@ mod control_trace {
     }
 }
 
+#[test]
+fn ept_diagnostic_output_keeps_attempts_results_failure_context_and_pending_cpu_mask() {
+    use crate::protocol::memory::{EPT_DIAGNOSTIC_SUBLEAF, INTERCEPT_DIAGNOSTIC_WORDS, EPT_SYNC_DIAGNOSTIC_WORDS};
+    let mut words = [0u64; INTERCEPT_DIAGNOSTIC_WORDS + EPT_SYNC_DIAGNOSTIC_WORDS + 8];
+    words[3..6].copy_from_slice(&[7, 5, 2]);
+    words[18..21].copy_from_slice(&[2, 2, 0]);
+    words[21..24].copy_from_slice(&[2, 0xffff800040123456, 0x800008]);
+    words[24..32].copy_from_slice(&[9, 5, 1, 1, 1, 1, 5, 1 << 63]);
+    words[32..].copy_from_slice(&[5, 0x1000, 7, 1 << 63, 0x401234, 0x800082, 2, 100]);
+    let mut queried = Vec::new();
+    let mut output = String::new();
+    crate::telemetry::append_ept_diagnostics(&mut output, "cpu.63", |subleaf| {
+        queried.push(subleaf);
+        let index = (subleaf - EPT_DIAGNOSTIC_SUBLEAF) as usize * 2;
+        (words[index], words[index + 1])
+    });
+    assert_eq!(queried, (0x400..0x414).collect::<Vec<_>>());
+    for line in [
+        "cpu.63.interception.apply.attempts=7",
+        "cpu.63.interception.apply.successes=5",
+        "cpu.63.interception.apply.failures=2",
+        "cpu.63.interception.recovery.successes=2",
+        "cpu.63.interception.failure_phase_name=apply",
+        "cpu.63.interception.failure_rip=0xffff800040123456",
+        "cpu.63.interception.failure_gpa=0x0000000000800008",
+        "cpu.63.ept_sync.failure_phase_name=parked-peer-release",
+        "cpu.63.ept_sync.pending_cpu_mask=0x8000000000000000",
+        "cpu.63.ept_sync.stall.owner=0x0000000000001000",
+        "cpu.63.ept_sync.stall.epoch=0x0000000000000007",
+        "cpu.63.ept_sync.stall.write_step=0x0000000000000002",
+    ] {
+        assert!(output.lines().any(|actual| actual == line), "missing diagnostic: {line}");
+    }
+}
+
 mod confirmation {
     use crate::commands::confirm_matrix_on;
     use std::io::Cursor;
@@ -831,6 +866,131 @@ mod elevation {
             receive_elevated_result(&listener, unsafe { get_current_process() }, [2; 16]).unwrap();
         child.join().unwrap();
         assert_eq!(received, expected);
+    }
+}
+
+mod exit_benchmark {
+    use crate::telemetry::{Mode, append_exit_benchmark};
+
+    #[test]
+    fn calibration_preserves_raw_tails_and_uses_nearest_rank_percentiles() {
+        let mut output = String::new();
+        append_exit_benchmark(
+            &mut output,
+            "cpu.3",
+            vec![30, 20, 0, u64::MAX],
+            (1..=100)
+                .map(|value| value * 100)
+                .chain([0, u64::MAX])
+                .collect(),
+            2_000_000_000,
+        )
+        .unwrap();
+        for line in [
+            "cpu.3.baseline_samples=2",
+            "cpu.3.baseline_rejected=2",
+            "cpu.3.samples=100",
+            "cpu.3.rejected=2",
+            "cpu.3.bracket_overhead_tsc_ticks=20",
+            "cpu.3.round_trip_tsc_ticks.min=100",
+            "cpu.3.round_trip_tsc_ticks.p50=5000",
+            "cpu.3.round_trip_tsc_ticks.p95=9500",
+            "cpu.3.round_trip_tsc_ticks.p99=9900",
+            "cpu.3.round_trip_tsc_ticks.max=10000",
+            "cpu.3.round_trip_tsc_ticks.mean=5050",
+            "cpu.3.calibrated_round_trip_tsc_ticks.mean=5030",
+            "cpu.3.calibrated_round_trip_ns.p99=4940",
+        ] {
+            assert!(
+                output.lines().any(|actual| actual == line),
+                "missing {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn saturated_calibration_averages_each_sample_and_unknown_frequency_stays_unavailable() {
+        let mut output = String::new();
+        append_exit_benchmark(&mut output, "cpu.0", vec![20], vec![10, 30], 0).unwrap();
+        assert!(output.contains("cpu.0.calibrated_round_trip_tsc_ticks.min=0\n"));
+        assert!(output.contains("cpu.0.calibrated_round_trip_tsc_ticks.mean=5\n"));
+        assert!(output.contains("cpu.0.round_trip_ns=unavailable\n"));
+        assert!(!output.contains("round_trip_ns.mean="));
+    }
+
+    #[test]
+    fn large_tsc_samples_do_not_overflow_means_or_time_conversion() {
+        let mut output = String::new();
+        let ticks = i64::MAX as u64;
+        append_exit_benchmark(&mut output, "cpu.0", vec![1], vec![ticks; 4], 1).unwrap();
+        assert!(output.contains(&format!("round_trip_tsc_ticks.mean={ticks}\n")));
+        assert!(output.contains(&format!(
+            "round_trip_ns.mean={}\n",
+            u128::from(ticks) * 1_000_000_000
+        )));
+    }
+
+    #[test]
+    fn empty_or_invalid_samples_cannot_report_success() {
+        for (baseline, samples) in [
+            (vec![], vec![10]),
+            (vec![10], vec![]),
+            (vec![0, u64::MAX], vec![10]),
+            (vec![10], vec![0, u64::MAX]),
+        ] {
+            assert!(
+                append_exit_benchmark(&mut String::new(), "cpu.0", baseline, samples, 1).is_err()
+            );
+        }
+        assert_eq!(Mode::from_u32(3).unwrap(), Mode::Benchmark);
+        assert!(Mode::from_u32(4).is_err());
+    }
+
+    #[test]
+    fn benchmark_flag_sends_only_a_query_and_normal_telemetry_keeps_its_mode() {
+        use crate::server::protocol::{
+            Request, RequestKind, Response, read_request, write_response,
+        };
+        use std::net::TcpListener;
+        for (flag, mode) in [(Some("--benchmark"), 3), (None, 0)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let (request_id, request) = read_request(&mut stream).unwrap();
+                assert_eq!(request, Request::Telemetry { mode, control: 0 });
+                write_response(
+                    &mut stream,
+                    request_id,
+                    &Response::success(RequestKind::Telemetry, "benchmark-test\n"),
+                )
+                .unwrap();
+            });
+            let mut arguments = vec!["--remote".into(), address.to_string(), "telemetry".into()];
+            arguments.extend(flag.map(str::to_string));
+            assert_eq!(crate::commands::run(arguments).unwrap(), 0);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn benchmark_flag_rejects_controls_other_modes_and_unrelated_commands() {
+        for arguments in [
+            vec!["telemetry", "watchdog", "--benchmark"],
+            vec!["telemetry", "eptdiag", "--benchmark"],
+            vec!["telemetry", "enable", "--benchmark"],
+            vec!["telemetry", "disable", "--benchmark"],
+            vec!["telemetry", "--benchmark", "--benchmark"],
+            vec!["status", "--benchmark"],
+            vec!["--benchmark"],
+        ] {
+            let error = crate::commands::run(arguments.into_iter().map(str::to_string).collect())
+                .unwrap_err();
+            assert!(error.contains("--benchmark"), "{error}");
+        }
     }
 }
 

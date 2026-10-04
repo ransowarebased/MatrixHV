@@ -7,6 +7,7 @@ project = Path(__file__).resolve().parents[1]
 output = project / "builds/exit-guard-tests"
 output.mkdir(parents=True, exist_ok=True)
 source = (project / "src/vmx/asm/exits.S").read_text()
+source = source.replace("call .Lresident_nested_eptp_sync_budget_start", "nop")
 diagnostics = (project / "src/asm/diagnostics.S").read_text()
 
 def macro_body(text, name):
@@ -29,6 +30,7 @@ values = dict(guest_cr0=0, guest_rflags=1, guest_ss_ar_bytes=2, guest_cr4=3,
               b_stop_result=72, b_event_context=80, event_ebs_seen=0,
               b_nested_eptp_sync_safe=0, b_canary_start=8, b_canary_end=16,
               b_root_vmx_active=24,
+              b_interception_timing_saved=32, b_interception_timing_start=40,
               boot_canary_start=0x4856424f4f544331, boot_canary_end=0x4856424f4f544332)
 assembly = re.sub(r"\{(\w+)\}", lambda match: str(values[match[1]]), privilege + xsetbv)
 assembly += """

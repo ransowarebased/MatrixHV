@@ -511,8 +511,20 @@ mod sync {
     static SERIAL: Mutex<()> = Mutex::new(());
 
     #[repr(C)]
+    struct Profile { active: AtomicU64, cause: AtomicU64 }
+    impl Profile {
+        fn new() -> Self {
+            Self {
+                active: AtomicU64::new(1),
+                cause: AtomicU64::new(0),
+            }
+        }
+    }
+
+    #[repr(C)]
     struct Event {
         cpus: [u64; 64],
+        interception: u64,
     }
 
     #[repr(C)]
@@ -543,6 +555,18 @@ mod sync {
         flushes: AtomicU64,
         cache_ept: u64,
         flushed_ept: AtomicU64,
+        sync_diagnostics: [AtomicU64; 8],
+        processor: AtomicU64,
+        tsc_hz: u64,
+        runtime_diagnostics: [AtomicU64; 24],
+        timer_pin: AtomicU64,
+        timer_value: AtomicU64,
+        timer_supported: AtomicU64,
+        revocations: AtomicU64,
+        clock_enabled: AtomicU64,
+        clock_ticks: AtomicU64,
+        clock_step: AtomicU64,
+        cancel_on_send: AtomicU64,
     }
 
     impl Context {
@@ -574,18 +598,32 @@ mod sync {
                 flushes: AtomicU64::new(0),
                 cache_ept: 0x205e,
                 flushed_ept: AtomicU64::new(0),
+                sync_diagnostics: std::array::from_fn(|_| AtomicU64::new(0)),
+                processor: AtomicU64::new(0),
+                tsc_hz: 1_000_000_000,
+                runtime_diagnostics: std::array::from_fn(|_| AtomicU64::new(0)),
+                timer_pin: AtomicU64::new(0),
+                timer_value: AtomicU64::new(77),
+                timer_supported: AtomicU64::new(0),
+                revocations: AtomicU64::new(0),
+                clock_enabled: AtomicU64::new(0),
+                clock_ticks: AtomicU64::new(1),
+                clock_step: AtomicU64::new(1),
+                cancel_on_send: AtomicU64::new(0),
             }
         }
     }
 
     core::arch::global_asm!(
         ".text",
-        ".macro test_sync_wrapper name, target",
+        ".macro test_sync_wrapper name, target, reset=1",
         ".globl \\name",
         "\\name:",
         "push rbx", "push rbp", "push rsi", "push rdi",
         "push r12", "push r13", "push r14", "push r15",
-        "mov r12, rcx", "cld", "call \\target",
+        "mov r12, rcx", "cld", "push rdx",
+        ".if \\reset", "call .Lresident_nested_eptp_sync_budget_start", ".endif",
+        "pop rdx", "call \\target",
         "pop r15", "pop r14", "pop r13", "pop r12",
         "pop rdi", "pop rsi", "pop rbp", "pop rbx", "ret",
         ".endm",
@@ -594,18 +632,42 @@ mod sync {
         "test_sync_wrapper sync_ready, .Lresident_nested_eptp_sync_ready",
         "test_sync_wrapper sync_end, .Lresident_nested_eptp_sync_end",
         "test_sync_wrapper sync_poll, .Lresident_nested_eptp_sync_poll",
+        "test_sync_wrapper sync_poll_retained, .Lresident_nested_eptp_sync_poll, 0",
+        "test_sync_wrapper sync_budget_check, .Lresident_nested_eptp_sync_budget_expired, 0",
         "test_sync_wrapper sync_enter, .Lresident_nested_eptp_sync_enter",
         "test_sync_wrapper sync_host_nmi, .Lresident_nested_eptp_sync_host_nmi",
+        "test_sync_wrapper sync_host_nmi_retained, .Lresident_nested_eptp_sync_host_nmi, 0",
         "test_sync_wrapper sync_exit_nmi, .Lresident_nested_eptp_sync_exit_nmi",
         "test_sync_wrapper sync_kick, .Lresident_nested_eptp_sync_kick",
+        "test_sync_wrapper sync_stall, .Ltest_read_stall",
+        ".globl sync_reset",
+        "sync_reset:", "push rdi", "cld", "xor eax, eax",
+        "lea rdi, [rip + .Lresident_eptp_sync_owner]",
+        "lea rcx, [rip + .Lresident_eptp_lists_live + 8]",
+        "sub rcx, rdi", "shr rcx, 3",
+        "rep stosq", "pop rdi", "ret",
+        ".Ltest_read_stall:", "mov rax, [r12 + {b_processor_number}]", "shl rax, 6",
+        "lea r9, [rip + .Lresident_interception_stall_records]", "add r9, rax",
+        "mov rax, [r9 + rdx * 8]", "ret",
         ".Lresident_guarded_rdmsr:",
+        "cmp ecx, 0x1b", "je .Ltest_read_apic",
+        "cmp ecx, 0x480", "je .Ltest_read_basic",
+        "cmp ecx, 0x485", "je .Ltest_read_misc",
+        "xor eax, eax", "mov rdx, [r12 + {test_timer_supported}]", "shl rdx, 6", "clc", "ret",
+        ".Ltest_read_basic:", "xor eax, eax", "mov edx, 0x800000", "clc", "ret",
+        ".Ltest_read_misc:", "mov eax, 5", "xor edx, edx", "clc", "ret",
+        ".Ltest_read_apic:",
         "mov rax, qword ptr [r12 + {test_apic_base}]",
         "mov rdx, rax", "shr rdx, 32", "mov eax, eax", "clc", "ret",
         ".Lresident_guarded_wrmsr:",
         "cmp qword ptr [r12 + {test_fail_send}], 0", "jne .Ltest_send_failed",
         "inc qword ptr [r12 + {test_sends}]",
         "mov qword ptr [r12 + {test_destination}], rdx",
-        "mov qword ptr [r12 + {test_icr}], rax", "clc", "ret",
+        "mov qword ptr [r12 + {test_icr}], rax",
+        "cmp qword ptr [r12 + {test_cancel_on_send}], 0", "je .Ltest_send_done",
+        "mov rax, [rip + .Lresident_eptp_sync_epoch]",
+        "mov [rip + .Lresident_eptp_sync_failure], rax",
+        ".Ltest_send_done:", "clc", "ret",
         ".Ltest_send_failed:",
         "cmp qword ptr [r12 + {test_consume_failed_token}], 0",
         "je .Ltest_send_failed_return",
@@ -619,8 +681,30 @@ mod sync {
         ".Lresident_nested_swap_ept02_cache:",
         "inc qword ptr [r12 + {test_swaps}]", "ret",
         ".Lresident_dispatch_halt:", ".Lresident_dispatch_vmread_failed:", "ud2",
+        ".Ltest_interception_callback:", "cmp edx, 2", "jne .Ltest_callback_return",
+        "inc qword ptr [r12 + {test_revocations}]",
+        ".Ltest_callback_return:", "xor eax, eax", "ret",
         include_str!("../builds/eptp-sync-tests/eptp-sync.S"),
+        b_processor_number = const std::mem::offset_of!(Context, processor),
+        b_watchdog_tsc_hz = const std::mem::offset_of!(Context, tsc_hz),
+        b_interception_runtime_diagnostics = const std::mem::offset_of!(Context, runtime_diagnostics),
+        b_last_guest_rip = const std::mem::offset_of!(Context, reason),
+        b_last_guest_physical_address = const std::mem::offset_of!(Context, exit_info),
+        event_interception_context = const std::mem::offset_of!(Event, interception),
+        interception_cause = const std::mem::offset_of!(Profile, cause),
+        interception_rendezvous_cause = const 3,
+        pin_based_vm_exec_control = const 0,
+        vmx_preemption_timer_value = const 1,
+        test_timer_pin = const std::mem::offset_of!(Context, timer_pin),
+        test_timer_supported = const std::mem::offset_of!(Context, timer_supported),
+        test_revocations = const std::mem::offset_of!(Context, revocations),
+        test_clock_enabled = const std::mem::offset_of!(Context, clock_enabled),
+        test_clock_ticks = const std::mem::offset_of!(Context, clock_ticks),
+        test_clock_step = const std::mem::offset_of!(Context, clock_step),
+        test_cancel_on_send = const std::mem::offset_of!(Context, cancel_on_send),
+        b_interception_step = const std::mem::offset_of!(Context, revocations),
         b_event_context = const std::mem::offset_of!(Context, event),
+        b_interception_sync_diagnostics = const std::mem::offset_of!(Context, sync_diagnostics),
         event_cpu_contexts = const std::mem::offset_of!(Event, cpus),
         b_nested_eptp_sync_ack = const std::mem::offset_of!(Context, ack),
         b_nested_eptp_sync_safe = const std::mem::offset_of!(Context, safe),
@@ -652,27 +736,43 @@ mod sync {
     );
 
     unsafe extern "win64" {
+        fn sync_reset();
         fn tracking_sync(context: *const Context, operation: u64) -> u64;
         fn sync_begin(context: *const Context) -> u64;
         fn sync_acquire(context: *const Context) -> u64;
         fn sync_ready(context: *const Context) -> u64;
         fn sync_end(context: *const Context);
         fn sync_poll(context: *const Context);
+        fn sync_poll_retained(context: *const Context);
+        fn sync_budget_check(context: *const Context) -> u64;
         fn sync_enter(context: *const Context);
         fn sync_host_nmi(context: *const Context) -> u64;
+        fn sync_host_nmi_retained(context: *const Context) -> u64;
         fn sync_exit_nmi(context: *const Context) -> u64;
         fn sync_kick(context: *const Context) -> u64;
+        fn sync_stall(context: *const Context, index: u64) -> u64;
+    }
+
+    fn isolate() -> std::sync::MutexGuard<'static, ()> {
+        let serial = SERIAL.lock().unwrap();
+        // Each fixture models a fresh resident instance, including assembly state.
+        // Keep the lock until all scoped peers have returned before another reset.
+        unsafe { sync_reset() };
+        serial
     }
 
     #[test]
     fn tracking_callback_acquires_flushes_and_releases_the_shared_barrier() {
-        let _serial = SERIAL.lock().unwrap();
-        let mut event = Box::new(Event { cpus: [0; 64] });
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
         let owner = Box::new(Context::new(&event, false));
         let mut peer = Box::new(Context::new(&event, true));
         peer.ept01 = 0;
         event.cpus[0] = &*owner as *const Context as u64;
+        owner.processor.store(0, Ordering::Release);
         event.cpus[1] = &*peer as *const Context as u64;
+        peer.processor.store(1, Ordering::Release);
         let returned = AtomicU64::new(0);
         thread::scope(|scope| {
             scope.spawn(|| {
@@ -713,12 +813,15 @@ mod sync {
 
     #[test]
     fn peers_park_until_release_then_retire_both_roots_and_local_translations() {
-        let _serial = SERIAL.lock().unwrap();
-        let mut event = Box::new(Event { cpus: [0; 64] });
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
         let owner = Box::new(Context::new(&event, false));
         let peer = Box::new(Context::new(&event, true));
         event.cpus[0] = &*owner as *const Context as u64;
+        owner.processor.store(0, Ordering::Release);
         event.cpus[63] = &*peer as *const Context as u64;
+        peer.processor.store(63, Ordering::Release);
         for epoch in 0..100 {
             assert_eq!(unsafe { sync_begin(&*owner) }, 1);
             assert_eq!(unsafe { sync_begin(&*peer) }, 0);
@@ -748,28 +851,33 @@ mod sync {
 
     #[test]
     fn idle_and_owner_gates_do_not_invalidate_or_wait() {
-        let _serial = SERIAL.lock().unwrap();
-        let mut event = Box::new(Event { cpus: [0; 64] });
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
         let owner = Box::new(Context::new(&event, false));
         event.cpus[3] = &*owner as *const Context as u64;
+        owner.processor.store(3, Ordering::Release);
         unsafe { sync_poll(&*owner) };
         assert_eq!(unsafe { sync_begin(&*owner) }, 1);
         assert_eq!(unsafe { sync_ready(&*owner) }, 1);
         unsafe { sync_poll(&*owner) };
         unsafe { sync_end(&*owner) };
-        assert_eq!(owner.ack.load(Ordering::Acquire), 0);
+        assert_ne!(owner.ack.load(Ordering::Acquire), 0);
         assert_eq!(owner.flushes.load(Ordering::Acquire), 0);
     }
 
     #[test]
     fn cancellation_and_immediate_reacquisition_require_fresh_peer_acknowledgements() {
-        let _serial = SERIAL.lock().unwrap();
-        let mut event = Box::new(Event { cpus: [0; 64] });
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
         let owner = Box::new(Context::new(&event, false));
         let peers = [Context::new(&event, false), Context::new(&event, true)];
         event.cpus[0] = &*owner as *const Context as u64;
+        owner.processor.store(0, Ordering::Release);
         for (index, peer) in peers.iter().enumerate() {
             event.cpus[index + 1] = peer as *const Context as u64;
+            peer.processor.store((index + 1) as u64, Ordering::Release);
         }
         let stop = AtomicU64::new(0);
         let returns = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -819,12 +927,15 @@ mod sync {
 
     #[test]
     fn nmi_parks_in_the_entry_window_and_defers_when_a_root_handler_is_busy() {
-        let _serial = SERIAL.lock().unwrap();
-        let mut event = Box::new(Event { cpus: [0; 64] });
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
         let owner = Box::new(Context::new(&event, false));
         let peer = Box::new(Context::new(&event, true));
         event.cpus[0] = &*owner as *const Context as u64;
+        owner.processor.store(0, Ordering::Release);
         event.cpus[1] = &*peer as *const Context as u64;
+        peer.processor.store(1, Ordering::Release);
         for safe in [0, 1] {
             peer.safe.store(safe, Ordering::Release);
             peer.pending_nmi.store(1, Ordering::Release);
@@ -858,8 +969,9 @@ mod sync {
 
     #[test]
     fn only_a_valid_nmi_exit_consumes_the_internal_token() {
-        let _serial = SERIAL.lock().unwrap();
-        let event = Event { cpus: [0; 64] };
+        let _serial = isolate();
+        let profile = Profile::new();
+        let event = Event { cpus: [0; 64], interception: &profile as *const _ as u64 };
         let peer = Context::new(&event, true);
         for (reason, info, consumed) in [
             (10, 0x80000202, 0),
@@ -881,13 +993,16 @@ mod sync {
 
     #[test]
     fn x2apic_kicks_use_full_destinations_and_preserve_external_nmis_on_send_failure() {
-        let _serial = SERIAL.lock().unwrap();
-        let mut event = Box::new(Event { cpus: [0; 64] });
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
         let owner = Box::new(Context::new(&event, false));
         let mut peer = Box::new(Context::new(&event, true));
         peer.apic_id = 0x12345678;
         event.cpus[0] = &*owner as *const Context as u64;
+        owner.processor.store(0, Ordering::Release);
         event.cpus[63] = &*peer as *const Context as u64;
+        peer.processor.store(63, Ordering::Release);
         assert_eq!(unsafe { sync_begin(&*owner) }, 1);
         let first = unsafe { sync_kick(&*owner) };
         let second = unsafe { sync_kick(&*owner) };
@@ -917,8 +1032,9 @@ mod sync {
     fn xapic_kicks_validate_destination_and_wait_for_an_idle_icr() {
         #[repr(C, align(4096))]
         struct ApicPage([u32; 1024]);
-        let _serial = SERIAL.lock().unwrap();
-        let mut event = Box::new(Event { cpus: [0; 64] });
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
         let owner = Box::new(Context::new(&event, false));
         let mut peer = Box::new(Context::new(&event, true));
         let mut apic = Box::new(ApicPage([0; 1024]));
@@ -927,7 +1043,9 @@ mod sync {
             Ordering::Release,
         );
         event.cpus[0] = &*owner as *const Context as u64;
+        owner.processor.store(0, Ordering::Release);
         event.cpus[1] = &*peer as *const Context as u64;
+        peer.processor.store(1, Ordering::Release);
         for (destination, busy, expected) in [(7, false, 1), (256, false, 0), (7, true, 0)] {
             peer.apic_id = destination;
             peer.pending_nmi.store(0, Ordering::Release);
@@ -947,11 +1065,13 @@ mod sync {
 
     #[test]
     fn acquisition_waits_for_peers_and_releases_ownership_on_transport_or_timeout_failure() {
-        let _serial = SERIAL.lock().unwrap();
-        let mut event = Box::new(Event { cpus: [0; 64] });
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
         let owner = Box::new(Context::new(&event, false));
         let peer = Box::new(Context::new(&event, true));
         event.cpus[0] = &*owner as *const Context as u64;
+        owner.processor.store(0, Ordering::Release);
         // No peer requires a functioning APIC when there is only one registered CPU.
         owner.apic_base.store(0, Ordering::Release);
         let acquired = unsafe { sync_acquire(&*owner) };
@@ -960,9 +1080,12 @@ mod sync {
         }
         assert_eq!(acquired, 1);
         event.cpus[1] = &*peer as *const Context as u64;
+        peer.processor.store(1, Ordering::Release);
         for base in [0, 0xc00] {
             owner.apic_base.store(base, Ordering::Release);
             assert_eq!(unsafe { sync_acquire(&*owner) }, 0);
+            assert_eq!(unsafe { sync_begin(&*peer) }, 0);
+            unsafe { sync_poll(&*owner); sync_poll(&*peer); }
             assert_eq!(
                 unsafe { sync_begin(&*peer) },
                 1,
@@ -989,5 +1112,268 @@ mod sync {
             assert_eq!(acquired, 1);
             assert_eq!(ready, 1);
         });
+    }
+
+    #[test]
+    fn synchronization_diagnostics_separate_contention_transport_and_both_timeout_phases() {
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
+        let owner = Box::new(Context::new(&event, false));
+        let mut peer = Box::new(Context::new(&event, false));
+        event.cpus[0] = &*owner as *const Context as u64;
+        owner.processor.store(0, Ordering::Release);
+        let counters = || owner.sync_diagnostics.each_ref().map(|value| value.load(Ordering::Acquire));
+        assert_eq!(unsafe { sync_acquire(&*owner) }, 1);
+        unsafe { sync_end(&*owner) };
+        assert_eq!(&counters()[..6], &[1, 1, 0, 0, 0, 0]);
+        event.cpus[63] = &*peer as *const Context as u64;
+        peer.processor.store(63, Ordering::Release);
+        assert_eq!(unsafe { sync_begin(&*peer) }, 1);
+        assert_eq!(unsafe { sync_acquire(&*owner) }, 0);
+        unsafe { sync_end(&*peer) };
+        assert_eq!(&counters()[..7], &[2, 1, 1, 0, 0, 0, 1]);
+        owner.apic_base.store(0, Ordering::Release);
+        assert_eq!(unsafe { sync_acquire(&*owner) }, 0);
+        assert_eq!(counters(), [3, 1, 1, 1, 0, 0, 2, 1 << 63]);
+        unsafe { sync_poll(&*owner); sync_poll(&*peer); }
+        owner.apic_base.store(0xc00, Ordering::Release);
+        assert_eq!(unsafe { sync_acquire(&*owner) }, 0);
+        assert_eq!(counters(), [4, 1, 1, 1, 1, 0, 4, 1 << 63]);
+        #[repr(C, align(4096))]
+        struct ApicPage([u32; 1024]);
+        let mut apic = Box::new(ApicPage([0; 1024]));
+        apic.0[0x300 / 4] = 0x1000;
+        peer.apic_id = 7;
+        unsafe { sync_poll(&*owner); sync_poll(&*peer); }
+        owner.apic_base.store((&*apic as *const ApicPage as u64) | 0x800, Ordering::Release);
+        assert_eq!(unsafe { sync_acquire(&*owner) }, 0);
+        assert_eq!(counters(), [5, 1, 1, 1, 1, 1, 3, 1 << 63]);
+unsafe { sync_poll(&*owner); sync_poll(&*peer); }
+                event.cpus[63] = 0;
+        assert_eq!(unsafe { sync_acquire(&*owner) }, 1);
+        unsafe { sync_end(&*owner) };
+        assert_eq!(counters(), [6, 2, 1, 1, 1, 1, 3, 1 << 63]);
+    }
+
+    #[test]
+    fn a_stalled_owner_cancels_peers_but_keeps_storage_quarantined_until_every_cpu_recovers() {
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
+        let owner = Box::new(Context::new(&event, false));
+        let peer = Box::new(Context::new(&event, false));
+        peer.processor.store(1, Ordering::Release);
+        event.cpus[0] = &*owner as *const Context as u64;
+        event.cpus[1] = &*peer as *const Context as u64;
+        profile.active.store(1, Ordering::Release);
+        assert_eq!(unsafe { sync_begin(&*owner) }, 1);
+        let started = Instant::now();
+        unsafe { sync_poll(&*peer); }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(profile.active.load(Ordering::Acquire), 2);
+        assert_eq!(profile.cause.load(Ordering::Acquire), 3);
+        assert_eq!(peer.sync_diagnostics[6].load(Ordering::Acquire), 5);
+        assert_eq!(peer.runtime_diagnostics[21].load(Ordering::Acquire), 7);
+        assert_eq!(peer.revocations.load(Ordering::Acquire), 1);
+        assert_eq!(unsafe { sync_stall(&*peer, 0) }, 5);
+        assert_eq!(unsafe { sync_stall(&*peer, 1) }, &*owner as *const Context as u64);
+        assert_eq!(unsafe { sync_stall(&*peer, 2) }, owner.ack.load(Ordering::Acquire));
+        assert_eq!(unsafe { sync_stall(&*peer, 3) }, 1);
+        assert_eq!(unsafe { sync_begin(&*peer) }, 0);
+        unsafe { sync_end(&*owner); }
+        assert_eq!(unsafe { sync_begin(&*peer) }, 0);
+        unsafe { sync_poll(&*owner); }
+        assert_eq!(unsafe { sync_begin(&*peer) }, 1);
+        unsafe { sync_end(&*peer); }
+        assert_eq!(owner.revocations.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn successive_owners_cannot_renew_a_peers_root_entry_budget() {
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
+        let owner = Box::new(Context::new(&event, false));
+        let peer = Box::new(Context::new(&event, false));
+        peer.processor.store(1, Ordering::Release);
+        event.cpus[0] = &*owner as *const Context as u64;
+        event.cpus[1] = &*peer as *const Context as u64;
+        profile.active.store(1, Ordering::Release);
+        unsafe { sync_poll(&*peer); }
+        let mut epochs = 0;
+        while unsafe { sync_budget_check(&*peer) } == 0 {
+            assert_eq!(unsafe { sync_begin(&*owner) }, 1);
+            unsafe { sync_end(&*owner); }
+            epochs += 1;
+            std::thread::sleep(Duration::from_millis(1));
+            assert!(epochs < 1000, "owner changes renewed the peer deadline");
+        }
+        assert!(epochs > 0);
+        assert_eq!(unsafe { sync_begin(&*owner) }, 1);
+        unsafe { sync_poll_retained(&*peer); }
+        assert_eq!(profile.active.load(Ordering::Acquire), 2);
+        assert_eq!(peer.sync_diagnostics[6].load(Ordering::Acquire), 5);
+        unsafe { sync_end(&*owner); sync_poll(&*owner); sync_poll(&*peer); }
+    }
+
+    #[test]
+    fn owner_ack_wait_uses_the_root_entry_budget() {
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
+        let mut owner = Box::new(Context::new(&event, false));
+        let peer = Box::new(Context::new(&event, false));
+        owner.tsc_hz = 10_000;
+        owner.clock_enabled.store(1, Ordering::Release);
+        peer.processor.store(1, Ordering::Release);
+        event.cpus[0] = &*owner as *const Context as u64;
+        event.cpus[1] = &*peer as *const Context as u64;
+        assert_eq!(unsafe { sync_acquire(&*owner) }, 0);
+        assert!(owner.clock_ticks.load(Ordering::Acquire) <= 205,
+                "an unresponsive peer held the owner beyond its 20 ms root budget");
+        assert_eq!(owner.sends.load(Ordering::Acquire), 1);
+        assert_eq!(owner.sync_diagnostics[6].load(Ordering::Acquire), 4);
+        unsafe { sync_poll(&*owner); sync_poll(&*peer); }
+        assert_eq!(unsafe { sync_begin(&*peer) }, 1);
+        unsafe { sync_end(&*peer); }
+    }
+
+    #[test]
+    fn cancelled_acquisition_stops_before_the_owner_deadline() {
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
+        let mut owner = Box::new(Context::new(&event, false));
+        let peer = Box::new(Context::new(&event, false));
+        owner.tsc_hz = 1000;
+        owner.clock_enabled.store(1, Ordering::Release);
+        owner.cancel_on_send.store(1, Ordering::Release);
+        peer.processor.store(1, Ordering::Release);
+        event.cpus[0] = &*owner as *const Context as u64;
+        event.cpus[1] = &*peer as *const Context as u64;
+        assert_eq!(unsafe { sync_acquire(&*owner) }, 0);
+        assert!(owner.clock_ticks.load(Ordering::Acquire) < 20,
+                "the owner kept polling an already cancelled epoch");
+        assert_eq!(owner.sync_diagnostics[4].load(Ordering::Acquire), 0);
+        unsafe { sync_poll(&*owner); sync_poll(&*peer); }
+        assert_eq!(unsafe { sync_begin(&*peer) }, 1);
+        unsafe { sync_end(&*peer); }
+    }
+
+    #[test]
+    fn busy_icr_uses_the_root_entry_budget() {
+        #[repr(C, align(4096))]
+        struct ApicPage([u32; 1024]);
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
+        let mut owner = Box::new(Context::new(&event, false));
+        let peer = Box::new(Context::new(&event, false));
+        let mut apic = Box::new(ApicPage([0; 1024]));
+        apic.0[0x300 / 4] = 0x1000;
+        owner.apic_base.store((&*apic as *const ApicPage as u64) | 0x800, Ordering::Release);
+        owner.tsc_hz = 1000;
+        owner.clock_enabled.store(1, Ordering::Release);
+        peer.processor.store(1, Ordering::Release);
+        event.cpus[0] = &*owner as *const Context as u64;
+        event.cpus[1] = &*peer as *const Context as u64;
+        assert_eq!(unsafe { sync_acquire(&*owner) }, 0);
+        assert!(owner.clock_ticks.load(Ordering::Acquire) <= 25,
+                "a busy APIC held the owner beyond its 20 ms root budget");
+        assert_eq!(owner.sync_diagnostics[6].load(Ordering::Acquire), 3);
+        assert_eq!(peer.pending_nmi.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn host_nmi_cannot_renew_an_expired_root_budget() {
+        let _serial = isolate();
+        let profile = Profile::new();
+        let mut event = Box::new(Event { cpus: [0; 64], interception: &profile as *const _ as u64 });
+        let owner = Box::new(Context::new(&event, false));
+        let mut peer = Box::new(Context::new(&event, false));
+        peer.processor.store(1, Ordering::Release);
+        peer.tsc_hz = 1000;
+        peer.clock_enabled.store(1, Ordering::Release);
+        event.cpus[0] = &*owner as *const Context as u64;
+        event.cpus[1] = &*peer as *const Context as u64;
+        unsafe { sync_poll(&*peer); }
+        peer.clock_ticks.store(100, Ordering::Release);
+        assert_eq!(unsafe { sync_begin(&*owner) }, 1);
+        peer.safe.store(1, Ordering::Release);
+        peer.pending_nmi.store(1, Ordering::Release);
+        assert_eq!(unsafe { sync_host_nmi_retained(&*peer) }, 1);
+        assert_eq!(peer.ack.load(Ordering::Acquire), 0,
+                   "the NMI reset an expired budget and started another parking interval");
+        assert_eq!(peer.sync_diagnostics[6].load(Ordering::Acquire), 5);
+        unsafe { sync_end(&*owner); }
+    }
+
+    #[test]
+    fn frozen_tsc_iteration_budget_stays_exhausted() {
+        let _serial = isolate();
+        let profile = Profile::new();
+        let event = Event { cpus: [0; 64], interception: &profile as *const _ as u64 };
+        let cpu = Context::new(&event, false);
+        cpu.clock_enabled.store(1, Ordering::Release);
+        cpu.clock_step.store(0, Ordering::Release);
+        unsafe { sync_poll(&cpu); }
+        let mut exhausted = false;
+        for _ in 0..1_000_001 {
+            if unsafe { sync_budget_check(&cpu) } != 0 {
+                exhausted = true;
+                break;
+            }
+        }
+        assert!(exhausted);
+        for _ in 0..3 {
+            assert_eq!(unsafe { sync_budget_check(&cpu) }, 1,
+                       "an exhausted fallback counter wrapped and renewed the budget");
+        }
+    }
+
+    #[test]
+    fn periodic_safe_points_do_not_need_a_lease_and_restore_the_timer_they_own() {
+        let _serial = isolate();
+        let profile = Profile::new();
+        let event = Event { cpus: [0; 64], interception: &profile as *const _ as u64 };
+        let cpu = Context::new(&event, false);
+        cpu.processor.store(30, Ordering::Release);
+        cpu.timer_supported.store(1, Ordering::Release);
+        profile.active.store(1, Ordering::Release);
+        unsafe { sync_enter(&cpu); }
+        assert_eq!(cpu.timer_pin.load(Ordering::Acquire), 64);
+        assert_eq!(cpu.timer_value.load(Ordering::Acquire), 625_000);
+        cpu.timer_value.store(0, Ordering::Release);
+        unsafe { sync_enter(&cpu); }
+        assert_eq!(cpu.timer_value.load(Ordering::Acquire), 625_000);
+        profile.active.store(2, Ordering::Release);
+        unsafe { sync_enter(&cpu); }
+        assert_eq!(cpu.timer_pin.load(Ordering::Acquire), 0);
+        assert_eq!(cpu.timer_value.load(Ordering::Acquire), 77);
+    }
+
+    #[test]
+    fn periodic_safe_points_preserve_an_earlier_timer_and_skip_unsupported_hardware() {
+        let _serial = isolate();
+        let profile = Profile::new();
+        let event = Event { cpus: [0; 64], interception: &profile as *const _ as u64 };
+        let cpu = Context::new(&event, false);
+        cpu.processor.store(31, Ordering::Release);
+        cpu.timer_supported.store(1, Ordering::Release);
+        cpu.timer_pin.store(64, Ordering::Release);
+        cpu.timer_value.store(3, Ordering::Release);
+        profile.active.store(1, Ordering::Release);
+        unsafe { sync_enter(&cpu); }
+        assert_eq!(cpu.timer_value.load(Ordering::Acquire), 3);
+        profile.active.store(2, Ordering::Release);
+        unsafe { sync_enter(&cpu); }
+        assert_eq!(cpu.timer_pin.load(Ordering::Acquire), 64);
+        let unsupported = Context::new(&event, false);
+        unsupported.processor.store(32, Ordering::Release);
+        profile.active.store(1, Ordering::Release);
+        unsafe { sync_enter(&unsupported); }
+        assert_eq!(unsupported.timer_pin.load(Ordering::Acquire), 0);
+        assert_eq!(unsupported.timer_value.load(Ordering::Acquire), 77);
     }
 }

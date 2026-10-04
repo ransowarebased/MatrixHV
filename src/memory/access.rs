@@ -9,6 +9,14 @@ pub trait PhysicalMemory {
     fn track(&mut self, _packet: &mut [u8], _la57: bool, _physical_bits: u32) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
+    fn intercept(
+        &mut self,
+        _packet: &mut [u8],
+        _la57: bool,
+        _physical_bits: u32,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
 }
 
 pub(crate) struct PageMapping {
@@ -389,6 +397,24 @@ pub fn execute(
     let count = word(packet, 32) as usize;
     if matches!(
         operation,
+        HOOK_INSTALL
+            | HOOK_REMOVE
+            | HOOK_ADD
+            | HOOK_DROP
+            | HOOK_LIST
+            | DEBUG_SET
+            | DEBUG_CLEAR
+            | INTERCEPT_STATUS
+            | INTERCEPT_RENEW
+            | INTERCEPT_RELEASE
+            | INTERCEPT_CONTEXT_ADD
+            | INTERCEPT_CONTEXT_REMOVE
+            | INTERCEPT_CONTEXT_LIST
+    ) {
+        return memory.intercept(packet, la57, physical_bits);
+    }
+    if matches!(
+        operation,
         AD_START | AD_STOP | AD_FETCH | AD_RELEASE | AD_STATUS | AD_CANCEL
     ) {
         return memory.track(packet, la57, physical_bits);
@@ -558,13 +584,77 @@ pub(crate) mod resident {
         pub tracking_session: u64,
         pub boot_context: u64,
         pub synchronize: u64,
+        pub interception_session: u64,
     }
-    const _: () = assert!(core::mem::size_of::<Environment>() == 88);
+    const _: () = assert!(core::mem::size_of::<Environment>() == 96);
     const _: () = assert!(core::mem::offset_of!(Environment, tracking_session) == 64);
     const _: () = assert!(core::mem::offset_of!(Environment, synchronize) == 80);
 
     struct Memory<'a> {
         environment: &'a Environment,
+    }
+
+    #[cfg(target_os = "uefi")]
+    pub(crate) fn instruction_bytes(
+        boot: &crate::vmx::resident::abi::ResidentBootContext,
+        configuration: &crate::memory::interception::RoadEptProfile,
+        rip: u64,
+        execution: &mut [u8; 15],
+        original: &mut [u8; 15],
+    ) -> usize {
+        use crate::vmx::vmcs::{GUEST_CR3, GUEST_CR4, vmread};
+        let environment = Environment {
+            caller_cr3: vmread(GUEST_CR3).unwrap_or(0),
+            guest_cr4: vmread(GUEST_CR4).unwrap_or(0),
+            ept: boot.cache_ept_pointer,
+            host_cr3: boot.expected_host_cr3,
+            syscall: 0,
+            kernel_cr3: 0,
+            physical_bits: u64::from(crate::arch::leaf(0x80000008).eax & 255),
+            root_history: 0,
+            tracking_session: 0,
+            boot_context: 0,
+            synchronize: 0,
+            interception_session: 0,
+        };
+        let mut memory = Memory {
+            environment: &environment,
+        };
+        for index in 0..15 {
+            let Some(address) = rip.checked_add(index as u64) else {
+                return index;
+            };
+            let Ok(mapping) = page_mapping(
+                &mut memory,
+                environment.caller_cr3,
+                address,
+                environment.guest_cr4 & (1 << 12) != 0,
+                environment.physical_bits as u32,
+            ) else {
+                return index;
+            };
+            if !mapping.present
+                || memory
+                    .read(mapping.physical_address, &mut original[index..index + 1])
+                    .is_err()
+            {
+                return index;
+            }
+            execution[index] = original[index];
+            if let Some(page_index) = configuration.pages[..configuration.hook_count]
+                .iter()
+                .position(|page| *page == mapping.physical_address & !4095)
+            {
+                let shadow = configuration.pool_base
+                    + (configuration.bank * intercept_bank_pages(configuration.cpu_mask)
+                        + INTERCEPT_TABLE_PAGES
+                        + page_index) as u64
+                        * 4096
+                    + (mapping.physical_address & 4095);
+                execution[index] = unsafe { (shadow as *const u8).read_volatile() };
+            }
+        }
+        15
     }
 
     impl Memory<'_> {
@@ -623,12 +713,42 @@ pub(crate) mod resident {
     }
 
     impl PhysicalMemory for Memory<'_> {
+        fn intercept(
+            &mut self,
+            packet: &mut [u8],
+            la57: bool,
+            physical_bits: u32,
+        ) -> Result<(), Error> {
+            if self.environment.synchronize == 0 {
+                return Err(Error::Unsupported);
+            }
+            unsafe {
+                crate::memory::interception::execute(
+                    self.environment.interception_session
+                        as *mut crate::memory::interception::Session,
+                    self,
+                    packet,
+                    la57,
+                    physical_bits,
+                )
+            }
+        }
         fn track(
             &mut self,
             packet: &mut [u8],
             la57: bool,
             physical_bits: u32,
         ) -> Result<(), Error> {
+            if word(packet, 12) == AD_START
+                && self.environment.interception_session != 0
+                && unsafe {
+                    &*(self.environment.interception_session
+                        as *const crate::memory::interception::Session)
+                }
+                .is_active()
+            {
+                return Err(Error::Busy);
+            }
             if self.environment.ept & (1 << 6) == 0 || self.environment.synchronize == 0 {
                 return Err(Error::Unsupported);
             }
@@ -681,6 +801,19 @@ pub(crate) mod resident {
             if bytes.len() > 4096 - (address as usize & 4095) {
                 return Err(Error::Bounds);
             }
+            if self.environment.interception_session != 0 {
+                let session = self.environment.interception_session
+                    as *mut crate::memory::interception::Session;
+                let active = unsafe { &*session }.is_active();
+                let configuration = unsafe { &*(*session).configuration.get() };
+                if active
+                    && configuration.pages[..configuration.hook_count].contains(&(address & !4095))
+                {
+                    return unsafe {
+                        crate::memory::interception::write_original(session, self, address, bytes)
+                    };
+                }
+            }
             let pointer = self.mapped(address, true)? as *mut u8;
             for (index, byte) in bytes.iter().enumerate() {
                 unsafe {
@@ -696,6 +829,269 @@ pub(crate) mod resident {
             let callback: unsafe extern "efiapi" fn(u64, u64) -> u64 =
                 unsafe { core::mem::transmute(self.environment.synchronize) };
             unsafe { callback(self.environment.boot_context, operation) }
+        }
+    }
+
+    impl crate::memory::interception::InterceptionMemory for Memory<'_> {
+        fn timing_available(&self) -> bool {
+            #[cfg(target_os = "uefi")]
+            {
+                use crate::vmx::resident::abi::{ResidentBootContext, ResidentEventContext};
+                let boot =
+                    unsafe { &*(self.environment.boot_context as *const ResidentBootContext) };
+                let event = unsafe { &*(boot.event_context as *const ResidentEventContext) };
+                for address in event.cpu_contexts.iter().filter(|address| **address != 0) {
+                    let cpu = unsafe { &*(*address as *const ResidentBootContext) };
+                    // Reference-TSC pages assume an invariant, common clock.
+                    // CPU-local compensation cannot satisfy that contract.
+                    if cpu.hyperv_timing_supported != 0 {
+                        return false;
+                    }
+                }
+                use crate::vmx::vmcs::{
+                    CPU_BASED_VM_EXEC_CONTROL, SECONDARY_VM_EXEC_CONTROL, vmread,
+                };
+                crate::arch::leaf(0x80000007).edx & (1 << 8) != 0
+                    && vmread(CPU_BASED_VM_EXEC_CONTROL).is_ok_and(|value| value & 8 != 0)
+                    && vmread(SECONDARY_VM_EXEC_CONTROL).is_ok_and(|value| value & (1 << 25) == 0)
+            }
+            #[cfg(not(target_os = "uefi"))]
+            {
+                true
+            }
+        }
+        fn clock(&self) -> u64 {
+            crate::memory::tracking::TrackingMemory::clock(self)
+        }
+        fn clock_hz(&self) -> u64 {
+            #[cfg(target_os = "uefi")]
+            {
+                let boot = unsafe {
+                    &*(self.environment.boot_context
+                        as *const crate::vmx::resident::abi::ResidentBootContext)
+                };
+                boot.watchdog_tsc_hz
+            }
+            #[cfg(not(target_os = "uefi"))]
+            {
+                1_000_000_000
+            }
+        }
+        fn timer_rate(&self) -> u32 {
+            #[cfg(target_os = "uefi")]
+            {
+                unsafe { crate::arch::read_msr(0x485) as u32 & 31 }
+            }
+            #[cfg(not(target_os = "uefi"))]
+            {
+                5
+            }
+        }
+        fn lease_available(&self) -> bool {
+            #[cfg(target_os = "uefi")]
+            {
+                let true_controls = unsafe { crate::arch::read_msr(0x480) } & (1 << 55) != 0;
+                let capabilities =
+                    unsafe { crate::arch::read_msr(if true_controls { 0x48d } else { 0x481 }) }
+                        >> 32;
+                capabilities & (1 << 6) != 0 && crate::arch::leaf(0x80000007).edx & (1 << 8) != 0
+            }
+            #[cfg(not(target_os = "uefi"))]
+            {
+                true
+            }
+        }
+        fn quiesce(&mut self) -> Result<(), Error> {
+            if self.synchronize(0) == 0 {
+                Err(Error::Busy)
+            } else {
+                Ok(())
+            }
+        }
+        fn flush(&mut self) {
+            self.synchronize(1);
+        }
+        fn resume(&mut self) {
+            self.synchronize(2);
+        }
+        fn base_ept(&self) -> u64 {
+            self.environment.ept
+        }
+        fn split_reclamation_allowed(&self) -> bool {
+            self.environment.tracking_session == 0
+                || !unsafe {
+                    &*(self.environment.tracking_session as *const crate::memory::tracking::Session)
+                }
+                .is_active()
+        }
+        fn split_reclamation_ready(&self, epoch: u64, cpu_mask: u64) -> bool {
+            #[cfg(target_os = "uefi")]
+            {
+                use crate::vmx::resident::abi::{ResidentBootContext, ResidentEventContext};
+                let boot =
+                    unsafe { &*(self.environment.boot_context as *const ResidentBootContext) };
+                let event = unsafe { &*(boot.event_context as *const ResidentEventContext) };
+                let expected = event
+                    .control_expected_mask
+                    .load(core::sync::atomic::Ordering::Acquire);
+                if expected == 0
+                    || expected & !cpu_mask != 0
+                    || event
+                        .control_active_mask
+                        .load(core::sync::atomic::Ordering::Acquire)
+                        != expected
+                {
+                    return false;
+                }
+                // CPUs outside the currently active mask may still retain an
+                // old translation, so every allocated CPU must acknowledge.
+                for cpu_index in 0..64 {
+                    let address = event.cpu_contexts[cpu_index];
+                    if cpu_mask & (1u64 << cpu_index) == 0 {
+                        if address != 0 {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if address == 0 {
+                        return false;
+                    }
+                    let cpu = unsafe { &*(address as *const ResidentBootContext) };
+                    if cpu
+                        .interception
+                        .split_flush_epoch
+                        .load(core::sync::atomic::Ordering::Acquire)
+                        < epoch
+                    {
+                        return false;
+                    }
+                }
+                true
+            }
+            #[cfg(not(target_os = "uefi"))]
+            {
+                let _ = (epoch, cpu_mask);
+                false
+            }
+        }
+        fn table_entry(&self, address: u64) -> Result<u64, Error> {
+            let pointer = self.host_address(address, false)?;
+            Ok(unsafe { (pointer as *const u64).read_volatile() })
+        }
+        fn store_entry(&mut self, address: u64, value: u64) -> Result<(), Error> {
+            let pointer = self.host_address(address, true)?;
+            unsafe {
+                (pointer as *mut u64).write_volatile(value);
+            }
+            Ok(())
+        }
+        fn store_page(&mut self, address: u64, bytes: &[u8; 4096]) -> Result<(), Error> {
+            self.host_address(address, true)?;
+            self.host_address(address + 4095, true)?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, 4096);
+            }
+            Ok(())
+        }
+        fn available(&self) -> bool {
+            #[cfg(target_os = "uefi")]
+            {
+                use crate::vmx::resident::abi::{ResidentBootContext, ResidentEventContext};
+                let boot =
+                    unsafe { &*(self.environment.boot_context as *const ResidentBootContext) };
+                let event = unsafe { &*(boot.event_context as *const ResidentEventContext) };
+                let expected = event
+                    .control_expected_mask
+                    .load(core::sync::atomic::Ordering::Acquire);
+                if expected == 0
+                    || event
+                        .control_active_mask
+                        .load(core::sync::atomic::Ordering::Acquire)
+                        != expected
+                {
+                    return false;
+                }
+                let session = unsafe {
+                    &*(self.environment.interception_session
+                        as *const crate::memory::interception::Session)
+                };
+                let cpu_mask = unsafe { &*session.configuration.get() }.cpu_mask;
+                if expected & !cpu_mask != 0 {
+                    return false;
+                }
+                if self.environment.guest_cr4 & (1 << 12) != 0 {
+                    return false;
+                }
+                for address in event.cpu_contexts.iter().filter(|address| **address != 0) {
+                    let cpu = unsafe { &*(*address as *const ResidentBootContext) };
+                    if cpu.nested.active != 0 || cpu.nested.l2_active != 0 {
+                        return false;
+                    }
+                }
+                if crate::vmx::vmcs::vmread(crate::vmx::vmcs::GUEST_IA32_EFER)
+                    .map_or(true, |efer| efer & 0x400 == 0)
+                {
+                    return false;
+                }
+                let true_controls = unsafe { crate::arch::read_msr(0x480) } & (1 << 55) != 0;
+                let capabilities =
+                    unsafe { crate::arch::read_msr(if true_controls { 0x48e } else { 0x482 }) }
+                        >> 32;
+                if capabilities & ((1 << 15) | (1 << 23)) != ((1 << 15) | (1 << 23)) {
+                    return false;
+                }
+            }
+            self.environment.tracking_session == 0
+                || !unsafe {
+                    &*(self.environment.tracking_session as *const crate::memory::tracking::Session)
+                }
+                .is_active()
+        }
+        fn split_available(&self) -> bool {
+            #[cfg(target_os = "uefi")]
+            {
+                let true_controls = unsafe { crate::arch::read_msr(0x480) } & (1 << 55) != 0;
+                let capabilities =
+                    unsafe { crate::arch::read_msr(if true_controls { 0x48e } else { 0x482 }) }
+                        >> 32;
+                if capabilities & (1 << 27) == 0 || unsafe { crate::arch::read_msr(0x48c) } & 1 == 0
+                {
+                    return false;
+                }
+                if crate::vmx::vmcs::vmread(crate::vmx::vmcs::CPU_BASED_VM_EXEC_CONTROL)
+                    .map_or(true, |primary| primary & (1 << 27) != 0)
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        fn write_original(&mut self, address: u64, bytes: &[u8]) -> Result<(), Error> {
+            if bytes.len() > 4096 - (address as usize & 4095) {
+                return Err(Error::Bounds);
+            }
+            let pointer = self.mapped(address, false)?;
+            self.host_address(pointer, true)?;
+            for (index, byte) in bytes.iter().enumerate() {
+                unsafe {
+                    (pointer as *mut u8).add(index).write_volatile(*byte);
+                }
+            }
+            Ok(())
+        }
+        fn vmfunc_available(&self) -> bool {
+            #[cfg(target_os = "uefi")]
+            {
+                if !crate::vmx::controls::native_eptp_switching_supported() {
+                    return false;
+                }
+                if crate::vmx::vmcs::vmread(crate::vmx::vmcs::SECONDARY_VM_EXEC_CONTROL)
+                    .map_or(true, |secondary| secondary & (1 << 13) != 0)
+                {
+                    return false;
+                }
+            }
+            true
         }
     }
 

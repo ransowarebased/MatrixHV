@@ -19,9 +19,19 @@ if ($Local) {
 }
 $logPath = Join-Path $OutputDirectory 'commands.log'
 
+function Write-CommandRecord([string]$record) {
+    $stream = [IO.File]::Open($logPath, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($record + "`n")
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally { $stream.Dispose() }
+}
+
 function Invoke-GuestScript([string]$scriptText, [int]$timeout = 20) {
     $scriptText = '$ProgressPreference="SilentlyContinue"; $ErrorActionPreference="Stop"; ' + $scriptText
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptText))
+    Write-CommandRecord ("BEGIN powershell.exe -NoProfile -EncodedCommand " + $encodedCommand)
     if ($Local) {
         $lines = & powershell.exe -NoProfile -EncodedCommand $encodedCommand
     } else {
@@ -32,13 +42,14 @@ function Invoke-GuestScript([string]$scriptText, [int]$timeout = 20) {
 }
 
 function Invoke-Bitmap([string[]]$bitmapArguments, [int]$expectedExit = 0) {
+    Write-CommandRecord ("BEGIN " + $guestNeo + ' ad-bitmap ' + ($bitmapArguments -join ' '))
     if ($Local) {
         $lines = & $guestNeo ad-bitmap @bitmapArguments
     } else {
         $lines = & $NeoPath --remote $Remote --timeout 45 exec $guestNeo ad-bitmap @bitmapArguments
     }
     $commandExit = $LASTEXITCODE
-    Add-Content -LiteralPath $logPath -Value (($bitmapArguments -join ' ') + "`n" + ($lines -join "`n"))
+    Write-CommandRecord (("END exit=" + $commandExit) + "`n" + ($lines -join "`n"))
     Write-Host ($lines -join "`n")
     if ($commandExit -ne $expectedExit) { throw "Bitmap command exited $commandExit, expected $expectedExit" }
     return $lines
@@ -46,13 +57,14 @@ function Invoke-Bitmap([string[]]$bitmapArguments, [int]$expectedExit = 0) {
 
 function Start-Session([string[]]$targetArguments) {
     for ($attempt = 0; $attempt -lt 5; ++$attempt) {
+        Write-CommandRecord ("BEGIN " + $guestNeo + ' ad-bitmap start ' + ($targetArguments -join ' '))
         if ($Local) {
             $lines = & $guestNeo ad-bitmap start @targetArguments
         } else {
             $lines = & $NeoPath --remote $Remote --timeout 45 exec $guestNeo ad-bitmap start @targetArguments
         }
         $commandExit = $LASTEXITCODE
-        Add-Content -LiteralPath $logPath -Value (('start ' + ($targetArguments -join ' ')) + "`n" + ($lines -join "`n"))
+        Write-CommandRecord (("END exit=" + $commandExit) + "`n" + ($lines -join "`n"))
         Write-Host ($lines -join "`n")
         if ($commandExit -eq 0 -and ($lines -join '') -match 'session=(\d+) state=ACTIVE') {
             return $Matches[1]

@@ -54,6 +54,9 @@ pub(crate) struct Session {
 }
 
 impl Session {
+    pub(crate) fn is_active(&self) -> bool {
+        self.state == TRACK_ACTIVE
+    }
     // ResidentPages supplies zeroed storage; initialize without placing this
     // multi-megabyte object on the small resident host stack.
     pub(crate) fn initialize(&mut self, pool_base: u64, pool_pages: usize) {

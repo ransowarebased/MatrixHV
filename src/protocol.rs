@@ -102,6 +102,8 @@ pub const MATRIXHV_STATUS_SIGNATURE_EAX: u32 = 0x4d48_5631;
 pub const MATRIXHV_STATUS_SIGNATURE_EBX: u32 = u32::from_le_bytes(*b"MATR");
 pub const MATRIXHV_STATUS_SIGNATURE_ECX: u32 = u32::from_le_bytes(*b"IXHV");
 pub const MATRIXHV_STATUS_PROTOCOL: u32 = 7;
+pub const MATRIXHV_EXIT_TIMING_CAPABILITY: u32 = 1 << 17;
+pub const MATRIXHV_EXIT_TIMING_SUBLEAF: u32 = 55;
 // The resident L1 contract excludes legacy hardware task switching and SMX.
 // Query this subleaf before booting a guest that requires either facility.
 pub const MATRIXHV_GUEST_CONTRACT_SUBLEAF: u32 = 54;
@@ -145,6 +147,80 @@ pub mod memory {
     pub const AD_STATUS: u32 = 8;
     pub const AD_ENUMERATE: u32 = 9;
     pub const AD_CANCEL: u32 = 10;
+    // Scoped interception uses CR3 at 16, optional second CR3 at 64, and token at 80.
+    // Hook descriptors use the WRITE layout; debug records are (address, redirect RIP).
+    // Status returns context count at 44, hits at 88, hook/debug counts at 104/108, state at 112,
+    // and a revocation cause at 116. Hook pages use execute-only shadows and
+    // original data mappings with a bounded monitor-trap window.
+    // Flags at 128 opt into cooperative VMFUNC (EAX=0, ECX=0 execute / 1 data).
+    // Switching code and its return path must occupy unhooked pages. Stores
+    // through the read-only data slot use MTF; CPU-private data views avoid
+    // parking peers for ordinary writes.
+    pub const HOOK_INSTALL: u32 = 11;
+    pub const HOOK_REMOVE: u32 = 12;
+    pub const DEBUG_SET: u32 = 13;
+    pub const DEBUG_CLEAR: u32 = 14;
+    pub const INTERCEPT_STATUS: u32 = 15;
+    pub const HOOK_ADD: u32 = 16;
+    pub const HOOK_DROP: u32 = 17;
+    pub const HOOK_LIST: u32 = 18;
+    pub const INTERCEPT_RENEW: u32 = 19;
+    pub const INTERCEPT_RELEASE: u32 = 20;
+    pub const INTERCEPT_CONTEXT_ADD: u32 = 21;
+    pub const INTERCEPT_CONTEXT_REMOVE: u32 = 22;
+    pub const INTERCEPT_CONTEXT_LIST: u32 = 23;
+    // Install/add return a stable ID at descriptor +16. List records contain
+    // (ID, GVA, patch length, reserved). Drop carries ID at 144.
+    // Lease duration (ms) is at 132; remaining time (ms) is at 136.
+    pub const INTERCEPT_DEFAULT_LEASE_MS: u32 = 30_000;
+    pub const INTERCEPT_MAX_LEASE_MS: u32 = 600_000;
+    pub const HOOK_MAX_PATCHES: usize = 32;
+    pub const HOOK_MAX_PAGES: usize = 32;
+    const _: () = assert!(HOOK_MAX_PAGES >= HOOK_MAX_PATCHES);
+    pub const INTERCEPT_TABLE_PAGES: usize = 2 + 6 * HOOK_MAX_PAGES;
+    pub const INTERCEPT_BASE_TABLE_PAGES: usize = 128;
+    pub const INTERCEPT_CPU_TABLE_PAGES: usize = 1 + 3 * HOOK_MAX_PAGES;
+    pub const INTERCEPT_CPU_VIEW_PAGES: usize = INTERCEPT_CPU_TABLE_PAGES + 1;
+    pub const fn intercept_bank_pages(cpu_mask: u64) -> usize {
+        INTERCEPT_TABLE_PAGES + 2 * HOOK_MAX_PAGES + 1
+            + cpu_mask.count_ones() as usize * INTERCEPT_CPU_VIEW_PAGES
+    }
+
+    pub const fn intercept_storage_pages(cpu_mask: u64) -> usize {
+        2 * intercept_bank_pages(cpu_mask) + INTERCEPT_BASE_TABLE_PAGES
+    }
+    pub const INTERCEPT_VMFUNC: u32 = 1;
+    pub const INTERCEPT_TSC_OFFSET: u32 = 2;
+    pub const INTERCEPT_CONCURRENT_WRITES: u32 = 4;
+    pub const INTERCEPT_PERSISTENT_DATA: u32 = 8;
+    pub const INTERCEPT_NO_LEASE: u32 = 16;
+    pub const INTERCEPT_EXECUTE_SLOT: u32 = 0;
+    pub const INTERCEPT_DATA_SLOT: u32 = 1;
+    pub const INTERCEPT_DISABLED: u32 = 0;
+    pub const INTERCEPT_ACTIVE: u32 = 1;
+    pub const INTERCEPT_REVOKED: u32 = 2;
+    pub const INTERCEPT_CAUSE_NONE: u32 = 0;
+    pub const INTERCEPT_CAUSE_CONTEXT: u32 = 1;
+    pub const INTERCEPT_CAUSE_MIXED_ACCESS: u32 = 2;
+    pub const INTERCEPT_CAUSE_RENDEZVOUS: u32 = 3;
+    pub const INTERCEPT_CAUSE_LEASE: u32 = 4;
+    pub const INTERCEPT_CAUSE_MERGE: u32 = 5;
+    pub const INTERCEPT_CAUSE_RUNTIME: u32 = 6;
+    pub const EPT_DIAGNOSTIC_CAPABILITY: u32 = 1 << 16;
+    pub const EPT_DIAGNOSTIC_SUBLEAF: u32 = 0x400;
+    // Runtime words are (attempts, successes, failures) for dispatch, apply,
+    // revoke, flush, observe, timing and recovery, then failure phase/RIP/GPA.
+    // Failure phase uses phase + 1 so zero denotes no recorded failure.
+    pub const INTERCEPT_RUNTIME_PHASES: usize = 7;
+    pub const INTERCEPT_DIAGNOSTIC_WORDS: usize = 24;
+    const _: () = assert!(INTERCEPT_DIAGNOSTIC_WORDS == INTERCEPT_RUNTIME_PHASES * 3 + 3);
+    // Sync words: attempts, successes, owner contention, transport failures,
+    // peer-ack timeouts, ICR timeouts, failure phase and pending CPU mask.
+    // Failure phases: 1 owner, 2 transport, 3 ICR, 4 peer acknowledgement,
+    // 5 parked-peer release. Stall records contain phase/owner/epoch/pending
+    // mask/RIP/GPA/write-step/TSC and are recorded without optional counters.
+    pub const EPT_SYNC_DIAGNOSTIC_WORDS: usize = 8;
+    pub const EPT_STALL_DIAGNOSTIC_SUBLEAF: u32 = EPT_DIAGNOSTIC_SUBLEAF + 16;
     // Token/T0/T1 occupy 80/88/96; state/count/pool usage occupy 104/108/112.
     // START carries (CR3, GVA) pairs. FETCH uses the first record index at 64.
     // ENUMERATE uses CR3 at 64 and GVA cursor at 16; returns the user limit at 72.
@@ -271,6 +347,7 @@ pub mod memory {
         Session = 11,
         Capacity = 12,
         Remapped = 13,
+        MergeConflict = 14,
     }
 
     pub fn word(bytes: &[u8], offset: usize) -> u32 {

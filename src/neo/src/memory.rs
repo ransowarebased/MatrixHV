@@ -6,6 +6,10 @@ pub(crate) mod access;
 #[path = "../../memory/tracking.rs"]
 pub(crate) mod tracking;
 
+#[cfg(test)]
+#[path = "../../memory/interception.rs"]
+pub(crate) mod interception;
+
 use crate::protocol::memory::{
     AD_BITMAP, AD_CANCEL, AD_ENABLED, AD_ENUMERATE, AD_FETCH, AD_LARGE_PAGE, AD_RELEASE, AD_START,
     AD_STATUS, AD_STOP, BUFFER_BYTES, HEADER_BYTES, INFO, INFO_BYTES, ITEM_BYTES, MAX_ITEMS,
@@ -28,6 +32,346 @@ pub(crate) fn number(text: &str) -> Result<u64, String> {
         text.parse()
     };
     value.map_err(|_| format!("invalid integer: {text}; use decimal or 0x-prefixed hexadecimal"))
+}
+
+pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, String> {
+    use crate::protocol::memory::{
+        DEBUG_CLEAR, DEBUG_SET, HOOK_ADD, HOOK_DROP, HOOK_INSTALL, HOOK_LIST, HOOK_MAX_PATCHES,
+        HOOK_REMOVE, INTERCEPT_CONTEXT_ADD, INTERCEPT_CONTEXT_LIST, INTERCEPT_CONTEXT_REMOVE,
+        INTERCEPT_MAX_LEASE_MS, INTERCEPT_RELEASE, INTERCEPT_RENEW, INTERCEPT_STATUS,
+    };
+    let mut arguments = arguments.to_vec();
+    let no_lease = if let Some(index) = arguments.iter().position(|value| value == "--no-lease") {
+        arguments.remove(index);
+        true
+    } else {
+        false
+    };
+    let mut modes = 0;
+    for (option, flag) in [
+        (
+            "--concurrent-writes",
+            crate::protocol::memory::INTERCEPT_CONCURRENT_WRITES,
+        ),
+        (
+            "--persistent-data",
+            crate::protocol::memory::INTERCEPT_PERSISTENT_DATA,
+        ),
+    ] {
+        if let Some(index) = arguments.iter().position(|value| value == option) {
+            arguments.remove(index);
+            modes |= flag;
+        }
+    }
+    let timing = if let Some(index) = arguments.iter().position(|value| value == "--tsc-offset") {
+        arguments.remove(index);
+        true
+    } else {
+        false
+    };
+    let mut lease_ms = 0;
+    if let Some(index) = arguments.iter().position(|value| value == "--lease-ms") {
+        if index + 1 >= arguments.len() {
+            return Err("--lease-ms requires a duration".into());
+        }
+        lease_ms = number(&arguments[index + 1])?;
+        if lease_ms == 0 || lease_ms > u64::from(INTERCEPT_MAX_LEASE_MS) {
+            return Err(format!(
+                "lease must be 1..={INTERCEPT_MAX_LEASE_MS} milliseconds"
+            ));
+        }
+        arguments.drain(index..index + 2);
+    }
+    let command = arguments.first().map(String::as_str);
+    let action = arguments.get(1).map(String::as_str);
+    let operation = match (command, action) {
+        (Some("hook"), Some("install")) => HOOK_INSTALL,
+        (Some("hook"), Some("add")) => HOOK_ADD,
+        (Some("hook"), Some("remove")) if arguments.len() == 4 => HOOK_DROP,
+        (Some("hook"), Some("remove")) => HOOK_REMOVE,
+        (Some("hook"), Some("list")) => HOOK_LIST,
+        (Some("hook"), Some("context-add")) => INTERCEPT_CONTEXT_ADD,
+        (Some("hook"), Some("context-remove")) => INTERCEPT_CONTEXT_REMOVE,
+        (Some("hook"), Some("context-list")) => INTERCEPT_CONTEXT_LIST,
+        (Some("hook" | "debug-registers"), Some("renew")) => INTERCEPT_RENEW,
+        (Some("hook" | "debug-registers"), Some("release")) => INTERCEPT_RELEASE,
+        (Some("debug-registers"), Some("set")) => DEBUG_SET,
+        (Some("debug-registers"), Some("clear")) => DEBUG_CLEAR,
+        (Some("hook" | "debug-registers"), Some("status")) => INTERCEPT_STATUS,
+        _ => return Err("usage: neo hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--lease-ms MS | --no-lease] [--tsc-offset] | hook add TOKEN ADDRESS HEX [...] | hook remove TOKEN [ID] | hook list TOKEN | hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN | hook renew TOKEN [--lease-ms MS] | hook release TOKEN | hook watch TOKEN [--lease-ms MS] | hook status; neo debug-registers set CR3 ADDRESS REDIRECT_RIP [...] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset] | debug-registers clear TOKEN | debug-registers status".into()),
+    };
+    if operation == INTERCEPT_STATUS && arguments.len() != 2
+        || matches!(
+            operation,
+            HOOK_REMOVE
+                | DEBUG_CLEAR
+                | HOOK_LIST
+                | INTERCEPT_RENEW
+                | INTERCEPT_RELEASE
+                | INTERCEPT_CONTEXT_LIST
+        ) && arguments.len() != 3
+    {
+        return Err("status takes no operands; remove/clear requires the token returned by installation or status".into());
+    }
+    if lease_ms != 0 && !matches!(operation, HOOK_INSTALL | DEBUG_SET | INTERCEPT_RENEW) {
+        return Err("--lease-ms applies to installation, debug setup or renewal".into());
+    }
+    if no_lease && (lease_ms != 0 || !matches!(operation, HOOK_INSTALL | DEBUG_SET)) {
+        return Err("--no-lease applies only to installation or debug setup and cannot be combined with --lease-ms".into());
+    }
+    if timing && !matches!(operation, HOOK_INSTALL | DEBUG_SET) {
+        return Err("--tsc-offset applies only to hook installation or debug setup".into());
+    }
+    if modes != 0 && operation != HOOK_INSTALL {
+        return Err("data-view modes apply only to hook installation".into());
+    }
+    let mut bytes = if matches!(operation, INTERCEPT_CONTEXT_ADD | INTERCEPT_CONTEXT_REMOVE) {
+        if arguments.len() < 4 || arguments.len() > ROOT_HISTORY_COUNT + 1 {
+            return Err("context change requires TOKEN and 1..14 CR3 roots".into());
+        }
+        let count = arguments.len() - 3;
+        let mut bytes = vec![0; HEADER_BYTES + count * 8];
+        bytes[80..88].copy_from_slice(&number(&arguments[2])?.to_le_bytes());
+        bytes[32..36].copy_from_slice(&(count as u32).to_le_bytes());
+        for (index, value) in arguments[3..].iter().enumerate() {
+            bytes[HEADER_BYTES + index * 8..HEADER_BYTES + index * 8 + 8]
+                .copy_from_slice(&number(value)?.to_le_bytes());
+        }
+        bytes
+    } else if operation == HOOK_ADD {
+        let token = number(arguments.get(2).ok_or("add requires a session token")?)?;
+        let items = parse_items(WRITE, &arguments[3..])?;
+        if items.len() > HOOK_MAX_PATCHES {
+            return Err("hook capacity exceeded".into());
+        }
+        for item in &items {
+            if item.bytes.len() > 4096 - (item.address as usize & 4095) {
+                return Err("each patch must fit inside one 4 KiB page".into());
+            }
+        }
+        let mut bytes = packet(WRITE, 0, 0, &items)?;
+        bytes[80..88].copy_from_slice(&token.to_le_bytes());
+        bytes
+    } else if matches!(operation, HOOK_INSTALL | DEBUG_SET) {
+        let cr3 = number(arguments.get(2).ok_or("installation requires CR3")?)?;
+        if cr3 & !4095 == 0 {
+            return Err("CR3 must contain a nonzero page-table root".into());
+        }
+        let mut operands = arguments[3..].to_vec();
+        let vmfunc = operands.last().is_some_and(|value| value == "--vmfunc");
+        if vmfunc {
+            if operation != HOOK_INSTALL {
+                return Err("--vmfunc applies only to hook installation".into());
+            }
+            operands.pop();
+        }
+        let mut alternate = 0;
+        if let Some(index) = operands.iter().position(|value| value == "--alternate-cr3") {
+            if index + 2 != operands.len() {
+                return Err("--alternate-cr3 CR3 must be the final option".into());
+            }
+            alternate = number(&operands[index + 1])?;
+            if alternate & !4095 == 0 {
+                return Err("alternate CR3 must contain a nonzero page-table root".into());
+            }
+            operands.truncate(index);
+        }
+        let mut packet = if operation == HOOK_INSTALL {
+            let items = parse_items(WRITE, &operands)?;
+            if items.len() > HOOK_MAX_PATCHES {
+                return Err(format!("hooks support at most {HOOK_MAX_PATCHES} patches"));
+            }
+            for item in &items {
+                if item.bytes.len() > 4096 - (item.address as usize & 4095) {
+                    return Err("each hook patch must fit inside one 4 KiB page".into());
+                }
+            }
+            let mut packet = packet(WRITE, 0, cr3, &items)?;
+            packet[12..16].copy_from_slice(&operation.to_le_bytes());
+            packet
+        } else {
+            if operands.is_empty() || !operands.len().is_multiple_of(2) || operands.len() > 8 {
+                return Err("debug-registers requires 1..4 ADDRESS REDIRECT_RIP pairs".into());
+            }
+            let count = operands.len() / 2;
+            let mut packet = vec![0; HEADER_BYTES + count * 16];
+            packet[16..24].copy_from_slice(&cr3.to_le_bytes());
+            packet[32..36].copy_from_slice(&(count as u32).to_le_bytes());
+            for (index, pair) in operands.as_chunks::<2>().0.iter().enumerate() {
+                let offset = HEADER_BYTES + index * 16;
+                packet[offset..offset + 8].copy_from_slice(&number(&pair[0])?.to_le_bytes());
+                packet[offset + 8..offset + 16].copy_from_slice(&number(&pair[1])?.to_le_bytes());
+            }
+            packet
+        };
+        packet[64..72].copy_from_slice(&alternate.to_le_bytes());
+        if vmfunc {
+            packet[128..132]
+                .copy_from_slice(&crate::protocol::memory::INTERCEPT_VMFUNC.to_le_bytes());
+        }
+        packet
+    } else if operation == HOOK_LIST {
+        vec![0; HEADER_BYTES + HOOK_MAX_PATCHES * ITEM_BYTES]
+    } else if operation == INTERCEPT_CONTEXT_LIST {
+        vec![0; HEADER_BYTES + ROOT_HISTORY_COUNT * 8]
+    } else {
+        vec![0; HEADER_BYTES]
+    };
+    bytes[0..8].copy_from_slice(&MEMORY_MAGIC.to_le_bytes());
+    bytes[8..12].copy_from_slice(&MEMORY_VERSION.to_le_bytes());
+    bytes[12..16].copy_from_slice(&operation.to_le_bytes());
+    let length = bytes.len() as u32;
+    bytes[36..40].copy_from_slice(&length.to_le_bytes());
+    if matches!(
+        operation,
+        HOOK_REMOVE
+            | HOOK_DROP
+            | HOOK_LIST
+            | DEBUG_CLEAR
+            | INTERCEPT_RENEW
+            | INTERCEPT_RELEASE
+            | INTERCEPT_CONTEXT_LIST
+    ) {
+        bytes[80..88].copy_from_slice(&number(&arguments[2])?.to_le_bytes());
+    }
+    if operation == HOOK_DROP {
+        bytes[144..152].copy_from_slice(&number(&arguments[3])?.to_le_bytes());
+    }
+    bytes[132..136].copy_from_slice(&(lease_ms as u32).to_le_bytes());
+    if no_lease {
+        let flags = word(&bytes, 128) | crate::protocol::memory::INTERCEPT_NO_LEASE;
+        bytes[128..132].copy_from_slice(&flags.to_le_bytes());
+    }
+    if timing {
+        let flags = word(&bytes, 128) | crate::protocol::memory::INTERCEPT_TSC_OFFSET;
+        bytes[128..132].copy_from_slice(&flags.to_le_bytes());
+    }
+    if modes != 0 {
+        let flags = word(&bytes, 128) | modes;
+        bytes[128..132].copy_from_slice(&flags.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
+    if arguments.get(1).is_some_and(|action| action == "watch") {
+        let mut renewal = arguments.to_vec();
+        renewal[1] = "renew".into();
+        let template = interception_packet(&renewal)?;
+        println!(
+            "Renewing session {} until this process exits; the watchdog remains armed.",
+            quad(&template, 80)
+        );
+        loop {
+            let mut bytes = template.clone();
+            if let Err(error) = invoke(&mut bytes) {
+                if word(&bytes, 40) == crate::protocol::memory::Error::Busy as u32 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                return Err(error);
+            }
+            if word(&bytes, 112) != crate::protocol::memory::INTERCEPT_ACTIVE {
+                return Err("session is no longer active".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(
+                (u64::from(word(&bytes, 132)) / 3).max(1),
+            ));
+        }
+    }
+    let mut bytes = interception_packet(arguments)?;
+    let operation = word(&bytes, 12);
+    invoke(&mut bytes)?;
+    let state = match word(&bytes, 112) {
+        crate::protocol::memory::INTERCEPT_DISABLED => "disabled",
+        crate::protocol::memory::INTERCEPT_ACTIVE => "active",
+        crate::protocol::memory::INTERCEPT_REVOKED => "revoked",
+        _ => "unknown",
+    };
+    println!(
+        "token={} cr3={:#x} alternate_cr3={:#x} hooks={} debug_targets={} hits={} state={state}",
+        quad(&bytes, 80),
+        quad(&bytes, 16),
+        quad(&bytes, 64),
+        word(&bytes, 104),
+        word(&bytes, 108),
+        quad(&bytes, 88)
+    );
+    let cause = match word(&bytes, 116) {
+        crate::protocol::memory::INTERCEPT_CAUSE_NONE => "none",
+        crate::protocol::memory::INTERCEPT_CAUSE_CONTEXT => "nested-or-cache-change",
+        crate::protocol::memory::INTERCEPT_CAUSE_MIXED_ACCESS => {
+            "instruction-fetch-and-data-on-hooked-code"
+        }
+        crate::protocol::memory::INTERCEPT_CAUSE_RENDEZVOUS => "cpu-rendezvous-failed",
+        crate::protocol::memory::INTERCEPT_CAUSE_LEASE => "lease-expired",
+        crate::protocol::memory::INTERCEPT_CAUSE_MERGE => "page-merge-conflict",
+        crate::protocol::memory::INTERCEPT_CAUSE_RUNTIME => "profile-runtime-failure",
+        _ => "unknown",
+    };
+    println!(
+        "mode=dual-eptp-split-view data_exits={} write_windows={} revocation_cause={cause}",
+        quad(&bytes, 96),
+        quad(&bytes, 120)
+    );
+    println!(
+        "lease_ms={} remaining_ms={} patches={} generation={}",
+        word(&bytes, 132),
+        quad(&bytes, 136),
+        quad(&bytes, 152),
+        quad(&bytes, 144)
+    );
+    if word(&bytes, 128) & crate::protocol::memory::INTERCEPT_NO_LEASE != 0 {
+        println!("lease=disabled lifetime=explicit-release");
+    }
+    if word(&bytes, 128) & crate::protocol::memory::INTERCEPT_TSC_OFFSET != 0 {
+        println!(
+            "timing=cpu-local-tsc-offset compensated_ticks={} reference_tsc=unsupported",
+            quad(&bytes, 72)
+        );
+    }
+    println!(
+        "contexts={} concurrent_writes={} persistent_data={}",
+        word(&bytes, 44),
+        word(&bytes, 128) & crate::protocol::memory::INTERCEPT_CONCURRENT_WRITES != 0,
+        word(&bytes, 128) & crate::protocol::memory::INTERCEPT_PERSISTENT_DATA != 0
+    );
+    if matches!(
+        operation,
+        crate::protocol::memory::HOOK_INSTALL | crate::protocol::memory::HOOK_ADD
+    ) {
+        for index in 0..word(&bytes, 32) as usize {
+            let descriptor = HEADER_BYTES + index * ITEM_BYTES;
+            println!(
+                "id={} address={:#x} length={}",
+                quad(&bytes, descriptor + 16),
+                quad(&bytes, descriptor),
+                word(&bytes, descriptor + 12)
+            );
+        }
+    } else if operation == crate::protocol::memory::HOOK_LIST {
+        for index in 0..word(&bytes, 32) as usize {
+            let descriptor = HEADER_BYTES + index * ITEM_BYTES;
+            println!(
+                "id={} address={:#x} length={}",
+                quad(&bytes, descriptor),
+                quad(&bytes, descriptor + 8),
+                word(&bytes, descriptor + 16)
+            );
+        }
+    } else if operation == crate::protocol::memory::INTERCEPT_CONTEXT_LIST {
+        for index in 0..word(&bytes, 32) as usize {
+            println!("context_cr3={:#x}", quad(&bytes, HEADER_BYTES + index * 8));
+        }
+    }
+    if word(&bytes, 128) & crate::protocol::memory::INTERCEPT_VMFUNC != 0 {
+        println!(
+            "vmfunc=cooperative function=0 execute_slot={} data_slot={} data_writes=mtf",
+            crate::protocol::memory::INTERCEPT_EXECUTE_SLOT,
+            crate::protocol::memory::INTERCEPT_DATA_SLOT
+        );
+    }
+    Ok(0)
 }
 
 pub(crate) fn packet(
@@ -471,6 +815,7 @@ pub(crate) fn invoke(bytes: &mut [u8]) -> Result<(), String> {
             return Err("MatrixHV memory transport is unavailable; boot the updated EFI and enable MatrixHV on this CPU".into());
         }
         if status != 0 {
+            bytes[40..44].copy_from_slice(&(status as u32).to_le_bytes());
             return Err(format!(
                 "memory transport failed: {}",
                 status_text(status as u32)
@@ -498,15 +843,18 @@ fn status_text(status: u32) -> &'static str {
         2 => "invalid range",
         3 => "page is not resident or mapped",
         4 => "page permission, EPT concealment, or non-RAM mapping denied access",
-        5 => "unsupported paging mode, nested guest, or EPT A/D capability",
+        5 => {
+            "unsupported paging mode, nested guest, hardware capability, or conflicting tracking session"
+        }
         6 => "prototype PTE could not be resolved",
         7 => "page is backed by the pagefile",
         8 => "copy-on-write requires the Windows memory manager",
         9 => "demand-zero write requires a physical backing page",
-        10 => "tracking session or CPU rendezvous is busy; retry",
+        10 => "tracking/interception session or CPU rendezvous is busy; retry",
         11 => "invalid session identifier or lifecycle state",
-        12 => "resident EPT split pool is exhausted",
+        12 => "resident EPT table pool is exhausted",
         13 => "virtual page mapping changed during the session",
+        14 => "original write committed; a page merge conflict revoked interception",
         ROAD_STATUS_DEMAND_ZERO => "DEMAND_ZERO (zero-filled read)",
         _ => "unknown status",
     }

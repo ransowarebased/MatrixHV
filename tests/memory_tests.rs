@@ -751,6 +751,7 @@ impl Machine {
             kernel_cr3: target_root,
             root_history: 0,
             tracking_session: 0,
+            interception_session: 0,
             boot_context: 0,
             synchronize: 0,
             physical_bits: 52,
@@ -867,6 +868,59 @@ fn resident_tracking_splits_large_ept_leaves_and_captures_exact_dirty_pages() {
         assert_eq!(record[TRACK_RECORD_BYTES - 1], 87);
         crate::memory::verify_dump(record).unwrap();
     }
+}
+
+#[test]
+fn resident_interception_transport_builds_a_private_root_in_validated_host_storage() {
+    let request = packet(INFO, 0, 0, &[]).unwrap();
+    let (mut machine, mut environment, buffer, target) = Machine::setup(&request);
+    machine.map(machine.ept, target, target, 0x37);
+    let pool_bytes = intercept_storage_pages(1) * 4096;
+    let pool_layout = std::alloc::Layout::from_size_align(pool_bytes, 4096).unwrap();
+    let pool = unsafe { std::alloc::alloc_zeroed(pool_layout) };
+    assert!(!pool.is_null());
+    for index in 0..pool_bytes / 4096 {
+        let address = pool as u64 + index as u64 * 4096;
+        machine.map(machine.host, address, address, 3);
+    }
+    machine.host_map_all();
+    let session_layout = std::alloc::Layout::new::<crate::memory::interception::Session>();
+    let mut session = unsafe {
+        Box::from_raw(std::alloc::alloc_zeroed(session_layout).cast::<crate::memory::interception::Session>())
+    };
+    session.initialize(pool as u64, 1);
+    let mut barrier = TrackingBarrier { operations: Vec::new(), root: machine.ept, target };
+    environment.interception_session = &*session as *const _ as u64;
+    environment.boot_context = &mut barrier as *mut _ as u64;
+    environment.synchronize = tracking_barrier as *const () as u64;
+    let install = crate::memory::interception_packet(&[
+        "hook".into(), "install".into(), format!("{:#x}", environment.kernel_cr3), "8".into(), "cc".into(),
+    ]).unwrap();
+    let installed = native_tracking_request(&environment, &[buffer], &install);
+    assert_eq!(word(&installed, 40), 0);
+    assert_eq!(barrier.operations, [0, 1, 2]);
+    let configuration = unsafe { &*session.configuration.get() };
+    let shadow = unsafe { ept_pointer(configuration.ept, target, 12).read() } & 0x000f_ffff_ffff_f000;
+    assert_eq!(unsafe { (shadow as *const u8).add(8).read() }, 0xcc);
+    assert_eq!(unsafe { (target as *const u8).add(8).read() }, 0);
+    let edit = packet(WRITE, 0, environment.kernel_cr3, &[Item { address: 9, bytes: vec![0x42] }]).unwrap();
+    let edited = native_tracking_request(&environment, &[buffer], &edit);
+    assert_eq!(word(&edited, HEADER_BYTES + 16), 0);
+    assert_eq!(unsafe { (target as *const u8).add(8).read() }, 0);
+    assert_eq!(unsafe { (shadow as *const u8).add(8).read() }, 0xcc);
+    assert_eq!(unsafe { (shadow as *const u8).add(9).read() }, 0x42);
+    let status = crate::memory::interception_packet(&["hook".into(), "status".into()]).unwrap();
+    let response = native_tracking_request(&environment, &[buffer], &status);
+    assert_eq!(word(&response, 104), 1);
+    assert_eq!(word(&response, 44), 1);
+    assert_eq!(quad(&response, 48), environment.caller_cr3);
+    assert_eq!(word(&response, 112), INTERCEPT_ACTIVE);
+    let token = quad(&response, 80).to_string();
+    let remove = crate::memory::interception_packet(&["hook".into(), "remove".into(), token]).unwrap();
+    let removed = native_tracking_request(&environment, &[buffer], &remove);
+    assert_eq!(word(&removed, 112), INTERCEPT_DISABLED);
+    drop(session);
+    unsafe { std::alloc::dealloc(pool, pool_layout); }
 }
 
 #[test]

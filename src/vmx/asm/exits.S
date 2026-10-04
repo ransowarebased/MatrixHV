@@ -695,12 +695,30 @@ jne matrixhv_resident_island_fatal
 mov rax, {boot_canary_end}
 cmp qword ptr [r12 + {b_canary_end}], rax
 jne matrixhv_resident_island_fatal
+cmp qword ptr [r12 + {b_interception_timing_saved}], 0
+je .Lresident_interception_clock_sampled
+lfence
+rdtsc
+lfence
+shl rdx, 32
+or rax, rdx
+mov qword ptr [r12 + {b_interception_timing_start}], rax
+.Lresident_interception_clock_sampled:
+call .Lresident_nested_eptp_sync_budget_start
 mov qword ptr [r12 + {b_root_vmx_active}], 1
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
 mov rax, {exit_reason}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
 mov qword ptr [r12 + {b_last_reason}], r11
+mov rax, qword ptr [r12 + {b_interception_ept}]
+mov qword ptr [r12 + {b_interception_exit_ept}], rax
+mov rax, qword ptr [r12 + {b_interception_step}]
+mov qword ptr [r12 + {b_interception_exit_step}], rax
+mov rax, qword ptr [r12 + {b_interception_vmfunc}]
+mov qword ptr [r12 + {b_interception_exit_vmfunc}], rax
+mov edx, 4
+call .Lresident_interception_callback
 matrixhv_island_control_rearm
 call .Lresident_nested_eptp_sync_poll
 mov rax, {guest_rip}
@@ -808,6 +826,17 @@ cmp qword ptr [r12 + {b_nested_l2_active}], 1
 je .Lresident_nested_l2_route
 .Lresident_dispatch_l1:
 matrixhv_resident_nested_l1_msr_rearm
+mov r8, rsp
+xor edx, edx
+call .Lresident_interception_callback
+cmp eax, 1
+je .Lresident_interception_retry
+cmp eax, 2
+je .Lresident_interception_advance
+cmp eax, 3
+je .Lresident_dispatch_inject_gp
+cmp eax, 4
+je .Lresident_dispatch_inject_ud
 matrixhv_island_event_observation
 .Lresident_dispatch_reason:
 cmp qword ptr [r12 + {b_telemetry_active}], 0
@@ -873,6 +902,12 @@ je .Lresident_dispatch_xsetbv
 cmp eax, {preemption_timer_reason}
 je .Lresident_dispatch_boot_timer
 jmp .Lresident_dispatch_unsupported
+.Lresident_interception_retry:
+call .Lresident_retry_interrupted_event
+jmp .Lresident_dispatch_resume
+.Lresident_interception_advance:
+call .Lresident_advance_guest_rip
+jmp .Lresident_dispatch_resume
 matrixhv_resident_ap_startup
 matrixhv_island_cache_flush
 matrixhv_resident_nested_reflection
@@ -902,6 +937,11 @@ call .Lresident_profile_exit_handler
 call .Lresident_watchdog_resuming
 call .Lresident_nested_eptp_sync_enter
 call .Lresident_nested_prepare_full_msr_entry
+cmp qword ptr [r12 + {b_interception_timing_saved}], 0
+je .Lresident_interception_clock_ready
+mov edx, 5
+call .Lresident_interception_callback
+.Lresident_interception_clock_ready:
 pop rax
 pop rcx
 pop rdx

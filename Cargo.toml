@@ -14,6 +14,8 @@ uefi = { version = "0.40.0", features = ["alloc", "global_allocator", "panic_han
 uefi-raw = "0.16.0"
 ed25519-dalek = { version = "2.2.0", default-features = false }
 sha2 = { version = "0.10.9", default-features = false, features = ["force-soft"] }
+yaxpeax-x86 = { version = "2.2.0", default-features = false }
+yaxpeax-arch = { version = "0.3.2", default-features = false }
 
 [profile.dev]
 panic = "abort"

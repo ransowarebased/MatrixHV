@@ -147,6 +147,9 @@ mov qword ptr [rsp + 96], rax
 mov qword ptr [rsp + 104], r12
 lea rax, [rip + .Lresident_memory_synchronize]
 mov qword ptr [rsp + 112], rax
+mov rax, qword ptr [r12 + {b_event_context}]
+mov rax, qword ptr [rax + {event_interception_context}]
+mov qword ptr [rsp + 120], rax
 lea r9, [rsp + 32]
 call r13
 fxrstor64 [rsp + 128]
@@ -200,6 +203,75 @@ pop rdi
 pop rsi
 pop rbp
 pop rbx
+ret
+.Lresident_interception_callback:
+mov rax, qword ptr [r12 + {b_event_context}]
+mov rax, qword ptr [rax + {event_interception_context}]
+test rax, rax
+jz .Lresident_interception_callback_idle
+cmp edx, 3
+je .Lresident_interception_callback_active
+cmp qword ptr [rax], 1
+je .Lresident_interception_callback_active
+cmp qword ptr [r12 + {b_interception_controls}], 0
+jne .Lresident_interception_callback_active
+cmp qword ptr [r12 + {b_interception_debug_armed}], 0
+jne .Lresident_interception_callback_active
+cmp qword ptr [r12 + {b_interception_ept}], 0
+jne .Lresident_interception_callback_active
+cmp edx, 0
+jne .Lresident_interception_callback_idle
+cmp qword ptr [r12 + {b_interception_exit_ept}], 0
+jne .Lresident_interception_callback_active
+cmp qword ptr [r12 + {b_interception_exit_step}], 0
+jne .Lresident_interception_callback_active
+cmp qword ptr [r12 + {b_interception_exit_vmfunc}], 0
+jne .Lresident_interception_callback_active
+cmp qword ptr [r12 + {b_last_reason}], 48
+jne .Lresident_interception_callback_idle
+cmp qword ptr [r12 + {b_interception_hook_count}], 0
+jne .Lresident_interception_callback_active
+.Lresident_interception_callback_idle:
+xor eax, eax
+ret
+.Lresident_interception_callback_active:
+// Preserve EFI nonvolatile registers and guest SIMD state across the relocated
+// Rust callback. R8 is the guest frame for dispatch; other phases ignore it.
+push rbx
+push rbp
+push rsi
+push rdi
+push r12
+push r13
+push r14
+push r15
+mov rbp, rsp
+and rsp, -16
+sub rsp, 544
+fxsave64 [rsp + 32]
+mov rcx, r12
+lea r9, [rip + .Lresident_memory_synchronize]
+mov rax, qword ptr [r12 + {b_event_context}]
+mov rax, qword ptr [rax + {event_interception_entry}]
+test rax, rax
+jz .Lresident_interception_callback_absent
+call rax
+jmp .Lresident_interception_callback_return
+.Lresident_interception_callback_absent:
+xor eax, eax
+.Lresident_interception_callback_return:
+fxrstor64 [rsp + 32]
+mov rsp, rbp
+pop r15
+pop r14
+pop r13
+pop r12
+pop rdi
+pop rsi
+pop rbp
+pop rbx
+cmp rax, -1
+je .Lresident_dispatch_halt
 ret
 .Lresident_dispatch_update_l2_reject:
 mov rax, 14
@@ -499,6 +571,11 @@ mov qword ptr [rsp], rax
 call .Lresident_advance_guest_rip
 jmp .Lresident_dispatch_resume
 .Lresident_dispatch_control_off_prepare:
+mov edx, 2
+call .Lresident_interception_callback
+mov edx, 1
+call .Lresident_interception_callback
+call .Lresident_interception_safe_point_timer
 mov rdi, qword ptr [r12 + {b_event_context}]
 test rdi, rdi
 jz .Lresident_control_off_failed

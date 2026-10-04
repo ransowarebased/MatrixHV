@@ -1940,6 +1940,23 @@ mod telemetry {
     }
 
     #[test]
+    fn exit_clock_diagnostics_report_compensation_and_full_width_frequency() {
+        let mut context = [0; 1024];
+        let mut remote = [0u64; 1024];
+        let mut shared = [0; 1024];
+        shared[offset("event_cpu_contexts") + 1] = remote.as_mut_ptr() as u64;
+        remote[offset("b_interception_timing_saved")] = 1;
+        remote[offset("b_watchdog_tsc_hz")] = 0x1122334455667788;
+        assert_eq!(
+            diagnostic(&mut context, &mut shared, (2 << 16) | 55),
+            [1, 0, 0x55667788, 0x11223344]
+        );
+        assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 55), [0; 4]);
+        assert_ne!(diagnostic(&mut context, &mut shared, 34)[0] & (1 << 17), 0);
+        assert_eq!(remote[offset("b_interception_timing_saved")], 1);
+    }
+
+    #[test]
     fn vmx_capability_queries_distinguish_host_support_from_nested_exposure() {
         let mut context = [0; 1024];
         let mut remote = [0u64; 1024];
@@ -1963,6 +1980,25 @@ mod telemetry {
             [0; 4]
         );
         assert_ne!(diagnostic(&mut context, &mut shared, 34)[0] & (1 << 12), 0);
+    }
+
+    #[test]
+    fn ept_diagnostics_expose_full_width_remote_counters_and_reject_out_of_range_subleaves() {
+        let mut context = [0; 1024];
+        let mut remote = [0u64; 1024];
+        let mut shared = [0; 1024];
+        shared[offset("event_cpu_contexts") + 63] = remote.as_mut_ptr() as u64;
+        remote[offset("b_interception_runtime_diagnostics")] = 0x123456789abcdef0;
+        remote[offset("b_interception_runtime_diagnostics") + 1] = 0xfedcba9876543210;
+        remote[offset("b_interception_sync_diagnostics") + 6] = 4;
+        remote[offset("b_interception_sync_diagnostics") + 7] = 1 << 63;
+        std::hint::black_box(&remote);
+        assert_eq!(diagnostic(&mut context, &mut shared, (64 << 16) | 0x400),
+            [0x9abcdef0, 0x12345678, 0x76543210, 0xfedcba98]);
+        assert_eq!(diagnostic(&mut context, &mut shared, (64 << 16) | 0x40f), [4, 0, 0, 0x80000000]);
+        assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 0x400), [0; 4]);
+        assert_eq!(diagnostic(&mut context, &mut shared, 0x410), [0; 4]);
+        assert_ne!(diagnostic(&mut context, &mut shared, 34)[0] & (1 << 16), 0);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 #[path = "../src/protocol.rs"]
 pub mod protocol;
 #[cfg(test_harness = "policy")]
-use vmx::{hyperv, nested, vmcs12};
+use vmx::hyperv;
 #[cfg(test_harness = "policy")]
 #[path = "../src/boot/config.rs"]
 pub mod config;

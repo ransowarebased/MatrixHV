@@ -43,11 +43,11 @@ offset = 0
 def append_u64_fields(source, prefix):
     global offset
     for name, kind in re.findall(r"(?:pub )?(\w+): ([^,\n]+),", source):
-        if kind in ("u64", "u32"):
-            size = 8 if kind == "u64" else 4
+        if kind in ("u64", "u32", "usize", "AtomicU64"):
+            size = 4 if kind == "u32" else 8
             offset = (offset + size - 1) // size * size
             fields[prefix + name] = offset
-            formats[prefix + name] = "<Q" if kind == "u64" else "<I"
+            formats[prefix + name] = "<I" if kind == "u32" else "<Q"
             offset += size
         elif kind == "WatchdogGuestState":
             append_u64_fields(structure(resident, kind), prefix + name + ".")
@@ -55,12 +55,25 @@ def append_u64_fields(source, prefix):
             append_u64_fields(structure(nested, kind), prefix + name + ".")
         elif kind == "NestedVmcs12State":
             append_u64_fields(structure(nested, kind), prefix + name + ".")
-        elif (array := re.fullmatch(r"\[(u64|u32); (\w+)\]", kind)):
+        elif kind == "InterceptionCpuState":
+            append_u64_fields(structure(resident, kind), prefix + name + ".")
+        elif kind == "RootFxState":
+            offset = (offset + 15) // 16 * 16 + 512
+        elif (array := re.fullmatch(r"\[u8; ([\w:]+)\]", kind)):
+            length = array[1].split("::")[-1]
+            offset += int(length) if length.isdecimal() else int(
+                re.search(r"const " + re.escape(length) + r": usize = (\d+)",
+                          (project / "src/protocol.rs").read_text())[1])
+        elif (array := re.fullmatch(r"\[\[u64; (\d+)\]; (\d+)\]", kind)):
+            offset = (offset + 7) // 8 * 8 + 8 * int(array[1]) * int(array[2])
+        elif (array := re.fullmatch(r"\[(u64|u32); ([\w:]+)\]", kind)):
             element, length = array.groups()
+            length = length.split("::")[-1]
             size = 8 if element == "u64" else 4
             offset = (offset + size - 1) // size * size
             count = int(length) if length.isdecimal() else int(
-                re.search(r"const " + re.escape(length) + r": usize = (\d+)", resident + nested)[1]
+                re.search(r"const " + re.escape(length) + r": usize = (\d+)",
+                          resident + nested + (project / "src/protocol.rs").read_text())[1]
             )
             for index in range(count):
                 if name == "flight_recorder_records" and index not in (0, count - 1):
@@ -69,8 +82,6 @@ def append_u64_fields(source, prefix):
                 fields[f"{prefix}{name}.{index}"] = offset
                 formats[f"{prefix}{name}.{index}"] = "<Q" if element == "u64" else "<I"
                 offset += size
-        elif name == "original_gdtr":
-            return
         else:
             raise RuntimeError(f"Unsupported resident layout field: {prefix}{name}: {kind}")
 
@@ -93,11 +104,19 @@ def plain_layout(source, name, stop=None):
     def size_of(kind):
         if kind in sizes:
             return sizes[kind]
-        array = re.fullmatch(r"\[(.*); ([\w:]+)\]", kind)
+        wrapper = re.fullmatch(r"UnsafeCell<(.*)>", kind)
+        if wrapper:
+            return size_of(wrapper[1])
+        array = re.fullmatch(r"\[(.*); ([\w:]+(?: - \d+)?)\]", kind)
         if array:
             size, alignment = size_of(array[1])
-            count = int(array[2]) if array[2].isdecimal() else constants[array[2].split("::")[-1]]
+            terms = array[2].split(" - ")
+            count = int(terms[0]) if terms[0].isdecimal() else constants[terms[0].split("::")[-1]]
+            if len(terms) == 2:
+                count -= int(terms[1])
             return size * count, alignment
+        if f"struct {kind} {{" not in source:
+            raise RuntimeError(f"Unsupported layout type: {name}: {kind}")
         _, size, alignment = plain_layout(source, kind)
         return size, alignment
 
@@ -144,6 +163,31 @@ try:
         result["cpus"].append(cpu)
         print("CPU", json.dumps(cpu))
     print("PHYSICAL", idc.send_dbg_command("phys"))
+    split_fixture_path = os.environ.get("MATRIXHV_SPLIT_FIXTURE")
+    if split_fixture_path:
+        split_fixture_path = Path(split_fixture_path)
+        fixture = json.loads(split_fixture_path.read_text())
+        table_cache = {}
+        def table_entry(table, index):
+            table &= 0x000FFFFFFFFFF000
+            if table not in table_cache:
+                table_cache[table] = idc.get_bytes(table, 4096, True)
+            return struct.unpack_from("<Q", table_cache[table], index * 8)[0]
+        regions = {}
+        start = int(fixture["stressBuffer"], 0)
+        for address in range(start, start + fixture["stressBytes"], 4096):
+            table = int(fixture["cr3"], 0)
+            for shift in (39, 30, 21, 12):
+                entry = table_entry(table, (address >> shift) & 511)
+                if entry & 1 == 0:
+                    raise RuntimeError(f"Stress page is not resident: {address:#x}")
+                if shift == 12 or shift in (30, 21) and entry & 128:
+                    physical = (entry & 0x000FFFFFFFFFF000 & ~((1 << shift) - 1)) | (address & ((1 << shift) - 1))
+                    regions.setdefault(physical >> 21, {"address": hex(address), "physical": hex(physical)})
+                    break
+                table = entry
+        result["split_regions"] = list(regions.values())
+        print("STRESS_REGIONS", len(regions))
     # Read after suspension so a guest reboot during IDA startup cannot leave
     # stale allocation addresses from an earlier boot in the same serial file.
     serial = serial_path.read_text(errors="replace")
@@ -233,6 +277,26 @@ try:
         values["event.host_fault_address"] = event[12]
         values["event.visual_base"] = event[5]
         values["event.visual_stride_bytes"] = event[6]
+        if "interception" not in result:
+            interception_source = (project / "src/memory/interception.rs").read_text() + (
+                project / "src/protocol.rs").read_text()
+            event_source = resident + (project / "src/vmx/bridge.rs").read_text() + (
+                project / "src/protocol.rs").read_text()
+            event_fields, _, _ = plain_layout(event_source, "ResidentEventContext")
+            session_fields, _, _ = plain_layout(interception_source, "Session", "splits")
+            profile_fields, profile_size, _ = plain_layout(interception_source, "RoadEptProfile")
+            _, split_size, _ = plain_layout(interception_source, "BaseSplit")
+            split_count = int(re.search(r"const INTERCEPT_BASE_TABLE_PAGES: usize = (\d+);", interception_source)[1])
+            pointer = idc.get_bytes(event_address + event_fields["interception_context_physical"], 8, True)
+            session_address = struct.unpack("<Q", pointer)[0]
+            profile_data = idc.get_bytes(session_address + session_fields["configuration"], profile_size, True)
+            epoch_address = session_address + session_fields["splits"] + split_size * split_count
+            epoch = struct.unpack("<Q", idc.get_bytes(epoch_address, 8, True))[0]
+            result["interception"] = {
+                "session": session_address, "split_epoch": epoch, "base_pool_capacity": split_count,
+                **{name: struct.unpack_from("<Q", profile_data, profile_fields[name])[0]
+                   for name in ("pool_base", "cpu_mask", "pool_used", "base_pool_used", "hook_count", "generation")},
+            }
         if "update" not in result:
             layout_source = resident + (project / "src/vmx/bridge.rs").read_text() + (project / "src/protocol.rs").read_text()
             event_fields, event_size, _ = plain_layout(layout_source, "ResidentEventContext")

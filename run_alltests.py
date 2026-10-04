@@ -38,6 +38,7 @@ def run_component(project, component, release=False):
         )
         execute([str(binary)], project)
     if component == "resident":
+        execute([sys.executable, str(project / "tests/run_interception_runtime_tests.py")], project)
         print("\n  resident::boot_state_layout", flush=True)
         prepare_boot_state(project)
         execute([sys.executable, str(project / "tests/run_flight_recorder_tests.py")], project)
@@ -58,7 +59,7 @@ def run_neo(project, release=False):
         for line in version.stdout.splitlines()
         if line.startswith("host: ")
     )
-    output = project / "builds" / "neo-tests-target"
+    output = project / "builds" / ".cargo-target-host"
     options = [
         "--manifest-path", str(project / "src/neo/Cargo.toml"),
         "--target", host_target, "--target-dir", str(output),

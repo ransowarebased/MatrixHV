@@ -78,6 +78,10 @@ def read_resident_assembly(project: Path) -> str:
                     expected = "one" if name.startswith("matrixhv_") else "at least one"
                     raise ValueError(f"Expected {expected} resident expansion for {name}, found {count}")
             result = "\n".join(helpers) + island
+            # Component harnesses omit the relocated Rust interception service;
+            # its entry/exit behavior is exercised by the dedicated runtime suite.
+            result = result.replace("call .Lresident_interception_callback", "xor eax, eax")
+            result = result.replace("call .Lresident_interception_safe_point_timer", "xor eax, eax")
             hyperv = (project / "src/vmx/hyperv.rs").read_text(encoding="utf-8")
             values = {name: int(value.replace("_", ""), 0) for name, value in re.findall(
                 r"pub const (HYPERV\w*): u32 = (0x[0-9a-fA-F_]+|[0-9_]+);", hyperv)}
@@ -124,6 +128,7 @@ def prepare_ept_cache(project: Path):
         r"const (?:EPT_GUEST_PHYSICAL_LIMIT|EPT_MINIMUM_MAPPED_END|EPT_2MB_PAGE_SIZE|EPT_1GB_PAGE_SIZE|EPT_512GB_PAGE_SIZE):[^;]+;", source
     ))
     assembly = (project / "src/vmx/asm/ept_cache.S").read_text(encoding="utf-8")
+    assembly = assembly.replace("call .Lresident_interception_callback", "xor eax, eax")
     transaction = assembly[assembly.index(".Lresident_update_dirty_mtrrs:"):assembly.index(".Lresident_rebuild_ept_cache:")]
     transaction = transaction.replace("{guest_cr0}", "0").replace("{cr0_read_shadow}", "1")
     transaction = transaction.replace("{b_mtrr_dirty}", "0")
@@ -199,9 +204,20 @@ def prepare_eptp_sync(project: Path):
     output = project / "builds" / "eptp-sync-tests"
     output.mkdir(parents=True, exist_ok=True)
     source = (project / "src/vmx/asm/eptp_switch.S").read_text()
+    source = source.replace("call .Lresident_interception_callback", "call .Ltest_interception_callback")
     start = source.index(".Lresident_nested_eptp_sync_acquire:")
     end = source.index(".endm", start)
     assembly = source[start:end]
+    assembly = assembly.replace(
+        "rdtsc",
+        "cmp qword ptr [r12 + {test_clock_enabled}], 0\n"
+        "je .Ltest_sync_real_clock\n"
+        "mov rax, [r12 + {test_clock_step}]\n"
+        "lock xadd [r12 + {test_clock_ticks}], rax\n"
+        "mov rdx, rax\nshr rdx, 32\nmov eax, eax\n"
+        "jmp .Ltest_sync_clock_done\n"
+        ".Ltest_sync_real_clock:\nrdtsc\n.Ltest_sync_clock_done:",
+    )
     state_start = source.index(".macro matrixhv_resident_eptp_switch_state")
     state_start = source.index("\n", state_start) + 1
     assembly += source[state_start:source.index(".endm", state_start)]
@@ -211,17 +227,19 @@ def prepare_eptp_sync(project: Path):
         "mov qword ptr [r12 + {test_flushed_ept}], r11\n"
         "inc qword ptr [r12 + {test_flushes}]\nmov eax, 1\ntest eax, eax",
     )
-    assert assembly.count("vmread r11, rax") == 1
     assembly = assembly.replace(
-        "vmread r11, rax",
-        "mov r11, qword ptr [r12 + {test_exit_info}]\n"
+        "mov eax, {exit_intr_info}\nvmread r11, rax",
+        "mov eax, {exit_intr_info}\nmov r11, qword ptr [r12 + {test_exit_info}]\n"
         "push rax\nmov eax, 1\ntest eax, eax\npop rax",
     )
+    assembly = assembly.replace("vmread r11, rax", "mov r11, [r12 + {test_timer_pin} + rax * 8]\ncmp r12, 0")
+    assembly = assembly.replace("vmwrite rax, r11", "mov [r12 + {test_timer_pin} + rax * 8], r11\ncmp r12, 0")
+    assembly = assembly.replace("vmwrite rax, r10", "mov [r12 + {test_timer_pin} + rax * 8], r10\ncmp r12, 0")
     assembly = assembly.replace(".balign 8\n.Lresident_eptp_sync_owner:",
                                 ".data\n.balign 8\n.Lresident_eptp_sync_owner:")
     control = (project / "src/vmx/asm/control.S").read_text()
     callback_start = control.index(".Lresident_memory_synchronize:")
-    callback_end = control.index(".Lresident_dispatch_update_l2_reject:", callback_start)
+    callback_end = control.index(".Lresident_interception_callback:", callback_start)
     assembly += "\n.text\n.globl tracking_sync\ntracking_sync:\n"
     assembly += control[callback_start:callback_end]
     (output / "eptp-sync.S").write_text(assembly + "\n.text\n")
@@ -626,6 +644,7 @@ def prepare_native_shadow(project: Path):
     assembly = block(".Lresident_nested_translate_current_vmcs:", ".Lresident_dispatch_vmread:")
     assembly += block(".Lresident_nested_validate_entry:", ".Lresident_vmcs12_field_index:")
     switch_source = (project / "src/vmx/asm/eptp_switch.S").read_text()
+    switch_source = switch_source.replace("call .Lresident_interception_callback", "xor eax, eax")
     start = switch_source.index(".Lresident_nested_validate_vm_functions:")
     assembly += switch_source[start:switch_source.index(".Lresident_nested_prepare_ept02:", start)]
     assembly += "\n.Lresident_nested_vmfunc_failed:\nxor eax, eax\nret\n"
@@ -810,6 +829,7 @@ def prepare_nested_ept(project: Path):
     output.mkdir(parents=True, exist_ok=True)
     source = read_resident_assembly(project)
     switch_source = (project / "src/vmx/asm/eptp_switch.S").read_text()
+    switch_source = switch_source.replace("call .Lresident_interception_callback", "xor eax, eax")
     exit_msr_start = source.index('.Lresident_nested_capture_vmcs02_guest_state:')
     exit_msr_end = source.index('lea rsi, [rip + .Lresident_nested_guest_state_table]', exit_msr_start)
     exit_msr_assembly = source[exit_msr_start:exit_msr_end].replace(
@@ -1597,6 +1617,9 @@ def prepare_resident_control(project: Path):
         first = source.index(start)
         return source[first:source.index(end, first)]
     entry = section("matrixhv_resident_dispatch_entry:", ".Lresident_control_rearm_done:")
+    # This harness exercises dispatch routing; parking deadlines run separately
+    # against the complete production synchronization assembly.
+    entry = entry.replace("call .Lresident_nested_eptp_sync_budget_start", "nop")
     reason = section(".Lresident_dispatch_reason_ready:", "and eax, 0xffff")
     assembly = "\n".join([
         section(".macro resident_control_on_restore_msr ", ".macro resident_control_native_checkpoint "),
@@ -2619,6 +2642,8 @@ def prepare_resident_telemetry(project: Path):
         cursor += 4096 if name == "event_control_cpu_states" else 1024 if name == "b_nested_exit_reason_counts" else 512 if name == "event_cpu_contexts" else (
             192 * 8 if name == "b_nested_failure_trace" else (
             56 if name in {"b_watchdog_before", "b_watchdog_after", "b_watchdog_resume", "b_entry_failure_guest"}
+            else 192 if name == "b_interception_runtime_diagnostics"
+            else 64 if name == "b_interception_sync_diagnostics"
             else 32 if name == "b_nested_exit_handler_cycles" else 8
             )
         )
@@ -2630,6 +2655,12 @@ def prepare_resident_telemetry(project: Path):
         "log_serial_sink": 1,
         "nested_failure_trace_capacity": 32,
         "nested_failure_trace_limit": 0x161,
+        "ept_diagnostic_subleaf": 0x400,
+        "ept_runtime_diagnostic_pairs": 12,
+        "ept_sync_diagnostic_pairs": 4,
+        "ept_stall_diagnostic_subleaf": 0x410,
+        "ept_diagnostic_capabilities": 0x3ffff,
+        "exit_timing_subleaf": 55,
         "guest_rip": 0, "guest_rsp": 1, "guest_rflags": 2,
         "guest_cr0": 3, "guest_cr3": 4, "guest_cr4": 5, "guest_efer": 6,
         "control_cpu_state_size": 64, "control_cpu_stage": 0, "control_cpu_phase": 8,
@@ -2733,7 +2764,8 @@ def prepare_resident_telemetry(project: Path):
     wrappers = wrappers.replace("ACTIVE_OFFSET", str(offsets["b_telemetry_active"]))
     counter_macro, assembly = assembly.split('.endm', 1)
     (output / "resident-telemetry.S").write_text(
-        counter_macro + '.endm\n' + wrappers + "\n" + assembly, encoding="utf-8"
+        counter_macro + '.endm\n' + wrappers + "\n" + assembly +
+        "\n.data\n.Lresident_interception_stall_records:\n.zero 4096\n.text\n", encoding="utf-8"
     )
     mapping = "fn offset(name: &str) -> usize { match name {\n"
     mapping += "\n".join(f'    "{name}" => {value // 8},' for name, value in offsets.items())
@@ -2776,6 +2808,10 @@ def prepare_resident_visual(project: Path):
     boot_timer_start = source.index('.Lresident_dispatch_boot_timer:')
     boot_timer_end = source.index('.Lresident_boot_timer_retry_event:', boot_timer_start)
     boot_timer = source[boot_timer_start:boot_timer_end]
+    # The isolated display tests have no interception timer owner. Its control
+    # and restoration are executed in the synchronization assembly harness.
+    boot_timer = boot_timer.replace("test qword ptr [r9 + r8 * 8], 8", "test r8, 0")
+    boot_timer = boot_timer.replace("lea r9, [rip + .Lresident_interception_timer_state]", "xor r9d, r9d")
     boot_timer = boot_timer.replace("rdtsc", "mov rax, qword ptr [rip + test_visual_tsc]\nmov rdx, rax\nshr rdx, 32")
     boot_timer = boot_timer.replace("vmread r11, rax", "mov r11, [r12 + {test_pin_controls}]\ncmp r12, 0")
     boot_timer = boot_timer.replace("vmwrite rax, r11", "mov [r12 + {test_pin_controls}], r11\ncmp r12, 0")
@@ -3058,7 +3094,7 @@ def prepare_boot_state(project: Path):
     collector = ast.parse((project / "tests/collect_boot_state.py").read_text())
     functions = [node for node in collector.body if isinstance(node, ast.FunctionDef)
                  and node.name in ("structure", "append_u64_fields")]
-    namespace = {"resident": resident, "nested": nested, "re": re,
+    namespace = {"resident": resident, "nested": nested, "re": re, "project": project,
                  "fields": {}, "formats": {}, "offset": 0}
     exec(compile(ast.Module(body=functions, type_ignores=[]), "collect_boot_state.py", "exec"), namespace)
     namespace["append_u64_fields"](namespace["structure"](resident, "ResidentBootContext"), "")

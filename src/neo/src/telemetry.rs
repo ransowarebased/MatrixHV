@@ -1,6 +1,12 @@
 use crate::protocol::{
+    MATRIXHV_EXIT_TIMING_CAPABILITY, MATRIXHV_EXIT_TIMING_SUBLEAF,
     MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX,
     MATRIXHV_STATUS_SIGNATURE_ECX,
+};
+use crate::protocol::memory::{
+    EPT_DIAGNOSTIC_CAPABILITY, EPT_DIAGNOSTIC_SUBLEAF, EPT_SYNC_DIAGNOSTIC_WORDS,
+    EPT_STALL_DIAGNOSTIC_SUBLEAF,
+    INTERCEPT_DIAGNOSTIC_WORDS, INTERCEPT_RUNTIME_PHASES,
 };
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -63,6 +69,66 @@ pub enum Mode {
     General = 0,
     Watchdog = 1,
     EptDiagnostics = 2,
+    Benchmark = 3,
+}
+
+pub(crate) fn append_ept_diagnostics(
+    output: &mut String,
+    prefix: &str,
+    mut read: impl FnMut(u32) -> (u64, u64),
+) {
+    let mut words = [0; INTERCEPT_DIAGNOSTIC_WORDS + EPT_SYNC_DIAGNOSTIC_WORDS];
+    for (index, values) in words.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        let (first, second) = read(EPT_DIAGNOSTIC_SUBLEAF + index as u32);
+        *values = [first, second];
+    }
+    let phases = [
+        "dispatch", "apply", "revoke", "flush", "observe", "timing", "recovery",
+    ];
+    for (index, phase) in phases.iter().enumerate() {
+        for (result, value) in ["attempts", "successes", "failures"]
+            .iter()
+            .zip(&words[index * 3..index * 3 + 3])
+        {
+            writeln!(output, "{prefix}.interception.{phase}.{result}={value}").unwrap();
+        }
+    }
+    let details = &words[INTERCEPT_RUNTIME_PHASES * 3..INTERCEPT_DIAGNOSTIC_WORDS];
+    let phase = if details[0] == 0 {
+        "none"
+    } else {
+        phases
+            .get((details[0] - 1) as usize)
+            .copied()
+            .unwrap_or("unknown")
+    };
+    writeln!(output, "{prefix}.interception.failure_phase={}\n{prefix}.interception.failure_phase_name={phase}\n{prefix}.interception.failure_rip=0x{:016x}\n{prefix}.interception.failure_gpa=0x{:016x}", details[0], details[1], details[2]).unwrap();
+    let sync = &words[INTERCEPT_DIAGNOSTIC_WORDS..];
+    for (name, value) in [
+        "attempts", "successes", "owner_contention", "transport_failures", "ack_timeouts", "icr_timeouts",
+    ]
+        .iter()
+        .zip(&sync[..6])
+    {
+        writeln!(output, "{prefix}.ept_sync.{name}={value}").unwrap();
+    }
+    let phase = match sync[6] {
+        0 => "none",
+        1 => "owner-acquisition",
+        2 => "nmi-transport",
+        3 => "apic-icr-delivery",
+        4 => "peer-acknowledgement",
+        5 => "parked-peer-release",
+        _ => "unknown",
+    };
+    writeln!(output, "{prefix}.ept_sync.failure_phase={}\n{prefix}.ept_sync.failure_phase_name={phase}\n{prefix}.ept_sync.pending_cpu_mask=0x{:016x}", sync[6], sync[7]).unwrap();
+    let names = ["phase", "owner", "epoch", "pending_cpu_mask", "rip", "gpa", "write_step", "tsc"];
+    for index in 0..4 {
+        let (first, second) = read(EPT_STALL_DIAGNOSTIC_SUBLEAF + index as u32);
+        for (name, value) in names[index * 2..index * 2 + 2].iter().zip([first, second]) {
+            writeln!(output, "{prefix}.ept_sync.stall.{name}=0x{value:016x}").unwrap();
+        }
+    }
 }
 
 impl Mode {
@@ -71,6 +137,7 @@ impl Mode {
             0 => Ok(Self::General),
             1 => Ok(Self::Watchdog),
             2 => Ok(Self::EptDiagnostics),
+            3 => Ok(Self::Benchmark),
             _ => Err(format!("unknown telemetry mode {value}")),
         }
     }
@@ -79,6 +146,7 @@ impl Mode {
             Self::General => "general",
             Self::Watchdog => "watchdog",
             Self::EptDiagnostics => "eptdiag",
+            Self::Benchmark => "benchmark",
         }
     }
 }
@@ -888,7 +956,204 @@ pub fn request_text(_mode: u32, _control: u32) -> Result<String, String> {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+fn benchmark_text() -> Result<String, String> {
+    const WARMUP_SAMPLES: usize = 64;
+    const BASELINE_SAMPLES: usize = 256;
+    const EXIT_SAMPLES: usize = 2048;
+
+    let mut affinity = CpuAffinity::current()?;
+    let observer_cpu = affinity.allowed()[0];
+    affinity.pin(observer_cpu)?;
+    verify_cpu(observer_cpu)?;
+    let registered_mask = pair(diagnostic(36)).0;
+    let cpus: Vec<u32> = affinity
+        .allowed()
+        .iter()
+        .copied()
+        .filter(|cpu| *cpu < 64 && registered_mask & (1u64 << cpu) != 0)
+        .collect();
+    if cpus.is_empty() {
+        return Err("no registered MatrixHV vCPUs are available in process CPU affinity".into());
+    }
+    let mut text = format!(
+        "format=matrixhv-exit-benchmark-v1\nmode=benchmark\nscope=allowed_registered_vcpus\nprobe=cpuid\nprobe_leaf=0\nprobe_subleaf=0\nexit_reason=10\nmeasurement=guest_before_cpuid_to_guest_after_reentry\nunit=tsc_ticks\ncalibration=minimum_empty_bracket\ncalibrated_values=estimates\noutliers=retained\nwarmup_samples={WARMUP_SAMPLES}\ncpu_count={}\nregistered_cpu_mask=0x{registered_mask:016x}\n",
+        cpus.len()
+    );
+    for cpu in cpus {
+        affinity.pin(cpu)?;
+        verify_cpu(cpu)?;
+        if diagnostic(34).eax & MATRIXHV_EXIT_TIMING_CAPABILITY == 0 {
+            return Err(format!(
+                "exit benchmark requires clock diagnostics on logical CPU {cpu}; update the hypervisor"
+            ));
+        }
+        let extended_limit = std::arch::x86_64::__cpuid(0x8000_0000).eax;
+        if extended_limit < 0x8000_0007
+            || std::arch::x86_64::__cpuid(0x8000_0007).edx & (1 << 8) == 0
+        {
+            return Err(format!(
+                "exit benchmark requires an invariant TSC on logical CPU {cpu}"
+            ));
+        }
+        let (compensation, tsc_hz) = pair(diagnostic(MATRIXHV_EXIT_TIMING_SUBLEAF));
+        if compensation != 0 {
+            return Err(format!(
+                "exit benchmark cannot measure complete exit cost with TSC compensation active on logical CPU {cpu}; release the interception profile first"
+            ));
+        }
+        let telemetry_enabled = diagnostic(37).eax;
+        for _ in 0..WARMUP_SAMPLES {
+            measure_exit_ticks(true);
+            measure_exit_ticks(false);
+        }
+        let mut baseline = Vec::with_capacity(BASELINE_SAMPLES);
+        let mut samples = Vec::with_capacity(EXIT_SAMPLES);
+        for _ in 0..BASELINE_SAMPLES {
+            baseline.push(measure_exit_ticks(false));
+        }
+        for _ in 0..EXIT_SAMPLES {
+            samples.push(measure_exit_ticks(true));
+        }
+        let (compensation_after, tsc_hz_after) = pair(diagnostic(MATRIXHV_EXIT_TIMING_SUBLEAF));
+        verify_cpu(cpu)?;
+        if compensation_after != 0 || tsc_hz != tsc_hz_after {
+            return Err(format!(
+                "guest TSC configuration changed during exit benchmark on logical CPU {cpu}"
+            ));
+        }
+        if diagnostic(37).eax != telemetry_enabled {
+            return Err(format!(
+                "telemetry collection changed during exit benchmark on logical CPU {cpu}"
+            ));
+        }
+        let prefix = format!("cpu.{cpu}");
+        writeln!(text, "{prefix}.telemetry_enabled={telemetry_enabled}\n{prefix}.tsc_compensation=0\n{prefix}.tsc_hz={tsc_hz}").unwrap();
+        append_exit_benchmark(&mut text, &prefix, baseline, samples, tsc_hz)?;
+    }
+    Ok(text)
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn measure_exit_ticks(probe: bool) -> u64 {
+    // Both timestamps execute in the guest. Host-only timestamps cannot include
+    // hardware VM exit and VM entry. Keep RBX preservation outside the bracket.
+    macro_rules! measure {
+        ($operation:literal) => {{
+            let elapsed: u64;
+            unsafe {
+                core::arch::asm!(
+                    "mov r9, rbx",
+                    "lfence",
+                    "rdtsc",
+                    "lfence",
+                    "shl rdx, 32",
+                    "or rax, rdx",
+                    "mov r8, rax",
+                    "xor eax, eax",
+                    "xor ecx, ecx",
+                    $operation,
+                    "lfence",
+                    "rdtsc",
+                    "lfence",
+                    "shl rdx, 32",
+                    "or rax, rdx",
+                    "sub rax, r8",
+                    "mov rbx, r9",
+                    lateout("rax") elapsed,
+                    out("rcx") _,
+                    out("rdx") _,
+                    out("r8") _,
+                    out("r9") _,
+                    options(nostack),
+                );
+            }
+            elapsed
+        }};
+    }
+    if probe {
+        measure!("cpuid")
+    } else {
+        measure!("nop")
+    }
+}
+
+pub(crate) fn append_exit_benchmark(
+    text: &mut String,
+    prefix: &str,
+    mut baseline: Vec<u64>,
+    mut samples: Vec<u64>,
+    tsc_hz: u64,
+) -> Result<(), String> {
+    let baseline_attempted = baseline.len();
+    let attempted = samples.len();
+    // Backwards or unchanged clocks are invalid; retain scheduling/interrupt tails.
+    baseline.retain(|ticks| *ticks != 0 && *ticks <= i64::MAX as u64);
+    samples.retain(|ticks| *ticks != 0 && *ticks <= i64::MAX as u64);
+    if baseline.is_empty() || samples.is_empty() {
+        return Err(format!(
+            "exit benchmark has no valid TSC samples for {prefix}"
+        ));
+    }
+    baseline.sort_unstable();
+    samples.sort_unstable();
+    let overhead = baseline[0];
+    writeln!(text, "{prefix}.baseline_samples={}\n{prefix}.baseline_rejected={}\n{prefix}.samples={}\n{prefix}.rejected={}\n{prefix}.bracket_overhead_tsc_ticks={overhead}", baseline.len(), baseline_attempted - baseline.len(), samples.len(), attempted - samples.len()).unwrap();
+    let percentile = |percent: usize| samples[(samples.len() * percent).div_ceil(100) - 1];
+    let mean = (samples.iter().map(|value| u128::from(*value)).sum::<u128>()
+        / samples.len() as u128) as u64;
+    let calibrated_mean = (samples
+        .iter()
+        .map(|value| u128::from(value.saturating_sub(overhead)))
+        .sum::<u128>()
+        / samples.len() as u128) as u64;
+    for (name, raw, calibrated) in [
+        ("min", samples[0], samples[0].saturating_sub(overhead)),
+        (
+            "p50",
+            percentile(50),
+            percentile(50).saturating_sub(overhead),
+        ),
+        (
+            "p95",
+            percentile(95),
+            percentile(95).saturating_sub(overhead),
+        ),
+        (
+            "p99",
+            percentile(99),
+            percentile(99).saturating_sub(overhead),
+        ),
+        (
+            "max",
+            samples[samples.len() - 1],
+            samples[samples.len() - 1].saturating_sub(overhead),
+        ),
+        ("mean", mean, calibrated_mean),
+    ] {
+        writeln!(text, "{prefix}.round_trip_tsc_ticks.{name}={raw}\n{prefix}.calibrated_round_trip_tsc_ticks.{name}={calibrated}").unwrap();
+        if tsc_hz != 0 {
+            let raw_ns = u128::from(raw) * 1_000_000_000 / u128::from(tsc_hz);
+            let calibrated_ns = u128::from(calibrated) * 1_000_000_000 / u128::from(tsc_hz);
+            writeln!(text, "{prefix}.round_trip_ns.{name}={raw_ns}\n{prefix}.calibrated_round_trip_ns.{name}={calibrated_ns}").unwrap();
+        }
+    }
+    if tsc_hz == 0 {
+        writeln!(text, "{prefix}.round_trip_ns=unavailable").unwrap();
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 pub fn snapshot_text(mode: Mode) -> Result<String, String> {
+    if mode == Mode::Benchmark {
+        return benchmark_text();
+    }
     let mut affinity = CpuAffinity::current()?;
     let observer_cpu = affinity.allowed()[0];
     affinity.pin(observer_cpu)?;
@@ -953,12 +1218,18 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
                     Mode::General => true,
                     Mode::Watchdog => index <= 6 || index >= 12,
                     Mode::EptDiagnostics => (6..=12).contains(&index),
+                    Mode::Benchmark => unreachable!(),
                 };
                 if selected {
                     let (first, second) = pair(diagnostic_cpu(index as u32 + 4, cpu));
                     writeln!(sample, "{prefix}.{}={first}", names[0]).unwrap();
                     writeln!(sample, "{prefix}.{}={second}", names[1]).unwrap();
                 }
+            }
+            if caps.eax & EPT_DIAGNOSTIC_CAPABILITY != 0 && mode != Mode::Watchdog {
+                append_ept_diagnostics(&mut sample, &prefix, |subleaf| {
+                    pair(diagnostic_cpu(subleaf, cpu))
+                });
             }
             if caps.eax & EXIT_PROFILE_CAPABILITY != 0 && mode == Mode::General {
                 writeln!(

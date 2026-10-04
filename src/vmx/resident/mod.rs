@@ -30,6 +30,15 @@ use super::state;
 use super::vmcs::*;
 use super::vmxon::{VmxInstructionResult, VmxonError};
 use crate::arch;
+use crate::memory::host::{
+    AddressConstraint, HostPagingError, PAGE_SIZE, RESIDENT_CODE_MEMORY_TYPE,
+    RESIDENT_EVENT_MEMORY_TYPE, ResidentPages,
+};
+use crate::protocol::{
+    CONTROL_MAGIC, CONTROL_PROBE_OPERATION, CONTROL_VERSION, ControlProbeSnapshot, ControlRequest,
+    ControlStatus, MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_PROTOCOL, MATRIXHV_STATUS_SIGNATURE_EAX,
+    MATRIXHV_STATUS_SIGNATURE_EBX, MATRIXHV_STATUS_SIGNATURE_ECX,
+};
 use crate::vmx::hyperv::{
     CPUID_HYPERVISOR_PRESENT_BIT, HYPERV_FEATURES_LEAF, HYPERV_GUEST_IDLE_ACCESS_MASK,
     HYPERV_GUEST_IDLE_FEATURE_MASK, HYPERV_GUEST_OS_ID_MSR, HYPERV_HYPERCALL_MSR,
@@ -39,16 +48,32 @@ use crate::vmx::hyperv::{
     HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START, native_hyperv_invariant_tsc,
     native_hyperv_reference_tsc,
 };
-use crate::memory::host::{
-    AddressConstraint, HostPagingError, PAGE_SIZE, RESIDENT_CODE_MEMORY_TYPE,
-    RESIDENT_EVENT_MEMORY_TYPE, ResidentPages,
+use crate::vmx::nested::{
+    CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, IA32_VMX_BASIC_MSR, IA32_VMX_CR0_FIXED0_MSR,
+    IA32_VMX_CR0_FIXED1_MSR, IA32_VMX_CR4_FIXED0_MSR, IA32_VMX_CR4_FIXED1_MSR,
+    IA32_VMX_ENTRY_CTLS_MSR, IA32_VMX_EPT_VPID_CAP_MSR, IA32_VMX_EXIT_CTLS_MSR, IA32_VMX_MISC_MSR,
+    IA32_VMX_PINBASED_CTLS_MSR, IA32_VMX_PROCBASED_CTLS_MSR, IA32_VMX_PROCBASED_CTLS2_MSR,
+    IA32_VMX_TRUE_ENTRY_CTLS_MSR, IA32_VMX_TRUE_EXIT_CTLS_MSR, IA32_VMX_TRUE_PINBASED_CTLS_MSR,
+    IA32_VMX_TRUE_PROCBASED_CTLS_MSR, IA32_VMX_VMCS_ENUM_MSR,
+    INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR, INVEPT_EXIT_REASON, INVVPID_EXIT_REASON,
+    NestedVmxState, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR,
+    VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR, VMCLEAR_EXIT_REASON,
+    VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR,
+    VMCS_UNSUPPORTED_COMPONENT_ERROR, VMFAIL_INVALID_STATUS, VMFAIL_VALID_STATUS,
+    VMLAUNCH_EXIT_REASON, VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_EXIT_REASON,
+    VMPTRLD_INCORRECT_REVISION_ERROR, VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR,
+    VMPTRLD_VMXON_POINTER_ERROR, VMPTRST_EXIT_REASON, VMREAD_EXIT_REASON, VMRESUME_EXIT_REASON,
+    VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_EXIT_REASON, VMWRITE_READ_ONLY_COMPONENT_ERROR,
+    VMX_STATUS_FLAGS_CLEAR_MASK, VMXOFF_EXIT_REASON, VMXON_EXIT_REASON, VMXON_IN_VMX_ROOT_ERROR,
 };
-use crate::vmx::nested::{CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, IA32_VMX_BASIC_MSR, IA32_VMX_CR0_FIXED0_MSR, IA32_VMX_CR0_FIXED1_MSR, IA32_VMX_CR4_FIXED0_MSR, IA32_VMX_CR4_FIXED1_MSR, IA32_VMX_ENTRY_CTLS_MSR, IA32_VMX_EPT_VPID_CAP_MSR, IA32_VMX_EXIT_CTLS_MSR, IA32_VMX_MISC_MSR, IA32_VMX_PINBASED_CTLS_MSR, IA32_VMX_PROCBASED_CTLS_MSR, IA32_VMX_PROCBASED_CTLS2_MSR, IA32_VMX_TRUE_ENTRY_CTLS_MSR, IA32_VMX_TRUE_EXIT_CTLS_MSR, IA32_VMX_TRUE_PINBASED_CTLS_MSR, IA32_VMX_TRUE_PROCBASED_CTLS_MSR, IA32_VMX_VMCS_ENUM_MSR, INVALID_OPERAND_TO_INVEPT_INVVPID_ERROR, INVEPT_EXIT_REASON, INVVPID_EXIT_REASON, NestedVmxState, VM_ENTRY_BLOCKED_BY_MOV_SS_ERROR, VM_ENTRY_INVALID_CONTROL_FIELDS_ERROR, VM_ENTRY_INVALID_HOST_STATE_FIELD_ERROR, VMCLEAR_EXIT_REASON, VMCLEAR_INVALID_PHYSICAL_ADDRESS_ERROR, VMCLEAR_VMXON_POINTER_ERROR, VMCS_UNSUPPORTED_COMPONENT_ERROR, VMFAIL_INVALID_STATUS, VMFAIL_VALID_STATUS, VMLAUNCH_EXIT_REASON, VMLAUNCH_NON_CLEAR_VMCS_ERROR, VMPTRLD_EXIT_REASON, VMPTRLD_INCORRECT_REVISION_ERROR, VMPTRLD_INVALID_PHYSICAL_ADDRESS_ERROR, VMPTRLD_VMXON_POINTER_ERROR, VMPTRST_EXIT_REASON, VMREAD_EXIT_REASON, VMRESUME_EXIT_REASON, VMRESUME_NON_LAUNCHED_VMCS_ERROR, VMWRITE_EXIT_REASON, VMWRITE_READ_ONLY_COMPONENT_ERROR, VMX_STATUS_FLAGS_CLEAR_MASK, VMXOFF_EXIT_REASON, VMXON_EXIT_REASON, VMXON_IN_VMX_ROOT_ERROR};
-use crate::vmx::vmcs12::{NestedVmcs12State, VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS, VMCS_FIELD_GUEST_RIP, VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP, VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR, VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET, VMCS_SHADOW_READ_BYPASS_MASK, VMCS_SHADOW_READ_TRAP_MASK, VMCS12_BACKING_MAGIC, VMCS12_BACKING_MAGIC_OFFSET, VMCS12_BACKING_QWORD_COUNT, VMCS12_BACKING_STATE_OFFSET, VMCS12_EXTENDED_FIELD_COUNT, VMCS12_LAUNCH_STATE_CLEAR, VMCS12_LAUNCH_STATE_LAUNCHED};
-use crate::protocol::{
-    CONTROL_MAGIC, CONTROL_PROBE_OPERATION, CONTROL_VERSION, ControlProbeSnapshot, ControlRequest,
-    ControlStatus, MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_PROTOCOL, MATRIXHV_STATUS_SIGNATURE_EAX,
-    MATRIXHV_STATUS_SIGNATURE_EBX, MATRIXHV_STATUS_SIGNATURE_ECX,
+use crate::vmx::vmcs12::{
+    NestedVmcs12State, VMCS_FIELD_EXIT_QUALIFICATION, VMCS_FIELD_GUEST_RFLAGS,
+    VMCS_FIELD_GUEST_RIP, VMCS_FIELD_GUEST_RSP, VMCS_FIELD_HOST_RIP, VMCS_FIELD_HOST_RSP,
+    VMCS_FIELD_VM_EXIT_INSTRUCTION_LEN, VMCS_FIELD_VM_EXIT_REASON, VMCS_FIELD_VM_INSTRUCTION_ERROR,
+    VMCS_SHADOW_READ_BITMAP_BYTE_OFFSET, VMCS_SHADOW_READ_BYPASS_MASK, VMCS_SHADOW_READ_TRAP_MASK,
+    VMCS12_BACKING_MAGIC, VMCS12_BACKING_MAGIC_OFFSET, VMCS12_BACKING_QWORD_COUNT,
+    VMCS12_BACKING_STATE_OFFSET, VMCS12_EXTENDED_FIELD_COUNT, VMCS12_LAUNCH_STATE_CLEAR,
+    VMCS12_LAUNCH_STATE_LAUNCHED,
 };
 use abi::*;
 use core::arch::global_asm;
@@ -251,7 +276,11 @@ impl ResidentCode {
         let length =
             usize::try_from(end - start).map_err(|_| ResidentProbeError::InvalidCodeLayout)?;
         let pages = ResidentPages::allocate_typed(
-            if event_context == 0 { length.div_ceil(PAGE_SIZE) } else { crate::update::BANK_PAGES },
+            if event_context == 0 {
+                length.div_ceil(PAGE_SIZE)
+            } else {
+                crate::update::BANK_PAGES
+            },
             AddressConstraint::Any,
             RESIDENT_CODE_MEMORY_TYPE,
         )
@@ -259,7 +288,8 @@ impl ResidentCode {
         if length > crate::update::BANK_BYTES || code_end <= start || code_end > end {
             return Err(ResidentProbeError::InvalidCodeLayout);
         }
-        let identity = unsafe { crate::update::hash(core::slice::from_raw_parts(start as *const u8, length)) };
+        let identity =
+            unsafe { crate::update::hash(core::slice::from_raw_parts(start as *const u8, length)) };
         unsafe {
             core::ptr::copy_nonoverlapping(start as *const u8, pages.pointer().as_ptr(), length);
             pages
@@ -288,16 +318,41 @@ impl ResidentCode {
                 .cast::<u64>()
                 .write_unaligned(event_context);
             for (slot, value) in [
-                (core::ptr::addr_of!(matrixhv_resident_core_version) as u64, core_version()),
-                (core::ptr::addr_of!(matrixhv_resident_update_context) as u64,
-                    if event_context == 0 { 0 } else { (*(event_context as *const ResidentEventContext)).update_context_physical }),
-                (core::ptr::addr_of!(matrixhv_resident_update_loader) as u64,
-                    if event_context == 0 { 0 } else { (*(event_context as *const ResidentEventContext)).update_loader_physical }),
+                (
+                    core::ptr::addr_of!(matrixhv_resident_core_version) as u64,
+                    core_version(),
+                ),
+                (
+                    core::ptr::addr_of!(matrixhv_resident_update_context) as u64,
+                    if event_context == 0 {
+                        0
+                    } else {
+                        (*(event_context as *const ResidentEventContext)).update_context_physical
+                    },
+                ),
+                (
+                    core::ptr::addr_of!(matrixhv_resident_update_loader) as u64,
+                    if event_context == 0 {
+                        0
+                    } else {
+                        (*(event_context as *const ResidentEventContext)).update_loader_physical
+                    },
+                ),
             ] {
-                pages.pointer().as_ptr().add((slot - start) as usize).cast::<u64>().write_unaligned(value);
+                pages
+                    .pointer()
+                    .as_ptr()
+                    .add((slot - start) as usize)
+                    .cast::<u64>()
+                    .write_unaligned(value);
             }
-            core::ptr::copy_nonoverlapping(identity.as_ptr(), pages.pointer().as_ptr()
-                .add((core::ptr::addr_of!(matrixhv_resident_core_identity) as u64 - start) as usize), 32);
+            core::ptr::copy_nonoverlapping(
+                identity.as_ptr(),
+                pages.pointer().as_ptr().add(
+                    (core::ptr::addr_of!(matrixhv_resident_core_identity) as u64 - start) as usize,
+                ),
+                32,
+            );
         }
         let base = pages.physical_address();
         Ok(Self {
@@ -329,25 +384,43 @@ pub(crate) const fn core_version() -> u64 {
     let bytes = env!("MATRIXHV_CORE_VERSION").as_bytes();
     let mut value = 0;
     let mut index = 0;
-    while index < bytes.len() { value = value * 10 + (bytes[index] - b'0') as u64; index += 1; }
+    while index < bytes.len() {
+        value = value * 10 + (bytes[index] - b'0') as u64;
+        index += 1;
+    }
     value
 }
 
-fn prepare_runtime_update(code: &ResidentCode, event: *mut ResidentEventContext) -> Result<(), ResidentProbeError> {
-    use crate::update::{Abi, EmbeddedImage, RuntimeContext, BANK_BYTES, MAX_PACKAGE_BYTES, STATE_ABI};
-    let (source_base, source_bytes) = crate::boot::firmware::loaded_image_extent()
-        .map_err(ResidentProbeError::Allocation)?;
+fn prepare_runtime_update(
+    code: &ResidentCode,
+    event: *mut ResidentEventContext,
+) -> Result<(), ResidentProbeError> {
+    use crate::update::{
+        Abi, BANK_BYTES, EmbeddedImage, MAX_PACKAGE_BYTES, RuntimeContext, STATE_ABI,
+    };
+    let (source_base, source_bytes) =
+        crate::boot::firmware::loaded_image_extent().map_err(ResidentProbeError::Allocation)?;
     let source = unsafe { core::slice::from_raw_parts(source_base as *const u8, source_bytes) };
     let image = EmbeddedImage::parse(source).map_err(|_| ResidentProbeError::InvalidCodeLayout)?;
     let entry_offset = crate::update::runtime::update_entry as *const () as u64 - source_base;
-    if entry_offset as usize >= source_bytes { return Err(ResidentProbeError::InvalidCodeLayout); }
-    let allocate = |bytes: usize, memory_type| ResidentPages::allocate_typed(bytes.div_ceil(PAGE_SIZE), AddressConstraint::Any, memory_type)
-        .map_err(ResidentProbeError::Allocation);
+    if entry_offset as usize >= source_bytes {
+        return Err(ResidentProbeError::InvalidCodeLayout);
+    }
+    let allocate = |bytes: usize, memory_type| {
+        ResidentPages::allocate_typed(
+            bytes.div_ceil(PAGE_SIZE),
+            AddressConstraint::Any,
+            memory_type,
+        )
+        .map_err(ResidentProbeError::Allocation)
+    };
     let mut root_image = allocate(source_bytes, RESIDENT_CODE_MEMORY_TYPE)?;
     let mut native_image = allocate(source_bytes, RESIDENT_CODE_MEMORY_TYPE)?;
     for pages in [&mut root_image, &mut native_image] {
-        let output = unsafe { core::slice::from_raw_parts_mut(pages.pointer().as_ptr(), pages.byte_len()) };
-        image.copy_relocated(output, source_base, pages.physical_address())
+        let output =
+            unsafe { core::slice::from_raw_parts_mut(pages.pointer().as_ptr(), pages.byte_len()) };
+        image
+            .copy_relocated(output, source_base, pages.physical_address())
             .map_err(|_| ResidentProbeError::InvalidCodeLayout)?;
     }
     let mut state_pages = allocate(size_of::<RuntimeContext>(), RESIDENT_EVENT_MEMORY_TYPE)?;
@@ -355,72 +428,133 @@ fn prepare_runtime_update(code: &ResidentCode, event: *mut ResidentEventContext)
     let mut bank = allocate(BANK_BYTES, RESIDENT_CODE_MEMORY_TYPE)?;
     let mut idts = allocate(64 * PAGE_SIZE, RESIDENT_EVENT_MEMORY_TYPE)?;
     let mut tracking_pages = allocate(
-        size_of::<crate::memory::tracking::Session>(), RESIDENT_EVENT_MEMORY_TYPE,
+        size_of::<crate::memory::tracking::Session>(),
+        RESIDENT_EVENT_MEMORY_TYPE,
     )?;
     let mut tracking_tables = allocate(
-        crate::protocol::memory::TRACK_TABLE_PAGES * PAGE_SIZE, RESIDENT_EVENT_MEMORY_TYPE,
+        crate::protocol::memory::TRACK_TABLE_PAGES * PAGE_SIZE,
+        RESIDENT_EVENT_MEMORY_TYPE,
     )?;
     unsafe {
-        (&mut *tracking_pages.pointer().as_ptr().cast::<crate::memory::tracking::Session>())
+        (&mut *tracking_pages
+            .pointer()
+            .as_ptr()
+            .cast::<crate::memory::tracking::Session>())
             .initialize(tracking_tables.physical_address(), tracking_tables.pages());
         (*event).tracking_context_physical = tracking_pages.physical_address();
     }
+    // CPU slots stay fixed after boot. Pack storage by enabled CPUs rather
+    // than reserving a full private EPT tree for every possible processor ID.
+    let interception_cpu_mask = crate::boot::smp::enabled_application_processors()
+        .map_err(ResidentProbeError::Allocation)?
+        .into_iter()
+        .fold(1u64, |mask, processor_number| mask | (1u64 << processor_number));
+    let mut interception_pages = allocate(
+        size_of::<crate::memory::interception::Session>(),
+        RESIDENT_EVENT_MEMORY_TYPE,
+    )?;
+    let mut interception_tables = allocate(
+        crate::protocol::memory::intercept_storage_pages(interception_cpu_mask) * PAGE_SIZE,
+        RESIDENT_EVENT_MEMORY_TYPE,
+    )?;
+    unsafe {
+        (&mut *interception_pages
+            .pointer()
+            .as_ptr()
+            .cast::<crate::memory::interception::Session>())
+            .initialize(interception_tables.physical_address(), interception_cpu_mask);
+        (*event).interception_context_physical = interception_pages.physical_address();
+        (*event).interception_entry_physical = root_image.physical_address()
+            + crate::memory::interception::runtime::interception_entry as *const () as u64
+            - source_base;
+    }
     let context = unsafe { &mut *state_pages.pointer().as_ptr().cast::<RuntimeContext>() };
-    context.abi = Abi { bridge: CONTROL_VERSION, boot_bytes: size_of::<ResidentBootContext>() as u32,
-        event_bytes: size_of::<ResidentEventContext>() as u32, nested_bytes: size_of::<NestedVmxState>() as u32,
-        cpu_bytes: size_of::<ControlCpuState>() as u32 };
+    context.abi = Abi {
+        bridge: CONTROL_VERSION,
+        boot_bytes: size_of::<ResidentBootContext>() as u32,
+        event_bytes: size_of::<ResidentEventContext>() as u32,
+        nested_bytes: size_of::<NestedVmxState>() as u32,
+        cpu_bytes: size_of::<ControlCpuState>() as u32,
+    };
     context.public_key = *include_bytes!(env!("MATRIXHV_UPDATE_PUBLIC_KEY"));
     context.staging = staging.physical_address();
     context.banks[1] = bank.physical_address();
     context.event_physical = event as u64;
     context.event_runtime = event as u64;
     context.status_offset = core::mem::offset_of!(ResidentEventContext, update_status);
-    context.masks_offsets = [core::mem::offset_of!(ResidentEventContext, control_expected_mask),
+    context.masks_offsets = [
+        core::mem::offset_of!(ResidentEventContext, control_expected_mask),
         core::mem::offset_of!(ResidentEventContext, control_active_mask),
         core::mem::offset_of!(ResidentEventContext, control_stopped_mask),
         core::mem::offset_of!(ResidentEventContext, control_failed_mask),
-        core::mem::offset_of!(ResidentEventContext, control_rearm_mask)];
+        core::mem::offset_of!(ResidentEventContext, control_rearm_mask),
+    ];
     context.cpu_states_offset = core::mem::offset_of!(ResidentEventContext, control_cpu_states);
     context.host_rip_offset = core::mem::offset_of!(ControlCpuState, host_fields) + 21 * 8;
-    context.bindings = [event as u64, resident_msr_switch_count(), crate::logging::backend() as u64,
-        root_image.physical_address() + entry_offset, state_pages.physical_address(), core_version()];
+    context.bindings = [
+        event as u64,
+        resident_msr_switch_count(),
+        crate::logging::backend() as u64,
+        root_image.physical_address() + entry_offset,
+        state_pages.physical_address(),
+        core_version(),
+    ];
     for (index, address) in context.bank_idts[1].iter_mut().enumerate() {
         *address = idts.physical_address() + (index * PAGE_SIZE) as u64;
     }
     let island_start = core::ptr::addr_of!(matrixhv_resident_island_start) as u64;
     let island_offset = |symbol| code.pages.physical_address() + symbol - island_start;
     unsafe {
-        (*event).control_off_native_rip = island_offset(core::ptr::addr_of!(matrixhv_resident_control_off_native) as u64);
-        (*event).control_recovery_physical = island_offset(core::ptr::addr_of!(matrixhv_resident_control_recovery_switch) as u64);
-        (*event).control_recovery_runtime = island_offset(core::ptr::addr_of!(matrixhv_resident_control_native_restore) as u64);
+        (*event).control_off_native_rip =
+            island_offset(core::ptr::addr_of!(matrixhv_resident_control_off_native) as u64);
+        (*event).control_recovery_physical =
+            island_offset(core::ptr::addr_of!(matrixhv_resident_control_recovery_switch) as u64);
+        (*event).control_recovery_runtime =
+            island_offset(core::ptr::addr_of!(matrixhv_resident_control_native_restore) as u64);
         (*event).memory_entry_physical = root_image.physical_address()
-            + crate::memory::access::resident::memory_entry as *const () as u64 - source_base;
+            + crate::memory::access::resident::memory_entry as *const () as u64
+            - source_base;
         (*event).update_loader_physical = context.bindings[3];
         (*event).update_loader_runtime = native_image.physical_address() + entry_offset;
         (*event).update_context_physical = state_pages.physical_address();
         (*event).update_context_runtime = state_pages.physical_address();
         (*event).update_public_key = context.public_key;
-        (*event).update_abi = [context.abi.bridge, context.abi.boot_bytes, context.abi.event_bytes,
-            context.abi.nested_bytes, context.abi.cpu_bytes, STATE_ABI];
+        (*event).update_abi = [
+            context.abi.bridge,
+            context.abi.boot_bytes,
+            context.abi.event_bytes,
+            context.abi.nested_bytes,
+            context.abi.cpu_bytes,
+            STATE_ABI,
+        ];
         (*event).update_image_physical = native_image.physical_address();
         (*event).update_image_runtime = native_image.physical_address();
         (*event).update_image_bytes = source_bytes as u64;
         (*event).update_relocations_start = image.relocations.start as u64;
         (*event).update_relocations_end = image.relocations.end as u64;
     }
-    for pages in [&mut root_image, &mut native_image, &mut state_pages, &mut staging, &mut bank, &mut idts] {
+    for pages in [
+        &mut root_image,
+        &mut native_image,
+        &mut state_pages,
+        &mut staging,
+        &mut bank,
+        &mut idts,
+    ] {
         pages.preserve();
     }
     tracking_pages.preserve();
     tracking_tables.preserve();
+    interception_pages.preserve();
+    interception_tables.preserve();
     Ok(())
 }
 
 pub fn status_from_error(error: &ResidentProbeError) -> Status {
     match error {
-        ResidentProbeError::FirmwareDiscovery(crate::boot::firmware::PciDiscoveryError::Allocation(
-            status,
-        ))
+        ResidentProbeError::FirmwareDiscovery(
+            crate::boot::firmware::PciDiscoveryError::Allocation(status),
+        )
         | ResidentProbeError::Allocation(status)
         | ResidentProbeError::Ept(EptError::Allocation(status))
         | ResidentProbeError::Vmxon(VmxonError::Allocation(status))
@@ -522,8 +656,11 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
             memory_entry_physical: 0,
             memory_kernel_cr3: AtomicU64::new(0),
             memory_root_sequence: AtomicU64::new(0),
-            memory_root_history: [const { AtomicU64::new(0) }; crate::protocol::memory::ROOT_HISTORY_COUNT],
+            memory_root_history: [const { AtomicU64::new(0) };
+                crate::protocol::memory::ROOT_HISTORY_COUNT],
             tracking_context_physical: 0,
+            interception_context_physical: 0,
+            interception_entry_physical: 0,
         });
         for (index, state) in (*context).control_cpu_states.iter_mut().enumerate() {
             let address = native_storage_pages.physical_address()
@@ -970,6 +1107,43 @@ global_asm!(
     memory_root_history_mask = const crate::protocol::memory::ROOT_HISTORY_COUNT - 1,
     event_memory_entry = const core::mem::offset_of!(ResidentEventContext, memory_entry_physical),
     event_tracking_context = const core::mem::offset_of!(ResidentEventContext, tracking_context_physical),
+    event_interception_context = const core::mem::offset_of!(ResidentEventContext, interception_context_physical),
+    event_interception_entry = const core::mem::offset_of!(ResidentEventContext, interception_entry_physical),
+    interception_cause = const core::mem::offset_of!(crate::memory::interception::Session, cause),
+    interception_rendezvous_cause = const crate::protocol::memory::INTERCEPT_CAUSE_RENDEZVOUS,
+    b_interception_runtime_diagnostics = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(InterceptionCpuState, runtime_diagnostics),
+    b_interception_sync_diagnostics = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(InterceptionCpuState, sync_diagnostics),
+    ept_diagnostic_subleaf = const crate::protocol::memory::EPT_DIAGNOSTIC_SUBLEAF,
+    ept_diagnostic_capabilities = const 0xffff | crate::protocol::memory::EPT_DIAGNOSTIC_CAPABILITY
+        | crate::protocol::MATRIXHV_EXIT_TIMING_CAPABILITY,
+    exit_timing_subleaf = const crate::protocol::MATRIXHV_EXIT_TIMING_SUBLEAF,
+    ept_runtime_diagnostic_pairs = const crate::protocol::memory::INTERCEPT_DIAGNOSTIC_WORDS / 2,
+    ept_sync_diagnostic_pairs = const crate::protocol::memory::EPT_SYNC_DIAGNOSTIC_WORDS / 2,
+    ept_stall_diagnostic_subleaf = const crate::protocol::memory::EPT_STALL_DIAGNOSTIC_SUBLEAF,
+    b_interception_controls = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(abi::InterceptionCpuState, controls_saved),
+    b_interception_debug_armed = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(abi::InterceptionCpuState, debug_armed),
+    b_interception_ept = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(abi::InterceptionCpuState, applied_ept),
+    b_interception_exit_ept = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(abi::InterceptionCpuState, exit_ept),
+    b_interception_step = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(abi::InterceptionCpuState, step_active),
+    b_interception_exit_step = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(abi::InterceptionCpuState, exit_step),
+    b_interception_hook_count = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(abi::InterceptionCpuState, hook_count),
+    b_interception_vmfunc = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(abi::InterceptionCpuState, vmfunc_armed),
+    b_interception_exit_vmfunc = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(abi::InterceptionCpuState, exit_vmfunc),
+    b_interception_timing_saved = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(abi::InterceptionCpuState, timing_saved),
+    b_interception_timing_start = const core::mem::offset_of!(ResidentBootContext, interception)
+        + core::mem::offset_of!(abi::InterceptionCpuState, timing_start),
     matrixhv_status_leaf = const MATRIXHV_STATUS_LEAF,
     matrixhv_status_signature_eax = const MATRIXHV_STATUS_SIGNATURE_EAX,
     matrixhv_status_signature_ebx = const MATRIXHV_STATUS_SIGNATURE_EBX,

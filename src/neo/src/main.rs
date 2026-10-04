@@ -43,3 +43,7 @@ mod memory_tests;
 #[cfg(test)]
 #[path = "../../../tests/tracking_tests.rs"]
 mod tracking_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/interception_tests.rs"]
+mod interception_tests;

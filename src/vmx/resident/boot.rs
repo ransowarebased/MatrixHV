@@ -713,7 +713,19 @@ fn protect_update_memory(
         (event.update_image_bytes as usize).div_ceil(PAGE_SIZE),
         zero_page,
     )?;
+    let interception = unsafe {
+        &*(event.interception_context_physical as *const crate::memory::interception::Session)
+    };
+    let interception_configuration = unsafe { &*interception.configuration.get() };
     for (base, pages) in [
+        (
+            event.interception_context_physical,
+            core::mem::size_of::<crate::memory::interception::Session>().div_ceil(PAGE_SIZE),
+        ),
+        (
+            interception_configuration.pool_base,
+            crate::protocol::memory::intercept_storage_pages(interception_configuration.cpu_mask),
+        ),
         (update.staging, MAX_PACKAGE_BYTES.div_ceil(PAGE_SIZE)),
         (
             event.update_context_physical,

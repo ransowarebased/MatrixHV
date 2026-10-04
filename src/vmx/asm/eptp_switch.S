@@ -653,30 +653,72 @@ push rdi
 push r13
 push r14
 push r15
+inc qword ptr [r12 + {b_interception_sync_diagnostics}]
 call .Lresident_nested_eptp_sync_begin
 test eax, eax
-jz .Lresident_nested_eptp_sync_acquire_return
+jz .Lresident_nested_eptp_sync_acquire_contended
 // Single-CPU operation does not require an enabled local APIC transport.
 call .Lresident_nested_eptp_sync_ready
 test eax, eax
 jnz .Lresident_nested_eptp_sync_acquire_return
+mov edx, 1
+call .Lresident_nested_eptp_sync_record
 call .Lresident_nested_eptp_sync_kick
 test eax, eax
 jz .Lresident_nested_eptp_sync_acquire_abort
-mov esi, 1000000
 .Lresident_nested_eptp_sync_acquire_wait:
+cmp qword ptr [rip + .Lresident_eptp_sync_failure], 0
+jne .Lresident_nested_eptp_sync_acquire_cancelled
+call .Lresident_nested_eptp_sync_budget_expired
+test eax, eax
+jnz .Lresident_nested_eptp_sync_acquire_timeout
 call .Lresident_nested_eptp_sync_ready
 test eax, eax
 jnz .Lresident_nested_eptp_sync_acquire_return
 pause
-dec esi
-jnz .Lresident_nested_eptp_sync_acquire_wait
+jmp .Lresident_nested_eptp_sync_acquire_wait
+.Lresident_nested_eptp_sync_acquire_timeout:
+inc qword ptr [r12 + {b_interception_sync_diagnostics} + 32]
+.Lresident_nested_eptp_sync_acquire_cancelled:
+mov qword ptr [r12 + {b_interception_sync_diagnostics} + 48], 4
 .Lresident_nested_eptp_sync_acquire_abort:
 // No EPT changes are permitted before acquisition succeeds. A CPU in INIT,
 // wait-for-SIPI or an unresponsive outer hypervisor cannot strand its peers.
+// Capture the unacknowledged CPU slots only on failure, outside the poll loop.
+xor eax, eax
+mov r9, qword ptr [r12 + {b_event_context}]
+test r9, r9
+jz .Lresident_nested_eptp_sync_pending_captured
+mov r10, qword ptr [rip + .Lresident_eptp_sync_epoch]
+xor ecx, ecx
+.Lresident_nested_eptp_sync_capture_pending:
+mov r11, qword ptr [r9 + {event_cpu_contexts} + rcx * 8]
+test r11, r11
+jz .Lresident_nested_eptp_sync_capture_next
+cmp r11, r12
+je .Lresident_nested_eptp_sync_capture_next
+cmp qword ptr [r11 + {b_nested_eptp_sync_ack}], r10
+je .Lresident_nested_eptp_sync_capture_next
+bts rax, rcx
+.Lresident_nested_eptp_sync_capture_next:
+inc ecx
+cmp ecx, 64
+jb .Lresident_nested_eptp_sync_capture_pending
+.Lresident_nested_eptp_sync_pending_captured:
+mov qword ptr [r12 + {b_interception_sync_diagnostics} + 56], rax
+call .Lresident_nested_eptp_sync_cancel
 call .Lresident_nested_eptp_sync_end
 xor eax, eax
+jmp .Lresident_nested_eptp_sync_acquire_return
+.Lresident_nested_eptp_sync_acquire_contended:
+inc qword ptr [r12 + {b_interception_sync_diagnostics} + 16]
+mov qword ptr [r12 + {b_interception_sync_diagnostics} + 48], 1
+mov qword ptr [r12 + {b_interception_sync_diagnostics} + 56], 0
 .Lresident_nested_eptp_sync_acquire_return:
+test eax, eax
+jz .Lresident_nested_eptp_sync_acquire_failed
+inc qword ptr [r12 + {b_interception_sync_diagnostics} + 8]
+.Lresident_nested_eptp_sync_acquire_failed:
 pop r15
 pop r14
 pop r13
@@ -687,13 +729,41 @@ pop rbx
 ret
 
 .Lresident_nested_eptp_sync_begin:
+// A cancelled generation keeps its storage quarantined until every allocated
+// CPU has restored a clean local view and the original owner has left.
+cmp qword ptr [rip + .Lresident_eptp_sync_failure], 0
+je .Lresident_nested_eptp_sync_begin_owner
+// Revocation callbacks must not clear the generation they are acknowledging.
+mov rcx, qword ptr [r12 + {b_processor_number}]
+bt qword ptr [rip + .Lresident_eptp_sync_recovered], rcx
+jnc .Lresident_nested_eptp_sync_busy
+cmp qword ptr [rip + .Lresident_eptp_sync_owner], 0
+jne .Lresident_nested_eptp_sync_busy
+mov r9, qword ptr [r12 + {b_event_context}]
+test r9, r9
+jz .Lresident_nested_eptp_sync_busy
+xor ecx, ecx
+.Lresident_nested_eptp_sync_recovery_scan:
+cmp qword ptr [r9 + {event_cpu_contexts} + rcx * 8], 0
+je .Lresident_nested_eptp_sync_recovery_next
+bt qword ptr [rip + .Lresident_eptp_sync_recovered], rcx
+jnc .Lresident_nested_eptp_sync_busy
+.Lresident_nested_eptp_sync_recovery_next:
+inc ecx
+cmp ecx, 64
+jb .Lresident_nested_eptp_sync_recovery_scan
+.Lresident_nested_eptp_sync_begin_owner:
 xor eax, eax
 lock cmpxchg qword ptr [rip + .Lresident_eptp_sync_owner], r12
 jne .Lresident_nested_eptp_sync_busy
+mov qword ptr [rip + .Lresident_eptp_sync_failure], 0
+mov qword ptr [rip + .Lresident_eptp_sync_recovered], 0
 inc qword ptr [rip + .Lresident_eptp_sync_epoch]
 jnz .Lresident_nested_eptp_sync_started
 inc qword ptr [rip + .Lresident_eptp_sync_epoch]
 .Lresident_nested_eptp_sync_started:
+mov rax, qword ptr [rip + .Lresident_eptp_sync_epoch]
+mov qword ptr [r12 + {b_nested_eptp_sync_ack}], rax
 mov eax, 1
 ret
 .Lresident_nested_eptp_sync_busy:
@@ -701,6 +771,8 @@ xor eax, eax
 ret
 
 .Lresident_nested_eptp_sync_ready:
+cmp qword ptr [rip + .Lresident_eptp_sync_failure], 0
+jne .Lresident_nested_eptp_sync_busy
 cmp qword ptr [rip + .Lresident_eptp_sync_owner], r12
 jne .Lresident_nested_eptp_sync_busy
 mov r9, qword ptr [r12 + {b_event_context}]
@@ -738,12 +810,12 @@ cmp qword ptr [rip + .Lresident_eptp_sync_owner], r12
 jne .Lresident_nested_eptp_sync_busy
 mov r15, qword ptr [r12 + {b_event_context}]
 test r15, r15
-jz .Lresident_nested_eptp_sync_busy
+jz .Lresident_nested_eptp_sync_transport_failed
 mov ecx, {apic_base_msr}
 call .Lresident_guarded_rdmsr
-jc .Lresident_nested_eptp_sync_busy
+jc .Lresident_nested_eptp_sync_transport_failed
 test eax, 0x800
-jz .Lresident_nested_eptp_sync_busy
+jz .Lresident_nested_eptp_sync_transport_failed
 mov ebp, eax
 and ebp, 0x400
 shl rdx, 32
@@ -755,10 +827,15 @@ jnz .Lresident_nested_eptp_sync_kick_scan
 mov r11, r13
 call .Lresident_ept01_host_page_is_mapped
 test eax, eax
-jz .Lresident_nested_eptp_sync_busy
+jz .Lresident_nested_eptp_sync_transport_failed
 .Lresident_nested_eptp_sync_kick_scan:
 xor ebx, ebx
 .Lresident_nested_eptp_sync_kick_peer:
+cmp qword ptr [rip + .Lresident_eptp_sync_failure], 0
+jne .Lresident_nested_eptp_sync_kick_cancelled
+call .Lresident_nested_eptp_sync_budget_expired
+test eax, eax
+jnz .Lresident_nested_eptp_sync_kick_timeout
 mov r14, qword ptr [r15 + {event_cpu_contexts} + rbx * 8]
 test r14, r14
 jz .Lresident_nested_eptp_sync_kick_next
@@ -770,14 +847,25 @@ je .Lresident_nested_eptp_sync_kick_next
 test ebp, ebp
 jnz .Lresident_nested_eptp_sync_queue_nmi
 cmp qword ptr [r14 + {b_nested_eptp_sync_apic_id}], 255
-ja .Lresident_nested_eptp_sync_busy
-mov ecx, 100000
+ja .Lresident_nested_eptp_sync_transport_failed
 .Lresident_nested_eptp_sync_icr_wait:
+cmp qword ptr [rip + .Lresident_eptp_sync_failure], 0
+jne .Lresident_nested_eptp_sync_kick_cancelled
+call .Lresident_nested_eptp_sync_budget_expired
+test eax, eax
+jnz .Lresident_nested_eptp_sync_icr_timeout
 test dword ptr [r13 + 0x300], 0x1000
 jz .Lresident_nested_eptp_sync_queue_nmi
 pause
-dec ecx
-jnz .Lresident_nested_eptp_sync_icr_wait
+jmp .Lresident_nested_eptp_sync_icr_wait
+.Lresident_nested_eptp_sync_icr_timeout:
+inc qword ptr [r12 + {b_interception_sync_diagnostics} + 40]
+mov qword ptr [r12 + {b_interception_sync_diagnostics} + 48], 3
+jmp .Lresident_nested_eptp_sync_busy
+.Lresident_nested_eptp_sync_kick_timeout:
+inc qword ptr [r12 + {b_interception_sync_diagnostics} + 32]
+.Lresident_nested_eptp_sync_kick_cancelled:
+mov qword ptr [r12 + {b_interception_sync_diagnostics} + 48], 4
 jmp .Lresident_nested_eptp_sync_busy
 .Lresident_nested_eptp_sync_queue_nmi:
 mov eax, 1
@@ -796,9 +884,9 @@ jnc .Lresident_nested_eptp_sync_kick_next
 xor eax, eax
 xchg qword ptr [r14 + {b_nested_eptp_sync_nmi}], rax
 test rax, rax
-jnz .Lresident_nested_eptp_sync_busy
+jnz .Lresident_nested_eptp_sync_transport_failed
 mov qword ptr [r14 + {b_nmi_pending}], 1
-jmp .Lresident_nested_eptp_sync_busy
+jmp .Lresident_nested_eptp_sync_transport_failed
 .Lresident_nested_eptp_sync_send_xapic:
 shl edx, 24
 mov dword ptr [r13 + 0x310], edx
@@ -809,8 +897,14 @@ cmp ebx, 64
 jb .Lresident_nested_eptp_sync_kick_peer
 mov eax, 1
 ret
+.Lresident_nested_eptp_sync_transport_failed:
+inc qword ptr [r12 + {b_interception_sync_diagnostics} + 24]
+mov qword ptr [r12 + {b_interception_sync_diagnostics} + 48], 2
+jmp .Lresident_nested_eptp_sync_busy
 
 .Lresident_nested_eptp_sync_poll:
+cmp qword ptr [rip + .Lresident_eptp_sync_failure], 0
+jne .Lresident_nested_eptp_sync_recover
 mov rax, qword ptr [rip + .Lresident_eptp_sync_owner]
 test rax, rax
 jz .Lresident_nested_eptp_sync_return
@@ -821,18 +915,194 @@ cmp qword ptr [r12 + {b_nested_l2_active}], 0
 je .Lresident_nested_eptp_sync_acknowledge
 call .Lresident_nested_capture_native_eptp
 .Lresident_nested_eptp_sync_acknowledge:
+call .Lresident_nested_eptp_sync_budget_expired
+test eax, eax
+jnz .Lresident_nested_eptp_sync_budget_timeout
+mov edx, 2
+call .Lresident_nested_eptp_sync_record
 mov r10, qword ptr [rip + .Lresident_eptp_sync_epoch]
 mov qword ptr [r12 + {b_nested_eptp_sync_ack}], r10
+// Budget checks may clobber scratch registers; retain the acknowledged epoch.
+push r10
 .Lresident_nested_eptp_sync_wait:
 pause
+call .Lresident_nested_eptp_sync_budget_expired
+test eax, eax
+jnz .Lresident_nested_eptp_sync_peer_timeout
+cmp qword ptr [rip + .Lresident_eptp_sync_failure], 0
+jne .Lresident_nested_eptp_sync_peer_cancelled
 cmp qword ptr [rip + .Lresident_eptp_sync_owner], 0
 je .Lresident_nested_eptp_sync_released
+mov r10, qword ptr [rsp]
 cmp qword ptr [rip + .Lresident_eptp_sync_epoch], r10
-je .Lresident_nested_eptp_sync_wait
+jne .Lresident_nested_eptp_sync_released
+jmp .Lresident_nested_eptp_sync_wait
+.Lresident_nested_eptp_sync_peer_timeout:
+inc qword ptr [r12 + {b_interception_sync_diagnostics} + 32]
+mov qword ptr [r12 + {b_interception_sync_diagnostics} + 48], 5
+call .Lresident_nested_eptp_sync_cancel
+.Lresident_nested_eptp_sync_peer_cancelled:
+add rsp, 8
+jmp .Lresident_nested_eptp_sync_recover
 .Lresident_nested_eptp_sync_released:
+add rsp, 8
 call .Lresident_nested_eptp_sync_flush_local
+// The deadline belongs to root entry, not to an owner or epoch. A succession
+// of released barriers cannot reset the CPU's accumulated parking budget.
+call .Lresident_nested_eptp_sync_budget_expired
+test eax, eax
+jnz .Lresident_nested_eptp_sync_budget_timeout
 jmp .Lresident_nested_eptp_sync_poll
+.Lresident_nested_eptp_sync_budget_timeout:
+inc qword ptr [r12 + {b_interception_sync_diagnostics} + 32]
+mov qword ptr [r12 + {b_interception_sync_diagnostics} + 48], 5
+call .Lresident_nested_eptp_sync_cancel
+jmp .Lresident_nested_eptp_sync_recover
+
+// One 20 ms budget covers owner acquisition, APIC delivery, peer parking and
+// entry-gate retries until the next VM exit. NMIs cannot renew that budget.
+.Lresident_nested_eptp_sync_budget_start:
+mov r8, qword ptr [r12 + {b_processor_number}]
+shl r8, 4
+lea r9, [rip + .Lresident_eptp_sync_budgets]
+add r9, r8
+call .Lresident_nested_eptp_sync_clock
+mov r10, qword ptr [r12 + {b_watchdog_tsc_hz}]
+test r10, r10
+jz .Lresident_nested_eptp_sync_budget_fallback
+mov r11, rax
+mov rax, r10
+xor edx, edx
+mov ecx, 50
+div rcx
+add rax, r11
+jmp .Lresident_nested_eptp_sync_budget_store
+.Lresident_nested_eptp_sync_budget_fallback:
+add rax, 80000000
+.Lresident_nested_eptp_sync_budget_store:
+mov qword ptr [r9], rax
+mov qword ptr [r9 + 8], 1000000
+ret
+.Lresident_nested_eptp_sync_budget_expired:
+mov r8, qword ptr [r12 + {b_processor_number}]
+shl r8, 4
+lea r9, [rip + .Lresident_eptp_sync_budgets]
+add r9, r8
+// Standalone control requests have no dispatch entry; initialize once there.
+cmp qword ptr [r9], 0
+jne .Lresident_nested_eptp_sync_budget_check
+call .Lresident_nested_eptp_sync_budget_start
+.Lresident_nested_eptp_sync_budget_check:
+call .Lresident_nested_eptp_sync_clock
+sub rax, qword ptr [r9]
+jns .Lresident_nested_eptp_sync_budget_exhausted
+cmp qword ptr [r9 + 8], 0
+je .Lresident_nested_eptp_sync_budget_exhausted
+sub qword ptr [r9 + 8], 1
+jbe .Lresident_nested_eptp_sync_budget_exhausted
+xor eax, eax
+ret
+.Lresident_nested_eptp_sync_budget_exhausted:
+mov eax, 1
+ret
+
+// A peer never steals ownership from a CPU that may still be committing stores.
+// Revocation closes MTF/RW windows and preserves completed guest writes through
+// the existing merge path. Reuse remains blocked if an owner never returns.
+.Lresident_nested_eptp_sync_cancel:
+mov edx, dword ptr [r12 + {b_interception_sync_diagnostics} + 48]
+call .Lresident_nested_eptp_sync_record
+mov r10, qword ptr [rip + .Lresident_eptp_sync_epoch]
+xor eax, eax
+lock cmpxchg qword ptr [rip + .Lresident_eptp_sync_failure], r10
+mov r9, qword ptr [r12 + {b_event_context}]
+mov r9, qword ptr [r9 + {event_interception_context}]
+test r9, r9
+jz .Lresident_nested_eptp_sync_return
+mov qword ptr [r9], 2
+mov qword ptr [r9 + {interception_cause}], {interception_rendezvous_cause}
+mov qword ptr [r12 + {b_interception_runtime_diagnostics} + 168], 7
+mov rax, qword ptr [r12 + {b_last_guest_rip}]
+mov qword ptr [r12 + {b_interception_runtime_diagnostics} + 176], rax
+mov rax, qword ptr [r12 + {b_last_guest_physical_address}]
+mov qword ptr [r12 + {b_interception_runtime_diagnostics} + 184], rax
+ret
+.Lresident_nested_eptp_sync_recover:
+mov r9, qword ptr [r12 + {b_event_context}]
+mov r9, qword ptr [r9 + {event_interception_context}]
+test r9, r9
+jz .Lresident_nested_eptp_sync_return
+mov qword ptr [r9], 2
+mov rcx, qword ptr [r12 + {b_processor_number}]
+bt qword ptr [rip + .Lresident_eptp_sync_recovered], rcx
+jc .Lresident_nested_eptp_sync_return
+mov edx, 2
+call .Lresident_interception_callback
+cmp rax, -1
+je .Lresident_dispatch_halt
+call .Lresident_nested_eptp_sync_flush_local
+mov rcx, qword ptr [r12 + {b_processor_number}]
+lock bts qword ptr [rip + .Lresident_eptp_sync_recovered], rcx
+ret
+
+.Lresident_nested_eptp_sync_clock:
+rdtsc
+shl rdx, 32
+or rax, rdx
+ret
+
+// One writer per CPU slot; publish the phase last. These records remain
+// available through diagnostic CPUID without enabling optional counters.
+.Lresident_nested_eptp_sync_record:
+mov r8, qword ptr [r12 + {b_processor_number}]
+shl r8, 6
+lea r9, [rip + .Lresident_interception_stall_records]
+add r9, r8
+mov qword ptr [r9], 0
+mov rax, qword ptr [rip + .Lresident_eptp_sync_owner]
+mov qword ptr [r9 + 8], rax
+mov rax, qword ptr [rip + .Lresident_eptp_sync_epoch]
+mov qword ptr [r9 + 16], rax
+xor r8d, r8d
+mov r11, qword ptr [r12 + {b_event_context}]
+xor ecx, ecx
+.Lresident_nested_eptp_sync_record_scan:
+mov r10, qword ptr [r11 + {event_cpu_contexts} + rcx * 8]
+test r10, r10
+jz .Lresident_nested_eptp_sync_record_next
+cmp r10, r12
+je .Lresident_nested_eptp_sync_record_next
+cmp r10, qword ptr [r9 + 8]
+jne .Lresident_nested_eptp_sync_record_ack
+cmp edx, 1
+ja .Lresident_nested_eptp_sync_record_pending
+.Lresident_nested_eptp_sync_record_ack:
+cmp qword ptr [r10 + {b_nested_eptp_sync_ack}], rax
+je .Lresident_nested_eptp_sync_record_next
+.Lresident_nested_eptp_sync_record_pending:
+bts r8, rcx
+.Lresident_nested_eptp_sync_record_next:
+inc ecx
+cmp ecx, 64
+jb .Lresident_nested_eptp_sync_record_scan
+mov qword ptr [r9 + 24], r8
+mov qword ptr [r12 + {b_interception_sync_diagnostics} + 56], r8
+mov rax, qword ptr [r12 + {b_last_guest_rip}]
+mov qword ptr [r9 + 32], rax
+mov rax, qword ptr [r12 + {b_last_guest_physical_address}]
+mov qword ptr [r9 + 40], rax
+mov rax, qword ptr [r12 + {b_interception_step}]
+mov qword ptr [r9 + 48], rax
+mov r8, rdx
+call .Lresident_nested_eptp_sync_clock
+mov qword ptr [r9 + 56], rax
+mov qword ptr [r9], r8
+ret
 .Lresident_nested_eptp_sync_flush_local:
+mov edx, 3
+call .Lresident_interception_callback
+cmp rax, -1
+je .Lresident_dispatch_halt
 // Retire local translations after the owner's stores and before VM entry.
 // Other CPUs cannot invalidate this logical processor's EPT caches for it.
 mov qword ptr [r12 + {b_nested_eptp_native_enabled}], 0
@@ -870,13 +1140,18 @@ ret
 .Lresident_nested_eptp_sync_enter:
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
 call .Lresident_nested_eptp_sync_poll
+mov edx, 1
+call .Lresident_interception_callback
+call .Lresident_interception_safe_point_timer
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 1
 mfence
 mov rax, qword ptr [rip + .Lresident_eptp_sync_owner]
 test rax, rax
 jz .Lresident_nested_eptp_sync_return
 cmp rax, r12
-jne .Lresident_nested_eptp_sync_enter
+je .Lresident_nested_eptp_sync_return
+cmp qword ptr [rip + .Lresident_eptp_sync_failure], 0
+je .Lresident_nested_eptp_sync_enter
 ret
 
 // Return one only for a queued synchronization NMI. An NMI that arrives in a
@@ -890,9 +1165,118 @@ cmp qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
 je .Lresident_nested_eptp_sync_nmi_handled
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
 call .Lresident_nested_eptp_sync_poll
+mov edx, 1
+call .Lresident_interception_callback
+call .Lresident_interception_safe_point_timer
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 1
 .Lresident_nested_eptp_sync_nmi_handled:
 mov eax, 1
+ret
+
+// The copied Rust callback is retained by live updates. Keep the periodic
+// safe point in the replaceable core, independently of lease/no-lease mode.
+// Save only timer state owned here; existing diagnostic/lease timers keep the
+// earlier deadline and retain their original owner and restoration path.
+.Lresident_interception_safe_point_timer:
+cmp qword ptr [r12 + {b_nested_l2_active}], 0
+jne .Lresident_nested_eptp_sync_return
+mov r8, qword ptr [r12 + {b_processor_number}]
+lea r9, [rip + .Lresident_interception_timer_state]
+cmp qword ptr [r9 + r8 * 8], 0
+jne .Lresident_interception_timer_known
+mov ecx, 0x480
+call .Lresident_guarded_rdmsr
+jc .Lresident_nested_eptp_sync_return
+bt edx, 23
+mov ecx, 0x481
+jnc .Lresident_interception_timer_controls
+mov ecx, 0x48d
+.Lresident_interception_timer_controls:
+call .Lresident_guarded_rdmsr
+jc .Lresident_nested_eptp_sync_return
+mov qword ptr [r9 + r8 * 8], 1
+test edx, 0x40
+jz .Lresident_nested_eptp_sync_return
+mov qword ptr [r9 + r8 * 8], 2
+.Lresident_interception_timer_known:
+cmp qword ptr [r9 + r8 * 8], 1
+je .Lresident_nested_eptp_sync_return
+mov r10, qword ptr [r12 + {b_event_context}]
+mov r10, qword ptr [r10 + {event_interception_context}]
+test r10, r10
+jz .Lresident_nested_eptp_sync_return
+cmp qword ptr [r10], 1
+je .Lresident_interception_timer_active
+cmp qword ptr [rip + .Lresident_eptp_sync_failure], 0
+jne .Lresident_interception_timer_active
+test qword ptr [r9 + r8 * 8], 8
+jz .Lresident_nested_eptp_sync_return
+mov eax, {pin_based_vm_exec_control}
+vmread r11, rax
+jna .Lresident_dispatch_halt
+and r11, -65
+vmwrite rax, r11
+jna .Lresident_dispatch_halt
+lea r10, [rip + .Lresident_interception_timer_original]
+mov r11, qword ptr [r10 + r8 * 8]
+mov eax, {vmx_preemption_timer_value}
+vmwrite rax, r11
+jna .Lresident_dispatch_halt
+mov qword ptr [r9 + r8 * 8], 2
+ret
+.Lresident_interception_timer_active:
+mov r10, qword ptr [r12 + {b_watchdog_tsc_hz}]
+test r10, r10
+jz .Lresident_nested_eptp_sync_return
+mov ecx, 0x485
+call .Lresident_guarded_rdmsr
+jc .Lresident_nested_eptp_sync_return
+and eax, 31
+mov ecx, eax
+shr r10, cl
+mov rax, r10
+xor edx, edx
+mov ecx, 50
+div rcx
+mov r10, rax
+cmp r10, 2
+jae .Lresident_interception_timer_ticks
+mov r10d, 2
+.Lresident_interception_timer_ticks:
+mov r11d, -1
+cmp r10, r11
+cmova r10, r11
+mov eax, {pin_based_vm_exec_control}
+vmread r11, rax
+jna .Lresident_dispatch_halt
+test r11, 0x40
+jnz .Lresident_interception_timer_minimum
+mov eax, {vmx_preemption_timer_value}
+vmread r11, rax
+jna .Lresident_dispatch_halt
+lea rax, [rip + .Lresident_interception_timer_original]
+mov qword ptr [rax + r8 * 8], r11
+or qword ptr [r9 + r8 * 8], 8
+mov eax, {pin_based_vm_exec_control}
+vmread r11, rax
+jna .Lresident_dispatch_halt
+or r11, 0x40
+vmwrite rax, r11
+jna .Lresident_dispatch_halt
+jmp .Lresident_interception_timer_program
+.Lresident_interception_timer_minimum:
+// A just-expired timer must be reloaded; a live earlier timer stays earlier.
+mov eax, {vmx_preemption_timer_value}
+vmread r11, rax
+jna .Lresident_dispatch_halt
+cmp r11, 2
+jb .Lresident_interception_timer_program
+cmp r10, r11
+cmova r10, r11
+.Lresident_interception_timer_program:
+mov eax, {vmx_preemption_timer_value}
+vmwrite rax, r10
+jna .Lresident_dispatch_halt
 ret
 
 // Check the interruption type before consuming a token: #PF, #UD and other
@@ -919,6 +1303,18 @@ ret
 .quad 0
 .Lresident_eptp_sync_epoch:
 .quad 0
+.Lresident_eptp_sync_failure:
+.quad 0
+.Lresident_eptp_sync_recovered:
+.quad 0
+.Lresident_interception_timer_state:
+.zero 512
+.Lresident_interception_timer_original:
+.zero 512
+.Lresident_interception_stall_records:
+.zero 4096
+.Lresident_eptp_sync_budgets:
+.zero 1024
 .Lresident_eptp_lists_live:
 .quad 0
 .endm
