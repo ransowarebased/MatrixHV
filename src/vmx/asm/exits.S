@@ -562,6 +562,7 @@ jmp .Lresident_host_exception
 .endr
 .Lresident_host_exception:
 cli
+call .Lresident_pt_freeze
 mov r8, qword ptr [rip + matrixhv_resident_island_event_context]
 test r8, r8
 jz matrixhv_resident_island_fatal
@@ -711,6 +712,7 @@ mov rax, {exit_reason}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
 mov qword ptr [r12 + {b_last_reason}], r11
+call .Lresident_pt_enter
 mov rax, qword ptr [r12 + {b_interception_ept}]
 mov qword ptr [r12 + {b_interception_exit_ept}], rax
 mov rax, qword ptr [r12 + {b_interception_step}]
@@ -942,6 +944,7 @@ je .Lresident_interception_clock_ready
 mov edx, 5
 call .Lresident_interception_callback
 .Lresident_interception_clock_ready:
+call .Lresident_pt_leave
 pop rax
 pop rcx
 pop rdx

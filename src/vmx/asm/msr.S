@@ -419,11 +419,13 @@ ret
 stc
 ret
 .Lresident_guarded_rdmsr:
+call .Lresident_pt_guest_msr
 .Lresident_rdmsr_instruction:
 rdmsr
 clc
 ret
 .Lresident_guarded_wrmsr:
+call .Lresident_pt_guest_msr
 .Lresident_wrmsr_instruction:
 wrmsr
 clc

@@ -9,6 +9,8 @@ OUTPUT = PROJECT / "builds/exit-event-tests"
 OUTPUT.mkdir(parents=True, exist_ok=True)
 EXITS = (PROJECT / "src/vmx/asm/exits.S").read_text(encoding="utf-8")
 NESTED = (PROJECT / "src/vmx/asm/nested.S").read_text(encoding="utf-8")
+# PT is inactive in these event tests; its MSR lifecycle has a dedicated suite.
+NESTED = NESTED.replace("call .Lresident_pt_leave", "nop")
 
 
 def section(source: str, first: str, last: str) -> str:

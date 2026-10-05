@@ -63,6 +63,16 @@ pub fn run_boot_loader(
             .map(|resources| (processor_number, resources))
         })
         .collect::<Result<alloc::vec::Vec<_>, _>>()?;
+    for resources in core::iter::once(&mut cpu_resources)
+        .chain(ap_resources.iter_mut().map(|(_, resources)| resources))
+    {
+        match crate::vmx::pt::TraceResources::allocate() {
+            Ok(trace) => resources.intel_pt = Some(trace),
+            Err(status) => crate::logging::info(format_args!(
+                "Intel PT runtime buffer unavailable: {status:?}"
+            )),
+        }
+    }
     let update = unsafe {
         &mut *((*(event_context as *const ResidentEventContext)).update_context_physical
             as *mut crate::update::RuntimeContext)
@@ -251,6 +261,9 @@ pub fn run_boot_loader(
             nested_state,
             options.cpuid_presence,
         ));
+        if let Some(trace) = &cpu_resources.intel_pt {
+            (*context).intel_pt = trace.state();
+        }
         (*context).diagnostic_interval_tsc = diagnostic_interval_tsc;
         (*context).telemetry_probe_active = u64::from(options.vmx_test);
         (*context).watchdog_tsc_hz = watchdog_tsc_hz;

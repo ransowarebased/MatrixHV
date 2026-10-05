@@ -10,7 +10,7 @@ import textwrap
 
 def read_resident_rust(project: Path) -> str:
     return (project / "src/protocol.rs").read_text(encoding="utf-8") + "\n" + "\n".join((project / "src/vmx" / name).read_text(encoding="utf-8")
-                     for name in ("resident/mod.rs", "resident/abi.rs", "resident/boot.rs", "state.rs", "msr.rs", "nested.rs", "vmcs12.rs", "bridge.rs", "entry.rs", "exits.rs"))
+                     for name in ("resident/mod.rs", "resident/abi.rs", "resident/boot.rs", "state.rs", "msr.rs", "nested.rs", "vmcs12.rs", "bridge.rs", "entry.rs", "exits.rs", "pt.rs"))
 
 
 def read_resident_assembly(project: Path) -> str:
@@ -80,6 +80,9 @@ def read_resident_assembly(project: Path) -> str:
             result = "\n".join(helpers) + island
             # Component harnesses omit the relocated Rust interception service;
             # its entry/exit behavior is exercised by the dedicated runtime suite.
+            # The optional PT state machine has a dedicated modeled MSR suite.
+            result = re.sub(r"call \.Lresident_pt_(?:enter|leave|guest_msr|freeze)", "nop", result)
+            result = re.sub(r"(?<=\.Lresident_dispatch_cpuid_diagnostic_extended:\n).*?\.Lresident_pt_query_range_done:\n", "", result, flags=re.S)
             result = result.replace("call .Lresident_interception_callback", "xor eax, eax")
             result = result.replace("call .Lresident_interception_safe_point_timer", "xor eax, eax")
             hyperv = (project / "src/vmx/hyperv.rs").read_text(encoding="utf-8")
@@ -3103,7 +3106,9 @@ def prepare_boot_state(project: Path):
     harness = "use std::mem::{offset_of, size_of};\n"
     harness += 'pub mod protocol { include!("../../src/protocol.rs"); }\n'
     harness += 'pub mod memory { pub mod host { pub const PAGE_SIZE: usize = 4096; } }\n'
-    harness += 'pub mod vmx { pub mod bridge { include!("../../src/vmx/bridge.rs"); } pub mod nested { include!("../../src/vmx/nested.rs"); } pub mod vmcs12 { include!("../../src/vmx/vmcs12.rs"); } }\n'
+    trace_source = (project / "src/vmx/pt.rs").read_text()
+    (output / "trace_state.rs").write_text(trace_source[trace_source.index("#[repr(C)]"):trace_source.index("pub(crate) fn supported")])
+    harness += 'pub mod vmx { pub mod pt { include!("trace_state.rs"); } pub mod bridge { include!("../../src/vmx/bridge.rs"); } pub mod nested { include!("../../src/vmx/nested.rs"); } pub mod vmcs12 { include!("../../src/vmx/vmcs12.rs"); } }\n'
     harness += 'pub mod abi { include!("../../src/vmx/resident/abi.rs"); }\n'
     harness += "use abi::ResidentBootContext;\n"
     harness += "fn main() {\n"

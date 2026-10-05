@@ -6,6 +6,7 @@ pub mod exits;
 pub mod hyperv;
 pub mod msr;
 pub mod nested;
+pub(crate) mod pt;
 pub mod resident;
 pub mod state;
 pub mod vcpu;

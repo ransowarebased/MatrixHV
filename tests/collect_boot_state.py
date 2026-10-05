@@ -32,7 +32,7 @@ def structure(source, name):
 
 
 resident = "\n".join((project / "src/vmx" / name).read_text()
-                     for name in ("resident/abi.rs",))
+                     for name in ("resident/abi.rs", "pt.rs"))
 nested = (project / "src/vmx/nested.rs").read_text() + "\n" + (
     project / "src/vmx/vmcs12.rs").read_text()
 fields = {}
@@ -57,6 +57,8 @@ def append_u64_fields(source, prefix):
             append_u64_fields(structure(nested, kind), prefix + name + ".")
         elif kind == "InterceptionCpuState":
             append_u64_fields(structure(resident, kind), prefix + name + ".")
+        elif kind == "crate::vmx::pt::TraceState":
+            append_u64_fields(structure(resident, "TraceState"), prefix + name + ".")
         elif kind == "RootFxState":
             offset = (offset + 15) // 16 * 16 + 512
         elif (array := re.fullmatch(r"\[u8; ([\w:]+)\]", kind)):
@@ -263,6 +265,19 @@ try:
         }, indent=2))
         if values["canary_start"] != 0x4856424F4F544331 or values["canary_end"] != 0x4856424F4F544332:
             raise RuntimeError("Resident context layout or canaries are invalid")
+        if values["intel_pt.table"]:
+            table = values["intel_pt.table"]
+            buffer = values["intel_pt.buffer"]
+            if table & 0xFFF or buffer & 0xFFFF:
+                raise RuntimeError("Intel PT allocations are misaligned")
+            topa_data = idc.get_bytes(table, 16, True)
+            if topa_data is None or len(topa_data) != 16:
+                raise RuntimeError("Cannot read Intel PT ToPA entries")
+            topa_entries = struct.unpack("<2Q", topa_data)
+            if topa_entries != (buffer | (4 << 6) | (1 << 4), table | 1):
+                raise RuntimeError("Intel PT ToPA entries are invalid")
+            values["intel_pt.topa_data_entry"] = topa_entries[0]
+            values["intel_pt.topa_end_entry"] = topa_entries[1]
         event_address = values["event_context"]
         ida_dbg.invalidate_dbgmem_contents(event_address, 104)
         event_data = idc.get_bytes(event_address, 104, True)

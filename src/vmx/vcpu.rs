@@ -429,6 +429,7 @@ pub(crate) struct ResidentCpuResources {
     pub(crate) host_stack: ResidentPages,
     pub(crate) resident_msr_state: ResidentPages,
     pub(crate) nested_msr_state: ResidentPages,
+    pub(crate) intel_pt: Option<super::pt::TraceResources>,
     pub(crate) nested_eptp_list: ResidentPages,
     pub(crate) nested_eptp_tables: ResidentPages,
     pub(crate) nested_vmxon_page: ResidentPages,
@@ -580,6 +581,7 @@ impl ResidentCpuResources {
             host_stack,
             resident_msr_state,
             nested_msr_state,
+            intel_pt: None,
             nested_eptp_list,
             nested_eptp_tables,
             nested_vmxon_page,
@@ -818,6 +820,13 @@ impl ResidentCpuResources {
             self.context_pages.pages(),
             zero_page_physical_address,
         )?;
+        if let Some(trace) = &self.intel_pt {
+            ept.conceal_guest_access(
+                trace.pages.physical_address(),
+                trace.pages.pages(),
+                zero_page_physical_address,
+            )?;
+        }
         ept.conceal_guest_access(
             self.host_stack.physical_address(),
             self.host_stack.pages(),
@@ -1002,6 +1011,9 @@ impl ResidentApLaunch<'_> {
             nested_state,
             self.options.cpuid_presence,
         );
+        if let Some(trace) = &self.resources.intel_pt {
+            state.intel_pt = trace.state();
+        }
         state.processor_number = self.processor_number as u64;
         // The AP startup probe explicitly collects diagnostics for its validation.
         state.telemetry_probe_active = 1;

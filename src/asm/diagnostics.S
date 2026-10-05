@@ -20,6 +20,7 @@ popfq
 .macro matrixhv_island_observation
 // Diagnostic subleaves expose bounded snapshots, never guest-selected memory.
 .Lresident_dispatch_cpuid_diagnostic:
+call .Lresident_pt_leave
 cmp ecx, {guest_contract_subleaf}
 je .Lresident_dispatch_cpuid_guest_contract
 xor eax, eax
@@ -62,6 +63,21 @@ mov ecx, dword ptr [r9 + {event_post_ebs_cpu_mask}]
 mov edx, dword ptr [r9 + {event_halted_cpu_mask}]
 jmp .Lresident_dispatch_cpuid_diagnostic_store
 .Lresident_dispatch_cpuid_diagnostic_extended:
+cmp ecx, {pt_subleaf}
+je .Lresident_pt_query
+cmp ecx, {pt_subleaf} + 1
+je .Lresident_pt_start
+cmp ecx, {pt_subleaf} + 2
+je .Lresident_pt_stop
+cmp ecx, {pt_subleaf} + 3
+je .Lresident_pt_layout
+cmp ecx, {pt_subleaf} + 4
+je .Lresident_pt_generation
+cmp ecx, {pt_data_subleaf}
+jb .Lresident_pt_query_range_done
+cmp ecx, {pt_data_subleaf} + {pt_buffer_bytes} / 16
+jb .Lresident_pt_data
+.Lresident_pt_query_range_done:
 cmp ecx, 4
 jb .Lresident_dispatch_cpuid_diagnostic_zero
 cmp ecx, 30
@@ -1541,6 +1557,8 @@ call .Lresident_serial_state
 // Terminal dispatch contract: r12 is the failed boot context. Atomically publishes the first CPU failure and emits diagnostics without firmware after EBS. Clobbers scratch registers and flags; always reaches the halt loop.
 .macro matrixhv_island_halt_observation
 .Lresident_dispatch_halt:
+call .Lresident_pt_leave
+mov qword ptr [r12 + {b_pt_armed}], 0
 mov r10, qword ptr [r12 + {b_event_context}]
 test r10, r10
 jz .Lresident_visual_halt_pre_ebs
@@ -1582,6 +1600,7 @@ call .Lresident_visual_callback
 // Unhandled GP contract: rsp contains saved rdx, saved rax, error code and hardware RIP. r8 receives the retained event context. Atomically claims the diagnostic and transfers to terminal host-fault output; clobbers scratch GPRs and flags and never returns.
 .macro matrixhv_island_gp_diagnostic
 .Lresident_host_gp_fatal:
+call .Lresident_pt_freeze
 mov r8, qword ptr [rip + matrixhv_resident_island_event_context]
 test r8, r8
 jz matrixhv_resident_island_fatal

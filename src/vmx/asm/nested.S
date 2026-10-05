@@ -3841,6 +3841,7 @@ call .Lresident_profile_exit_handler
 call .Lresident_watchdog_resuming
 call .Lresident_nested_eptp_sync_enter
 call .Lresident_nested_prepare_full_msr_entry
+call .Lresident_pt_leave
 pop rax
 pop rcx
 pop rdx
@@ -3931,6 +3932,7 @@ call .Lresident_profile_exit_handler
 call .Lresident_watchdog_resuming
 call .Lresident_nested_eptp_sync_enter
 call .Lresident_nested_prepare_full_msr_entry
+call .Lresident_pt_leave
 pop rax
 pop rcx
 pop rdx

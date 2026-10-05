@@ -20,6 +20,10 @@ enum Action {
     Telemetry(telemetry::CaptureOptions),
     TelemetryControl(telemetry::Control),
     TelemetryControlTrace(telemetry::ControlTraceOptions),
+    IntelPt {
+        operation: String,
+        output: Option<PathBuf>,
+    },
     Install,
     Uninstall,
     ApplyUpdate(PathBuf),
@@ -40,13 +44,19 @@ struct RemoteStatus {
 }
 
 pub fn run(arguments: Vec<String>) -> Result<i32, String> {
-    if matches!(arguments.first().map(String::as_str), Some("hook" | "debug-registers")) {
+    if matches!(
+        arguments.first().map(String::as_str),
+        Some("hook" | "debug-registers")
+    ) {
         return crate::memory::run_interception(&arguments);
     }
     if arguments.first().map(String::as_str) == Some("ad-bitmap") {
         return crate::memory::run_bitmap(&arguments);
     }
-    if matches!(arguments.first().map(String::as_str), Some("read" | "write")) {
+    if matches!(
+        arguments.first().map(String::as_str),
+        Some("read" | "write")
+    ) {
         return crate::memory::run(&arguments);
     }
     let Some(options) = parse_options(arguments)? else {
@@ -132,6 +142,10 @@ fn run_local(action: Action, listen_address: &str) -> Result<i32, String> {
                 "{}",
                 telemetry::request_text(telemetry::Mode::General as u32, control as u32)?
             );
+            Ok(0)
+        }
+        Action::IntelPt { operation, output } => {
+            print!("{}", telemetry::intel_pt(&operation, output.as_deref())?);
             Ok(0)
         }
         Action::TelemetryControlTrace(options) => {
@@ -291,6 +305,7 @@ fn run_remote(remote: &str, timeout: Duration, action: Action) -> Result<i32, St
         Action::Shell
         | Action::Matrix(_)
         | Action::TelemetryControlTrace(_)
+        | Action::IntelPt { .. }
         | Action::Serve
         | Action::Install
         | Action::Uninstall
@@ -616,6 +631,27 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
                     "matrix requires on, off, status, or update --binary PACKAGE".to_string(),
                 );
             }
+            Some("pt") if positional.len() == 2 => {
+                let operation = positional[1].as_str();
+                if !matches!(operation, "start" | "stop" | "status" | "dump") {
+                    return Err(
+                        "pt requires start, stop, status, or dump --output DIRECTORY".into(),
+                    );
+                }
+                if seconds.is_some()
+                    || interval_ms.is_some()
+                    || (operation != "dump" && output.is_some())
+                {
+                    return Err("pt only accepts --output with dump".into());
+                }
+                if operation == "dump" && output.is_none() {
+                    return Err("pt dump requires --output DIRECTORY".into());
+                }
+                Action::IntelPt {
+                    operation: operation.into(),
+                    output: output.clone(),
+                }
+            }
             Some("serve") if positional.len() == 1 => Action::Serve,
             Some("shell") if positional.len() == 1 => Action::Shell,
             Some("ping") if positional.len() == 1 => Action::Ping,
@@ -681,7 +717,7 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
     }
     if !matches!(
         &action,
-        Action::Telemetry(_) | Action::TelemetryControlTrace(_)
+        Action::Telemetry(_) | Action::TelemetryControlTrace(_) | Action::IntelPt { .. }
     ) && telemetry_options_given
     {
         return Err("telemetry options require the telemetry command".to_string());
@@ -699,6 +735,9 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
     }
     if remote.is_some() && matches!(&action, Action::Matrix(_)) {
         return Err("matrix commands require the local Windows runtime bridge".to_string());
+    }
+    if remote.is_some() && matches!(&action, Action::IntelPt { .. }) {
+        return Err("Intel PT commands require local execution".into());
     }
     if remote.is_some() && matches!(&action, Action::Shell) {
         return Err("the interactive shell requires local execution".to_string());
@@ -730,14 +769,16 @@ fn print_usage() {
     println!(
         "neo telemetry --benchmark [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nBenchmark measures CPUID leaf 0 from guest to guest, including VM exit, handling and reentry.\nIt pins each available registered CPU and reports raw/calibrated TSC ticks, nanoseconds and min/mean/p50/p95/p99/max.\nCollection settings stay unchanged; compare telemetry disabled/enabled in separate runs.\nAn invariant TSC and clock diagnostics are required; release profiles using TSC compensation first.\nWith --remote, the benchmark runs on the remote server.\n"
     );
-    println!("neo hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo hook add TOKEN ADDRESS HEX [...] | hook remove TOKEN [ID] | hook list TOKEN\nneo hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN\nneo hook renew TOKEN [--lease-ms MS] | hook watch TOKEN [--lease-ms MS] | hook release TOKEN | hook status\nneo debug-registers set CR3 ADDRESS REDIRECT_RIP [...] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo debug-registers clear TOKEN | debug-registers status\nVMFUNC uses EAX=0 and ECX=0 (execute) or 1 (original data) from unhooked code.\nOne profile admits the primary CR3 and validated aliases. Conflicting original writes revoke the profile.\nThe default lease is 30 seconds; watch renews it until the process exits. --no-lease requires explicit release and does not need a VMX preemption timer.\nTSC compensation is CPU-local and requires an invariant TSC without Hyper-V Reference TSC or scaling. Guest CPU migration can expose clock skew.\n");
+    println!(
+        "neo hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo hook add TOKEN ADDRESS HEX [...] | hook remove TOKEN [ID] | hook list TOKEN\nneo hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN\nneo hook renew TOKEN [--lease-ms MS] | hook watch TOKEN [--lease-ms MS] | hook release TOKEN | hook status\nneo debug-registers set CR3 ADDRESS REDIRECT_RIP [...] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo debug-registers clear TOKEN | debug-registers status\nVMFUNC uses EAX=0 and ECX=0 (execute) or 1 (original data) from unhooked code.\nOne profile admits the primary CR3 and validated aliases. Conflicting original writes revoke the profile.\nThe default lease is 30 seconds; watch renews it until the process exits. --no-lease requires explicit release and does not need a VMX preemption timer.\nTSC compensation is CPU-local and requires an invariant TSC without Hyper-V Reference TSC or scaling. Guest CPU migration can expose clock skew.\n"
+    );
     if cfg!(target_os = "windows") {
         println!(
             "Launching neo without a command opens the Matrix interactive shell.\nUse install to register automatic startup at Windows sign-in.\n"
         );
     }
     println!(
-        "neo read PID|NAME CR3|auto [ADDRESS SIZE ...] [--kernel-cr3 CR3]\nneo write PID|NAME CR3|auto ADDRESS HEX [ADDRESS HEX ...] [--kernel-cr3 CR3]\nneo ad-bitmap start --pid PID [--gva GVA --pages COUNT]\nneo ad-bitmap start --cr3 CR3 --gva GVA --pages COUNT\nneo ad-bitmap stop SESSION [--output DIRECTORY]\nneo ad-bitmap dump SESSION --output DIRECTORY\nneo ad-bitmap release SESSION | cancel SESSION | status\nneo shell\nneo serve [--listen ADDRESS:PORT]\nneo ping | status | install | uninstall\nneo matrix on | off [--cpu INDEX] | status\nneo matrix update --binary PACKAGE\nneo telemetry enable | disable\nneo telemetry control --cpu INDEX --output FILE [--seconds 1..3600]\nneo telemetry | -t [watchdog | eptdiag] [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nneo --remote ADDRESS:PORT [status | ping | telemetry [enable | disable | watchdog | eptdiag] | -t [watchdog | eptdiag] | exec PROGRAM [ARGUMENT ...]]\nneo --remote ADDRESS:PORT --update [--binary PATH]\n\nCounters and basic records start disabled; use telemetry enable/disable to control collection.\nDisabling collection preserves snapshots and stops watchdog capture.\nWatchdog renews a 15-second lease; its interval must not exceed 5000 ms.\nControl tracing selects a separate observer CPU and saves native context/stack .bin files beside FILE when supported by the EFI.\nThe remote transport is plaintext and unauthenticated."
+        "neo read PID|NAME CR3|auto [ADDRESS SIZE ...] [--kernel-cr3 CR3]\nneo write PID|NAME CR3|auto ADDRESS HEX [ADDRESS HEX ...] [--kernel-cr3 CR3]\nneo ad-bitmap start --pid PID [--gva GVA --pages COUNT]\nneo ad-bitmap start --cr3 CR3 --gva GVA --pages COUNT\nneo ad-bitmap stop SESSION [--output DIRECTORY]\nneo ad-bitmap dump SESSION --output DIRECTORY\nneo ad-bitmap release SESSION | cancel SESSION | status\nneo shell\nneo serve [--listen ADDRESS:PORT]\nneo ping | status | install | uninstall\nneo matrix on | off [--cpu INDEX] | status\nneo matrix update --binary PACKAGE\nneo pt start | stop | status\nneo pt dump --output DIRECTORY\nneo telemetry enable | disable\nneo telemetry control --cpu INDEX --output FILE [--seconds 1..3600]\nneo telemetry | -t [watchdog | eptdiag] [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nneo --remote ADDRESS:PORT [status | ping | telemetry [enable | disable | watchdog | eptdiag] | -t [watchdog | eptdiag] | exec PROGRAM [ARGUMENT ...]]\nneo --remote ADDRESS:PORT --update [--binary PATH]\n\nIntel PT captures VMX root handlers only after pt start; pt dump stops capture and exports per-CPU raw .pt files and decoding metadata. It requires PT/ToPA support in VMX and an available engine.\nCounters and basic records start disabled; use telemetry enable/disable to control collection.\nDisabling collection preserves snapshots and stops watchdog capture.\nWatchdog renews a 15-second lease; its interval must not exceed 5000 ms.\nControl tracing selects a separate observer CPU and saves native context/stack .bin files beside FILE when supported by the EFI.\nThe remote transport is plaintext and unauthenticated."
     );
 }
 
@@ -858,6 +899,39 @@ mod tests {
             let mut invalid = arguments.clone();
             invalid.extend(suffix);
             assert!(parse_options(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn intel_pt_requires_explicit_runtime_operation_and_dump_directory() {
+        for operation in ["start", "stop", "status"] {
+            let options = parse_options(vec!["pt".into(), operation.into()])
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                options.action,
+                Action::IntelPt { output: None, .. }
+            ));
+        }
+        let dump = parse_options(vec![
+            "pt".into(),
+            "dump".into(),
+            "--output".into(),
+            "trace".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(dump.action, Action::IntelPt { output: Some(path), .. } if path == std::path::PathBuf::from("trace"))
+        );
+        for arguments in [
+            vec!["pt", "dump"],
+            vec!["pt", "invalid"],
+            vec!["pt", "start", "--output", "trace"],
+            vec!["pt", "start", "--seconds", "1"],
+            vec!["--remote", "localhost:4040", "pt", "start"],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned).collect()).is_err());
         }
     }
 

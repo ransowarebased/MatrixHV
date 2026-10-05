@@ -754,6 +754,7 @@ global_asm!(
     include_str!("../asm/msr.S"),
     include_str!("../asm/control.S"),
     include_str!("../../asm/diagnostics.S"),
+    include_str!("../asm/pt.S"),
     include_str!("../asm/island.S"),
     p_root_rsp = const core::mem::offset_of!(ResidentContext, root_rsp),
     boot_context_size = const size_of::<ResidentBootContext>(),
@@ -1117,7 +1118,8 @@ global_asm!(
         + core::mem::offset_of!(InterceptionCpuState, sync_diagnostics),
     ept_diagnostic_subleaf = const crate::protocol::memory::EPT_DIAGNOSTIC_SUBLEAF,
     ept_diagnostic_capabilities = const 0xffff | crate::protocol::memory::EPT_DIAGNOSTIC_CAPABILITY
-        | crate::protocol::MATRIXHV_EXIT_TIMING_CAPABILITY,
+        | crate::protocol::MATRIXHV_EXIT_TIMING_CAPABILITY
+        | crate::protocol::MATRIXHV_INTEL_PT_CAPABILITY,
     exit_timing_subleaf = const crate::protocol::MATRIXHV_EXIT_TIMING_SUBLEAF,
     ept_runtime_diagnostic_pairs = const crate::protocol::memory::INTERCEPT_DIAGNOSTIC_WORDS / 2,
     ept_sync_diagnostic_pairs = const crate::protocol::memory::EPT_SYNC_DIAGNOSTIC_WORDS / 2,
@@ -1186,6 +1188,40 @@ global_asm!(
     b_ept_probe_resume_rip = const BCTX_EPT_PROBE_RESUME_RIP,
     b_ept_test_violation_seen = const BCTX_EPT_TEST_VIOLATION_SEEN,
     b_exit_count = const BCTX_EXIT_COUNT,
+    b_pt_support = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, support),
+    b_pt_armed = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, armed),
+    b_pt_owned = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, owned),
+    b_pt_table = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, table),
+    b_pt_buffer = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, buffer),
+    b_pt_bytes = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, bytes),
+    b_pt_status = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, status),
+    b_pt_output_pointer = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, output_pointer),
+    b_pt_saved_control = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, saved_control),
+    b_pt_saved_status = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, saved_status),
+    b_pt_saved_base = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, saved_base),
+    b_pt_saved_pointer = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, saved_pointer),
+    b_pt_code_base = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, code_base),
+    b_pt_code_bytes = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, code_bytes),
+    b_pt_generation = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, generation),
+    pt_control = const crate::vmx::pt::TRACE_CONTROL,
+    pt_buffer_bytes = const crate::vmx::pt::BUFFER_BYTES,
+    pt_subleaf = const crate::protocol::MATRIXHV_INTEL_PT_SUBLEAF,
+    pt_data_subleaf = const crate::protocol::MATRIXHV_INTEL_PT_DATA_SUBLEAF,
     b_flight_sequence = const core::mem::offset_of!(ResidentBootContext, flight_recorder_sequence),
     b_flight_frozen = const core::mem::offset_of!(ResidentBootContext, flight_recorder_frozen),
     b_flight_records = const core::mem::offset_of!(ResidentBootContext, flight_recorder_records),

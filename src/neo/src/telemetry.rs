@@ -619,6 +619,152 @@ fn diagnostic_cpu(subleaf: u32, cpu: u32) -> std::arch::x86_64::CpuidResult {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+pub fn intel_pt(operation: &str, output: Option<&std::path::Path>) -> Result<String, String> {
+    use crate::protocol::{
+        MATRIXHV_INTEL_PT_BUFFER_BYTES, MATRIXHV_INTEL_PT_CAPABILITY,
+        MATRIXHV_INTEL_PT_DATA_SUBLEAF, MATRIXHV_INTEL_PT_SUBLEAF,
+    };
+    let mut affinity = CpuAffinity::current()?;
+    let allowed = affinity.allowed().to_vec();
+    affinity.pin(allowed[0])?;
+    verify_cpu(allowed[0])?;
+    if diagnostic(34).eax & MATRIXHV_INTEL_PT_CAPABILITY == 0 {
+        return Err("MatrixHV does not support runtime Intel PT diagnostics".into());
+    }
+    let registered = pair(diagnostic(36)).0;
+    let cpus: Vec<_> = allowed
+        .into_iter()
+        .filter(|cpu| *cpu < 64 && registered & (1_u64 << cpu) != 0)
+        .collect();
+    if cpus.is_empty() {
+        return Err("no registered MatrixHV CPUs are available in this process affinity".into());
+    }
+    // Preflight every selected CPU before changing collection on any CPU.
+    if operation == "start" {
+        for &cpu in &cpus {
+            affinity.pin(cpu)?;
+            verify_cpu(cpu)?;
+            let state = diagnostic(MATRIXHV_INTEL_PT_SUBLEAF);
+            if !matches!(state.eax, 1 | 3) {
+                return Err(format!(
+                    "Intel PT is unavailable on CPU {cpu}: state={}",
+                    state.eax
+                ));
+            }
+        }
+    }
+    let directory = if operation == "dump" {
+        let directory = output.ok_or("pt dump requires --output DIRECTORY")?;
+        std::fs::create_dir(directory)
+            .map_err(|error| format!("failed to create {}: {error}", directory.display()))?;
+        Some(directory)
+    } else {
+        None
+    };
+    let mut text = String::from(
+        "format=matrixhv-intel-pt-v1\nscope=vmx_root_handlers\nstate_values=0:no_buffer,1:ready,2:unsupported,3:busy,4:msr_fault\n",
+    );
+    let mut started = Vec::new();
+    let result = (|| {
+        for &cpu in &cpus {
+            affinity.pin(cpu)?;
+            verify_cpu(cpu)?;
+            let subleaf = match operation {
+                "start" => MATRIXHV_INTEL_PT_SUBLEAF + 1,
+                "stop" | "dump" => MATRIXHV_INTEL_PT_SUBLEAF + 2,
+                "status" => MATRIXHV_INTEL_PT_SUBLEAF,
+                _ => return Err("unknown Intel PT operation".into()),
+            };
+            let was_armed = diagnostic(MATRIXHV_INTEL_PT_SUBLEAF).ebx != 0;
+            let mut state = diagnostic(subleaf);
+            if operation == "start" {
+                if state.ebx != 1 {
+                    return Err(format!("Intel PT start rejected on CPU {cpu}"));
+                }
+                if !was_armed {
+                    started.push(cpu);
+                }
+                // Force a normal exit so hardware ownership/fault checks run now.
+                std::arch::x86_64::__cpuid_count(0, 0);
+                state = diagnostic(MATRIXHV_INTEL_PT_SUBLEAF);
+                if state.eax != 1 || state.ebx != 1 {
+                    return Err(format!(
+                        "Intel PT start failed on CPU {cpu}: state={}",
+                        state.eax
+                    ));
+                }
+            }
+            if state.ecx as usize > MATRIXHV_INTEL_PT_BUFFER_BYTES {
+                return Err(format!("invalid Intel PT length on CPU {cpu}"));
+            }
+            let prefix = format!("cpu.{cpu}");
+            writeln!(text, "{prefix}.state={}\n{prefix}.armed={}\n{prefix}.bytes={}\n{prefix}.rtit_status=0x{:x}", state.eax, state.ebx, state.ecx, state.edx).unwrap();
+            if let Some(directory) = directory {
+                if state.ebx != 0 {
+                    return Err(format!("Intel PT remains armed on CPU {cpu}"));
+                }
+                let (generation, trace_control) = pair(diagnostic(MATRIXHV_INTEL_PT_SUBLEAF + 4));
+                let mut data = Vec::with_capacity(state.ecx as usize);
+                for index in 0..(state.ecx as usize).div_ceil(16) {
+                    let (first, second) =
+                        pair(diagnostic(MATRIXHV_INTEL_PT_DATA_SUBLEAF + index as u32));
+                    data.extend_from_slice(&first.to_le_bytes());
+                    data.extend_from_slice(&second.to_le_bytes());
+                }
+                data.truncate(state.ecx as usize);
+                let after = diagnostic(MATRIXHV_INTEL_PT_SUBLEAF);
+                if after.ebx != 0
+                    || after.ecx != state.ecx
+                    || pair(diagnostic(MATRIXHV_INTEL_PT_SUBLEAF + 4)).0 != generation
+                {
+                    return Err(format!("Intel PT capture changed during export on CPU {cpu}"));
+                }
+                let (code_base, code_bytes) = pair(diagnostic(MATRIXHV_INTEL_PT_SUBLEAF + 3));
+                let signature = std::arch::x86_64::__cpuid_count(1, 0).eax;
+                writeln!(text, "{prefix}.code_base=0x{code_base:x}\n{prefix}.code_bytes={code_bytes}\n{prefix}.cpuid_1_eax=0x{signature:x}\n{prefix}.trace_control=0x{trace_control:x}\n{prefix}.generation={generation}").unwrap();
+                for index in 0..=1 {
+                    let caps = std::arch::x86_64::__cpuid_count(0x14, index);
+                    writeln!(
+                        text,
+                        "{prefix}.cpuid_14_{index}={:x},{:x},{:x},{:x}",
+                        caps.eax, caps.ebx, caps.ecx, caps.edx
+                    )
+                    .unwrap();
+                }
+                let path = directory.join(format!("cpu-{cpu}.pt"));
+                std::fs::write(&path, data)
+                    .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        for cpu in started {
+            if affinity.pin(cpu).is_ok() {
+                diagnostic(MATRIXHV_INTEL_PT_SUBLEAF + 2);
+            }
+        }
+    }
+    result?;
+    if let Some(directory) = directory {
+        let path = directory.join("metadata.txt");
+        std::fs::write(&path, &text)
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    }
+    Ok(text)
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+pub fn intel_pt(_operation: &str, _output: Option<&std::path::Path>) -> Result<String, String> {
+    Err("runtime Intel PT diagnostics require x86-64 Windows or Linux".into())
+}
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 fn pair(result: std::arch::x86_64::CpuidResult) -> (u64, u64) {
     (
         u64::from(result.eax) | (u64::from(result.ebx) << 32),

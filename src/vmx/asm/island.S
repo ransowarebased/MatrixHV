@@ -184,6 +184,7 @@ matrixhv_island_output
 matrixhv_resident_ept_cache
 matrixhv_resident_eptp_switch
 matrixhv_island_flight_recorder
+matrixhv_island_pt
 .balign 4096
 .globl matrixhv_resident_code_end
 matrixhv_resident_code_end:

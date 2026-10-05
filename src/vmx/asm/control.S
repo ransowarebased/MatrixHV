@@ -279,6 +279,8 @@ mov rdi, qword ptr [r12 + {b_event_context}]
 mov dword ptr [rdi + {event_update_status} + {update_status_error}], eax
 jmp .Lresident_update_return
 .Lresident_dispatch_update:
+call .Lresident_pt_leave
+mov qword ptr [r12 + {b_pt_armed}], 0
 mov r13, qword ptr [rip + matrixhv_resident_update_context]
 test r13, r13
 jz .Lresident_update_invalid

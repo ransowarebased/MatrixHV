@@ -251,6 +251,7 @@ pub struct ResidentBootContext {
     pub cpuid_leaf0: [u32; 4],
     pub memory_scratch: [u8; crate::protocol::memory::BUFFER_BYTES],
     pub interception: InterceptionCpuState,
+    pub(crate) intel_pt: crate::vmx::pt::TraceState,
 }
 
 pub const RESIDENT_BOOT_CONTEXT_PAGES: usize = size_of::<ResidentBootContext>().div_ceil(PAGE_SIZE);
@@ -398,6 +399,7 @@ impl ResidentBootContext {
             root_vmx_active: 0,
             memory_scratch: [0; crate::protocol::memory::BUFFER_BYTES],
             interception: InterceptionCpuState::default(),
+            intel_pt: crate::vmx::pt::TraceState::default(),
             cpuid_leaf0: [
                 cpuid_leaf0.eax,
                 cpuid_leaf0.ebx,
