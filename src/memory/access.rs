@@ -410,6 +410,10 @@ pub fn execute(
             | INTERCEPT_CONTEXT_ADD
             | INTERCEPT_CONTEXT_REMOVE
             | INTERCEPT_CONTEXT_LIST
+            | CPUID_SET
+            | CPUID_CLEAR
+            | SYSCALL_SET
+            | SYSCALL_CLEAR
     ) {
         return memory.intercept(packet, la57, physical_bits);
     }
@@ -833,6 +837,9 @@ pub(crate) mod resident {
     }
 
     impl crate::memory::interception::InterceptionMemory for Memory<'_> {
+        fn syscall_context(&self) -> [u64; 3] {
+            [self.environment.syscall, self.environment.kernel_cr3, self.environment.guest_cr4]
+        }
         fn timing_available(&self) -> bool {
             #[cfg(target_os = "uefi")]
             {
@@ -1250,6 +1257,10 @@ pub(crate) mod resident {
                 72,
                 if environment.ept & (1 << 6) != 0 {
                     AD_ENABLED
+                } else {
+                    0
+                } | if environment.interception_session != 0 {
+                    CPUID_PROFILE_CAPABILITY | PRIVATE_SHARED_DATA_CAPABILITY | SYSCALL_PROFILE_CAPABILITY
                 } else {
                     0
                 },

@@ -18,6 +18,7 @@ struct Machine {
     clock: u64,
     lease_available: bool,
     timing_available: bool,
+    syscall_cr4: u64,
     denied_guard: Option<u64>,
     reclamation_allowed: bool,
     reclamation_ready: bool,
@@ -38,6 +39,7 @@ impl Machine {
             clock: 1000,
             lease_available: true,
             timing_available: true,
+            syscall_cr4: 0,
             denied_guard: None,
             reclamation_allowed: true,
             reclamation_ready: true,
@@ -99,6 +101,9 @@ impl PhysicalMemory for Machine {
 }
 
 impl InterceptionMemory for Machine {
+    fn syscall_context(&self) -> [u64; 3] {
+        [0xffff800000400000, ROOT, self.syscall_cr4]
+    }
     fn clock(&self) -> u64 {
         self.clock
     }
@@ -222,6 +227,308 @@ fn packet(arguments: &[&str]) -> Vec<u8> {
 
 fn execute(session: &mut Session, machine: &mut Machine, packet: &mut [u8]) -> Result<(), Error> {
     unsafe { interception::execute(session, machine, packet, false, 48) }
+}
+
+fn cpuid_request() -> Vec<u8> {
+    let mut request = vec![0; HEADER_BYTES + CPUID_RECORD_BYTES];
+    for (offset, value) in [(0, MEMORY_MAGIC), (16, ROOT), (24, 0x7ffe0ff0),
+                          (144, 0xffff_ffff_f000_0040), (152, 0x40)] {
+        request[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    let length = request.len() as u32;
+    for (offset, value) in [(8, MEMORY_VERSION), (12, CPUID_SET), (32, 1), (36, length),
+                          (132, 100), (HEADER_BYTES, 1)] {
+        request[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    for (index, value) in [656981_u32, 0x200800, 33221631, 3219913727].into_iter().enumerate() {
+        let offset = HEADER_BYTES + 16 + index * 4;
+        request[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    request[HEADER_BYTES + 36..HEADER_BYTES + 40].copy_from_slice(&0xff00_0000_u32.to_le_bytes());
+    request
+}
+
+fn syscall_request(machine: &mut Machine, token: u64) -> Vec<u8> {
+    machine.store_entry(ROOT + 256 * 8, 0x4007).unwrap();
+    machine.write(GPA, &[0x0f, 0x01, 0xf8]).unwrap();
+    let mut request = cpuid_request();
+    request.truncate(HEADER_BYTES);
+    for (offset, value) in [(24, 0x400000_u64), (48, 0xffff800000400000), (80, token)] {
+        request[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    for (offset, value) in [(12, SYSCALL_SET), (32, 0), (36, HEADER_BYTES as u32)] {
+        request[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    request
+}
+
+#[test]
+fn syscall_install_shares_the_owned_token_and_lease_with_cpuid_and_code_hooks() {
+    let mut machine = Machine::new();
+    let mut session = session();
+    let mut code = packet(&["hook", "install", "0x3000", "0x400009", "cc"]);
+    execute(&mut session, &mut machine, &mut code).unwrap();
+    let mut cpu = cpuid_request();
+    cpu[80..88].copy_from_slice(&quad(&code, 80).to_le_bytes());
+    execute(&mut session, &mut machine, &mut cpu).unwrap();
+    let mut request = syscall_request(&mut machine, quad(&cpu, 80));
+    execute(&mut session, &mut machine, &mut request).unwrap();
+    let token = quad(&request, 80);
+    assert_eq!(token, quad(&cpu, 80) + 1);
+    assert_eq!(session.syscall.get_mut().token, token);
+    assert_eq!(session.cpuid.get_mut().token, token);
+    assert_eq!(word(&request, 104), 1);
+    assert_eq!(word(&request, 108), 1);
+    assert_eq!(word(&request, 128) & INTERCEPT_SYSCALL, INTERCEPT_SYSCALL);
+    assert_eq!(session.lease_deadline.load(core::sync::atomic::Ordering::Acquire), 1100);
+    let mut clear = request.clone();
+    clear[12..16].copy_from_slice(&SYSCALL_CLEAR.to_le_bytes());
+    execute(&mut session, &mut machine, &mut clear).unwrap();
+    assert!(session.is_active());
+    assert_eq!(session.syscall.get_mut().entry, 0);
+    assert_eq!(word(&clear, 108), 0);
+    assert_eq!(word(&clear, 104), 1);
+    assert_eq!(word(&clear, 24), 1);
+    assert_eq!(word(&clear, 128) & INTERCEPT_SYSCALL, 0);
+    let mut release = packet(&["hook", "release", &token.to_string()]);
+    execute(&mut session, &mut machine, &mut release).unwrap();
+    assert!(!session.is_active());
+    assert_eq!(session.cpuid.get_mut().count, 0);
+}
+
+#[test]
+fn syscall_install_rejects_unowned_tokens_and_generic_debug_cannot_replace_it() {
+    let mut machine = Machine::new();
+    let mut session = session();
+    let mut request = syscall_request(&mut machine, 0);
+    execute(&mut session, &mut machine, &mut request).unwrap();
+    let token = quad(&request, 80);
+    let mut stale = syscall_request(&mut machine, token - 1);
+    assert_eq!(execute(&mut session, &mut machine, &mut stale), Err(Error::Session));
+    let mut generic = packet(&["debug-registers", "set", "0x3000", "0x400000", "0x400100"]);
+    assert_eq!(execute(&mut session, &mut machine, &mut generic), Err(Error::Busy));
+    assert_eq!(session.syscall.get_mut().token, token);
+    assert_eq!(session.syscall.get_mut().callback, 0x400000);
+    let mut cpu = cpuid_request();
+    cpu[80..88].copy_from_slice(&token.to_le_bytes());
+    execute(&mut session, &mut machine, &mut cpu).unwrap();
+    assert_eq!(session.syscall.get_mut().token, quad(&cpu, 80));
+}
+
+#[test]
+fn syscall_validation_refuses_unsupported_entry_cet_la57_and_nonexecutable_callbacks() {
+    for rejected in 0..8 {
+        let mut machine = Machine::new();
+        let mut session = session();
+        let mut request = syscall_request(&mut machine, 0);
+        let expected = match rejected {
+            0 => { machine.syscall_cr4 = 1 << 23; Error::Unsupported }
+            1 => { machine.syscall_cr4 = 1 << 12; Error::Unsupported }
+            2 => { machine.write(GPA, &[0x90]).unwrap(); Error::Unsupported }
+            3 => { machine.store_entry(0x6000, GPA | 3).unwrap(); Error::Permission }
+            4 => { machine.store_entry(0x6000, GPA | 7 | (1 << 63)).unwrap(); Error::Permission }
+            5 => { request[24..32].copy_from_slice(&0xffff800000400000_u64.to_le_bytes()); Error::Bounds }
+            6 => { request[48..56].copy_from_slice(&0xffff800000400001_u64.to_le_bytes()); Error::Bounds }
+            _ => { machine.store_entry(0x4000, 0x5003).unwrap(); Error::Permission }
+        };
+        assert_eq!(execute(&mut session, &mut machine, &mut request), Err(expected), "case={rejected}");
+        assert!(!session.is_active());
+        assert_eq!(session.configuration.get_mut().debug_count, 0);
+        assert_eq!(session.syscall.get_mut().entry, 0);
+        assert_eq!(machine.events.last(), Some(&"resume"));
+    }
+}
+
+#[test]
+fn syscall_clear_without_other_profiles_disables_the_session_and_expiry_restores_native_data() {
+    let mut machine = Machine::new();
+    let mut session = session();
+    let mut request = syscall_request(&mut machine, 0);
+    execute(&mut session, &mut machine, &mut request).unwrap();
+    let mut clear = request.clone();
+    clear[12..16].copy_from_slice(&SYSCALL_CLEAR.to_le_bytes());
+    execute(&mut session, &mut machine, &mut clear).unwrap();
+    assert!(!session.is_active());
+    let mut request = syscall_request(&mut machine, 0);
+    execute(&mut session, &mut machine, &mut request).unwrap();
+    machine.clock += 101;
+    let mut status = packet(&["hook", "status"]);
+    execute(&mut session, &mut machine, &mut status).unwrap();
+    assert_eq!(word(&status, 112), INTERCEPT_REVOKED);
+    assert_eq!(word(&status, 116), INTERCEPT_CAUSE_LEASE);
+    assert_eq!(word(&status, 128) & INTERCEPT_SYSCALL, 0);
+    assert_eq!(machine.leaf(machine.base_ept(), GPA).0 & 7, 7);
+}
+
+#[test]
+fn private_shared_data_maps_both_scoped_views_without_guarding_native_storage() {
+    let mut machine = Machine::new();
+    machine.store_entry(0x4000 + ((0x7ffe0000_u64 >> 30) & 511) * 8, 0x5007).unwrap();
+    machine.store_entry(0x5000 + ((0x7ffe0000_u64 >> 21) & 511) * 8, 0x7007).unwrap();
+    machine.store_entry(0x7000 + ((0x7ffe0000_u64 >> 12) & 511) * 8, GPA | 5).unwrap();
+    let mut session = session();
+    let mut request = packet(&["hook", "install", "0x3000", "0x7ffe0000", &"33".repeat(4096)]);
+    request[128..132].copy_from_slice(&INTERCEPT_PRIVATE_SHARED_DATA.to_le_bytes());
+    let original = machine.pages[&GPA].clone();
+    let native_leaf = machine.leaf(machine.base_ept(), GPA);
+    execute(&mut session, &mut machine, &mut request).unwrap();
+    let configuration = unsafe { &*session.configuration.get() };
+    let shadow = machine.leaf(configuration.ept, GPA).0;
+    assert_eq!(shadow & 7, 3);
+    assert_ne!(shadow & MASK, GPA);
+    assert_eq!(machine.leaf(configuration.data_ept, GPA).0, shadow);
+    assert_eq!(machine.leaf(machine.base_ept(), GPA), native_leaf);
+    assert_eq!(machine.pages[&GPA], original);
+    assert_eq!(machine.pages[&(shadow & MASK)].as_ref(), &[0x33; 4096]);
+    let mut cpu = cpuid_request();
+    cpu[80..88].copy_from_slice(&configuration.token.to_le_bytes());
+    execute(&mut session, &mut machine, &mut cpu).unwrap();
+    assert_eq!(word(&cpu, 24), 1);
+    assert_eq!(word(&cpu, 104), 1);
+    assert_eq!(word(&cpu, 128), INTERCEPT_PRIVATE_SHARED_DATA);
+    let token = quad(&cpu, 80);
+    machine.map_hook_page(1, GPA + 4096);
+    let shadow_page = shadow & MASK;
+    machine.pages.get_mut(&shadow_page).unwrap()[0x900] = 0x42;
+    let mut added = packet(&["hook", "add", &token.to_string(), "0x401008", "cc"]);
+    execute(&mut session, &mut machine, &mut added).unwrap();
+    let configuration = unsafe { &*session.configuration.get() };
+    assert_eq!(configuration.hook_count, 2);
+    let shared_leaf = machine.leaf(configuration.ept, GPA).0;
+    assert_eq!(shared_leaf & 7, 3);
+    assert_eq!(machine.leaf(configuration.data_ept, GPA).0, shared_leaf);
+    assert_eq!(machine.pages[&(shared_leaf & MASK)][0x900], 0x42);
+    let code_leaf = machine.leaf(configuration.ept, GPA + 4096).0;
+    assert_eq!(code_leaf & 7, 4);
+    assert_eq!(machine.pages[&(code_leaf & MASK)][8], 0xcc);
+    assert_eq!(machine.leaf(machine.base_ept(), GPA + 4096).0 & 7, 5);
+    let code_id = quad(&added, HEADER_BYTES + 16);
+    let mut rejected = packet(&["hook", "add", &token.to_string(), "0x401009", "cc"]);
+    let spare_root = configuration.pool_base
+        + ((configuration.bank ^ 1) * intercept_bank_pages(configuration.cpu_mask)) as u64 * 4096;
+    machine.failed_stores.insert(spare_root, 1);
+    assert_eq!(execute(&mut session, &mut machine, &mut rejected), Err(Error::Permission));
+    assert!(session.is_active(), "cause={}, state={}", session.cause.load(core::sync::atomic::Ordering::Acquire), session.active.load(core::sync::atomic::Ordering::Acquire));
+    assert_eq!(machine.leaf(machine.base_ept(), GPA).0 & (MASK | 7), GPA | 7);
+    let mut dropped = packet(&["hook", "remove", &token.to_string(), &code_id.to_string()]);
+    execute(&mut session, &mut machine, &mut dropped).unwrap();
+    assert_eq!(word(&dropped, 104), 1);
+    assert_eq!(machine.leaf(machine.base_ept(), GPA + 4096).0 & 7, 7);
+    let configuration = unsafe { &*session.configuration.get() };
+    let shared_leaf = machine.leaf(configuration.ept, GPA).0;
+    assert_eq!(machine.pages[&(shared_leaf & MASK)][0x900], 0x42);
+    let mut release = packet(&["hook", "release", &token.to_string()]);
+    execute(&mut session, &mut machine, &mut release).unwrap();
+    assert!(!session.is_active());
+    assert_eq!(machine.leaf(machine.base_ept(), GPA), native_leaf);
+    assert_eq!(machine.pages[&GPA], original);
+}
+
+#[test]
+fn private_shared_data_rejects_partial_pages_other_addresses_and_vmfunc() {
+    for (address, length, flags) in [
+        ("0x400000", 4096, INTERCEPT_PRIVATE_SHARED_DATA),
+        ("0x7ffe0000", 4095, INTERCEPT_PRIVATE_SHARED_DATA),
+        ("0x7ffe0000", 4096, INTERCEPT_PRIVATE_SHARED_DATA | INTERCEPT_VMFUNC),
+        ("0x7ffe0000", 4096, INTERCEPT_PRIVATE_SHARED_DATA | INTERCEPT_NO_LEASE),
+    ] {
+        let mut machine = Machine::new();
+        machine.store_entry(0x4000 + ((0x7ffe0000_u64 >> 30) & 511) * 8, 0x5007).unwrap();
+        machine.store_entry(0x5000 + ((0x7ffe0000_u64 >> 21) & 511) * 8, 0x7007).unwrap();
+        machine.store_entry(0x7000 + ((0x7ffe0000_u64 >> 12) & 511) * 8, GPA | 5).unwrap();
+        let mut session = session();
+        let native_leaf = machine.leaf(machine.base_ept(), GPA);
+        let mut request = packet(&["hook", "install", "0x3000", address, &"33".repeat(length)]);
+        request[128..132].copy_from_slice(&flags.to_le_bytes());
+        assert_eq!(execute(&mut session, &mut machine, &mut request), Err(Error::Format));
+        assert!(!session.is_active());
+        assert_eq!(machine.leaf(machine.base_ept(), GPA), native_leaf);
+    }
+}
+
+#[test]
+fn cpuid_identity_is_scoped_gated_and_preserves_the_native_apic_id() {
+    let mut machine = Machine::new();
+    let mut session = session();
+    let mut request = cpuid_request();
+    execute(&mut session, &mut machine, &mut request).unwrap();
+    assert_eq!(word(&request, 24), 1);
+    assert_eq!(word(&request, 112), INTERCEPT_ACTIVE);
+    let configuration = unsafe { &*session.configuration.get() };
+    let profile = unsafe { &*session.cpuid.get() };
+    let evaluate = |cr3, cpl, debug, selector| interception::cpuid_values(
+        configuration, profile, cr3, cpl, debug, selector, [7, 0xab12_3456, 9, 11],
+    );
+    assert_eq!(evaluate(ROOT | 7, 3, [0x7ffe0ff0, 0x440], [1, 999]),
+               Some([656981, 0xab20_0800, 33221631, 3219913727]));
+    for (cr3, cpl, debug, selector) in [
+        (ROOT + 4096, 3, [0x7ffe0ff0, 0x440], [1, 0]),
+        (ROOT, 0, [0x7ffe0ff0, 0x440], [1, 0]),
+        (ROOT, 3, [0x7ffe0ff1, 0x440], [1, 0]),
+        (ROOT, 3, [0x7ffe0ff0, 0x400], [1, 0]),
+        (ROOT, 3, [0x7ffe0ff0, 0x1000_0440], [1, 0]),
+        (ROOT, 3, [0x7ffe0ff0, 0x440], [2, 0]),
+    ] {
+        assert_eq!(evaluate(cr3, cpl, debug, selector), None);
+    }
+}
+
+#[test]
+fn invalid_cpuid_records_cannot_replace_an_active_profile_or_hide_the_transport() {
+    let mut machine = Machine::new();
+    let mut session = session();
+    let mut install = cpuid_request();
+    execute(&mut session, &mut machine, &mut install).unwrap();
+    for forbidden in [0_u32, 0x8000_0000, MEMORY_LEAF, crate::protocol::MATRIXHV_STATUS_LEAF] {
+        let mut invalid = cpuid_request();
+        invalid[80..88].copy_from_slice(&1_u64.to_le_bytes());
+        invalid[HEADER_BYTES..HEADER_BYTES + 4].copy_from_slice(&forbidden.to_le_bytes());
+        assert_eq!(execute(&mut session, &mut machine, &mut invalid), Err(Error::Format));
+        assert_eq!(unsafe { &*session.cpuid.get() }.records[0].leaf, 1);
+        assert_eq!(unsafe { &*session.configuration.get() }.token, 1);
+    }
+    let mut stale = cpuid_request();
+    assert_eq!(execute(&mut session, &mut machine, &mut stale), Err(Error::Session));
+    let mut overlap = cpuid_request();
+    overlap.extend_from_within(HEADER_BYTES..);
+    let length = overlap.len() as u32;
+    overlap[32..36].copy_from_slice(&2_u32.to_le_bytes());
+    overlap[36..40].copy_from_slice(&length.to_le_bytes());
+    overlap[80..88].copy_from_slice(&1_u64.to_le_bytes());
+    assert_eq!(execute(&mut session, &mut machine, &mut overlap), Err(Error::Format));
+    assert!(session.is_active());
+}
+
+#[test]
+fn removing_hooks_preserves_cpuid_until_release_and_expired_profiles_cannot_reactivate() {
+    let mut machine = Machine::new();
+    let mut session = session();
+    let mut install = cpuid_request();
+    execute(&mut session, &mut machine, &mut install).unwrap();
+    let mut hooks = packet(&["hook", "install", "0x3000", "0x400008", "cc"]);
+    execute(&mut session, &mut machine, &mut hooks).unwrap();
+    assert_eq!(unsafe { &*session.cpuid.get() }.token, 2);
+    let mut remove = packet(&["hook", "remove", "2"]);
+    execute(&mut session, &mut machine, &mut remove).unwrap();
+    assert!(session.is_active());
+    let mut clear = vec![0; HEADER_BYTES];
+    clear[..8].copy_from_slice(&MEMORY_MAGIC.to_le_bytes());
+    for (offset, value) in [(8, MEMORY_VERSION), (12, CPUID_CLEAR), (36, HEADER_BYTES as u32)] {
+        clear[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    clear[80..88].copy_from_slice(&2_u64.to_le_bytes());
+    execute(&mut session, &mut machine, &mut clear).unwrap();
+    assert!(!session.is_active());
+    assert_eq!(word(&clear, 24), 0);
+    let mut reinstall = cpuid_request();
+    execute(&mut session, &mut machine, &mut reinstall).unwrap();
+    machine.clock += 101;
+    let mut status = packet(&["hook", "status"]);
+    execute(&mut session, &mut machine, &mut status).unwrap();
+    assert!(!session.is_active());
+    assert_eq!(word(&status, 116), INTERCEPT_CAUSE_LEASE);
+    let mut renew = packet(&["hook", "renew", "3"]);
+    assert_eq!(execute(&mut session, &mut machine, &mut renew), Err(Error::Session));
 }
 
 #[test]

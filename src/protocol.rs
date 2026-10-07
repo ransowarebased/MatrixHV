@@ -173,6 +173,22 @@ pub mod memory {
     pub const INTERCEPT_CONTEXT_ADD: u32 = 21;
     pub const INTERCEPT_CONTEXT_REMOVE: u32 = 22;
     pub const INTERCEPT_CONTEXT_LIST: u32 = 23;
+    // CPUID profiles share the interception token, CR3 scope and lease.
+    // Install carries DR3 at 24, DR7 mask/value at 144/152, and 48-byte
+    // records (leaf, subleaf, subleaf mask, reserved, values[4], keep masks[4]).
+    // Only nonzero-CPL callers matching the debug-register gate participate.
+    // Status returns the configured CPUID record count at 24.
+    pub const CPUID_SET: u32 = 24;
+    pub const CPUID_CLEAR: u32 = 25;
+    // A single native LSTAR breakpoint returns to a scoped user callback with
+    // SYSRET64 state. Install carries callback at 24, LSTAR at 48 and token at 80.
+    pub const SYSCALL_SET: u32 = 26;
+    pub const SYSCALL_CLEAR: u32 = 27;
+    pub const SYSCALL_PROFILE_CAPABILITY: u32 = 1 << 3;
+    pub const INTERCEPT_SYSCALL: u32 = 64;
+    pub const CPUID_PROFILE_CAPABILITY: u32 = 1 << 1;
+    pub const CPUID_MAX_RECORDS: usize = 16;
+    pub const CPUID_RECORD_BYTES: usize = 48;
     // Install/add return a stable ID at descriptor +16. List records contain
     // (ID, GVA, patch length, reserved). Drop carries ID at 144.
     // Lease duration (ms) is at 132; remaining time (ms) is at 136.
@@ -198,6 +214,10 @@ pub mod memory {
     pub const INTERCEPT_CONCURRENT_WRITES: u32 = 4;
     pub const INTERCEPT_PERSISTENT_DATA: u32 = 8;
     pub const INTERCEPT_NO_LEASE: u32 = 16;
+    // One full-page record at 0x7ffe0000 replaces only its scoped data view.
+    // Additional code hooks share the token. The native shared page stays writable.
+    pub const INTERCEPT_PRIVATE_SHARED_DATA: u32 = 32;
+    pub const PRIVATE_SHARED_DATA_CAPABILITY: u32 = 1 << 2;
     pub const INTERCEPT_EXECUTE_SLOT: u32 = 0;
     pub const INTERCEPT_DATA_SLOT: u32 = 1;
     pub const INTERCEPT_DISABLED: u32 = 0;

@@ -27,6 +27,7 @@ for declaration, replacement in [
     ('fn entry_bits(', 'fn entry_bits(pointer: u64, set: u64, clear: u64) { crate::hardware::entry_bits(pointer, set, clear); }'),
     ('fn page_byte(', 'fn page_byte(address: u64, value: Option<u8>) -> u8 { crate::hardware::page_byte(address, value) }'),
     ('fn clock()', 'fn clock() -> u64 { crate::hardware::clock() }'),
+    ('fn syscall_msrs()', 'fn syscall_msrs() -> [u64; 2] { crate::hardware::syscall_msrs() }'),
     ('fn fetch_instruction(', 'fn fetch_instruction(_: &ResidentBootContext, _: &RoadEptProfile, rip: u64, execution: &mut [u8; 15], original: &mut [u8; 15]) -> usize { crate::hardware::fetch_instruction(rip, execution, original) }'),
     ('fn original_value(', 'fn original_value(address: u64, width: usize, value: Option<u64>) -> u64 { crate::hardware::original_value(address, width, value) }'),
 ]:
@@ -41,12 +42,12 @@ assert 'core::arch::asm!' not in runtime
 engine = source[:source.index('pub(crate) trait InterceptionMemory')]
 engine = engine.replace('use crate::memory::access::{PhysicalMemory, page_mapping};', '')
 engine = re.sub(r'const OPTIONS: u32 = .*?;', '', engine, flags=re.S)
-# Pool ownership is exercised by the frontend harness; this extraction runs
-# only VM-exit callbacks and does not allocate or inspect split records.
-engine = engine.replace('#[derive(Clone, Copy, Default)]\n' + item(source, 'struct BaseSplit'), '')
-engine = engine.replace('    splits: UnsafeCell<[BaseSplit; INTERCEPT_BASE_TABLE_PAGES]>,\n', '')
-engine = engine.replace('        self.splits.get_mut().fill(BaseSplit::default());\n', '')
-engine += '\n'.join(item(source, declaration) for declaration in ['fn canonical(', 'fn bank_base(', 'fn expired(', 'fn lock_refresh(', 'fn data_root(', 'fn data_leaves(', 'fn root_matches(', 'fn baseline_page(', 'fn merge_byte(']) + '\n' + runtime
+# Split ownership is tested by the frontend harness. Keep its storage opaque
+# here while preserving the complete session layout and resident ABI assertions.
+engine = engine.replace(item(source, 'struct BaseSplit'), 'struct BaseSplit { storage: [u64; 6] }')
+engine = engine.replace('        self.splits.get_mut().fill(BaseSplit::default());',
+                        '        for split in self.splits.get_mut() { split.storage.fill(0); }')
+engine += '\n'.join(item(source, declaration) for declaration in ['fn canonical(', 'fn bank_base(', 'fn expired(', 'fn lock_refresh(', 'fn data_root(', 'fn data_leaves(', 'fn root_matches(', 'fn baseline_page(', 'fn merge_byte(', 'fn cpuid_values(']) + '\n' + runtime
 abi = (project / 'src/vmx/resident/abi.rs').read_text()
 cpu = 'use core::sync::atomic::AtomicU64;\n#[repr(C)]\n#[derive(Default)]\n' + item(abi, 'pub struct InterceptionCpuState')
 vmcs = (project / 'src/vmx/vmcs.rs').read_text()
