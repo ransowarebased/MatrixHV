@@ -236,7 +236,9 @@ xor eax, eax
 ret
 .Lresident_interception_callback_active:
 // Preserve EFI nonvolatile registers and guest SIMD state across the relocated
-// Rust callback. R8 is the guest frame for dispatch; other phases ignore it.
+// Rust callback. R8 is the guest frame; argument five points to the FXSAVE area
+// so syscall routing can commit XMM4/XMM5 changes before FXRSTOR. This callback
+// signature and its Rust implementation must be installed together at boot.
 push rbx
 push rbp
 push rsi
@@ -247,8 +249,10 @@ push r14
 push r15
 mov rbp, rsp
 and rsp, -16
-sub rsp, 544
-fxsave64 [rsp + 32]
+sub rsp, 560
+fxsave64 [rsp + 48]
+lea rax, [rsp + 48]
+mov qword ptr [rsp + 32], rax
 mov rcx, r12
 lea r9, [rip + .Lresident_memory_synchronize]
 mov rax, qword ptr [r12 + {b_event_context}]
@@ -260,7 +264,7 @@ jmp .Lresident_interception_callback_return
 .Lresident_interception_callback_absent:
 xor eax, eax
 .Lresident_interception_callback_return:
-fxrstor64 [rsp + 32]
+fxrstor64 [rsp + 48]
 mov rsp, rbp
 pop r15
 pop r14

@@ -9,12 +9,42 @@ const OPTIONS: u32 = INTERCEPT_VMFUNC
     | INTERCEPT_TSC_OFFSET
     | INTERCEPT_CONCURRENT_WRITES
     | INTERCEPT_PERSISTENT_DATA
-    | INTERCEPT_NO_LEASE;
+    | INTERCEPT_NO_LEASE
+    | INTERCEPT_PRIVATE_SHARED_DATA;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct DebugTarget {
     pub address: u64,
     pub redirect: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CpuidRecord {
+    pub leaf: u32,
+    pub subleaf: u32,
+    pub subleaf_mask: u32,
+    pub values: [u32; 4],
+    pub keep_masks: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CpuidProfile {
+    pub records: [CpuidRecord; CPUID_MAX_RECORDS],
+    pub count: usize,
+    pub dr3: u64,
+    pub dr7_mask: u64,
+    pub dr7_value: u64,
+    pub token: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SyscallProfile {
+    pub entry: u64,
+    pub callback: u64,
+    pub token: u64,
 }
 
 #[repr(C)]
@@ -113,8 +143,18 @@ pub(crate) struct Session {
     splits: UnsafeCell<[BaseSplit; INTERCEPT_BASE_TABLE_PAGES]>,
     pub split_epoch: AtomicU64,
     cr3_targets: UnsafeCell<[Cr3Targets; 64]>,
+    pub cpuid: UnsafeCell<CpuidProfile>,
+    pub syscall: UnsafeCell<SyscallProfile>,
+    pub exit_debug: [AtomicU64; 64],
 }
 const _: () = assert!(core::mem::offset_of!(Session, active) == 0);
+// Hot updates preserve every existing field and use only the zeroed tail of
+// the original page allocation. Increasing the allocation requires a new ABI.
+const _: () = assert!(
+    core::mem::size_of::<Session>().div_ceil(4096)
+        == core::mem::offset_of!(Session, cpuid).div_ceil(4096)
+);
+const _: () = assert!(core::mem::offset_of!(Session, cpuid) == 346_352);
 
 impl Session {
     pub(crate) fn initialize(&mut self, pool_base: u64, cpu_mask: u64) {
@@ -137,6 +177,11 @@ impl Session {
         self.splits.get_mut().fill(BaseSplit::default());
         self.split_epoch.store(0, Ordering::Relaxed);
         self.cr3_targets.get_mut().fill(Cr3Targets::default());
+        *self.cpuid.get_mut() = CpuidProfile::default();
+        *self.syscall.get_mut() = SyscallProfile::default();
+        for owned in &self.exit_debug {
+            owned.store(0, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -145,6 +190,7 @@ impl Session {
 }
 
 pub(crate) trait InterceptionMemory: PhysicalMemory {
+    fn syscall_context(&self) -> [u64; 3];
     fn quiesce(&mut self) -> Result<(), Error>;
     fn flush(&mut self);
     fn resume(&mut self);
@@ -194,16 +240,17 @@ fn data_root(configuration: &RoadEptProfile, cpu_index: usize) -> u64 {
 }
 
 #[cfg(target_os = "uefi")]
-fn data_leaves(configuration: &RoadEptProfile, cpu_index: usize) -> &[u64] {
+fn data_leaves(configuration: &RoadEptProfile, cpu_index: usize) -> impl Iterator<Item = &u64> {
     let leaves = if configuration.cpu_data[cpu_index] != 0 {
         &configuration.cpu_leaves[cpu_index]
     } else {
         &configuration.data_leaves
     };
-    &leaves[..configuration.hook_count]
+    leaves[..configuration.hook_count].iter().zip(&configuration.base_leaves)
+        .filter(|(_, base)| **base != 0).map(|(pointer, _)| pointer)
 }
 
-#[cfg(target_os = "uefi")]
+#[cfg(any(target_os = "uefi", test))]
 fn root_matches(configuration: &RoadEptProfile, cr3: u64) -> bool {
     let cr3 = cr3 & MASK;
     cr3 != 0 && configuration.registered_roots().any(|root| root == cr3)
@@ -229,7 +276,7 @@ fn lease_duration(
     default_ms: u32,
 ) -> Result<(u32, u64), Error> {
     if word(packet, 128) & INTERCEPT_NO_LEASE != 0 {
-        return if word(packet, 132) == 0 && matches!(word(packet, 12), HOOK_INSTALL | DEBUG_SET) {
+        return if word(packet, 132) == 0 && matches!(word(packet, 12), HOOK_INSTALL | DEBUG_SET | CPUID_SET | SYSCALL_SET) {
             Ok((0, 0))
         } else {
             Err(Error::Format)
@@ -601,6 +648,14 @@ fn install(
     if hooks.is_empty() || hooks.len() > HOOK_MAX_PATCHES {
         return Err(Error::Bounds);
     }
+    let private_data = flags & INTERCEPT_PRIVATE_SHARED_DATA != 0;
+    if private_data
+        && (hooks.iter().filter(|hook| hook.address == 0x7ffe0000 && hook.length == 4096).count() != 1
+            || hooks.iter().any(|hook| hook.address & !4095 == 0x7ffe0000 && (hook.address != 0x7ffe0000 || hook.length != 4096))
+            || flags & (INTERCEPT_VMFUNC | INTERCEPT_CONCURRENT_WRITES | INTERCEPT_PERSISTENT_DATA | INTERCEPT_NO_LEASE) != 0)
+    {
+        return Err(Error::Format);
+    }
     configuration.pool_used = 0;
     configuration.ept =
         clone_root(memory, configuration, memory.base_ept() & MASK)? | (memory.base_ept() & !MASK);
@@ -611,6 +666,7 @@ fn install(
     for hook in hooks {
         let address = hook.address;
         let length = hook.length;
+        let private_page = private_data && address == 0x7ffe0000;
         let mapping = page_mapping(memory, configuration.roots[0], address, la57, physical_bits)?;
         if !mapping.present {
             return Err(Error::Unmapped);
@@ -622,6 +678,11 @@ fn install(
         let existing_page = configuration.pages[..page_count]
             .iter()
             .position(|page| *page == gpa);
+        if let Some(index) = existing_page {
+            if (configuration.base_leaves[index] == 0) != private_page {
+                return Err(Error::Format);
+            }
+        }
         for alternate_root in configuration
             .roots
             .iter()
@@ -654,7 +715,7 @@ fn install(
         if existing_page.is_none() {
             let execute_leaf = leaf(memory, configuration, splits, gpa, configuration.ept, false)?;
             let entry = memory.table_entry(execute_leaf)?;
-            memory.store_entry(execute_leaf, shadow | (entry & !MASK & !7) | 4)?;
+            memory.store_entry(execute_leaf, shadow | (entry & !MASK & !7) | if private_page { 3 } else { 4 })?;
             let data_leaf = leaf(
                 memory,
                 configuration,
@@ -664,10 +725,15 @@ fn install(
                 false,
             )?;
             let entry = memory.table_entry(data_leaf)?;
-            memory.store_entry(data_leaf, (entry & !7) | 1)?;
+            memory.store_entry(data_leaf, if private_page {
+                shadow | (entry & !MASK & !7) | 3
+            } else {
+                (entry & !7) | 1
+            })?;
             configuration.data_leaves[page_count] = data_leaf;
-            configuration.base_leaves[page_count] =
-                leaf(memory, configuration, splits, gpa, memory.base_ept(), true)?;
+            configuration.base_leaves[page_count] = if private_page { 0 } else {
+                leaf(memory, configuration, splits, gpa, memory.base_ept(), true)?
+            };
             configuration.pages[page_count] = gpa;
             page_count += 1;
         }
@@ -687,14 +753,18 @@ fn install(
     // Revoke the write bit only after all descriptors and private roots pass.
     let mut original_entries = [0; HOOK_MAX_PAGES];
     for (index, entry) in original_entries[..page_count].iter_mut().enumerate() {
-        *entry = memory.table_entry(configuration.base_leaves[index])?;
+        if configuration.base_leaves[index] != 0 {
+            *entry = memory.table_entry(configuration.base_leaves[index])?;
+        }
     }
     // Keep the validated guard set available to the transaction's cleanup even
     // if a later table write fails before publication.
     configuration.hook_count = page_count;
     for index in 0..page_count {
         let pointer = configuration.base_leaves[index];
-        memory.store_entry(pointer, original_entries[index] & !2)?;
+        if pointer != 0 {
+            memory.store_entry(pointer, original_entries[index] & !2)?;
+        }
     }
     Ok(())
 }
@@ -705,6 +775,7 @@ fn restore_base(
 ) -> Result<(), Error> {
     let mut result = Ok(());
     for pointer in &configuration.base_leaves[..configuration.hook_count] {
+        if *pointer == 0 { continue; }
         let restored = memory
             .table_entry(*pointer)
             .and_then(|entry| memory.store_entry(*pointer, entry | 2));
@@ -720,6 +791,9 @@ fn refresh_page(
     memory: &mut impl InterceptionMemory,
     index: usize,
 ) -> Result<(), Error> {
+    if configuration.base_leaves[index] == 0 {
+        return Ok(());
+    }
     let shadow = bank_base(configuration) + (INTERCEPT_TABLE_PAGES + index) as u64 * 4096;
     let baseline = baseline_page(configuration, index);
     let mut original = [0; 4096];
@@ -844,6 +918,94 @@ pub(crate) unsafe fn write_original(
     result
 }
 
+fn cpuid_profile(packet: &[u8], la57: bool) -> Result<CpuidProfile, Error> {
+    let count = word(packet, 32) as usize;
+    if count == 0
+        || count > CPUID_MAX_RECORDS
+        || packet.len() != HEADER_BYTES + count * CPUID_RECORD_BYTES
+    {
+        return Err(Error::Bounds);
+    }
+    let mut profile = CpuidProfile {
+        count,
+        dr3: quad(packet, 24),
+        dr7_mask: quad(packet, 144),
+        dr7_value: quad(packet, 152),
+        ..CpuidProfile::default()
+    };
+    if profile.dr3 == 0
+        || !canonical(profile.dr3, la57)
+        || profile.dr7_mask == 0
+        || profile.dr7_value & !profile.dr7_mask != 0
+    {
+        return Err(Error::Bounds);
+    }
+    for index in 0..count {
+        let offset = HEADER_BYTES + index * CPUID_RECORD_BYTES;
+        let mut record = CpuidRecord {
+            leaf: word(packet, offset),
+            subleaf: word(packet, offset + 4),
+            subleaf_mask: word(packet, offset + 8),
+            ..CpuidRecord::default()
+        };
+        // Keep the native discovery and MatrixHV transport leaves available.
+        if record.leaf == 0
+            || record.leaf == 0x8000_0000
+            || (0x4000_0000..0x5000_0000).contains(&record.leaf)
+            || word(packet, offset + 12) != 0
+            || record.subleaf & !record.subleaf_mask != 0
+        {
+            return Err(Error::Format);
+        }
+        for register in 0..4 {
+            record.values[register] = word(packet, offset + 16 + register * 4);
+            record.keep_masks[register] = word(packet, offset + 32 + register * 4);
+            if record.values[register] & record.keep_masks[register] != 0 {
+                return Err(Error::Format);
+            }
+        }
+        if profile.records[..index].iter().any(|previous| {
+            previous.leaf == record.leaf
+                && (previous.subleaf ^ record.subleaf)
+                    & previous.subleaf_mask & record.subleaf_mask == 0
+        }) {
+            return Err(Error::Format);
+        }
+        profile.records[index] = record;
+    }
+    Ok(profile)
+}
+
+#[cfg(any(target_os = "uefi", test))]
+pub(crate) fn cpuid_values(
+    configuration: &RoadEptProfile,
+    profile: &CpuidProfile,
+    cr3: u64,
+    cpl: u64,
+    debug: [u64; 2],
+    selector: [u32; 2],
+    native: [u32; 4],
+) -> Option<[u32; 4]> {
+    if profile.token != configuration.token
+        || cpl == 0
+        || !root_matches(configuration, cr3)
+        || debug[0] != profile.dr3
+        || debug[1] & profile.dr7_mask != profile.dr7_value
+    {
+        return None;
+    }
+    profile.records[..profile.count]
+        .iter()
+        .find(|record| {
+            record.leaf == selector[0] && selector[1] & record.subleaf_mask == record.subleaf
+        })
+        .map(|record| {
+            core::array::from_fn(|index| {
+                native[index] & record.keep_masks[index] | record.values[index]
+            })
+        })
+}
+
 fn set_debug(configuration: &mut RoadEptProfile, packet: &[u8], la57: bool) -> Result<(), Error> {
     let count = word(packet, 32) as usize;
     if count == 0 || count > 4 || packet.len() != HEADER_BYTES + count * 16 {
@@ -873,6 +1035,59 @@ fn set_debug(configuration: &mut RoadEptProfile, packet: &[u8], la57: bool) -> R
     Ok(())
 }
 
+fn syscall_profile(
+    packet: &[u8],
+    memory: &mut impl InterceptionMemory,
+    physical_bits: u32,
+) -> Result<SyscallProfile, Error> {
+    if packet.len() != HEADER_BYTES || word(packet, 32) != 0 {
+        return Err(Error::Bounds);
+    }
+    let [entry, kernel_cr3, cr4] = memory.syscall_context();
+    let callback = quad(packet, 24);
+    if cr4 & ((1 << 12) | (1 << 23)) != 0 {
+        // CET changes SSP across SYSCALL/SYSRET. This profile supports the
+        // recovered four-level, non-CET kernel entry only.
+        return Err(Error::Unsupported);
+    }
+    if entry != quad(packet, 48) || entry < 0xffff_8000_0000_0000
+        || !canonical(entry, false) || entry & 4095 > 4093
+        || callback == 0 || callback >> 47 != 0
+    {
+        return Err(Error::Bounds);
+    }
+    let mapping = page_mapping(memory, kernel_cr3, entry, false, physical_bits)?;
+    if !mapping.present {
+        return Err(Error::Unmapped);
+    }
+    let mut prefix = [0; 3];
+    memory.read(mapping.physical_address, &mut prefix)?;
+    if prefix != [0x0f, 0x01, 0xf8] {
+        return Err(Error::Unsupported);
+    }
+    let mut table = root(quad(packet, 16), physical_bits)?;
+    for shift in [39, 30, 21, 12] {
+        let mut bytes = [0; 8];
+        memory.read(table + ((callback >> shift) & 511) * 8, &mut bytes)?;
+        let entry = u64::from_le_bytes(bytes);
+        if entry & 1 == 0 {
+            return Err(Error::Unmapped);
+        }
+        if entry & 4 == 0 || entry & (1 << 63) != 0 {
+            return Err(Error::Permission);
+        }
+        if shift == 12 || shift <= 30 && entry & 128 != 0 {
+            // Also validate reserved physical bits and large-page alignment.
+            if !page_mapping(memory, quad(packet, 16), callback, false, physical_bits)?.present {
+                return Err(Error::Unmapped);
+            }
+            return Ok(SyscallProfile { entry: quad(packet, 48), callback, token: 0 });
+        }
+        table = entry & MASK;
+    }
+    Err(Error::Unmapped)
+}
+
 fn change_hooks(
     session: &Session,
     configuration: &mut RoadEptProfile,
@@ -896,6 +1111,16 @@ fn change_hooks(
         previous_count
     };
     pending[..count].copy_from_slice(&hooks[..count]);
+    if operation != HOOK_INSTALL && configuration.options & INTERCEPT_PRIVATE_SHARED_DATA != 0 {
+        if let Some(index) = configuration.base_leaves[..configuration.hook_count].iter().position(|pointer| *pointer == 0) {
+            let shadow = bank_base(configuration) + (INTERCEPT_TABLE_PAGES + index) as u64 * 4096;
+            if let Some(hook) = pending[..count].iter_mut().find(|hook| hook.address == 0x7ffe0000) {
+                for (index, bytes) in hook.bytes.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                    *bytes = memory.table_entry(shadow + index as u64 * 8)?.to_le_bytes();
+                }
+            }
+        }
+    }
     let mut next_id = session.next_id.load(Ordering::Relaxed);
     let added = if operation == HOOK_DROP {
         if packet.len() != HEADER_BYTES {
@@ -970,7 +1195,7 @@ fn change_hooks(
         } else {
             0
         }) | (configuration.options
-            & (INTERCEPT_CONCURRENT_WRITES | INTERCEPT_PERSISTENT_DATA | INTERCEPT_NO_LEASE))
+            & (INTERCEPT_CONCURRENT_WRITES | INTERCEPT_PERSISTENT_DATA | INTERCEPT_NO_LEASE | INTERCEPT_PRIVATE_SHARED_DATA))
             | (if configuration.timing != 0 {
                 INTERCEPT_TSC_OFFSET
             } else {
@@ -1009,7 +1234,7 @@ fn change_hooks(
         if let Err(rollback_error) = rollback_splits(session, memory, previous_epoch) {
             restored = Err(rollback_error);
         }
-        for pointer in &configuration.base_leaves[..configuration.hook_count] {
+        for pointer in configuration.base_leaves[..configuration.hook_count].iter().filter(|pointer| **pointer != 0) {
             let guarded = memory
                 .table_entry(*pointer)
                 .and_then(|entry| memory.store_entry(*pointer, entry & !2));
@@ -1098,7 +1323,7 @@ pub(crate) unsafe fn execute(
                     // quarantined tables. Do not overwrite it after a failed flush.
                     return Err(Error::Busy);
                 }
-                if matches!(operation, HOOK_INSTALL | HOOK_ADD | DEBUG_SET) && !memory.available() {
+                if matches!(operation, HOOK_INSTALL | HOOK_ADD | DEBUG_SET | CPUID_SET | SYSCALL_SET) && !memory.available() {
                     return Err(Error::Unsupported);
                 }
                 if matches!(operation, HOOK_INSTALL | HOOK_ADD) && !memory.split_available() {
@@ -1122,18 +1347,45 @@ pub(crate) unsafe fn execute(
                         .store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
                 }
                 match operation {
-                    HOOK_INSTALL | DEBUG_SET => {
+                    HOOK_INSTALL | DEBUG_SET | CPUID_SET | SYSCALL_SET => {
+                        let cpuid = if operation == CPUID_SET {
+                            Some(cpuid_profile(packet, la57)?)
+                        } else {
+                            None
+                        };
+                        if matches!(operation, CPUID_SET | SYSCALL_SET) && session.is_active()
+                            && quad(packet, 80) != configuration.token
+                        {
+                            return Err(Error::Session);
+                        }
+                        let syscall = if operation == SYSCALL_SET {
+                            if session.is_active() && configuration.debug_count != 0
+                                && unsafe { &*session.syscall.get() }.token != configuration.token
+                            {
+                                return Err(Error::Busy);
+                            }
+                            Some(syscall_profile(packet, memory, physical_bits)?)
+                        } else {
+                            if operation == DEBUG_SET && session.is_active()
+                                && unsafe { &*session.syscall.get() }.entry != 0
+                            {
+                                return Err(Error::Busy);
+                            }
+                            None
+                        };
                         let (duration, ticks) =
                             lease_duration(packet, memory, INTERCEPT_DEFAULT_LEASE_MS)?;
                         let token = configuration.token.checked_add(1).ok_or(Error::Capacity)?;
                         let flags = word(packet, 128);
                         if flags & !OPTIONS != 0
-                            || operation == DEBUG_SET
+                            || matches!(operation, DEBUG_SET | CPUID_SET | SYSCALL_SET)
                                 && flags
                                     & (INTERCEPT_VMFUNC
                                         | INTERCEPT_CONCURRENT_WRITES
                                         | INTERCEPT_PERSISTENT_DATA)
                                     != 0
+                            || operation == SYSCALL_SET
+                                && flags & !(INTERCEPT_TSC_OFFSET | INTERCEPT_NO_LEASE) != 0
                         {
                             return Err(Error::Format);
                         }
@@ -1156,6 +1408,8 @@ pub(crate) unsafe fn execute(
                             configuration.roots = roots;
                             configuration.hook_count = 0;
                             configuration.debug_count = 0;
+                            unsafe { *session.cpuid.get() = CpuidProfile::default(); }
+                            unsafe { *session.syscall.get() = SyscallProfile::default(); }
                             configuration.timing = 0;
                             configuration.extra_roots.fill(0);
                             session.hook_records.store(0, Ordering::Relaxed);
@@ -1175,11 +1429,34 @@ pub(crate) unsafe fn execute(
                                 la57,
                                 physical_bits,
                             )?;
+                        } else if let Some(syscall) = syscall {
+                            configuration.debug.fill(DebugTarget::default());
+                            configuration.debug[0] = DebugTarget {
+                                address: syscall.entry, redirect: syscall.callback,
+                            };
+                            configuration.debug_count = 1;
+                            unsafe { *session.syscall.get() = syscall; }
+                            if flags & INTERCEPT_TSC_OFFSET != 0 {
+                                configuration.timing = 1;
+                            }
+                        } else if let Some(cpuid) = cpuid {
+                            unsafe { *session.cpuid.get() = cpuid; }
+                            if flags & INTERCEPT_TSC_OFFSET != 0 {
+                                configuration.timing = 1;
+                            }
                         } else {
                             set_debug(configuration, packet, la57)?;
                             if flags & INTERCEPT_TSC_OFFSET != 0 {
                                 configuration.timing = 1;
                             }
+                        }
+                        let profile = unsafe { &mut *session.cpuid.get() };
+                        if operation == CPUID_SET || profile.token == configuration.token {
+                            profile.token = token;
+                        }
+                        let syscall = unsafe { &mut *session.syscall.get() };
+                        if syscall.entry != 0 && (operation == SYSCALL_SET || syscall.token == configuration.token) {
+                            syscall.token = token;
                         }
                         configuration.token = token;
                         session
@@ -1214,7 +1491,8 @@ pub(crate) unsafe fn execute(
                                 la57,
                                 physical_bits,
                             )?;
-                            if configuration.hook_count == 0 && configuration.debug_count == 0 {
+                            if configuration.hook_count == 0 && configuration.debug_count == 0
+                                && unsafe { &*session.cpuid.get() }.count == 0 {
                                 session.active.store(0, Ordering::Release);
                             }
                         }
@@ -1274,7 +1552,7 @@ pub(crate) unsafe fn execute(
                         configuration.extra_roots = roots;
                         configuration.generation = generation;
                     }
-                    HOOK_REMOVE | DEBUG_CLEAR | INTERCEPT_RELEASE => {
+                    HOOK_REMOVE | DEBUG_CLEAR | CPUID_CLEAR | SYSCALL_CLEAR | INTERCEPT_RELEASE => {
                         if packet.len() != HEADER_BYTES || quad(packet, 80) != configuration.token {
                             return Err(Error::Session);
                         }
@@ -1284,10 +1562,18 @@ pub(crate) unsafe fn execute(
                             configuration.vmfunc = 0;
                             session.hook_records.store(0, Ordering::Relaxed);
                         }
-                        if operation == DEBUG_CLEAR || operation == INTERCEPT_RELEASE {
+                        if matches!(operation, DEBUG_CLEAR | SYSCALL_CLEAR | INTERCEPT_RELEASE) {
+                            if operation == SYSCALL_CLEAR && unsafe { &*session.syscall.get() }.entry == 0 {
+                                return Err(Error::Session);
+                            }
                             configuration.debug_count = 0;
+                            unsafe { *session.syscall.get() = SyscallProfile::default(); }
                         }
-                        if configuration.hook_count == 0 && configuration.debug_count == 0 {
+                        if operation == CPUID_CLEAR || operation == INTERCEPT_RELEASE {
+                            unsafe { *session.cpuid.get() = CpuidProfile::default(); }
+                        }
+                        if configuration.hook_count == 0 && configuration.debug_count == 0
+                            && unsafe { &*session.cpuid.get() }.count == 0 {
                             session.active.store(0, Ordering::Release);
                         }
                         if operation == HOOK_REMOVE || operation == INTERCEPT_RELEASE {
@@ -1347,6 +1633,7 @@ pub(crate) unsafe fn execute(
         }
         let configuration = unsafe { &*session.configuration.get() };
         packet[16..24].copy_from_slice(&configuration.roots[0].to_le_bytes());
+        packet[24..28].copy_from_slice(&(unsafe { &*session.cpuid.get() }.count as u32).to_le_bytes());
         packet[64..72].copy_from_slice(&configuration.roots[1].to_le_bytes());
         packet[80..88].copy_from_slice(&configuration.token.to_le_bytes());
         packet[88..96].copy_from_slice(&session.hits.load(Ordering::Relaxed).to_le_bytes());
@@ -1366,7 +1653,7 @@ pub(crate) unsafe fn execute(
             } else {
                 0
             }) | (if session.is_active() && configuration.hook_count != 0 {
-                configuration.options & (INTERCEPT_CONCURRENT_WRITES | INTERCEPT_PERSISTENT_DATA)
+                configuration.options & (INTERCEPT_CONCURRENT_WRITES | INTERCEPT_PERSISTENT_DATA | INTERCEPT_PRIVATE_SHARED_DATA)
             } else {
                 0
             }) | (if session.is_active() && configuration.timing != 0 {
@@ -1375,6 +1662,10 @@ pub(crate) unsafe fn execute(
                 0
             }) | (if session.is_active() && session.lease_ms.load(Ordering::Acquire) == 0 {
                 INTERCEPT_NO_LEASE
+            } else {
+                0
+            }) | (if session.is_active() && unsafe { &*session.syscall.get() }.entry != 0 {
+                INTERCEPT_SYSCALL
             } else {
                 0
             }))
@@ -1434,6 +1725,79 @@ pub(crate) mod runtime {
         }
     }
 
+    fn syscall_msrs() -> [u64; 2] {
+        unsafe { [crate::arch::read_msr(0xc000_0081), crate::arch::read_msr(0xc000_0082)] }
+    }
+
+    fn syscall_gate(registers: &[u64; 6]) -> bool {
+        registers[3] == 0x7ffe_0ff0 && registers[5] & 0xffff_ffff_f000_0040 == 0x40
+    }
+
+    fn route_syscall(
+        profile: &SyscallProfile,
+        frame: &mut [u64],
+        fx_state: &mut [u8; 512],
+    ) -> Result<u64, ()> {
+        let [star, lstar] = syscall_msrs();
+        let kernel_cs = (star >> 32) as u16 & !3;
+        if lstar != profile.entry || read(GUEST_RIP)? != lstar
+            || read(GUEST_CR4)? & ((1 << 12) | (1 << 23)) != 0
+            || read(GUEST_IA32_EFER)? & 0x401 != 0x401
+            || read(GUEST_CS_SELECTOR)? != u64::from(kernel_cs)
+            || read(GUEST_SS_SELECTOR)? != u64::from(kernel_cs.wrapping_add(8))
+            || read(GUEST_CS_AR_BYTES)? & 0x60ff != 0x209b
+            || read(GUEST_INTERRUPTIBILITY_INFO)? != 0
+            || profile.callback == 0 || profile.callback >> 47 != 0
+            || frame[1] >> 47 != 0
+        {
+            write(GUEST_RFLAGS, read(GUEST_RFLAGS)? | (1 << 16))?;
+            return Ok(1);
+        }
+        let bypass = u64::from_le_bytes(fx_state[240..248].try_into().map_err(|_| ())?);
+        if bypass == 0x1337_1337_1337_1337 {
+            // RF permits exactly one native LSTAR instruction with the owned
+            // execution breakpoint still armed. SWAPGS remains native code.
+            write(GUEST_RFLAGS, read(GUEST_RFLAGS)? | (1 << 16))?;
+            fx_state[224..240].fill(0);
+            fx_state[224..228].copy_from_slice(&(frame[0] as u32).to_le_bytes());
+            fx_state[240..256].fill(0);
+            return Ok(1);
+        }
+        let user_selector = (star >> 48) as u16;
+        let values = [
+            (GUEST_CS_SELECTOR, u64::from(user_selector.wrapping_add(16) | 3)),
+            (GUEST_SS_SELECTOR, u64::from(user_selector.wrapping_add(8) | 3)),
+            (GUEST_CS_BASE, 0), (GUEST_SS_BASE, 0),
+            (GUEST_CS_LIMIT, 0xffff_ffff), (GUEST_SS_LIMIT, 0xffff_ffff),
+            (GUEST_CS_AR_BYTES, 0xa0fb), (GUEST_SS_AR_BYTES, 0xc0f3),
+            (GUEST_RFLAGS, (frame[10] & 0x3c7fd7) | 2),
+            (GUEST_RIP, profile.callback),
+        ];
+        let mut saved = [0; 10];
+        for (index, (field, _)) in values.iter().enumerate() {
+            saved[index] = read(*field)?;
+        }
+        for (index, (field, value)) in values.iter().enumerate() {
+            if write(*field, *value).is_err() {
+                for prior in (0..index).rev() {
+                    if write(values[prior].0, saved[prior]).is_err() {
+                        // A partial privilege transition must halt rather than
+                        // pass through the ordinary base-profile recovery.
+                        return Ok(u64::MAX);
+                    }
+                }
+                return Err(());
+            }
+        }
+        // This runs before SWAPGS: RSP, FS and GS already belong to the user.
+        // Intel SYSRET64 sets descriptor caches directly, without a GDT load.
+        fx_state[224..240].fill(0);
+        fx_state[224..228].copy_from_slice(&(frame[0] as u32).to_le_bytes());
+        frame[0] = frame[1];
+        frame[1] = profile.callback;
+        Ok(1)
+    }
+
     fn configure_timing(boot: &mut ResidentBootContext, enabled: bool) -> Result<(), ()> {
         let cpu = &mut boot.interception;
         if enabled {
@@ -1487,6 +1851,10 @@ pub(crate) mod runtime {
             let remaining = if remaining as i64 <= 0 { 2 } else { remaining };
             let rate = unsafe { &*session.configuration.get() }.timer_rate;
             let mut ticks = (remaining >> rate).clamp(2, u64::from(u32::MAX));
+            let configuration = unsafe { &*session.configuration.get() };
+            if configuration.options & INTERCEPT_PRIVATE_SHARED_DATA != 0 {
+                ticks = ticks.min(((session.tsc_hz.load(Ordering::Acquire) / 1000) >> rate).max(2));
+            }
             if cpu.timer_pin != 0 && boot.diagnostic_interval_tsc != 0 {
                 ticks = ticks.min(read(VMX_PREEMPTION_TIMER_VALUE)?.max(2));
             }
@@ -1577,6 +1945,7 @@ pub(crate) mod runtime {
         // Original writes are serialized across the full MTF window. Validate
         // all pages before publishing bytes so a conflict cannot partially merge.
         for index in 0..configuration.hook_count {
+            if configuration.base_leaves[index] == 0 { continue; }
             let original = configuration.pages[index];
             let shadow = bank_base(configuration) + (INTERCEPT_TABLE_PAGES + index) as u64 * 4096;
             let baseline = baseline_page(configuration, index);
@@ -1591,6 +1960,7 @@ pub(crate) mod runtime {
             }
         }
         for index in 0..configuration.hook_count {
+            if configuration.base_leaves[index] == 0 { continue; }
             let original = configuration.pages[index];
             let shadow = bank_base(configuration) + (INTERCEPT_TABLE_PAGES + index) as u64 * 4096;
             let baseline = baseline_page(configuration, index);
@@ -1746,6 +2116,10 @@ pub(crate) mod runtime {
         if boot.processor_number >= 64 {
             return Err(());
         }
+        // Revocation can restore DRs before dispatch sees the queued #DB.
+        // Capture ownership per CPU before lease checks or barrier callbacks.
+        session.exit_debug[boot.processor_number as usize]
+            .store(boot.interception.debug_armed, Ordering::Release);
         boot.interception.exit_timer = boot.interception.timer_armed;
         if boot.interception.data_pending != 0 && read(GUEST_RIP)? != boot.interception.data_rip {
             boot.interception.data_pending = 0;
@@ -1796,7 +2170,7 @@ pub(crate) mod runtime {
         let configuration = unsafe { &*session.configuration.get() };
         boot.interception.cooperative_data = 0;
         boot.interception.data_pending = 0;
-        for pointer in &configuration.base_leaves[..configuration.hook_count] {
+        for pointer in configuration.base_leaves[..configuration.hook_count].iter().filter(|pointer| **pointer != 0) {
             entry_bits(*pointer, 2, 0);
         }
         let mut result = Ok(());
@@ -1843,7 +2217,7 @@ pub(crate) mod runtime {
             // Another CPU may revoke while a rendezvous is already owned. Each
             // returning CPU restores guards before invalidating its base view.
             let configuration = unsafe { &*session.configuration.get() };
-            for pointer in &configuration.base_leaves[..configuration.hook_count] {
+            for pointer in configuration.base_leaves[..configuration.hook_count].iter().filter(|pointer| **pointer != 0) {
                 entry_bits(*pointer, 2, 0);
             }
         }
@@ -1924,11 +2298,29 @@ pub(crate) mod runtime {
                 cpu.hook_token = configuration.token;
                 cpu.hook_generation = configuration.generation;
             }
-            if target && configuration.debug_count != 0 && cpu.guest_debug[5] & 0x20ff == 0 {
+            let syscall = unsafe { &*session.syscall.get() };
+            if target && syscall.entry != 0 && syscall.token == configuration.token
+                && syscall_gate(&cpu.guest_debug) && cpu.guest_debug[5] & 0x2003 == 0
+                && syscall_msrs()[1] == syscall.entry
+                && read(GUEST_CR4)? & ((1 << 12) | (1 << 23)) == 0
+            {
+                let mut registers: [u64; 5] = cpu.guest_debug[..5].try_into().map_err(|_| ())?;
+                registers[0] = syscall.entry;
+                registers[4] &= !1;
+                load_debug(&registers);
+                write(GUEST_DR7, (cpu.guest_debug[5] & !0x000f_0003) | 2)?;
+                cpu.debug_targets[0] = [syscall.entry, syscall.callback];
+                cpu.debug_targets[3] = [syscall.entry, u64::MAX];
+                cpu.debug_armed = 1;
+                cpu.debug_count = 1;
+                cpu.debug_token = configuration.token;
+                cpu.debug_generation = configuration.generation;
+            } else if target && syscall.entry == 0 && configuration.debug_count != 0 && cpu.guest_debug[5] & 0x20ff == 0 {
                 // Existing guest breakpoints and general-detect own their registers.
                 // Suspend our overlay until the guest releases those resources.
                 let mut registers = [0; 5];
                 let mut dr7 = 0x400;
+                cpu.debug_targets.fill([0; 2]);
                 for (index, debug) in configuration.debug[..configuration.debug_count]
                     .iter()
                     .enumerate()
@@ -2161,10 +2553,19 @@ pub(crate) mod runtime {
     }
 
     fn original_value(address: u64, width: usize, value: Option<u64>) -> u64 {
-        if value.is_none() && address as usize % width == 0 {
+        if address as usize % width == 0 {
             // Match aligned x86 scalar-load atomicity when peers are running.
             // A byte-at-a-time emulated load could tear across a concurrent store.
             unsafe {
+                if let Some(value) = value {
+                    match width {
+                        1 => (address as *mut u8).write_volatile(value as u8),
+                        2 => (address as *mut u16).write_volatile(value as u16),
+                        4 => (address as *mut u32).write_volatile(value as u32),
+                        8 => (address as *mut u64).write_volatile(value),
+                        _ => return 0,
+                    }
+                }
                 return match width {
                     1 => u64::from((address as *const u8).read_volatile()),
                     2 => u64::from((address as *const u16).read_volatile()),
@@ -2185,6 +2586,41 @@ pub(crate) mod runtime {
             }
         }
         u64::from_le_bytes(bytes)
+    }
+
+    fn refresh_shared_data(session: &Session) {
+        let configuration = unsafe { &*session.configuration.get() };
+        if configuration.options & INTERCEPT_PRIVATE_SHARED_DATA == 0
+            || lock_refresh(session).is_err()
+        {
+            return;
+        }
+        let Some(index) = configuration.base_leaves[..configuration.hook_count].iter().position(|pointer| *pointer == 0) else {
+            session.refresh_lock.store(0, Ordering::Release);
+            return;
+        };
+        let source = configuration.pages[index];
+        let destination = bank_base(configuration) + (INTERCEPT_TABLE_PAGES + index) as u64 * 4096;
+        for offset in [0x8, 0x14, 0x320] {
+            // KSYSTEM_TIME readers compare High1Time and High2Time. Publish
+            // High2Time first and High1Time last using aligned scalar stores.
+            for _ in 0..8 {
+                let high = original_value(source + offset + 4, 4, None);
+                let low = original_value(source + offset, 4, None);
+                if high == original_value(source + offset + 8, 4, None) {
+                    original_value(destination + offset + 8, 4, Some(high));
+                    original_value(destination + offset, 4, Some(low));
+                    original_value(destination + offset + 4, 4, Some(high));
+                    break;
+                }
+            }
+        }
+        for (offset, width) in [(0x2e4, 4), (0x340, 8), (0x348, 8), (0x350, 8)] {
+            let source_offset = if offset == 0x350 { 0x348 } else { offset };
+            let value = original_value(source + source_offset, width, None);
+            original_value(destination + offset, width, Some(value));
+        }
+        session.refresh_lock.store(0, Ordering::Release);
     }
 
     fn register_location(reg: yaxpeax_x86::long_mode::RegSpec) -> Option<(usize, usize, u32)> {
@@ -2657,14 +3093,52 @@ pub(crate) mod runtime {
         boot: &mut ResidentBootContext,
         frame: &mut [u64],
         synchronize: Synchronize,
+        fx_state: &mut [u8; 512],
     ) -> Result<u64, ()> {
-        let armed = boot.interception.debug_armed != 0;
+        if boot.processor_number >= 64 {
+            return Err(());
+        }
+        let exit_armed = session.exit_debug[boot.processor_number as usize].swap(0, Ordering::AcqRel);
+        let armed = boot.interception.debug_armed != 0 || exit_armed != 0;
+        let syscall_armed = armed && boot.interception.debug_count == 1
+            && boot.interception.debug_targets[3][1] == u64::MAX;
         restore_debug(&mut boot.interception)?;
         let reason = boot.last_reason & 0xffff;
         let stepped = boot.interception.exit_step != 0;
         finish_step(session, boot, synchronize)?;
-        if reason == 52 && boot.interception.exit_timer != 0 && boot.diagnostic_interval_tsc == 0 {
-            return Ok(1);
+        if reason == 10 && session.is_active() && boot.nested.active == 0 {
+            let configuration = unsafe { &*session.configuration.get() };
+            let profile = unsafe { &*session.cpuid.get() };
+            let selector = [frame[0] as u32, frame[1] as u32];
+            if profile.records[..profile.count].iter().any(|record| {
+                record.leaf == selector[0] && selector[1] & record.subleaf_mask == record.subleaf
+            }) && read(GUEST_IA32_EFER)? & 0x400 != 0 {
+                let native = core::arch::x86_64::__cpuid_count(selector[0], selector[1]);
+                if let Some(values) = cpuid_values(
+                    configuration,
+                    profile,
+                    read(GUEST_CR3)?,
+                    read(GUEST_CS_SELECTOR)? & 3,
+                    [boot.interception.guest_debug[3], boot.interception.guest_debug[5]],
+                    selector,
+                    [native.eax, native.ebx, native.ecx, native.edx],
+                ) {
+                    frame[0] = u64::from(values[0]);
+                    frame[3] = u64::from(values[1]);
+                    frame[1] = u64::from(values[2]);
+                    frame[2] = u64::from(values[3]);
+                    session.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(2);
+                }
+            }
+        }
+        if reason == 52 && boot.interception.exit_timer != 0 {
+            if session.is_active() {
+                refresh_shared_data(session);
+            }
+            if boot.diagnostic_interval_tsc == 0 {
+                return Ok(1);
+            }
         }
         if reason == 37 && stepped {
             if boot.telemetry_active != 0 {
@@ -2799,6 +3273,32 @@ pub(crate) mod runtime {
                     .enumerate()
                 {
                     if debug_status & (1 << index) != 0 && rip == target[0] {
+                        let syscall = unsafe { &*session.syscall.get() };
+                        if syscall_armed {
+                            // Foreign breakpoint causes still belong to the guest.
+                            if debug_status & 14 != 0 {
+                                break;
+                            }
+                            write(GUEST_PENDING_DBG_EXCEPTIONS, read(GUEST_PENDING_DBG_EXCEPTIONS)? & !1)?;
+                            if session.is_active() && syscall.token == configuration.token
+                                && syscall.entry == target[0] && syscall.callback == target[1]
+                                && boot.interception.debug_token == configuration.token
+                                && boot.interception.debug_generation == configuration.generation
+                                && root_matches(configuration, read(GUEST_CR3)?)
+                                && syscall_gate(&boot.interception.guest_debug)
+                            {
+                                let outcome = route_syscall(syscall, frame, fx_state)?;
+                                if outcome == u64::MAX {
+                                    session.cause.store(u64::from(INTERCEPT_CAUSE_RUNTIME), Ordering::Release);
+                                    session.active.store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
+                                } else {
+                                    session.hits.fetch_add(1, Ordering::Relaxed);
+                                }
+                                return Ok(outcome);
+                            }
+                            write(GUEST_RFLAGS, read(GUEST_RFLAGS)? | (1 << 16))?;
+                            return Ok(1);
+                        }
                         write(
                             GUEST_PENDING_DBG_EXCEPTIONS,
                             read(GUEST_PENDING_DBG_EXCEPTIONS)? & !15,
@@ -2818,7 +3318,7 @@ pub(crate) mod runtime {
             let mut registers: [u64; 5] = boot.interception.guest_debug[..5]
                 .try_into()
                 .map_err(|_| ())?;
-            registers[4] |= debug_status & if armed { 0xe000 } else { 0xe00f };
+            registers[4] |= debug_status & if syscall_armed { 0xe00e } else if armed { 0xe000 } else { 0xe00f };
             for bit in [11, 16] {
                 if debug_status & (1 << bit) != 0 {
                     registers[4] &= !(1 << bit);
@@ -2871,6 +3371,7 @@ pub(crate) mod runtime {
         phase: u64,
         frame: *mut u64,
         synchronize: Synchronize,
+        fx_state: *mut u8,
     ) -> u64 {
         let boot = unsafe { &mut *boot };
         let event = unsafe { &*(boot.event_context as *const ResidentEventContext) };
@@ -2882,6 +3383,7 @@ pub(crate) mod runtime {
                 boot,
                 unsafe { core::slice::from_raw_parts_mut(frame, 15) },
                 synchronize,
+                unsafe { &mut *fx_state.cast::<[u8; 512]>() },
             ),
             1 => apply(session, boot, synchronize).map(|()| 0),
             2 => {
@@ -2948,7 +3450,7 @@ pub(crate) mod runtime {
             5 => compensate_timing(session, boot).map(|()| 0),
             _ => Err(()),
         };
-        diagnostic_result(boot, phase as usize, result.is_ok());
+        diagnostic_result(boot, phase as usize, result.as_ref().is_ok_and(|value| *value != u64::MAX));
         match result {
             Ok(value) => value,
             Err(()) => {
