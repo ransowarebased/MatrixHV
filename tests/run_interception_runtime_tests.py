@@ -25,6 +25,7 @@ for declaration, replacement in [
     ('fn load_debug(', 'fn load_debug(registers: &[u64; 5]) { crate::hardware::load_debug(registers); }'),
     ('fn invalidate(', 'fn invalidate(ept: u64) -> Result<(), ()> { crate::hardware::invalidate(ept) }'),
     ('fn entry_bits(', 'fn entry_bits(pointer: u64, set: u64, clear: u64) { crate::hardware::entry_bits(pointer, set, clear); }'),
+    ('fn shared_entry(', 'fn shared_entry(pointer: u64, target: u64, permissions: u64) { crate::hardware::shared_entry(pointer, target, permissions); }'),
     ('fn page_byte(', 'fn page_byte(address: u64, value: Option<u8>) -> u8 { crate::hardware::page_byte(address, value) }'),
     ('fn clock()', 'fn clock() -> u64 { crate::hardware::clock() }'),
     ('fn syscall_msrs()', 'fn syscall_msrs() -> [u64; 2] { crate::hardware::syscall_msrs() }'),

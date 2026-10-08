@@ -266,7 +266,7 @@ function New-ImageFileDescriptor {
     }
 }
 
-$BuildRoot = [System.IO.Path]::GetFullPath('D:\Projetos\MatrixHV\builds')
+$BuildRoot = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $PSScriptRoot) 'builds'))
 $ConfigurationName = $Configuration.ToLowerInvariant()
 
 if ([string]::IsNullOrWhiteSpace($BootBinary)) {

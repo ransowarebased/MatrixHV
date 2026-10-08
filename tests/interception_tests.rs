@@ -361,22 +361,46 @@ fn syscall_clear_without_other_profiles_disables_the_session_and_expiry_restores
 }
 
 #[test]
-fn private_shared_data_maps_both_scoped_views_without_guarding_native_storage() {
+fn private_shared_data_traps_scoped_accesses_and_preserves_native_storage() {
     let mut machine = Machine::new();
-    machine.store_entry(0x4000 + ((0x7ffe0000_u64 >> 30) & 511) * 8, 0x5007).unwrap();
-    machine.store_entry(0x5000 + ((0x7ffe0000_u64 >> 21) & 511) * 8, 0x7007).unwrap();
-    machine.store_entry(0x7000 + ((0x7ffe0000_u64 >> 12) & 511) * 8, GPA | 5).unwrap();
+    machine
+        .store_entry(0x4000 + ((0x7ffe0000_u64 >> 30) & 511) * 8, 0x5007)
+        .unwrap();
+    machine
+        .store_entry(0x5000 + ((0x7ffe0000_u64 >> 21) & 511) * 8, 0x7007)
+        .unwrap();
+    machine
+        .store_entry(0x7000 + ((0x7ffe0000_u64 >> 12) & 511) * 8, GPA | 5)
+        .unwrap();
     let mut session = session();
-    let mut request = packet(&["hook", "install", "0x3000", "0x7ffe0000", &"33".repeat(4096)]);
+    let mut request = packet(&[
+        "hook",
+        "install",
+        "0x3000",
+        "0x7ffe0000",
+        &"33".repeat(4096),
+    ]);
     request[128..132].copy_from_slice(&INTERCEPT_PRIVATE_SHARED_DATA.to_le_bytes());
     let original = machine.pages[&GPA].clone();
     let native_leaf = machine.leaf(machine.base_ept(), GPA);
     execute(&mut session, &mut machine, &mut request).unwrap();
     let configuration = unsafe { &*session.configuration.get() };
     let shadow = machine.leaf(configuration.ept, GPA).0;
-    assert_eq!(shadow & 7, 3);
+    assert_eq!(shadow & 7, 0);
     assert_ne!(shadow & MASK, GPA);
-    assert_eq!(machine.leaf(configuration.data_ept, GPA).0, shadow);
+    assert_eq!(
+        machine.leaf(configuration.data_ept, GPA).0 & (MASK | 7),
+        GPA
+    );
+    for cpu_index in 0..64 {
+        if configuration.cpu_mask & (1 << cpu_index) != 0 {
+            assert_ne!(configuration.cpu_data[cpu_index], 0);
+            assert_eq!(
+                machine.leaf(configuration.cpu_data[cpu_index], GPA).0 & (MASK | 7),
+                GPA
+            );
+        }
+    }
     assert_eq!(machine.leaf(machine.base_ept(), GPA), native_leaf);
     assert_eq!(machine.pages[&GPA], original);
     assert_eq!(machine.pages[&(shadow & MASK)].as_ref(), &[0x33; 4096]);
@@ -395,8 +419,11 @@ fn private_shared_data_maps_both_scoped_views_without_guarding_native_storage() 
     let configuration = unsafe { &*session.configuration.get() };
     assert_eq!(configuration.hook_count, 2);
     let shared_leaf = machine.leaf(configuration.ept, GPA).0;
-    assert_eq!(shared_leaf & 7, 3);
-    assert_eq!(machine.leaf(configuration.data_ept, GPA).0, shared_leaf);
+    assert_eq!(shared_leaf & 7, 0);
+    assert_eq!(
+        machine.leaf(configuration.data_ept, GPA).0 & (MASK | 7),
+        GPA
+    );
     assert_eq!(machine.pages[&(shared_leaf & MASK)][0x900], 0x42);
     let code_leaf = machine.leaf(configuration.ept, GPA + 4096).0;
     assert_eq!(code_leaf & 7, 4);
@@ -407,9 +434,20 @@ fn private_shared_data_maps_both_scoped_views_without_guarding_native_storage() 
     let spare_root = configuration.pool_base
         + ((configuration.bank ^ 1) * intercept_bank_pages(configuration.cpu_mask)) as u64 * 4096;
     machine.failed_stores.insert(spare_root, 1);
-    assert_eq!(execute(&mut session, &mut machine, &mut rejected), Err(Error::Permission));
-    assert!(session.is_active(), "cause={}, state={}", session.cause.load(core::sync::atomic::Ordering::Acquire), session.active.load(core::sync::atomic::Ordering::Acquire));
-    assert_eq!(machine.leaf(machine.base_ept(), GPA).0 & (MASK | 7), GPA | 7);
+    assert_eq!(
+        execute(&mut session, &mut machine, &mut rejected),
+        Err(Error::Permission)
+    );
+    assert!(
+        session.is_active(),
+        "cause={}, state={}",
+        session.cause.load(core::sync::atomic::Ordering::Acquire),
+        session.active.load(core::sync::atomic::Ordering::Acquire)
+    );
+    assert_eq!(
+        machine.leaf(machine.base_ept(), GPA).0 & (MASK | 7),
+        GPA | 7
+    );
     let mut dropped = packet(&["hook", "remove", &token.to_string(), &code_id.to_string()]);
     execute(&mut session, &mut machine, &mut dropped).unwrap();
     assert_eq!(word(&dropped, 104), 1);
@@ -422,6 +460,33 @@ fn private_shared_data_maps_both_scoped_views_without_guarding_native_storage() 
     assert!(!session.is_active());
     assert_eq!(machine.leaf(machine.base_ept(), GPA), native_leaf);
     assert_eq!(machine.pages[&GPA], original);
+}
+
+#[test]
+fn private_shared_data_routes_only_user_reads_to_the_identity_page() {
+    use crate::memory::interception::shared_data_target;
+    let shadow = GPA + 4096;
+    assert_eq!(
+        shared_data_target(GPA, shadow, 0x7ffe03d8, 3, 1),
+        Ok(shadow)
+    );
+    for linear in [0xfffff780000003d8, 0xfffff78000000718, 0x7ffe03d8] {
+        for access in [1, 2, 3] {
+            assert_eq!(shared_data_target(GPA, shadow, linear, 0, access), Ok(GPA));
+        }
+    }
+    assert_eq!(
+        shared_data_target(GPA, shadow, 0x7ffe03d8, 3, 2),
+        Err(Error::Permission)
+    );
+    assert_eq!(
+        shared_data_target(GPA, shadow, 0xfffff780000003d8, 3, 1),
+        Err(Error::Permission)
+    );
+    assert_eq!(
+        shared_data_target(GPA, shadow, 0x7ffe03d8, 1, 1),
+        Err(Error::Permission)
+    );
 }
 
 #[test]

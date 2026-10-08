@@ -220,7 +220,7 @@ fn private_shared_data_survives_code_write_windows_and_refreshes_at_any_page_ind
     configuration.data_leaves[1] = 0xb000;
     let private_shadow = SHADOW + 4096;
     hardware::original_value(private_shadow + 0xffc, 4, Some(0x13371337));
-    hardware::entry_bits(0xb000, private_shadow | 0x33, 0);
+    hardware::entry_bits(0xb000, 0x900030, 0);
     assert_eq!(scenario.call(1), 0);
     hardware::write(GUEST_RIP, 0x401000).unwrap();
     hardware::write(GUEST_PHYSICAL_ADDRESS, 0x800009).unwrap();
@@ -242,7 +242,7 @@ fn private_shared_data_survives_code_write_windows_and_refreshes_at_any_page_ind
     assert_eq!(hardware::original_value(private_shadow + 8, 4, None), 123);
     assert_eq!(hardware::original_value(private_shadow + 12, 4, None), 7);
     hardware::STATE.with(|state| {
-        assert_eq!(state.borrow().entries[&0xb000], private_shadow | 0x33);
+        assert_eq!(state.borrow().entries[&0xb000], 0x900030);
         assert!(!state.borrow().entries.contains_key(&0));
     });
     scenario.session.active.store(0, Ordering::Release);
@@ -326,6 +326,63 @@ fn cpuid_dispatch_matches_the_intel_gate_and_zero_extends_only_output_registers(
         } else {
             assert_eq!(scenario.frame, before);
             assert_eq!(scenario.session.hits.load(Ordering::Acquire), 0);
+        }
+    }
+}
+
+#[test]
+fn private_shared_data_keeps_kernel_xstate_native_and_closes_each_cpu_window() {
+    for (cpl, linear, target, access) in [
+        (3, 0x7ffe03d8, SHADOW, 1),
+        (0, 0xfffff780000003d8, 0x800000, 1),
+        (0, 0xfffff78000000718, 0x800000, 1),
+        (0, 0xfffff780000003d8, 0x800000, 2),
+    ] {
+        for (exit_reason, cancelled) in [(37, false), (1, false), (37, true)] {
+            let mut scenario = Scenario::new();
+            let configuration = scenario.session.configuration.get_mut();
+            configuration.options = protocol::memory::INTERCEPT_PRIVATE_SHARED_DATA;
+            configuration.base_leaves[0] = 0;
+            configuration.debug_count = 0;
+            configuration.cpu_data[0] = 0xa05e;
+            configuration.cpu_leaves[0][0] = 0xb000;
+            configuration.cpu_data[1] = 0xc05e;
+            configuration.cpu_leaves[1][0] = 0xd000;
+            hardware::shared_entry(0xb000, 0x800000, 0);
+            hardware::shared_entry(0xd000, 0x800000, 0);
+            let mut instruction = [0x90; 15];
+            instruction[..2].copy_from_slice(&[0x8b, 0x01]);
+            hardware::STATE.with(|state| state.borrow_mut().instruction = Some((instruction, instruction)));
+            for (field, value) in [
+                (GUEST_CS_SELECTOR, cpl), (GUEST_RIP, 0x401000),
+                (GUEST_PHYSICAL_ADDRESS, 0x8003d8), (GUEST_LINEAR_ADDRESS, linear),
+            ] {
+                hardware::write(field, value).unwrap();
+            }
+            assert_eq!(scenario.call(1), 0);
+            assert_eq!(scenario.exit(48, 0x180 | access), 1);
+            assert_eq!(scenario.boot.interception.step_active, 5);
+            assert_eq!(scenario.call(1), 0);
+            assert_eq!(hardware::read(EPT_POINTER), Ok(0xa05e));
+            assert_ne!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+            hardware::STATE.with(|state| {
+                assert_eq!(state.borrow().entries[&0xb000] & 0x000f_ffff_ffff_f007, target | if access == 2 { 3 } else { 1 });
+                assert_eq!(state.borrow().entries[&0xd000], 0x800000);
+            });
+            if cancelled {
+                scenario.session.active.store(0, Ordering::Release);
+            }
+            scenario.exit(exit_reason, 0);
+            assert_eq!(scenario.boot.interception.step_active, 0);
+            assert_eq!(scenario.call(1), 0);
+            assert_eq!(hardware::read(EPT_POINTER), Ok(if cancelled { 0x105e } else { 0x805e }));
+            assert_eq!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+            hardware::STATE.with(|state| {
+                assert_eq!(state.borrow().entries[&0xb000], 0x800000);
+                assert_eq!(state.borrow().entries[&0xd000], 0x800000);
+                assert!(!state.borrow().entries.contains_key(&0));
+            });
+            assert_eq!(scenario.session.is_active(), !cancelled);
         }
     }
 }
@@ -441,6 +498,13 @@ mod hardware {
             let mut state = state.borrow_mut();
             let value = *state.entries.get(&pointer).unwrap_or(&0);
             state.entries.insert(pointer, (value | set) & !clear);
+        });
+    }
+    pub fn shared_entry(pointer: u64, target: u64, permissions: u64) {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let value = *state.entries.get(&pointer).unwrap_or(&0);
+            state.entries.insert(pointer, target | (value & !0x000f_ffff_ffff_f000 & !7) | permissions);
         });
     }
     pub fn page_byte(address: u64, value: Option<u8>) -> u8 {

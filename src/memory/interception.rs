@@ -12,6 +12,21 @@ const OPTIONS: u32 = INTERCEPT_VMFUNC
     | INTERCEPT_NO_LEASE
     | INTERCEPT_PRIVATE_SHARED_DATA;
 
+#[cfg(any(target_os = "uefi", test))]
+pub(crate) fn shared_data_target(
+    native: u64,
+    shadow: u64,
+    linear: u64,
+    cpl: u64,
+    access: u64,
+) -> Result<u64, Error> {
+    match cpl {
+        0 => Ok(native),
+        3 if linear & !4095 == 0x7ffe0000 && access == 1 => Ok(shadow),
+        _ => Err(Error::Permission),
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct DebugTarget {
     pub address: u64,
@@ -715,7 +730,9 @@ fn install(
         if existing_page.is_none() {
             let execute_leaf = leaf(memory, configuration, splits, gpa, configuration.ept, false)?;
             let entry = memory.table_entry(execute_leaf)?;
-            memory.store_entry(execute_leaf, shadow | (entry & !MASK & !7) | if private_page { 3 } else { 4 })?;
+            // KUSER_SHARED_DATA aliases the same GPA in user and kernel space.
+            // Trap accesses so kernel XSTATE initialization uses native features.
+            memory.store_entry(execute_leaf, shadow | (entry & !MASK & !7) | if private_page { 0 } else { 4 })?;
             let data_leaf = leaf(
                 memory,
                 configuration,
@@ -726,7 +743,7 @@ fn install(
             )?;
             let entry = memory.table_entry(data_leaf)?;
             memory.store_entry(data_leaf, if private_page {
-                shadow | (entry & !MASK & !7) | 3
+                gpa | (entry & !MASK & !7)
             } else {
                 (entry & !7) | 1
             })?;
@@ -1931,6 +1948,13 @@ pub(crate) mod runtime {
             .unwrap();
     }
 
+    fn shared_entry(pointer: u64, target: u64, permissions: u64) {
+        let entry = unsafe { &*(pointer as *const AtomicU64) };
+        entry.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            Some(target | (value & !MASK & !7) | permissions)
+        }).unwrap();
+    }
+
     fn page_byte(address: u64, value: Option<u8>) -> u8 {
         unsafe {
             let pointer = address as *mut u8;
@@ -2003,7 +2027,8 @@ pub(crate) mod runtime {
         boot: &mut ResidentBootContext,
         synchronize: Synchronize,
     ) -> Result<(), ()> {
-        let reading = boot.interception.step_active == 4;
+        let shared = boot.interception.step_active == 5;
+        let reading = matches!(boot.interception.step_active, 4 | 5);
         let writing = matches!(boot.interception.step_active, 2 | 3);
         if boot.interception.step_active == 0 {
             return Ok(());
@@ -2018,6 +2043,15 @@ pub(crate) mod runtime {
             if reading {
                 for pointer in data_leaves(configuration, boot.processor_number as usize) {
                     entry_bits(*pointer, 0, 6);
+                }
+                if shared {
+                    for index in 0..configuration.hook_count {
+                        if configuration.base_leaves[index] == 0 {
+                            let pointer =
+                                configuration.cpu_leaves[boot.processor_number as usize][index];
+                            shared_entry(pointer, configuration.pages[index], 0);
+                        }
+                    }
                 }
                 invalidate(data_root(configuration, boot.processor_number as usize))?;
             }
@@ -3088,6 +3122,65 @@ pub(crate) mod runtime {
         Ok(1)
     }
 
+    fn shared_data_access(
+        session: &Session,
+        boot: &mut ResidentBootContext,
+        configuration: &RoadEptProfile,
+        index: usize,
+    ) -> Result<u64, ()> {
+        let cpu_index = boot.processor_number as usize;
+        let private = configuration.cpu_data[cpu_index];
+        if private == 0
+            || private == configuration.data_ept
+            || boot.last_qualification & 0x180 != 0x180
+            || read(GUEST_CS_AR_BYTES)? & 0x2000 == 0
+        {
+            return Err(());
+        }
+        let access = boot.last_qualification & 7;
+        let native = configuration.pages[index];
+        let shadow = bank_base(configuration) + (INTERCEPT_TABLE_PAGES + index) as u64 * 4096;
+        let target = shared_data_target(
+            native,
+            shadow,
+            read(GUEST_LINEAR_ADDRESS)?,
+            read(GUEST_CS_SELECTOR)? & 3,
+            access,
+        )
+        .map_err(|_| ())?;
+        let mut execution = [0; 15];
+        let mut original = [0; 15];
+        let count = fetch_instruction(
+            boot,
+            configuration,
+            read(GUEST_RIP)?,
+            &mut execution,
+            &mut original,
+        );
+        // The CPU-private data root executes native hook-page bytes for one
+        // instruction. Refuse a changed instruction before opening that view.
+        use yaxpeax_arch::LengthedInstruction;
+        let instruction = yaxpeax_x86::long_mode::InstDecoder::default()
+            .decode_slice(&execution[..count])
+            .map_err(|_| ())?;
+        let length = instruction.len().to_const() as usize;
+        if execution[..length] != original[..length] {
+            return Err(());
+        }
+        let pointer = configuration.cpu_leaves[cpu_index][index];
+        shared_entry(pointer, target, if access & 2 != 0 { 3 } else { 1 });
+        for pointer in data_leaves(configuration, cpu_index) {
+            entry_bits(*pointer, 4, 2);
+        }
+        boot.interception.step_active = 5;
+        boot.interception.step_cr3 = read(GUEST_CR3)? & MASK;
+        boot.interception.cooperative_data = 0;
+        boot.interception.data_pending = 0;
+        invalidate(private)?;
+        session.data_exits.fetch_add(1, Ordering::Relaxed);
+        Ok(1)
+    }
+
     fn dispatch(
         session: &Session,
         boot: &mut ResidentBootContext,
@@ -3171,6 +3264,11 @@ pub(crate) mod runtime {
                     return Ok(1);
                 }
                 if access & 3 != 0 {
+                    if let Some(index) = configuration.pages[..configuration.hook_count].iter()
+                        .enumerate().find_map(|(index, page)| (*page == gpa && configuration.base_leaves[index] == 0).then_some(index))
+                    {
+                        return shared_data_access(session, boot, configuration, index);
+                    }
                     boot.interception.data_address = read(GUEST_PHYSICAL_ADDRESS)?;
                     boot.interception.data_linear = read(GUEST_LINEAR_ADDRESS)?;
                     boot.interception.data_qualification = boot.last_qualification;
