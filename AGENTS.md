@@ -34,12 +34,12 @@ All AI agents and contributors working on this repository must strictly adhere t
 
 ## 4. No Markdown Documentation Files in the Repository
 - **No generated `.md` files**: Do not generate, add, or commit Markdown (`.md`) documentation files, reports, summaries, or walkthrough notes inside the repository tree.
-- **External Markdown location**: Any temporary or generated `.md` files must be created and kept under `C:\Temp`; do not persist them in the codebase.
+- **External Markdown location**: Any temporary or generated `.md` files must be created in the system temporary directory; do not persist them in the codebase.
 
 ---
 
 ## 5. Build and Test Locations
-- **Build output root**: All MatrixHV build, packaging, and generated boot artifacts must be written under `D:\\Projetos\\MatrixHV\\builds`.
+- **Build output root**: All MatrixHV build, packaging, and generated boot artifacts must be written under the repository-root `builds/` directory.
 - **Generated artifacts are not versioned**: Files produced under `builds/` must remain ignored by Git unless the user explicitly requests otherwise.
 - **Tests**: Source-level and host-runnable tests belong under `tests/`.
 - **Temporary compiler output**: Cargo target directories may use temporary locations or `builds/.cargo-target`; do not place compiler caches in source directories.
