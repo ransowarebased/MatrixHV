@@ -621,10 +621,21 @@ pub(crate) mod resident {
             synchronize: 0,
             interception_session: 0,
         };
+        instruction_bytes_in(&environment, configuration, rip, execution, original)
+    }
+
+    pub(crate) fn instruction_bytes_in(
+        environment: &Environment,
+        configuration: &crate::memory::interception::RoadEptProfile,
+        rip: u64,
+        execution: &mut [u8; 15],
+        original: &mut [u8; 15],
+    ) -> usize {
         let mut memory = Memory {
-            environment: &environment,
+            environment,
         };
-        for index in 0..15 {
+        let mut index = 0;
+        while index < execution.len() {
             let Some(address) = rip.checked_add(index as u64) else {
                 return index;
             };
@@ -637,14 +648,15 @@ pub(crate) mod resident {
             ) else {
                 return index;
             };
+            let count = (execution.len() - index).min(4096 - (address as usize & 4095));
             if !mapping.present
                 || memory
-                    .read(mapping.physical_address, &mut original[index..index + 1])
+                    .read(mapping.physical_address, &mut original[index..index + count])
                     .is_err()
             {
                 return index;
             }
-            execution[index] = original[index];
+            execution[index..index + count].copy_from_slice(&original[index..index + count]);
             if let Some(page_index) = configuration.pages[..configuration.hook_count]
                 .iter()
                 .position(|page| *page == mapping.physical_address & !4095)
@@ -655,8 +667,11 @@ pub(crate) mod resident {
                         + page_index) as u64
                         * 4096
                     + (mapping.physical_address & 4095);
-                execution[index] = unsafe { (shadow as *const u8).read_volatile() };
+                for offset in 0..count {
+                    execution[index + offset] = unsafe { (shadow as *const u8).add(offset).read_volatile() };
+                }
             }
+            index += count;
         }
         15
     }
@@ -837,6 +852,13 @@ pub(crate) mod resident {
     }
 
     impl crate::memory::interception::InterceptionMemory for Memory<'_> {
+        fn check_budget(&self) -> Result<(), Error> {
+            if self.environment.synchronize != 0 && self.synchronize(3) == 0 {
+                Err(Error::Busy)
+            } else {
+                Ok(())
+            }
+        }
         fn syscall_context(&self) -> [u64; 3] {
             [self.environment.syscall, self.environment.kernel_cr3, self.environment.guest_cr4]
         }
@@ -847,6 +869,11 @@ pub(crate) mod resident {
                 let boot =
                     unsafe { &*(self.environment.boot_context as *const ResidentBootContext) };
                 let event = unsafe { &*(boot.event_context as *const ResidentEventContext) };
+                // Independent per-CPU offsets break Windows' common TSC clock
+                // even when Hyper-V reference time is not advertised.
+                if event.cpu_contexts.iter().filter(|address| **address != 0).count() > 1 {
+                    return false;
+                }
                 for address in event.cpu_contexts.iter().filter(|address| **address != 0) {
                     let cpu = unsafe { &*(*address as *const ResidentBootContext) };
                     // Reference-TSC pages assume an invariant, common clock.

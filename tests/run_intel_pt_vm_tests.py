@@ -57,7 +57,6 @@ def main():
     if supported:
         first = values(pt("start"))
         assert all(first[cpu + ".armed"] == "1" for cpu in cpus), first
-        inactive(pt("stop"))
     else:
         pt("start", expected=1)
         after = values(pt("status"))
@@ -66,7 +65,17 @@ def main():
 
     guest_output = rf"C:\MatrixHVIntelPtTests\capture-{time.time_ns()}"
     snapshot = values(pt("dump", "--output", guest_output))
-    inactive(pt("status"))
+    circular = all(snapshot.get(cpu + ".circular") == "1" for cpu in cpus)
+    if supported and circular:
+        after = values(pt("status"))
+        assert all(after[cpu + ".armed"] == "1" for cpu in cpus), after
+        restarted = values(pt("start"))
+        assert all(restarted[cpu + ".armed"] == "1" for cpu in cpus), restarted
+        second = values(pt("dump", "--output", guest_output + "-second"))
+        assert all(int(second[cpu + ".snapshot_sequence"]) > int(snapshot[cpu + ".snapshot_sequence"]) for cpu in cpus), second
+        assert all(second[cpu + ".generation"] == snapshot[cpu + ".generation"] for cpu in cpus), second
+    else:
+        inactive(pt("status"))
     files = json.loads(powershell(
         "$ErrorActionPreference='Stop'; Get-ChildItem -LiteralPath '" + guest_output +
         "' | Select-Object Name,Length | ConvertTo-Json -Compress"))
@@ -81,6 +90,8 @@ def main():
     metadata = powershell("Get-Content -Raw -LiteralPath '" + guest_output + "\\metadata.txt'")
     assert "scope=vmx_root_handlers" in metadata and "cpuid_14_0=" in metadata, metadata
     (output / "metadata.txt").write_text(metadata)
+    if circular:
+        assert "callbacks.hash_scope=relocated_root_image_at_boot" in metadata, metadata
     pt("dump", "--output", guest_output, expected=1)
     pt("start", "--output", guest_output, expected=1)
     pt("dump", expected=1)
@@ -94,6 +105,7 @@ def main():
     assert "failed=0x0" in matrix and "stopped=0x0" in matrix, matrix
     result = {"runtime_commands": "PASS", "cpu_count": len(cpus),
               "capture_hardware_available": supported, "guest_export": guest_output,
+              "circular_snapshot_tested": supported and circular,
               "initial_states": initial, "export_files": files}
     (output / "results.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))

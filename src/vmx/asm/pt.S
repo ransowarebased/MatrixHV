@@ -87,14 +87,15 @@ je .Lresident_pt_leave_done
 resident_pt_save
 // Clearing TraceEn drains buffered packets before reading the output pointer.
 resident_pt_write 0x570, 0, .Lresident_pt_restore_failed
-mov qword ptr [r12 + {b_pt_owned}], 0
 resident_pt_read 0x571, {b_pt_status}, .Lresident_pt_snapshot_failed
 resident_pt_read 0x561, {b_pt_output_pointer}, .Lresident_pt_snapshot_failed
 mov rax, qword ptr [r12 + {b_pt_output_pointer}]
 shr rax, 32
 cmp rax, {pt_buffer_bytes}
 ja .Lresident_pt_snapshot_failed
-mov qword ptr [r12 + {b_pt_bytes}], rax
+// Export a complete circular window. Before the first wrap, the unused tail
+// remains zero-filled; the decoder synchronizes at the first retained PSB.
+mov qword ptr [r12 + {b_pt_bytes}], {pt_buffer_bytes}
 test qword ptr [r12 + {b_pt_status}], 0x30
 jz .Lresident_pt_restore_state
 mov qword ptr [r12 + {b_pt_armed}], 0
@@ -102,11 +103,14 @@ jmp .Lresident_pt_restore_state
 .Lresident_pt_snapshot_failed:
 mov qword ptr [r12 + {b_pt_support}], 4
 mov qword ptr [r12 + {b_pt_armed}], 0
+mov qword ptr [r12 + {b_pt_bytes}], 0
 .Lresident_pt_restore_state:
 resident_pt_write_saved 0x560, {b_pt_saved_base}, .Lresident_pt_restore_failed
 resident_pt_write_saved 0x561, {b_pt_saved_pointer}, .Lresident_pt_restore_failed
 resident_pt_write_saved 0x571, {b_pt_saved_status}, .Lresident_pt_restore_failed
 resident_pt_write_saved 0x570, {b_pt_saved_control}, .Lresident_pt_restore_failed
+.Lresident_pt_restore_complete:
+mov qword ptr [r12 + {b_pt_owned}], 0
 resident_pt_restore
 .Lresident_pt_leave_done:
 popfq
@@ -114,11 +118,20 @@ ret
 .Lresident_pt_restore_failed:
 mov qword ptr [r12 + {b_pt_support}], 4
 mov qword ptr [r12 + {b_pt_armed}], 0
-// A failed restore cannot safely return to a guest with diagnostic MSRs loaded.
-cli
-.Lresident_pt_restore_halt:
-hlt
-jmp .Lresident_pt_restore_halt
+mov qword ptr [r12 + {b_pt_bytes}], 0
+// Retry the entire saved state once, with tracing disabled. Ownership cannot
+// be released until every guest MSR has been restored successfully.
+resident_pt_write 0x570, 0, .Lresident_pt_restore_irrecoverable
+resident_pt_write_saved 0x560, {b_pt_saved_base}, .Lresident_pt_restore_irrecoverable
+resident_pt_write_saved 0x561, {b_pt_saved_pointer}, .Lresident_pt_restore_irrecoverable
+resident_pt_write_saved 0x571, {b_pt_saved_status}, .Lresident_pt_restore_irrecoverable
+resident_pt_write_saved 0x570, {b_pt_saved_control}, .Lresident_pt_restore_irrecoverable
+jmp .Lresident_pt_restore_complete
+.Lresident_pt_restore_irrecoverable:
+// Prevent fatal diagnostics from recursing through the failed restore.
+mov qword ptr [r12 + {b_pt_owned}], 0
+mov qword ptr [r12 + {b_stop_result}], 0x5054
+jmp .Lresident_dispatch_halt
 
 .Lresident_pt_freeze:
 push r12
@@ -179,6 +192,9 @@ mov qword ptr [r8 + {b_pt_support}], 1
 mov qword ptr [r8 + {b_pt_bytes}], 0
 mov qword ptr [r8 + {b_pt_status}], 0
 mov qword ptr [r8 + {b_pt_output_pointer}], 0x7f
+mov qword ptr [r8 + {b_pt_snapshot_bytes}], 0
+mov qword ptr [r8 + {b_pt_snapshot_pointer}], 0
+inc qword ptr [r8 + {b_pt_snapshot_sequence}]
 mov qword ptr [r8 + {b_pt_armed}], 1
 jmp .Lresident_pt_query
 .Lresident_pt_stop:
@@ -222,16 +238,68 @@ jmp .Lresident_dispatch_cpuid_vmx_pair
 mov rax, qword ptr [r8 + {b_pt_code_base}]
 mov rdx, qword ptr [r8 + {b_pt_code_bytes}]
 jmp .Lresident_dispatch_cpuid_vmx_pair
+.Lresident_pt_snapshot:
+cmp r8, r12
+jne .Lresident_dispatch_cpuid_diagnostic_zero
+cmp qword ptr [r8 + {b_pt_owned}], 0
+jne .Lresident_dispatch_cpuid_diagnostic_zero
+// Diagnostic exits have already drained PT. Copy the ring once, then leave
+// tracing armed while userspace exports this separate immutable snapshot.
+push rsi
+push rdi
+mov rsi, qword ptr [r8 + {b_pt_buffer}]
+mov rdi, qword ptr [r8 + {b_pt_snapshot}]
+mov r10, qword ptr [r8 + {b_pt_output_pointer}]
+shr r10, 32
+cmp r10, {pt_buffer_bytes}
+ja .Lresident_pt_snapshot_invalid
+mov rcx, qword ptr [r8 + {b_pt_bytes}]
+cmp rcx, {pt_buffer_bytes}
+ja .Lresident_pt_snapshot_invalid
+test rcx, rcx
+jz .Lresident_pt_snapshot_empty
+cmp r10, rcx
+ja .Lresident_pt_snapshot_invalid
+.Lresident_pt_snapshot_empty:
+mov qword ptr [r8 + {b_pt_snapshot_pointer}], r10
+mov qword ptr [r8 + {b_pt_snapshot_bytes}], rcx
+test rcx, rcx
+jz .Lresident_pt_snapshot_copied
+add rsi, r10
+sub rcx, r10
+rep movsb
+mov rsi, qword ptr [r8 + {b_pt_buffer}]
+mov rcx, r10
+rep movsb
+.Lresident_pt_snapshot_copied:
+inc qword ptr [r8 + {b_pt_snapshot_sequence}]
+pop rdi
+pop rsi
+jmp .Lresident_pt_query
+.Lresident_pt_snapshot_invalid:
+pop rdi
+pop rsi
+jmp .Lresident_dispatch_cpuid_diagnostic_zero
+.Lresident_pt_snapshot_identity:
+mov rax, qword ptr [r8 + {b_pt_snapshot_sequence}]
+mov rdx, qword ptr [r8 + {b_pt_snapshot_pointer}]
+jmp .Lresident_dispatch_cpuid_vmx_pair
 .Lresident_pt_data:
+mov r10, qword ptr [r8 + {b_pt_snapshot}]
+mov r11, qword ptr [r8 + {b_pt_snapshot_bytes}]
+test r11, r11
+jnz .Lresident_pt_data_ready
 cmp qword ptr [r8 + {b_pt_armed}], 0
 jne .Lresident_dispatch_cpuid_diagnostic_zero
 cmp qword ptr [r8 + {b_pt_owned}], 0
 jne .Lresident_dispatch_cpuid_diagnostic_zero
+mov r10, qword ptr [r8 + {b_pt_buffer}]
+mov r11, qword ptr [r8 + {b_pt_bytes}]
+.Lresident_pt_data_ready:
 sub ecx, {pt_data_subleaf}
 shl ecx, 4
-cmp rcx, qword ptr [r8 + {b_pt_bytes}]
+cmp rcx, r11
 jae .Lresident_dispatch_cpuid_diagnostic_zero
-mov r10, qword ptr [r8 + {b_pt_buffer}]
 mov rax, qword ptr [r10 + rcx]
 mov rdx, qword ptr [r10 + rcx + 8]
 jmp .Lresident_dispatch_cpuid_vmx_pair

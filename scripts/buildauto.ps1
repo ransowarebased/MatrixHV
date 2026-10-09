@@ -18,7 +18,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$BuildRoot = 'D:\Projetos\MatrixHV\builds'
+$BuildRoot = Join-Path $ProjectRoot 'builds'
 $TargetTriple = 'x86_64-unknown-uefi'
 $BinaryName = 'MatrixHV'
 $ManifestPath = Join-Path $ProjectRoot 'Cargo.toml'

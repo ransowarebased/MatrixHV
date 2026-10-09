@@ -205,6 +205,7 @@ impl Session {
 }
 
 pub(crate) trait InterceptionMemory: PhysicalMemory {
+    fn check_budget(&self) -> Result<(), Error>;
     fn syscall_context(&self) -> [u64; 3];
     fn quiesce(&mut self) -> Result<(), Error>;
     fn flush(&mut self);
@@ -232,17 +233,11 @@ fn expired(session: &Session, now: u64) -> bool {
 }
 
 fn lock_refresh(session: &Session) -> Result<(), Error> {
-    for _ in 0..100_000 {
-        if session
-            .refresh_lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Ok(());
-        }
-        core::hint::spin_loop();
-    }
-    Err(Error::Busy)
+    // The owner may be in a guest MTF window waiting for this CPU. Root must
+    // never spin on that owner; callers either defer refresh or revoke safely.
+    session.refresh_lock.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .map(|_| ())
+        .map_err(|_| Error::Busy)
 }
 
 #[cfg(target_os = "uefi")]
@@ -357,6 +352,7 @@ fn retire_splits(
     // Restore PTs before PDs. Only tables allocated by this session are owned.
     for shift in [21, 30] {
         for (slot, split) in splits.iter_mut().enumerate() {
+            memory.check_budget()?;
             if split.retired_epoch != 0 || split.shift != shift {
                 continue;
             }
@@ -376,6 +372,9 @@ fn retire_splits(
             let mut accessed_dirty = (parent | split.original) & 0x300;
             let mut uniform = true;
             for index in 0..512 {
+                if index % 64 == 0 {
+                    memory.check_budget()?;
+                }
                 let entry = memory.table_entry(table + index * 8)?;
                 let expected = (split.gpa + index * (size / 512)) | attributes;
                 if entry & !0x300 != expected & !0x300 {
@@ -521,6 +520,9 @@ fn leaf(
             };
             let attributes = entry & !MASK & if shift == 21 { !128 } else { u64::MAX };
             for index in 0..512 {
+                if index % 64 == 0 {
+                    memory.check_budget()?;
+                }
                 memory.store_entry(
                     child + index * 8,
                     (base + index * (size / 512)) | attributes,
@@ -578,6 +580,9 @@ fn copy_table(
     destination: u64,
 ) -> Result<(), Error> {
     for index in 0..512 {
+        if index % 64 == 0 {
+            memory.check_budget()?;
+        }
         memory.store_entry(
             destination + index * 8,
             memory.table_entry(source + index * 8)?,
@@ -679,6 +684,7 @@ fn install(
     configuration.patch_mask.fill([0; 64]);
     let mut page_count = 0;
     for hook in hooks {
+        memory.check_budget()?;
         let address = hook.address;
         let length = hook.length;
         let private_page = private_data && address == 0x7ffe0000;
@@ -767,6 +773,7 @@ fn install(
     configuration.timing = u64::from(flags & INTERCEPT_TSC_OFFSET != 0);
     configuration.options = flags;
     cpu_views(configuration, memory, page_count)?;
+    memory.check_budget()?;
     // Revoke the write bit only after all descriptors and private roots pass.
     let mut original_entries = [0; HOOK_MAX_PAGES];
     for (index, entry) in original_entries[..page_count].iter_mut().enumerate() {
@@ -817,6 +824,9 @@ fn refresh_page(
     memory.read(configuration.pages[index], &mut original)?;
     let mut merged = original;
     for (chunk_index, chunk) in merged.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        if chunk_index % 32 == 0 {
+            memory.check_budget()?;
+        }
         let patched = memory
             .table_entry(shadow + chunk_index as u64 * 8)?
             .to_le_bytes();
@@ -1332,7 +1342,8 @@ pub(crate) unsafe fn execute(
             && operation != INTERCEPT_CONTEXT_LIST
         {
             memory.quiesce()?;
-            let result = (|| {
+            let mut result = (|| {
+                memory.check_budget()?;
                 if !reclaim_splits(session, memory)
                     && matches!(operation, HOOK_INSTALL | HOOK_ADD | HOOK_DROP)
                 {
@@ -1603,6 +1614,14 @@ pub(crate) unsafe fn execute(
                 }
                 Ok(())
             })();
+            // A timed-out builder must never publish an active profile after
+            // peers have abandoned the rendezvous. Cleanup remains permitted.
+            if memory.check_budget().is_err() {
+                session.cause.store(u64::from(INTERCEPT_CAUSE_RENDEZVOUS), Ordering::Release);
+                session.active.store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
+                result = restore_base(unsafe { &*session.configuration.get() }, memory)
+                    .and(Err(Error::Busy));
+            }
             memory.flush();
             memory.resume();
             result?;
@@ -1798,8 +1817,8 @@ pub(crate) mod runtime {
             if write(*field, *value).is_err() {
                 for prior in (0..index).rev() {
                     if write(values[prior].0, saved[prior]).is_err() {
-                        // A partial privilege transition must halt rather than
-                        // pass through the ordinary base-profile recovery.
+                        // A partial privilege transition requires a platform
+                        // reset instead of ordinary base-profile recovery.
                         return Ok(u64::MAX);
                     }
                 }
@@ -1869,7 +1888,9 @@ pub(crate) mod runtime {
             let rate = unsafe { &*session.configuration.get() }.timer_rate;
             let mut ticks = (remaining >> rate).clamp(2, u64::from(u32::MAX));
             let configuration = unsafe { &*session.configuration.get() };
-            if configuration.options & INTERCEPT_PRIVATE_SHARED_DATA != 0 {
+            if configuration.options & INTERCEPT_PRIVATE_SHARED_DATA != 0
+                && root_matches(configuration, read(GUEST_CR3)?)
+            {
                 ticks = ticks.min(((session.tsc_hz.load(Ordering::Acquire) / 1000) >> rate).max(2));
             }
             if cpu.timer_pin != 0 && boot.diagnostic_interval_tsc != 0 {
@@ -1929,14 +1950,18 @@ pub(crate) mod runtime {
     fn invalidate(ept: u64) -> Result<(), ()> {
         #[repr(C, align(16))]
         struct Descriptor([u64; 2]);
-        let descriptor = Descriptor([ept, 0]);
-        let failed: u8;
-        unsafe {
-            core::arch::asm!("invept {kind}, [{descriptor}]", "setna {failed}",
-                kind = in(reg) 1u64, descriptor = in(reg) &descriptor,
-                failed = lateout(reg_byte) failed, options(nostack));
+        for (kind, descriptor) in [(1u64, Descriptor([ept, 0])), (2, Descriptor([0, 0]))] {
+            let failed: u8;
+            unsafe {
+                core::arch::asm!("invept {kind}, [{descriptor}]", "setna {failed}",
+                    kind = in(reg) kind, descriptor = in(reg) &descriptor,
+                    failed = lateout(reg_byte) failed, options(nostack));
+            }
+            if failed == 0 {
+                return Ok(());
+            }
         }
-        if failed == 0 { Ok(()) } else { Err(()) }
+        Err(())
     }
 
     fn entry_bits(pointer: u64, set: u64, clear: u64) {
@@ -1965,7 +1990,7 @@ pub(crate) mod runtime {
         }
     }
 
-    fn refresh(configuration: &RoadEptProfile) -> Result<(), Error> {
+    fn refresh(configuration: &RoadEptProfile, boot: &mut ResidentBootContext, synchronize: Synchronize) -> Result<(), Error> {
         // Original writes are serialized across the full MTF window. Validate
         // all pages before publishing bytes so a conflict cannot partially merge.
         for index in 0..configuration.hook_count {
@@ -1974,6 +1999,9 @@ pub(crate) mod runtime {
             let shadow = bank_base(configuration) + (INTERCEPT_TABLE_PAGES + index) as u64 * 4096;
             let baseline = baseline_page(configuration, index);
             for offset in 0..4096 {
+                if offset % 256 == 0 && unsafe { synchronize(boot as *mut _ as u64, 3) } == 0 {
+                    return Err(Error::Busy);
+                }
                 merge_byte(
                     page_byte(baseline + offset, None),
                     page_byte(original + offset, None),
@@ -1989,6 +2017,9 @@ pub(crate) mod runtime {
             let shadow = bank_base(configuration) + (INTERCEPT_TABLE_PAGES + index) as u64 * 4096;
             let baseline = baseline_page(configuration, index);
             for offset in 0..4096 {
+                if offset % 256 == 0 && unsafe { synchronize(boot as *mut _ as u64, 3) } == 0 {
+                    return Err(Error::Busy);
+                }
                 let current = page_byte(original + offset, None);
                 let merged = merge_byte(
                     page_byte(baseline + offset, None),
@@ -2059,10 +2090,10 @@ pub(crate) mod runtime {
                 for pointer in data_leaves(configuration, boot.processor_number as usize) {
                     entry_bits(*pointer, 0, 6);
                 }
-                if refresh(configuration).is_err() {
+                if let Err(error) = refresh(configuration, boot, synchronize) {
                     session
                         .cause
-                        .store(u64::from(INTERCEPT_CAUSE_MERGE), Ordering::Release);
+                        .store(u64::from(if error == Error::Busy { INTERCEPT_CAUSE_RENDEZVOUS } else { INTERCEPT_CAUSE_MERGE }), Ordering::Release);
                     session
                         .active
                         .store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
@@ -2481,14 +2512,21 @@ pub(crate) mod runtime {
         if !no_flush && read(SECONDARY_VM_EXEC_CONTROL)? & (1 << 5) != 0 {
             #[repr(C, align(16))]
             struct Descriptor([u64; 2]);
-            let descriptor = Descriptor([read(VIRTUAL_PROCESSOR_ID)?, 0]);
-            let failed: u8;
-            unsafe {
-                core::arch::asm!("invvpid {kind}, [{descriptor}]", "setna {failed}",
-                    kind = in(reg) 1u64, descriptor = in(reg) &descriptor,
-                    failed = lateout(reg_byte) failed, options(nostack));
+            let vpid = read(VIRTUAL_PROCESSOR_ID)?;
+            let mut invalidated = false;
+            for (kind, descriptor) in [(1u64, Descriptor([vpid, 0])), (2, Descriptor([0, 0]))] {
+                let failed: u8;
+                unsafe {
+                    core::arch::asm!("invvpid {kind}, [{descriptor}]", "setna {failed}",
+                        kind = in(reg) kind, descriptor = in(reg) &descriptor,
+                        failed = lateout(reg_byte) failed, options(nostack));
+                }
+                if failed == 0 {
+                    invalidated = true;
+                    break;
+                }
             }
-            if failed != 0 {
+            if !invalidated {
                 return Err(());
             }
         }
@@ -2577,13 +2615,22 @@ pub(crate) mod runtime {
         execution: &mut [u8; 15],
         original: &mut [u8; 15],
     ) -> usize {
-        crate::memory::access::resident::instruction_bytes(
+        let Ok(cr3) = read(GUEST_CR3) else {
+            return 0;
+        };
+        let count = crate::memory::access::resident::instruction_bytes(
             boot,
             configuration,
             rip,
             execution,
             original,
-        )
+        );
+        // Base EPT write guards also trap unregistered processes, whose
+        // instruction fetches use the original page rather than the shadow.
+        if !root_matches(configuration, cr3) {
+            execution[..count].copy_from_slice(&original[..count]);
+        }
+        count
     }
 
     fn original_value(address: u64, width: usize, value: Option<u64>) -> u64 {
@@ -2778,6 +2825,12 @@ pub(crate) mod runtime {
         })
     }
 
+    enum Emulation {
+        Unsupported,
+        Completed,
+        Fatal,
+    }
+
     // Emulate scalar patched instructions against the GPA already translated by
     // hardware. No speculative guest walks, partial cross-page writes or MMIO.
     fn emulate_mixed(
@@ -2785,7 +2838,7 @@ pub(crate) mod runtime {
         frame: &mut [u64],
         instruction: &yaxpeax_x86::long_mode::Instruction,
         length: u64,
-    ) -> Result<bool, ()> {
+    ) -> Result<Emulation, ()> {
         use yaxpeax_x86::long_mode::{Opcode, Operand};
         let opcode = instruction.opcode();
         if instruction.operand_count() != 2
@@ -2795,7 +2848,7 @@ pub(crate) mod runtime {
             || read(GUEST_DR7)? & 0xff != 0
             || boot.interception.data_qualification & 0x180 != 0x180
         {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         }
         if !matches!(
             opcode,
@@ -2811,7 +2864,7 @@ pub(crate) mod runtime {
                 | Opcode::XOR
                 | Opcode::TEST
         ) {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         }
         let left = instruction.operand(0);
         let right = instruction.operand(1);
@@ -2820,30 +2873,31 @@ pub(crate) mod runtime {
         } else if right.is_memory() && !left.is_memory() {
             1
         } else {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         };
         let Some(size) = instruction.mem_size() else {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         };
         let Some(width) = size.bytes_size() else {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         };
         let width = usize::from(width);
         if ![1, 2, 4, 8].contains(&width) {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         }
         let address = boot.interception.data_address;
         if width > 4096 - (address as usize & 4095)
             || effective_address(frame, instruction, memory_index, length).ok()
                 != Some(boot.interception.data_linear)
         {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         }
         if read(GUEST_CS_AR_BYTES)? & 0x2000 == 0 {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         }
         let mask = u64::MAX >> (64 - width * 8);
-        let mut flags = read(GUEST_RFLAGS)?;
+        let saved_flags = read(GUEST_RFLAGS)?;
+        let mut flags = saved_flags;
         let memory = original_value(address, width, None);
         let operand_value = |operand: &Operand| -> Result<u64, ()> {
             if operand.is_memory() {
@@ -2856,16 +2910,16 @@ pub(crate) mod runtime {
         };
         let a = match operand_value(&left) {
             Ok(value) => value & mask,
-            Err(()) => return Ok(false),
+            Err(()) => return Ok(Emulation::Unsupported),
         };
         let b = match operand_value(&right) {
             Ok(value) => value & mask,
-            Err(()) => return Ok(false),
+            Err(()) => return Ok(Emulation::Unsupported),
         };
         // Reject non-GPR destinations before writing any architectural state.
         if let Operand::Register { reg } = &left {
             if register_location(*reg).is_none() {
-                return Ok(false);
+                return Ok(Emulation::Unsupported);
             }
         }
         let sign = 1u64 << (width * 8 - 1);
@@ -2879,7 +2933,7 @@ pub(crate) mod runtime {
             Opcode::AND | Opcode::TEST => a & b,
             Opcode::OR => a | b,
             Opcode::XOR => a ^ b,
-            _ => return Ok(false),
+            _ => return Ok(Emulation::Unsupported),
         };
         if !matches!(
             opcode,
@@ -2917,68 +2971,84 @@ pub(crate) mod runtime {
                 }
             }
         }
-        if !matches!(opcode, Opcode::CMP | Opcode::TEST) {
-            if memory_index == 0 {
-                if boot.interception.data_qualification & 2 == 0 {
-                    return Ok(false);
-                }
-                original_value(address, width, Some(result));
-            } else if let Operand::Register { reg } = left {
-                set_register(frame, reg, result)?;
-            } else {
-                return Ok(false);
+        let stores_result = !matches!(opcode, Opcode::CMP | Opcode::TEST);
+        if stores_result && memory_index == 0 && boot.interception.data_qualification & 2 == 0 {
+            return Ok(Emulation::Unsupported);
+        }
+        let saved_interruptibility = read(GUEST_INTERRUPTIBILITY_INFO)?;
+        let saved_rip = read(GUEST_RIP)?;
+        let values = [
+            (GUEST_RFLAGS, flags & !0x10000, saved_flags),
+            (GUEST_INTERRUPTIBILITY_INFO, saved_interruptibility & !3, saved_interruptibility),
+            (GUEST_RIP, saved_rip.wrapping_add(length), saved_rip),
+        ];
+        let restore = |count: usize| {
+            let mut restored = true;
+            for (field, _, saved) in values[..count].iter().rev() {
+                restored &= write(*field, *saved).is_ok();
+            }
+            restored
+        };
+        // Commit fallible VMCS updates before touching guest data. Recovery
+        // may retry the instruction only after every completed write is undone.
+        for (index, (field, value, _)) in values.iter().enumerate() {
+            if write(*field, *value).is_err() {
+                return if restore(index) { Err(()) } else { Ok(Emulation::Fatal) };
             }
         }
-        write(GUEST_RFLAGS, flags & !0x10000)?;
-        write(
-            GUEST_INTERRUPTIBILITY_INFO,
-            read(GUEST_INTERRUPTIBILITY_INFO)? & !3,
-        )?;
-        write(GUEST_RIP, read(GUEST_RIP)?.wrapping_add(length))?;
-        Ok(true)
+        if stores_result {
+            if memory_index == 0 {
+                original_value(address, width, Some(result));
+            } else if let Operand::Register { reg } = left {
+                if set_register(frame, reg, result).is_err() {
+                    return if restore(values.len()) { Err(()) } else { Ok(Emulation::Fatal) };
+                }
+            }
+        }
+        Ok(Emulation::Completed)
     }
 
     fn emulate_scalar_read(
         boot: &mut ResidentBootContext,
         configuration: &RoadEptProfile,
         frame: &mut [u64],
-    ) -> Result<bool, ()> {
+    ) -> Result<Emulation, ()> {
         use yaxpeax_arch::LengthedInstruction;
         use yaxpeax_x86::long_mode::{InstDecoder, Opcode, Operand};
         if boot.interception.data_qualification & 7 != 1
             || read(GUEST_CS_AR_BYTES)? & 0x2000 == 0
         {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         }
         let mut execution = [0; 15];
         let mut original = [0; 15];
         let rip = read(GUEST_RIP)?;
         let count = fetch_instruction(boot, configuration, rip, &mut execution, &mut original);
         let Ok(instruction) = InstDecoder::default().decode_slice(&execution[..count]) else {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         };
         if !matches!(instruction.opcode(), Opcode::MOV | Opcode::MOVZX | Opcode::MOVSX | Opcode::MOVSXD)
             || !matches!(instruction.operand(0), Operand::Register { .. })
             || !instruction.operand(1).is_memory()
         {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         }
         let Some(width) = instruction.mem_size().and_then(|size| size.bytes_size()) else {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         };
         if ![1, 2, 4, 8].contains(&width)
             || boot.interception.data_address % u64::from(width) != 0
         {
-            return Ok(false);
+            return Ok(Emulation::Unsupported);
         }
         // A scalar load has no shared EPT mutation and requires no parked peer,
         // refresh merge, or guest MTF instruction window.
-        if emulate_mixed(boot, frame, &instruction, instruction.len().to_const() as u64)? {
+        let outcome = emulate_mixed(boot, frame, &instruction, instruction.len().to_const() as u64)?;
+        if matches!(outcome, Emulation::Completed) {
             boot.interception.cooperative_data = 0;
             boot.interception.data_pending = 0;
-            return Ok(true);
         }
-        Ok(false)
+        Ok(outcome)
     }
 
     fn mixed_access(
@@ -2991,8 +3061,10 @@ pub(crate) mod runtime {
         // Shared roots park peers; private roots own refresh serialization across
         // the instruction window so original data and snapshots remain stable.
         let configuration = unsafe { &*session.configuration.get() };
-        if emulate_scalar_read(boot, configuration, frame)? {
-            return Ok(1);
+        match emulate_scalar_read(boot, configuration, frame)? {
+            Emulation::Completed => return Ok(1),
+            Emulation::Fatal => return Ok(u64::MAX),
+            Emulation::Unsupported => {}
         }
         let mut execution = [0; 15];
         let mut original = [0; 15];
@@ -3061,8 +3133,8 @@ pub(crate) mod runtime {
         }
         if concurrent {
             if lock_refresh(session).is_err() {
-                session.cause.store(u64::from(INTERCEPT_CAUSE_RENDEZVOUS), Ordering::Release);
-                revoke(session, boot, synchronize)?;
+                // Keep this CPU's write guard closed while the owner finishes
+                // its MTF window. Reentry retries without spinning in root.
                 return Ok(1);
             }
             boot.interception.refresh_owned = 1;
@@ -3083,11 +3155,15 @@ pub(crate) mod runtime {
                 if let Ok(instruction) =
                     yaxpeax_x86::long_mode::InstDecoder::default().decode_slice(&execution[..count])
                 {
-                    if emulate_mixed(boot, frame, &instruction, length as u64)? {
-                        if refresh(configuration).is_err() {
+                    let outcome = emulate_mixed(boot, frame, &instruction, length as u64)?;
+                    if matches!(outcome, Emulation::Fatal) {
+                        return Ok(u64::MAX);
+                    }
+                    if matches!(outcome, Emulation::Completed) {
+                        if let Err(error) = refresh(configuration, boot, synchronize) {
                             session
                                 .cause
-                                .store(u64::from(INTERCEPT_CAUSE_MERGE), Ordering::Release);
+                                .store(u64::from(if error == Error::Busy { INTERCEPT_CAUSE_RENDEZVOUS } else { INTERCEPT_CAUSE_MERGE }), Ordering::Release);
                             session
                                 .active
                                 .store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
@@ -3127,6 +3203,7 @@ pub(crate) mod runtime {
         boot: &mut ResidentBootContext,
         configuration: &RoadEptProfile,
         index: usize,
+        frame: &mut [u64],
     ) -> Result<u64, ()> {
         let cpu_index = boot.processor_number as usize;
         let private = configuration.cpu_data[cpu_index];
@@ -3166,6 +3243,26 @@ pub(crate) mod runtime {
         let length = instruction.len().to_const() as usize;
         if execution[..length] != original[..length] {
             return Err(());
+        }
+        // Common clock and feature loads can complete without an EPT window.
+        // Select the same CPL-specific backing page as the hardware fallback.
+        use yaxpeax_x86::long_mode::Opcode;
+        if access == 1 && matches!(instruction.opcode(), Opcode::MOV | Opcode::MOVZX | Opcode::MOVSX | Opcode::MOVSXD) {
+            let physical = read(GUEST_PHYSICAL_ADDRESS)?;
+            let width = instruction.mem_size().and_then(|size| size.bytes_size()).unwrap_or(0);
+            if matches!(width, 1 | 2 | 4 | 8) && physical % u64::from(width) == 0 {
+                boot.interception.data_address = target + (physical & 4095);
+                boot.interception.data_linear = read(GUEST_LINEAR_ADDRESS)?;
+                boot.interception.data_qualification = boot.last_qualification;
+                match emulate_mixed(boot, frame, &instruction, length as u64)? {
+                    Emulation::Completed => {
+                        session.data_exits.fetch_add(1, Ordering::Relaxed);
+                        return Ok(1);
+                    }
+                    Emulation::Fatal => return Ok(u64::MAX),
+                    Emulation::Unsupported => {}
+                }
+            }
         }
         let pointer = configuration.cpu_leaves[cpu_index][index];
         shared_entry(pointer, target, if access & 2 != 0 { 3 } else { 1 });
@@ -3234,9 +3331,6 @@ pub(crate) mod runtime {
             }
         }
         if reason == 37 && stepped {
-            if boot.telemetry_active != 0 {
-                boot.mtf_exits += 1;
-            }
             return Ok(1);
         }
         if reason == 48 {
@@ -3267,16 +3361,22 @@ pub(crate) mod runtime {
                     if let Some(index) = configuration.pages[..configuration.hook_count].iter()
                         .enumerate().find_map(|(index, page)| (*page == gpa && configuration.base_leaves[index] == 0).then_some(index))
                     {
-                        return shared_data_access(session, boot, configuration, index);
+                        return shared_data_access(session, boot, configuration, index, frame);
                     }
                     boot.interception.data_address = read(GUEST_PHYSICAL_ADDRESS)?;
                     boot.interception.data_linear = read(GUEST_LINEAR_ADDRESS)?;
                     boot.interception.data_qualification = boot.last_qualification;
                     let writing = access & 2 != 0;
                     let concurrent = configuration.options & INTERCEPT_CONCURRENT_WRITES != 0;
-                    if !writing && emulate_scalar_read(boot, configuration, frame)? {
-                        session.data_exits.fetch_add(1, Ordering::Relaxed);
-                        return Ok(1);
+                    if !writing {
+                        match emulate_scalar_read(boot, configuration, frame)? {
+                            Emulation::Completed => {
+                                session.data_exits.fetch_add(1, Ordering::Relaxed);
+                                return Ok(1);
+                            }
+                            Emulation::Fatal => return Ok(u64::MAX),
+                            Emulation::Unsupported => {}
+                        }
                     }
                     if configuration.options & INTERCEPT_PERSISTENT_DATA != 0 {
                         boot.interception.cooperative_data = 1;
@@ -3294,11 +3394,8 @@ pub(crate) mod runtime {
                         }
                         if concurrent {
                             if lock_refresh(session).is_err() {
-                                session.cause.store(
-                                    u64::from(INTERCEPT_CAUSE_RENDEZVOUS),
-                                    Ordering::Release,
-                                );
-                                revoke(session, boot, synchronize)?;
+                                // Contention is transient; the private data
+                                // view still denies writes on this CPU.
                                 return Ok(1);
                             }
                             boot.interception.refresh_owned = 1;
@@ -3475,7 +3572,15 @@ pub(crate) mod runtime {
         let event = unsafe { &*(boot.event_context as *const ResidentEventContext) };
         let session = unsafe { &*(event.interception_context_physical as *const Session) };
         diagnostic_attempt(boot, phase as usize);
-        let result = match phase {
+        // The VMX preemption timer runs only in non-root. Charge callbacks to
+        // the dispatcher's existing root budget before starting optional work.
+        let budget_expired = matches!(phase, 0 | 1)
+            && session.is_active()
+            && unsafe { synchronize(boot as *mut _ as u64, 3) } == 0;
+        let result = if budget_expired {
+            session.cause.store(u64::from(INTERCEPT_CAUSE_RENDEZVOUS), Ordering::Release);
+            Err(())
+        } else { match phase {
             0 => dispatch(
                 session,
                 boot,
@@ -3547,9 +3652,17 @@ pub(crate) mod runtime {
             4 => observe_exit(session, boot, synchronize).map(|()| 0),
             5 => compensate_timing(session, boot).map(|()| 0),
             _ => Err(()),
-        };
+        } };
         diagnostic_result(boot, phase as usize, result.as_ref().is_ok_and(|value| *value != u64::MAX));
         match result {
+            Ok(u64::MAX) => {
+                let _ = session.cause.compare_exchange(
+                    u64::from(INTERCEPT_CAUSE_NONE), u64::from(INTERCEPT_CAUSE_RUNTIME),
+                    Ordering::AcqRel, Ordering::Acquire,
+                );
+                session.active.store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
+                u64::MAX
+            }
             Ok(value) => value,
             Err(()) => {
                 if session.cause.load(Ordering::Acquire) == u64::from(INTERCEPT_CAUSE_NONE) {
@@ -3566,7 +3679,15 @@ pub(crate) mod runtime {
                 let retired = revoke(session, boot, synchronize)
                     .and_then(|()| apply(session, boot, synchronize));
                 diagnostic_result(boot, 6, retired.is_ok());
-                if retired.is_ok() { 0 } else { u64::MAX }
+                if retired.is_err() {
+                    u64::MAX
+                } else if phase == 0 && boot.last_reason & 0xffff == 48 {
+                    // A recovered EPT fault must reexecute on the restored base;
+                    // forwarding it would reach the unexpected-violation reset.
+                    1
+                } else {
+                    0
+                }
             }
         }
     }

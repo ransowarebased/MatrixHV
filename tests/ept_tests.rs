@@ -567,6 +567,9 @@ mod sync {
         clock_ticks: AtomicU64,
         clock_step: AtomicU64,
         cancel_on_send: AtomicU64,
+        watchdog_phase: AtomicU64,
+        watchdog_sequence: AtomicU64,
+        telemetry_active: u64,
     }
 
     impl Context {
@@ -610,6 +613,9 @@ mod sync {
                 clock_ticks: AtomicU64::new(1),
                 clock_step: AtomicU64::new(1),
                 cancel_on_send: AtomicU64::new(0),
+                watchdog_phase: AtomicU64::new(1),
+                watchdog_sequence: AtomicU64::new(0),
+                telemetry_active: 1,
             }
         }
     }
@@ -708,6 +714,9 @@ mod sync {
         event_cpu_contexts = const std::mem::offset_of!(Event, cpus),
         b_nested_eptp_sync_ack = const std::mem::offset_of!(Context, ack),
         b_nested_eptp_sync_safe = const std::mem::offset_of!(Context, safe),
+        b_watchdog_phase = const std::mem::offset_of!(Context, watchdog_phase),
+        b_watchdog_sequence = const std::mem::offset_of!(Context, watchdog_sequence),
+        b_telemetry_active = const std::mem::offset_of!(Context, telemetry_active),
         b_nested_eptp_sync_nmi = const std::mem::offset_of!(Context, pending_nmi),
         b_last_reason = const std::mem::offset_of!(Context, reason),
         exit_intr_info = const 0,
@@ -957,13 +966,21 @@ mod sync {
                 });
                 let ready = until(|| unsafe { sync_ready(&*owner) } == 1);
                 let early_return = returned.load(Ordering::Acquire);
+                let observed_phase = peer.watchdog_phase.load(Ordering::Acquire);
+                let observed_sequence = peer.watchdog_sequence.load(Ordering::Acquire);
                 unsafe { sync_end(&*owner) };
                 assert!(ready);
                 assert_eq!(early_return, 0);
+                if safe == 1 {
+                    assert_eq!(observed_phase, 4);
+                    assert_eq!(observed_sequence & 1, 1);
+                }
             });
             assert_eq!(peer.safe.load(Ordering::Acquire), 1);
             assert_eq!(peer.pending_nmi.load(Ordering::Acquire), 0);
             assert_eq!(unsafe { sync_host_nmi(&*peer) }, 0);
+            assert_eq!(peer.watchdog_phase.load(Ordering::Acquire), 1);
+            assert_eq!(peer.watchdog_sequence.load(Ordering::Acquire) & 1, 0);
         }
     }
 

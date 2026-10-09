@@ -1,3 +1,32 @@
+mod telemetry_cleanup {
+    use crate::telemetry::{CaptureOptions, Control, Mode, capture};
+    use std::time::Duration;
+
+    #[test]
+    fn a_partially_failed_initial_watchdog_start_still_stops_every_selected_cpu() {
+        let mut controls = Vec::new();
+        let result = capture(
+            CaptureOptions {
+                mode: Mode::Watchdog,
+                seconds: None,
+                interval: Duration::from_millis(200),
+                output: None,
+            },
+            |mode, control| {
+                assert_eq!(mode, Mode::Watchdog);
+                controls.push(control as u32);
+                if matches!(control, Control::Start) {
+                    Err("partial start".into())
+                } else {
+                    Ok(String::new())
+                }
+            },
+        );
+        assert_eq!(result, Err("partial start".into()));
+        assert_eq!(controls, [Control::Start as u32, Control::Stop as u32]);
+    }
+}
+
 mod transport {
     use crate::server::protocol::{
         MAX_FRAME_SIZE, ProtocolError, Request, RequestKind, Response, read_request, read_response,

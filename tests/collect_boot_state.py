@@ -268,13 +268,14 @@ try:
         if values["intel_pt.table"]:
             table = values["intel_pt.table"]
             buffer = values["intel_pt.buffer"]
-            if table & 0xFFF or buffer & 0xFFFF:
+            snapshot = values["intel_pt.snapshot"]
+            if table & 0xFFF or buffer & 0xFFFF or snapshot != buffer + 65536:
                 raise RuntimeError("Intel PT allocations are misaligned")
             topa_data = idc.get_bytes(table, 16, True)
             if topa_data is None or len(topa_data) != 16:
                 raise RuntimeError("Cannot read Intel PT ToPA entries")
             topa_entries = struct.unpack("<2Q", topa_data)
-            if topa_entries != (buffer | (4 << 6) | (1 << 4), table | 1):
+            if topa_entries != (buffer | (4 << 6), table | 1):
                 raise RuntimeError("Intel PT ToPA entries are invalid")
             values["intel_pt.topa_data_entry"] = topa_entries[0]
             values["intel_pt.topa_end_entry"] = topa_entries[1]

@@ -296,8 +296,13 @@ call .Lresident_interception_callback
     mov qword ptr [rsp + 8], 0
     mov eax, 1
     invept rax, xmmword ptr [rsp]
+    ja .Lresident_cache_invalidated
+    mov qword ptr [rsp], 0
+    mov eax, 2
+    invept rax, xmmword ptr [rsp]
+.Lresident_cache_invalidated:
     lea rsp, [rsp + 16]
-    jna .Lresident_dispatch_halt
+    jna .Lresident_invalidation_failed
     resident_telemetry_counter inc, {b_invept_exits}, {b_telemetry_active}
     cmp qword ptr [r12 + {b_nested_ept02_cache_initialized}], 0
     je .Lresident_cache_synced

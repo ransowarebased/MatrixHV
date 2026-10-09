@@ -78,11 +78,12 @@ def read_resident_assembly(project: Path) -> str:
                     expected = "one" if name.startswith("matrixhv_") else "at least one"
                     raise ValueError(f"Expected {expected} resident expansion for {name}, found {count}")
             result = "\n".join(helpers) + island
+            result = result.replace("jna .Lresident_invalidation_failed", "jna .Lresident_dispatch_halt")
             # Component harnesses omit the relocated Rust interception service;
             # its entry/exit behavior is exercised by the dedicated runtime suite.
             # The optional PT state machine has a dedicated modeled MSR suite.
             result = re.sub(r"call \.Lresident_pt_(?:enter|leave|guest_msr|freeze)", "nop", result)
-            result = re.sub(r"(?<=\.Lresident_dispatch_cpuid_diagnostic_extended:\n).*?\.Lresident_pt_query_range_done:\n", "", result, flags=re.S)
+            result = re.sub(r"cmp ecx, \{pt_subleaf\}\n.*?\.Lresident_pt_query_range_done:\n", "", result, flags=re.S)
             result = result.replace("call .Lresident_interception_callback", "xor eax, eax")
             result = result.replace("call .Lresident_interception_safe_point_timer", "xor eax, eax")
             hyperv = (project / "src/vmx/hyperv.rs").read_text(encoding="utf-8")
@@ -208,9 +209,12 @@ def prepare_eptp_sync(project: Path):
     output.mkdir(parents=True, exist_ok=True)
     source = (project / "src/vmx/asm/eptp_switch.S").read_text()
     source = source.replace("call .Lresident_interception_callback", "call .Ltest_interception_callback")
+    source = source.replace("call .Lresident_interception_clock_commit", "mov edx, 5\ncall .Ltest_interception_callback")
+    source = source.replace("call .Lresident_watchdog_resuming", "mov qword ptr [r12 + {b_watchdog_phase}], 1\ninc qword ptr [r12 + {b_watchdog_sequence}]")
     start = source.index(".Lresident_nested_eptp_sync_acquire:")
     end = source.index(".endm", start)
     assembly = source[start:end]
+    assembly = assembly.replace("jna .Lresident_invalidation_failed", "jna .Lresident_dispatch_halt")
     assembly = assembly.replace(
         "rdtsc",
         "cmp qword ptr [r12 + {test_clock_enabled}], 0\n"
@@ -224,7 +228,7 @@ def prepare_eptp_sync(project: Path):
     state_start = source.index(".macro matrixhv_resident_eptp_switch_state")
     state_start = source.index("\n", state_start) + 1
     assembly += source[state_start:source.index(".endm", state_start)]
-    assert assembly.count("invept rax, xmmword ptr [rsp]") == 1
+    assert assembly.count("invept rax, xmmword ptr [rsp]") == 2
     assembly = assembly.replace(
         "invept rax, xmmword ptr [rsp]",
         "mov qword ptr [r12 + {test_flushed_ept}], r11\n"
@@ -267,6 +271,12 @@ def prepare_logger(project: Path):
     toggle = item(runtime, "pub fn set_enabled(")
     active_backend = item(runtime, "pub(crate) fn backend(")
     probe = item(runtime, "fn probe_com1(")
+    serial_guard = "\n".join(item(runtime, declaration) for declaration in (
+        "struct SerialLockGuard", "impl SerialLockGuard", "impl Drop for SerialLockGuard",
+    ))
+    serial_state = "\n".join(re.findall(
+        r"(?:const RUST_LOCK_OWNER|static (?:FALLBACK_LOCK|SHARED_LOCK_ADDRESS)):[^;]+;", runtime
+    ))
     firmware_guard = item(screen, "fn firmware_calls_allowed(")
     constants = "\n".join(
         re.findall(r"(?:pub\(crate\) )?const (?:COM1|TRANSMIT_EMPTY|TX_WAIT_LIMIT):[^;]+;", runtime)
@@ -276,8 +286,9 @@ def prepare_logger(project: Path):
         r"static (?:BACKEND|SERIAL_PRESENT):[^;]+;", runtime
     ))
     (output / "definitions.rs").write_text("\n".join([
-        "use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};",
+        "use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};",
         backend, backend_state, selector, toggle, active_backend, probe, firmware_guard, constants,
+        serial_state, serial_guard,
     ]), encoding="utf-8")
 
 
@@ -832,6 +843,7 @@ def prepare_nested_ept(project: Path):
     output.mkdir(parents=True, exist_ok=True)
     source = read_resident_assembly(project)
     switch_source = (project / "src/vmx/asm/eptp_switch.S").read_text()
+    switch_source = switch_source.replace("jna .Lresident_invalidation_failed", "jna .Lresident_dispatch_halt")
     switch_source = switch_source.replace("call .Lresident_interception_callback", "xor eax, eax")
     exit_msr_start = source.index('.Lresident_nested_capture_vmcs02_guest_state:')
     exit_msr_end = source.index('lea rsi, [rip + .Lresident_nested_guest_state_table]', exit_msr_start)
@@ -893,7 +905,7 @@ def prepare_nested_ept(project: Path):
     macro_end = source.index('.endm', macro_start) + len('.endm')
     assembly = source[macro_start:macro_end] + "\n" + assembly
     assert assembly.count("vmread r8, rax") == 1
-    assert assembly.count("invept rax, xmmword ptr [rsp]") == 2
+    assert assembly.count("invept rax, xmmword ptr [rsp]") == 4
     assembly = assembly.replace(
         "vmread r8, rax",
         "mov r8, qword ptr [r12 + {b_last_guest_physical_address}]\n"
@@ -1623,6 +1635,9 @@ def prepare_resident_control(project: Path):
     # This harness exercises dispatch routing; parking deadlines run separately
     # against the complete production synchronization assembly.
     entry = entry.replace("call .Lresident_nested_eptp_sync_budget_start", "nop")
+    entry = entry.replace("call .Lresident_telemetry_begin", "nop")
+    entry = entry.replace("call .Lresident_watchdog_begin", "nop")
+    entry = re.sub(r"^resident_telemetry_counter[^\n]*\n", "", entry, flags=re.M)
     reason = section(".Lresident_dispatch_reason_ready:", "and eax, 0xffff")
     assembly = "\n".join([
         section(".macro resident_control_on_restore_msr ", ".macro resident_control_native_checkpoint "),
@@ -1659,7 +1674,7 @@ def prepare_resident_control(project: Path):
         "native_stack_bytes": 4096, "native_recovery_pml4": 4096,
         "boot_canary_start": 0x12345678, "boot_canary_end": 0x87654321,
         "host_page_address_mask": 0x000FFFFFFFFFF000,
-        "exit_reason": 0, "exit_qualification": 1, "vm_entry_msr_load_count": 2,
+        "exit_reason": 0, "exit_qualification": 1, "vm_entry_msr_load_count": 2, "guest_rip": 3,
         "spec_ctrl_msr": 0x48,
     }
     assembly = re.sub(r"\{([a-z0-9_]+)\}", lambda match: str(
@@ -1916,6 +1931,8 @@ def prepare_resident_control(project: Path):
     .Lresident_dispatch_vmread_failed:
     .Lresident_dispatch_vmwrite_failed:
     matrixhv_resident_island_fatal:
+    .Lresident_platform_reset:
+    .Lresident_platform_reset_cf9:
         ud2
     matrixhv_resident_set_variable:
         ud2
@@ -2192,6 +2209,7 @@ def prepare_resident_msr(project: Path):
     cr_start = cr_source.index('.Lresident_ap_cr_access:')
     cr_end = cr_source.index('.endm', cr_start)
     cr_access = cr_source[cr_start:cr_end].strip()
+    cr_access = cr_access.replace("jna .Lresident_invalidation_failed", "jna .Lresident_dispatch_halt")
     cr_constants = {
         'b_last_qualification': 0, 'b_nested_l1_cr4': 8,
         'b_nested_vmx_cr0_fixed0': 16, 'b_nested_vmx_cr0_fixed1': 24,
@@ -2641,13 +2659,15 @@ def prepare_resident_telemetry(project: Path):
     offsets = {}
     cursor = 0
     for name in names:
+        if name == next(item for item in names if item.startswith("event_")):
+            cursor = 0
         offsets[name] = cursor
         cursor += 4096 if name == "event_control_cpu_states" else 1024 if name == "b_nested_exit_reason_counts" else 512 if name == "event_cpu_contexts" else (
             192 * 8 if name == "b_nested_failure_trace" else (
             56 if name in {"b_watchdog_before", "b_watchdog_after", "b_watchdog_resume", "b_entry_failure_guest"}
             else 192 if name == "b_interception_runtime_diagnostics"
             else 64 if name == "b_interception_sync_diagnostics"
-            else 32 if name == "b_nested_exit_handler_cycles" else 8
+            else 32 if name in {"b_nested_exit_handler_cycles", "event_callback_image_hash"} else 8
             )
         )
     constants = {
@@ -2664,6 +2684,7 @@ def prepare_resident_telemetry(project: Path):
         "ept_stall_diagnostic_subleaf": 0x410,
         "ept_diagnostic_capabilities": 0x3ffff,
         "exit_timing_subleaf": 55,
+        "callback_identity_subleaf": 0x610,
         "guest_rip": 0, "guest_rsp": 1, "guest_rflags": 2,
         "guest_cr0": 3, "guest_cr3": 4, "guest_cr4": 5, "guest_efer": 6,
         "control_cpu_state_size": 64, "control_cpu_stage": 0, "control_cpu_phase": 8,
@@ -2922,8 +2943,12 @@ def prepare_resident_visual(project: Path):
         inc rcx
         mov qword ptr [rip + .Ltest_serial_length], rcx
     .Ltest_serial_char_done:
+        clc
         pop rdx
         pop rcx
+        ret
+    .Lresident_serial_retire:
+        stc
         ret
     .globl test_paint_stage
     test_paint_stage:

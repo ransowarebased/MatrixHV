@@ -225,6 +225,9 @@ jmp .Lresident_dispatch_halt
 .Lresident_dispatch_vmread_failed:
 resident_diagnostic_message .Lvmread_failed_message, {vmread_failed_message_len}
 jmp .Lresident_dispatch_halt
+.Lresident_invalidation_failed:
+mov qword ptr [r12 + {b_stop_result}], 0x494e
+jmp .Lresident_dispatch_halt
 .Lresident_dispatch_inject_gp:
 mov eax, dword ptr [r12 + {b_last_reason}]
 sub eax, {rdmsr_reason}
@@ -667,7 +670,7 @@ ret
 matrixhv_island_host_fatal
 .endm
 
-// VM-exit entry contract: VMCS HOST_RSP points at a boot-context pointer on a 16-byte-aligned root stack. Saves all 15 guest GPRs (120 bytes); r12 identifies the context throughout dispatch. Helpers preserve that frame and either return, resume, reflect to L1, or halt. No Rust or firmware entry is reachable after EBS.
+// VM-exit entry contract: VMCS HOST_RSP points at a boot-context pointer on a 16-byte-aligned root stack. Saves all 15 guest GPRs (120 bytes); r12 identifies the context throughout dispatch. Helpers preserve that frame and either return, resume, reflect to L1, or reset the platform. Runtime Rust callbacks use the retained root image; firmware calls are excluded after EBS.
 .macro matrixhv_island_dispatch
 .globl matrixhv_resident_dispatch_entry
 matrixhv_resident_dispatch_entry:
@@ -705,13 +708,27 @@ shl rdx, 32
 or rax, rdx
 mov qword ptr [r12 + {b_interception_timing_start}], rax
 .Lresident_interception_clock_sampled:
-call .Lresident_nested_eptp_sync_budget_start
 mov qword ptr [r12 + {b_root_vmx_active}], 1
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
 mov rax, {exit_reason}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
 mov qword ptr [r12 + {b_last_reason}], r11
+mov eax, {guest_rip}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+mov qword ptr [r12 + {b_last_guest_rip}], r11
+mov eax, {exit_qualification}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+mov qword ptr [r12 + {b_last_qualification}], r11
+mov rax, qword ptr [rsp]
+mov qword ptr [r12 + {b_last_rax}], rax
+mov r10d, eax
+call .Lresident_telemetry_begin
+resident_telemetry_counter inc, {b_exit_count}, {b_telemetry_active}
+call .Lresident_watchdog_begin
+call .Lresident_nested_eptp_sync_budget_start
 call .Lresident_pt_enter
 mov rax, qword ptr [r12 + {b_interception_ept}]
 mov qword ptr [r12 + {b_interception_exit_ept}], rax
@@ -729,7 +746,6 @@ jc .Lresident_dispatch_vmread_failed
 jz .Lresident_dispatch_vmread_failed
 mov qword ptr [r12 + {b_last_guest_rip}], r11
 mov r10d, dword ptr [rsp]
-call .Lresident_telemetry_begin
 // Keep logged exits and all L2 exits on the complete observation/reflection path.
 .Lresident_dispatch_cpuid_leaf0_check:
 cmp qword ptr [r12 + {b_last_reason}], {cpuid_reason}
@@ -753,7 +769,6 @@ cmp rax, qword ptr [r12 + {b_expected_host_cr3}]
 jne .Lresident_dispatch_host_cr3_mismatch
 jmp .Lresident_dispatch_l1
 .Lresident_dispatch_full:
-resident_telemetry_counter inc, {b_exit_count}, {b_telemetry_active}
 cmp qword ptr [r12 + {b_telemetry_active}], 0
 je .Lresident_normal_exit_recorded
 mov rax, qword ptr [rsp]
@@ -809,7 +824,6 @@ je .Lresident_boot_timer_retry_event
 mov qword ptr [r12 + {b_nested_vmcs02_launched}], 1
 jmp .Lresident_nested_l2_resume_ept
 .Lresident_dispatch_external_exit:
-call .Lresident_watchdog_begin
 mov rax, cr3
 cmp rax, qword ptr [r12 + {b_expected_host_cr3}]
 jne .Lresident_dispatch_host_cr3_mismatch
@@ -936,15 +950,10 @@ call .Lresident_deliver_pending_nmi
 call .Lresident_reload_diagnostic_timer
 call .Lresident_sample_framebuffer_on_exit
 call .Lresident_profile_exit_handler
-call .Lresident_watchdog_resuming
 call .Lresident_nested_eptp_sync_enter
 call .Lresident_nested_prepare_full_msr_entry
-cmp qword ptr [r12 + {b_interception_timing_saved}], 0
-je .Lresident_interception_clock_ready
-mov edx, 5
-call .Lresident_interception_callback
-.Lresident_interception_clock_ready:
 call .Lresident_pt_leave
+call .Lresident_watchdog_resuming
 pop rax
 pop rcx
 pop rdx
@@ -1009,15 +1018,20 @@ mov qword ptr [r12 + {b_watchdog_phase}], 2
 resident_telemetry_counter inc, {b_watchdog_resume_failures}, {b_telemetry_active}
 matrixhv_diagnostic_vmresume_failure
 jmp .Lresident_dispatch_halt
+// Timing runs inside the entry gate while host-NMI callbacks are excluded.
+.Lresident_interception_clock_commit:
+cmp qword ptr [r12 + {b_interception_timing_saved}], 0
+je .Lresident_interception_clock_ready
+mov edx, 5
+call .Lresident_interception_callback
+.Lresident_interception_clock_ready:
+ret
 // Separate emulated VMCS access, entry, EPT invalidation, and other exit costs.
 matrixhv_island_profile
 matrixhv_island_halt_observation
 .Lresident_dispatch_halt_now:
 mov qword ptr [r12 + {b_flight_frozen}], 1
-cli
-.Lresident_dispatch_halt_loop:
-hlt
-jmp .Lresident_dispatch_halt_loop
+jmp .Lresident_platform_reset
 .endm
 
 // CR0/CR4 and VPID contract: r12 is the boot context; rsp addresses the saved guest GPR frame. Validate architectural transitions against visible control registers and stage legacy PAE PDPTEs before writing guest state. Successful writes commit EFER/entry mode, retire translations and advance RIP; invalid values inject GP without changing state. Scratch GPRs and flags are clobbered. The TLB helper balances a 16-byte descriptor and preserves the guest frame.
@@ -1345,8 +1359,13 @@ jmp .Lresident_dispatch_halt_loop
     mov qword ptr [rsp + 8], 0
     mov eax, 1
     invvpid rax, xmmword ptr [rsp]
+    ja .Lap_guest_tlb_invalidated
+    mov qword ptr [rsp], 0
+    mov eax, 2
+    invvpid rax, xmmword ptr [rsp]
+.Lap_guest_tlb_invalidated:
     lea rsp, [rsp + 16]
-    jna .Lresident_dispatch_halt
+    jna .Lresident_invalidation_failed
 .Lap_flush_guest_tlb_done:
     ret
 

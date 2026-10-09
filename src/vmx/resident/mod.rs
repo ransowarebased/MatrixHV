@@ -423,6 +423,14 @@ fn prepare_runtime_update(
             .copy_relocated(output, source_base, pages.physical_address())
             .map_err(|_| ResidentProbeError::InvalidCodeLayout)?;
     }
+    unsafe {
+        (*event).callback_image_base = root_image.physical_address();
+        (*event).callback_image_bytes = source_bytes as u64;
+        (*event).callback_image_version = core_version();
+        (*event).callback_image_hash = crate::update::hash(core::slice::from_raw_parts(
+            root_image.pointer().as_ptr(), source_bytes,
+        ));
+    }
     let mut state_pages = allocate(size_of::<RuntimeContext>(), RESIDENT_EVENT_MEMORY_TYPE)?;
     let mut staging = allocate(MAX_PACKAGE_BYTES, RESIDENT_EVENT_MEMORY_TYPE)?;
     let mut bank = allocate(BANK_BYTES, RESIDENT_CODE_MEMORY_TYPE)?;
@@ -661,6 +669,11 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
             tracking_context_physical: 0,
             interception_context_physical: 0,
             interception_entry_physical: 0,
+            callback_image_base: 0,
+            callback_image_bytes: 0,
+            callback_image_version: 0,
+            callback_image_hash: [0; 32],
+            reset_io: crate::boot::firmware::resident_reset_io(),
         });
         for (index, state) in (*context).control_cpu_states.iter_mut().enumerate() {
             let address = native_storage_pages.physical_address()
@@ -776,6 +789,7 @@ global_asm!(
     event_update_public_key = const core::mem::offset_of!(ResidentEventContext, update_public_key),
     event_update_abi = const core::mem::offset_of!(ResidentEventContext, update_abi),
     event_update_loader_runtime = const core::mem::offset_of!(ResidentEventContext, update_loader_runtime),
+    event_update_loader_physical = const core::mem::offset_of!(ResidentEventContext, update_loader_physical),
     event_update_context_runtime = const core::mem::offset_of!(ResidentEventContext, update_context_runtime),
     event_update_image_physical = const core::mem::offset_of!(ResidentEventContext, update_image_physical),
     event_update_image_runtime = const core::mem::offset_of!(ResidentEventContext, update_image_runtime),
@@ -1110,6 +1124,11 @@ global_asm!(
     event_tracking_context = const core::mem::offset_of!(ResidentEventContext, tracking_context_physical),
     event_interception_context = const core::mem::offset_of!(ResidentEventContext, interception_context_physical),
     event_interception_entry = const core::mem::offset_of!(ResidentEventContext, interception_entry_physical),
+    event_callback_image_base = const core::mem::offset_of!(ResidentEventContext, callback_image_base),
+    event_callback_image_bytes = const core::mem::offset_of!(ResidentEventContext, callback_image_bytes),
+    event_callback_image_version = const core::mem::offset_of!(ResidentEventContext, callback_image_version),
+    event_callback_image_hash = const core::mem::offset_of!(ResidentEventContext, callback_image_hash),
+    callback_identity_subleaf = const crate::protocol::MATRIXHV_CALLBACK_IDENTITY_SUBLEAF,
     interception_cause = const core::mem::offset_of!(crate::memory::interception::Session, cause),
     interception_rendezvous_cause = const crate::protocol::memory::INTERCEPT_CAUSE_RENDEZVOUS,
     b_interception_runtime_diagnostics = const core::mem::offset_of!(ResidentBootContext, interception)
@@ -1119,7 +1138,9 @@ global_asm!(
     ept_diagnostic_subleaf = const crate::protocol::memory::EPT_DIAGNOSTIC_SUBLEAF,
     ept_diagnostic_capabilities = const 0xffff | crate::protocol::memory::EPT_DIAGNOSTIC_CAPABILITY
         | crate::protocol::MATRIXHV_EXIT_TIMING_CAPABILITY
-        | crate::protocol::MATRIXHV_INTEL_PT_CAPABILITY,
+        | crate::protocol::MATRIXHV_INTEL_PT_CAPABILITY
+        | crate::protocol::MATRIXHV_CALLBACK_IDENTITY_CAPABILITY
+        | crate::protocol::MATRIXHV_INTEL_PT_RING_CAPABILITY,
     exit_timing_subleaf = const crate::protocol::MATRIXHV_EXIT_TIMING_SUBLEAF,
     ept_runtime_diagnostic_pairs = const crate::protocol::memory::INTERCEPT_DIAGNOSTIC_WORDS / 2,
     ept_sync_diagnostic_pairs = const crate::protocol::memory::EPT_SYNC_DIAGNOSTIC_WORDS / 2,
@@ -1218,6 +1239,14 @@ global_asm!(
         + core::mem::offset_of!(crate::vmx::pt::TraceState, code_bytes),
     b_pt_generation = const core::mem::offset_of!(ResidentBootContext, intel_pt)
         + core::mem::offset_of!(crate::vmx::pt::TraceState, generation),
+    b_pt_snapshot = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, snapshot),
+    b_pt_snapshot_bytes = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, snapshot_bytes),
+    b_pt_snapshot_sequence = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, snapshot_sequence),
+    b_pt_snapshot_pointer = const core::mem::offset_of!(ResidentBootContext, intel_pt)
+        + core::mem::offset_of!(crate::vmx::pt::TraceState, snapshot_pointer),
     pt_control = const crate::vmx::pt::TRACE_CONTROL,
     pt_buffer_bytes = const crate::vmx::pt::BUFFER_BYTES,
     pt_subleaf = const crate::protocol::MATRIXHV_INTEL_PT_SUBLEAF,
@@ -1620,6 +1649,7 @@ global_asm!(
     event_failed_exit_reason = const core::mem::offset_of!(ResidentEventContext, failed_exit_reason),
     event_failed_qualification = const core::mem::offset_of!(ResidentEventContext, failed_qualification),
     event_failed_stop_result = const core::mem::offset_of!(ResidentEventContext, failed_stop_result),
+    event_reset_io = const core::mem::offset_of!(ResidentEventContext, reset_io),
     event_control_expected_mask = const core::mem::offset_of!(ResidentEventContext, control_expected_mask),
     event_control_active_mask = const core::mem::offset_of!(ResidentEventContext, control_active_mask),
     event_control_stopped_mask = const core::mem::offset_of!(ResidentEventContext, control_stopped_mask),

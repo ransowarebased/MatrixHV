@@ -23,7 +23,11 @@ def main():
                         help="Check safe rejection on a target known to lack the required VMX timer")
     parser.add_argument("--no-lease", action="store_true",
                         help="Use explicit-release sessions and skip watchdog expiry tests")
+    parser.add_argument("--write-iterations", type=int, default=32,
+                        help="Number of writes per CPU in the concurrent writer regression")
     arguments = parser.parse_args()
+    if arguments.write_iterations < 1:
+        parser.error("--write-iterations must be positive")
     project = Path(__file__).resolve().parents[1]
     output = arguments.output.resolve()
     output.relative_to(project / "builds")
@@ -227,7 +231,8 @@ def main():
             fixture_command("write", offset=130, value=167)
             expect_execution(51)
             if mode == "--concurrent-writes":
-                actual = fixture_command("concurrent", function=0, iterations=32, writing=True)
+                actual = fixture_command("concurrent", function=0,
+                                         iterations=arguments.write_iterations, writing=True)
                 assert actual == [51] * fixture["processors"], actual
                 assert field(neo("hook", "status"), "state") == "active"
             release()

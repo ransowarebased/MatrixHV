@@ -434,7 +434,7 @@ pub fn capture_control(options: ControlTraceOptions) -> Result<(), String> {
         .map_err(|error| format!("failed to create {}: {error}", options.output.display()))?;
     writeln!(
         file,
-        "format=matrixhv-control-trace-v2\nobserver_cpu={observer_cpu}\ntarget_cpu={}\npolling=continuous\nnative_capture_supported={}\nnative_snapshot_encoding=little_endian_u64_header_and_raw_stack\n",
+        "format=matrixhv-control-trace-v2\nobserver_cpu={observer_cpu}\ntarget_cpu={}\npolling_interval_ms=1\nnative_capture_supported={}\nnative_snapshot_encoding=little_endian_u64_header_and_raw_stack\n",
         options.cpu,
         native_layout.is_some(),
     )
@@ -514,10 +514,11 @@ pub fn capture_control(options: ControlTraceOptions) -> Result<(), String> {
             previous_native = published;
             next_heartbeat = now + Duration::from_millis(100);
         }
-        if now >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Ok(());
         }
-        std::hint::spin_loop();
+        std::thread::sleep(Duration::from_millis(1).min(remaining));
     }
 }
 
@@ -536,11 +537,13 @@ pub fn capture(
     if options.mode == Mode::Watchdog && options.interval > Duration::from_secs(5) {
         return Err("watchdog sampling interval must not exceed 5000 ms".to_string());
     }
-    if options.mode == Mode::Watchdog {
-        request(options.mode, Control::Start)?;
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    let result = capture_samples(&options, &mut request);
+    let result = (|| {
+        if options.mode == Mode::Watchdog {
+            request(options.mode, Control::Start)?;
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        capture_samples(&options, &mut request)
+    })();
     if options.mode == Mode::Watchdog {
         let stopped = request(options.mode, Control::Stop);
         result.and(stopped.map(|_| ()))
@@ -619,6 +622,27 @@ fn diagnostic_cpu(subleaf: u32, cpu: u32) -> std::arch::x86_64::CpuidResult {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+fn append_callback_identity(text: &mut String) {
+    use crate::protocol::{MATRIXHV_CALLBACK_IDENTITY_CAPABILITY, MATRIXHV_CALLBACK_IDENTITY_SUBLEAF};
+    if diagnostic(34).eax & MATRIXHV_CALLBACK_IDENTITY_CAPABILITY == 0 {
+        text.push_str("callbacks.identity=unavailable\ncallbacks.validation=boot_required\n");
+        return;
+    }
+    let (base, bytes) = pair(diagnostic(MATRIXHV_CALLBACK_IDENTITY_SUBLEAF));
+    let (version, interception) = pair(diagnostic(MATRIXHV_CALLBACK_IDENTITY_SUBLEAF + 1));
+    let (memory, update) = pair(diagnostic(MATRIXHV_CALLBACK_IDENTITY_SUBLEAF + 2));
+    writeln!(text, "callbacks.image_base=0x{base:x}\ncallbacks.image_bytes={bytes}\ncallbacks.boot_version={version}\ncallbacks.interception_entry=0x{interception:x}\ncallbacks.memory_entry=0x{memory:x}\ncallbacks.update_entry=0x{update:x}\ncallbacks.hash_scope=relocated_root_image_at_boot").unwrap();
+    text.push_str("callbacks.sha256=");
+    for index in 3..5 {
+        let (first, second) = pair(diagnostic(MATRIXHV_CALLBACK_IDENTITY_SUBLEAF + index));
+        for byte in first.to_le_bytes().into_iter().chain(second.to_le_bytes()) {
+            write!(text, "{byte:02x}").unwrap();
+        }
+    }
+    text.push('\n');
+}
+
+#[cfg(all(target_arch = "x86_64", any(target_os = "windows", target_os = "linux")))]
 pub fn intel_pt(operation: &str, output: Option<&std::path::Path>) -> Result<String, String> {
     use crate::protocol::{
         MATRIXHV_INTEL_PT_BUFFER_BYTES, MATRIXHV_INTEL_PT_CAPABILITY,
@@ -664,13 +688,16 @@ pub fn intel_pt(operation: &str, output: Option<&std::path::Path>) -> Result<Str
     let mut text = String::from(
         "format=matrixhv-intel-pt-v1\nscope=vmx_root_handlers\nstate_values=0:no_buffer,1:ready,2:unsupported,3:busy,4:msr_fault\n",
     );
+    append_callback_identity(&mut text);
     let mut started = Vec::new();
     let result = (|| {
         for &cpu in &cpus {
             affinity.pin(cpu)?;
             verify_cpu(cpu)?;
+            let circular = diagnostic(34).eax & crate::protocol::MATRIXHV_INTEL_PT_RING_CAPABILITY != 0;
             let subleaf = match operation {
                 "start" => MATRIXHV_INTEL_PT_SUBLEAF + 1,
+                "dump" if circular => MATRIXHV_INTEL_PT_SUBLEAF + 5,
                 "stop" | "dump" => MATRIXHV_INTEL_PT_SUBLEAF + 2,
                 "status" => MATRIXHV_INTEL_PT_SUBLEAF,
                 _ => return Err("unknown Intel PT operation".into()),
@@ -700,10 +727,11 @@ pub fn intel_pt(operation: &str, output: Option<&std::path::Path>) -> Result<Str
             let prefix = format!("cpu.{cpu}");
             writeln!(text, "{prefix}.state={}\n{prefix}.armed={}\n{prefix}.bytes={}\n{prefix}.rtit_status=0x{:x}", state.eax, state.ebx, state.ecx, state.edx).unwrap();
             if let Some(directory) = directory {
-                if state.ebx != 0 {
+                if !circular && state.ebx != 0 {
                     return Err(format!("Intel PT remains armed on CPU {cpu}"));
                 }
                 let (generation, trace_control) = pair(diagnostic(MATRIXHV_INTEL_PT_SUBLEAF + 4));
+                let snapshot = pair(diagnostic(MATRIXHV_INTEL_PT_SUBLEAF + 6));
                 let mut data = Vec::with_capacity(state.ecx as usize);
                 for index in 0..(state.ecx as usize).div_ceil(16) {
                     let (first, second) =
@@ -713,13 +741,17 @@ pub fn intel_pt(operation: &str, output: Option<&std::path::Path>) -> Result<Str
                 }
                 data.truncate(state.ecx as usize);
                 let after = diagnostic(MATRIXHV_INTEL_PT_SUBLEAF);
-                if after.ebx != 0
-                    || after.ecx != state.ecx
+                if (!circular && (after.ebx != 0 || after.ecx != state.ecx))
+                    || (circular && pair(diagnostic(MATRIXHV_INTEL_PT_SUBLEAF + 6)) != snapshot)
                     || pair(diagnostic(MATRIXHV_INTEL_PT_SUBLEAF + 4)).0 != generation
                 {
                     return Err(format!("Intel PT capture changed during export on CPU {cpu}"));
                 }
                 let (code_base, code_bytes) = pair(diagnostic(MATRIXHV_INTEL_PT_SUBLEAF + 3));
+                writeln!(text, "{prefix}.circular={}\n{prefix}.snapshot_sequence={}\n{prefix}.write_offset={}\n{prefix}.buffer_order={}\n{prefix}.coverage={}",
+                    u8::from(circular), snapshot.0, snapshot.1,
+                    if circular { "oldest_first_zero_padded" } else { "linear" },
+                    if circular { "latest_window_history_overwritten" } else { "stops_at_capacity" }).unwrap();
                 let signature = std::arch::x86_64::__cpuid_count(1, 0).eax;
                 writeln!(text, "{prefix}.code_base=0x{code_base:x}\n{prefix}.code_bytes={code_bytes}\n{prefix}.cpuid_1_eax=0x{signature:x}\n{prefix}.trace_control=0x{trace_control:x}\n{prefix}.generation={generation}").unwrap();
                 for index in 0..=1 {
@@ -1317,6 +1349,7 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
         "format=matrixhv-telemetry-v{format_version}\nmode={}\nscope=registered_vcpus\n",
         mode.name()
     );
+    append_callback_identity(&mut text);
     if mode != Mode::EptDiagnostics {
         text.push_str("guest_state_fields=rip,rsp,rflags,cr0,cr3,cr4,efer\nguest_state_capture=watchdog_lease\nfault_scope=host_exception\n");
     }

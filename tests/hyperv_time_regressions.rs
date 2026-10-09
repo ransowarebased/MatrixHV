@@ -1,5 +1,28 @@
 core::arch::global_asm!(include_str!("../builds/hyperv-time-tests/hypercall.S"));
 
+#[test]
+fn reset_register_requires_a_supported_byte_io_register() {
+    let mut fadt = [0u8; 129];
+    fadt[112..116].copy_from_slice(&(1u32 << 10).to_le_bytes());
+    fadt[116..120].copy_from_slice(&[1, 8, 0, 1]);
+    fadt[120..128].copy_from_slice(&0xcf9u64.to_le_bytes());
+    fadt[128] = 6;
+    assert_eq!(acpi_reset_register(&fadt), Some(0x60cf9));
+    fadt[119] = 0;
+    assert_eq!(acpi_reset_register(&fadt), Some(0x60cf9));
+    for (index, invalid) in [(112, 0), (116, 0), (116, 2), (117, 16), (118, 1), (119, 2)] {
+        let mut malformed = fadt;
+        if index == 112 { malformed[113] = 0; }
+        malformed[index] = invalid;
+        assert_eq!(acpi_reset_register(&malformed), None);
+    }
+    for port in [0u64, 0x10000, u64::MAX] {
+        fadt[120..128].copy_from_slice(&port.to_le_bytes());
+        assert_eq!(acpi_reset_register(&fadt), None);
+    }
+    assert_eq!(acpi_reset_register(&fadt[..128]), None);
+}
+
 unsafe extern "win64" {
     fn test_hypercall(context: *mut u64, registers: *mut u64) -> u32;
 }

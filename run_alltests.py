@@ -45,6 +45,7 @@ def run_component(project, component, release=False):
         execute([sys.executable, str(project / "tests/run_intel_pt_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_exit_guard_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_exit_event_tests.py")], project)
+        execute([sys.executable, str(project / "tests/run_watchdog_recovery_tests.py")], project)
         proof_binary = project / "builds/tests/resident/proof_exit_regressions.exe"
         execute(["rustc", "--edition=2024", "-Dwarnings", "--test",
                  str(project / "tests/proof_exit_regressions.rs"), "-o", str(proof_binary)], project)

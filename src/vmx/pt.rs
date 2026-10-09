@@ -22,6 +22,10 @@ pub(crate) struct TraceState {
     pub code_base: u64,
     pub code_bytes: u64,
     pub generation: u64,
+    pub snapshot: u64,
+    pub snapshot_bytes: u64,
+    pub snapshot_sequence: u64,
+    pub snapshot_pointer: u64,
 }
 
 pub(crate) fn supported(max_leaf: u32, leaf7_ebx: u32, pt_ecx: u32, vmx_misc: u64) -> bool {
@@ -32,23 +36,27 @@ pub(crate) struct TraceResources {
     pub pages: ResidentPages,
     table: u64,
     buffer: u64,
+    snapshot: u64,
 }
 
 impl TraceResources {
     pub fn allocate() -> Result<Self, Status> {
         // One data region works on single-entry ToPA implementations too.
         // Over-allocation supplies the 64 KiB alignment required by size=4.
-        let pages = ResidentPages::allocate(32, AddressConstraint::Any)?;
+        let pages = ResidentPages::allocate(48, AddressConstraint::Any)?;
         let table = pages.physical_address();
         let buffer = (table + 4096 + BUFFER_BYTES as u64 - 1) & !(BUFFER_BYTES as u64 - 1);
         unsafe {
-            (table as *mut u64).write(buffer | (4 << 6) | (1 << 4));
+            // END links back to this table; omit STOP to retain the latest
+            // root activity after arbitrarily many wraps.
+            (table as *mut u64).write(buffer | (4 << 6));
             (table as *mut u64).add(1).write(table | 1);
         }
         Ok(Self {
             pages,
             table,
             buffer,
+            snapshot: buffer + BUFFER_BYTES as u64,
         })
     }
 
@@ -68,6 +76,7 @@ impl TraceResources {
             support: if available { 1 } else { 2 },
             table: self.table,
             buffer: self.buffer,
+            snapshot: self.snapshot,
             output_pointer: 0x7f,
             ..TraceState::default()
         }

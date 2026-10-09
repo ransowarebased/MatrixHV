@@ -16,6 +16,7 @@ values.update(b_last_reason=len(fields) * 8, cpuid_reason=10,
               matrixhv_status_leaf=0x4d485652, pt_control=0x2105,
               pt_buffer_bytes=65536, pt_subleaf=0x600, pt_data_subleaf=0x1000,
               event_ebs_seen=64, b_canary_start=0, b_canary_end=0,
+              b_stop_result=(len(fields) + 2) * 8,
               boot_canary_start=0x4856424f4f544331, boot_canary_end=0x4856424f4f544332)
 assembly = (project / "src/vmx/asm/pt.S").read_text()
 assembly = re.sub(r"\{(\w+)\}", lambda match: str(values[match[1]]), assembly)
@@ -98,6 +99,13 @@ mov qword ptr [rbx + r11], rax
 clc
 ret
 .Ltest_write_fault:
+cmp qword ptr [rbx + 136], 1
+jbe .Ltest_write_fault_clear
+dec qword ptr [rbx + 136]
+stc
+ret
+.Ltest_write_fault_clear:
+mov qword ptr [rbx + 136], 0
 mov qword ptr [rbx + 56], 0
 stc
 ret
@@ -142,6 +150,8 @@ cmp dword ptr [rdx + 88], 1
 je .Lresident_pt_start
 cmp dword ptr [rdx + 88], 2
 je .Lresident_pt_stop
+cmp dword ptr [rdx + 88], 5
+je .Lresident_pt_snapshot
 mov ecx, dword ptr [rdx + 88]
 jmp .Lresident_pt_data
 .Lresident_dispatch_cpuid_diagnostic_zero:
@@ -168,6 +178,9 @@ ret
 matrixhv_resident_island_start:
 .zero 16
 matrixhv_resident_island_end:
+.Lresident_dispatch_halt:
+inc qword ptr [rbx + 144]
+resident_pt_restore
 """
 (output / "pt.S").write_text(assembly)
 binary = output / "intel_pt_tests.exe"

@@ -63,6 +63,11 @@ mov ecx, dword ptr [r9 + {event_post_ebs_cpu_mask}]
 mov edx, dword ptr [r9 + {event_halted_cpu_mask}]
 jmp .Lresident_dispatch_cpuid_diagnostic_store
 .Lresident_dispatch_cpuid_diagnostic_extended:
+cmp ecx, {callback_identity_subleaf}
+jb .Lresident_dispatch_cpuid_identity_done
+cmp ecx, {callback_identity_subleaf} + 5
+jb .Lresident_dispatch_cpuid_callback_identity
+.Lresident_dispatch_cpuid_identity_done:
 cmp ecx, {pt_subleaf}
 je .Lresident_pt_query
 cmp ecx, {pt_subleaf} + 1
@@ -73,6 +78,10 @@ cmp ecx, {pt_subleaf} + 3
 je .Lresident_pt_layout
 cmp ecx, {pt_subleaf} + 4
 je .Lresident_pt_generation
+cmp ecx, {pt_subleaf} + 5
+je .Lresident_pt_snapshot
+cmp ecx, {pt_subleaf} + 6
+je .Lresident_pt_snapshot_identity
 cmp ecx, {pt_data_subleaf}
 jb .Lresident_pt_query_range_done
 cmp ecx, {pt_data_subleaf} + {pt_buffer_bytes} / 16
@@ -276,6 +285,28 @@ mov ebx, dword ptr [r8 + {b_nested_failure_count} + 4]
 mov ecx, {nested_failure_trace_capacity}
 xor edx, edx
 jmp .Lresident_dispatch_cpuid_diagnostic_store
+.Lresident_dispatch_cpuid_callback_identity:
+sub ecx, {callback_identity_subleaf}
+lea r10, [r9 + {event_callback_image_hash}]
+cmp ecx, 3
+jae .Lresident_dispatch_cpuid_callback_hash
+mov rax, qword ptr [r9 + {event_callback_image_base}]
+mov rdx, qword ptr [r9 + {event_callback_image_bytes}]
+test ecx, ecx
+jz .Lresident_dispatch_cpuid_vmx_pair
+mov rax, qword ptr [r9 + {event_callback_image_version}]
+mov rdx, qword ptr [r9 + {event_interception_entry}]
+cmp ecx, 1
+je .Lresident_dispatch_cpuid_vmx_pair
+mov rax, qword ptr [r9 + {event_memory_entry}]
+mov rdx, qword ptr [r9 + {event_update_loader_physical}]
+jmp .Lresident_dispatch_cpuid_vmx_pair
+.Lresident_dispatch_cpuid_callback_hash:
+sub ecx, 3
+shl ecx, 4
+mov rax, qword ptr [r10 + rcx]
+mov rdx, qword ptr [r10 + rcx + 8]
+jmp .Lresident_dispatch_cpuid_vmx_pair
 .Lresident_dispatch_cpuid_nested_failure_record:
 sub ecx, 0x101
 mov eax, ecx
@@ -470,8 +501,9 @@ inc qword ptr [r12 + {b_nested_exit_reason_counts} + rax * 8]
 .Lresident_telemetry_begin_done:
 ret
 .Lresident_watchdog_begin:
+mov qword ptr [r12 + {b_watchdog_phase}], 0
 cmp qword ptr [r12 + {b_telemetry_active}], 0
-je .Lresident_watchdog_handler_start_done
+je .Lresident_watchdog_handler_started
 cmp qword ptr [r12 + {b_last_reason}], {cpuid_reason}
 jne .Lresident_watchdog_begin_observed
 cmp dword ptr [r12 + {b_last_rax}], {matrixhv_status_leaf}
@@ -555,15 +587,11 @@ lea r10, [r12 + {b_entry_failure_guest}]
 call .Lresident_watchdog_capture
 mov qword ptr [r12 + {b_entry_failure_state}], 2
 .Lresident_watchdog_begin_done:
-cmp qword ptr [r12 + {b_last_reason}], {cpuid_reason}
-jne .Lresident_watchdog_handler_started
-cmp dword ptr [r12 + {b_last_rax}], {matrixhv_status_leaf}
-je .Lresident_watchdog_handler_start_done
 .Lresident_watchdog_handler_started:
 mov qword ptr [r12 + {b_watchdog_phase}], 3
-.Lresident_watchdog_handler_start_done:
 ret
 .Lresident_watchdog_handler_returned:
+mov qword ptr [r12 + {b_watchdog_phase}], 4
 cmp qword ptr [r12 + {b_telemetry_active}], 0
 je .Lresident_watchdog_after_handler_done
 cmp qword ptr [r12 + {b_last_reason}], {cpuid_reason}
@@ -587,14 +615,15 @@ jne .Lresident_watchdog_resume_observed
 cmp dword ptr [r12 + {b_last_rax}], {matrixhv_status_leaf}
 je .Lresident_watchdog_resume_ready
 .Lresident_watchdog_resume_observed:
-mov qword ptr [r12 + {b_watchdog_phase}], 1
 cmp qword ptr [r12 + {b_watchdog_deadline}], 0
 je .Lresident_watchdog_resume_commit
 lea r10, [r12 + {b_watchdog_resume}]
 call .Lresident_watchdog_capture
 .Lresident_watchdog_resume_commit:
+mov qword ptr [r12 + {b_watchdog_phase}], 1
 inc qword ptr [r12 + {b_watchdog_sequence}]
 .Lresident_watchdog_resume_ready:
+mov qword ptr [r12 + {b_watchdog_phase}], 1
 ret
 .Lresident_watchdog_capture:
 mov rax, {guest_rip}
@@ -1275,20 +1304,22 @@ ret
 .ascii "rdx"
 .Lresident_serial_write:
 test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}
-jz .Lresident_serial_write_done
+jz .Lresident_serial_retire
 test r9d, r9d
 jz .Lresident_serial_write_done
 lodsb
 call .Lresident_serial_char
+jc .Lresident_serial_write_done
 dec r9d
 jmp .Lresident_serial_write
 .Lresident_serial_write_done:
 ret
 .Lresident_serial_char:
 test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}
-jz .Lresident_serial_char_done
+jz .Lresident_serial_retire
 mov r10b, al
 call .Lresident_serial_acquire
+jc .Lresident_serial_retire
 mov dx, {serial_status_port}
 mov ecx, {serial_wait_limit}
 .Lresident_serial_wait:
@@ -1297,10 +1328,12 @@ test al, {serial_transmit_empty}
 jnz .Lresident_serial_ready
 dec ecx
 jnz .Lresident_serial_wait
-cmp r10b, 0x0a
-je .Lresident_serial_release
-ret
-.Lresident_serial_char_done:
+.Lresident_serial_retire:
+// Retire an unavailable sink so later diagnostics cannot repeat root-mode waits.
+// A peer can retire it midway through an owned line; release that ownership too.
+call .Lresident_serial_release
+lock and byte ptr [rip + matrixhv_resident_island_log_backend], 0xfe
+stc
 ret
 .Lresident_serial_ready:
 mov dx, {serial_port}
@@ -1308,12 +1341,15 @@ mov al, r10b
 out dx, al
 cmp r10b, 0x0a
 je .Lresident_serial_release
+clc
 ret
 .Lresident_serial_acquire:
+push r11
 mov rcx, qword ptr [r12 + {b_serial_lock}]
 test rcx, rcx
 jz .Lresident_serial_acquire_done
 mov rdx, r12
+mov r11d, {serial_wait_limit}
 .Lresident_serial_acquire_retry:
 cmp qword ptr [rcx], r12
 je .Lresident_serial_acquire_done
@@ -1321,8 +1357,14 @@ xor eax, eax
 lock cmpxchg qword ptr [rcx], rdx
 je .Lresident_serial_acquire_done
 pause
-jmp .Lresident_serial_acquire_retry
+dec r11d
+jnz .Lresident_serial_acquire_retry
+pop r11
+stc
+ret
 .Lresident_serial_acquire_done:
+pop r11
+clc
 ret
 .Lresident_serial_release:
 mov rcx, qword ptr [r12 + {b_serial_lock}]
@@ -1332,10 +1374,11 @@ cmp qword ptr [rcx], r12
 jne .Lresident_serial_release_done
 mov qword ptr [rcx], 0
 .Lresident_serial_release_done:
+clc
 ret
 .Lresident_serial_hex64:
 test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}
-jz .Lresident_serial_hex64_done
+jz .Lresident_serial_retire
 mov rbx, rax
 mov r13d, 16
 .Lresident_serial_hex64_loop:
@@ -1350,6 +1393,7 @@ jmp .Lresident_serial_hex64_emit
 add al, 0x30
 .Lresident_serial_hex64_emit:
 call .Lresident_serial_char
+jc .Lresident_serial_hex64_done
 dec r13d
 jnz .Lresident_serial_hex64_loop
 .Lresident_serial_hex64_done:
@@ -1554,9 +1598,14 @@ call .Lresident_serial_write
 call .Lresident_serial_state
 .endm
 
-// Terminal dispatch contract: r12 is the failed boot context. Atomically publishes the first CPU failure and emits diagnostics without firmware after EBS. Clobbers scratch registers and flags; always reaches the halt loop.
+// Terminal dispatch records the first failure without firmware calls. A corrupt
+// VMCS cannot certify a native handoff; reset the platform after bounded output.
 .macro matrixhv_island_halt_observation
 .Lresident_dispatch_halt:
+mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
+mov qword ptr [r12 + {b_watchdog_phase}], 5
+or qword ptr [r12 + {b_watchdog_sequence}], 1
+mov qword ptr [r12 + {b_flight_frozen}], 1
 call .Lresident_pt_leave
 mov qword ptr [r12 + {b_pt_armed}], 0
 mov r10, qword ptr [r12 + {b_event_context}]
@@ -1614,7 +1663,8 @@ mov qword ptr [r8 + {event_host_fault_vector}], 13
 jmp .Lresident_island_fatal_owned
 .endm
 
-// Terminal host-fault contract: direct entry disables interrupts and claims shared output; the owned entry accepts r8 as the event context. Uses retained framebuffer/serial state only, clobbers scratch GPRs and flags, and halts permanently.
+// Host faults use retained diagnostics and request a platform reset. Recovery
+// cannot depend on the failed VMCS, guest register frame, or firmware services.
 .macro matrixhv_island_host_fatal
 .globl matrixhv_resident_island_fatal
 matrixhv_resident_island_fatal:
@@ -1646,8 +1696,47 @@ mov dx, {serial_port}
 mov al, 0x21
 out dx, al
 1:
-hlt
-jmp 1b
+jmp .Lresident_platform_reset
+.Lresident_platform_reset:
+cli
+// The ACPI I/O reset tuple is validated and retained before ExitBootServices.
+mov r8, qword ptr [rip + matrixhv_resident_island_event_context]
+test r8, r8
+jz .Lresident_platform_reset_cf9
+mov rax, qword ptr [r8 + {event_reset_io}]
+test ax, ax
+jz .Lresident_platform_reset_cf9
+mov dx, ax
+shr rax, 16
+out dx, al
+.Lresident_platform_reset_cf9:
+cli
+// Intel reset control is also understood by common VM platforms. Both writes
+// are required when an earlier reset request left RST_CPU asserted.
+mov dx, 0xcf9
+mov al, 2
+out dx, al
+mov al, 6
+out dx, al
+// A missing or busy legacy keyboard controller must never cause another stall.
+mov ecx, 65536
+.Lresident_platform_reset_keyboard_wait:
+in al, 0x64
+test al, 2
+jz .Lresident_platform_reset_keyboard
+pause
+loop .Lresident_platform_reset_keyboard_wait
+jmp .Lresident_platform_reset_triple_fault
+.Lresident_platform_reset_keyboard:
+mov al, 0xfe
+out 0x64, al
+.Lresident_platform_reset_triple_fault:
+lidt [rip + .Lresident_platform_reset_empty_idt]
+int3
+ud2
+.Lresident_platform_reset_empty_idt:
+.word 0
+.quad 0
 .endm
 
 // Boot sampling contract: r12 is the boot context, rsp retains the guest frame. Updates deadlines and retires the instrumentation timer when the framebuffer window expires. Clobbers scratch GPRs/flags and branches to the dispatcher event-retry path; it never advances guest RIP.

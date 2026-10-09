@@ -1128,8 +1128,14 @@ mov qword ptr [rsp], r11
 mov qword ptr [rsp + 8], 0
 mov eax, 1
 invept rax, xmmword ptr [rsp]
+ja .Lresident_nested_eptp_sync_invalidated
+// All-context invalidation also covers a malformed or retired EPTP descriptor.
+mov qword ptr [rsp], 0
+mov eax, 2
+invept rax, xmmword ptr [rsp]
+.Lresident_nested_eptp_sync_invalidated:
 lea rsp, [rsp + 16]
-jna .Lresident_dispatch_halt
+jna .Lresident_invalidation_failed
 .Lresident_nested_eptp_sync_return:
 ret
 
@@ -1143,6 +1149,7 @@ call .Lresident_nested_eptp_sync_poll
 mov edx, 1
 call .Lresident_interception_callback
 call .Lresident_interception_safe_point_timer
+call .Lresident_interception_clock_commit
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 1
 mfence
 mov rax, qword ptr [rip + .Lresident_eptp_sync_owner]
@@ -1164,10 +1171,29 @@ jz .Lresident_nested_eptp_sync_return
 cmp qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
 je .Lresident_nested_eptp_sync_nmi_handled
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
+// An NMI can interrupt the final register restore after the exit was closed.
+// Reopen that observation until all NMI-side callbacks have returned.
+mov rax, qword ptr [r12 + {b_watchdog_phase}]
+push rax
+mov qword ptr [r12 + {b_watchdog_phase}], 4
+cmp qword ptr [r12 + {b_telemetry_active}], 0
+je .Lresident_nested_eptp_sync_nmi_poll
+cmp eax, 1
+jne .Lresident_nested_eptp_sync_nmi_poll
+inc qword ptr [r12 + {b_watchdog_sequence}]
+.Lresident_nested_eptp_sync_nmi_poll:
 call .Lresident_nested_eptp_sync_poll
 mov edx, 1
 call .Lresident_interception_callback
 call .Lresident_interception_safe_point_timer
+pop rax
+cmp eax, 1
+jne .Lresident_nested_eptp_sync_nmi_restore_phase
+call .Lresident_watchdog_resuming
+jmp .Lresident_nested_eptp_sync_nmi_ready
+.Lresident_nested_eptp_sync_nmi_restore_phase:
+mov qword ptr [r12 + {b_watchdog_phase}], rax
+.Lresident_nested_eptp_sync_nmi_ready:
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 1
 .Lresident_nested_eptp_sync_nmi_handled:
 mov eax, 1

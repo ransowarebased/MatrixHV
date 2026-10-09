@@ -184,6 +184,8 @@ cmp edx, 0
 je .Lresident_memory_synchronize_acquire
 cmp edx, 1
 je .Lresident_memory_synchronize_flush
+cmp edx, 3
+je .Lresident_memory_synchronize_budget
 call .Lresident_nested_eptp_sync_end
 mov eax, 1
 jmp .Lresident_memory_synchronize_return
@@ -193,6 +195,10 @@ jmp .Lresident_memory_synchronize_return
 .Lresident_memory_synchronize_flush:
 call .Lresident_nested_eptp_sync_flush_local
 mov eax, 1
+jmp .Lresident_memory_synchronize_return
+.Lresident_memory_synchronize_budget:
+call .Lresident_nested_eptp_sync_budget_expired
+xor eax, 1
 .Lresident_memory_synchronize_return:
 add rsp, 8
 pop r15
@@ -250,6 +256,9 @@ push r15
 mov rbp, rsp
 and rsp, -16
 sub rsp, 560
+mov rax, qword ptr [r12 + {b_nested_eptp_sync_safe}]
+mov qword ptr [rsp + 40], rax
+mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
 fxsave64 [rsp + 48]
 lea rax, [rsp + 48]
 mov qword ptr [rsp + 32], rax
@@ -265,6 +274,11 @@ jmp .Lresident_interception_callback_return
 xor eax, eax
 .Lresident_interception_callback_return:
 fxrstor64 [rsp + 48]
+cmp rax, -1
+je .Lresident_interception_callback_unwind
+mov rcx, qword ptr [rsp + 40]
+mov qword ptr [r12 + {b_nested_eptp_sync_safe}], rcx
+.Lresident_interception_callback_unwind:
 mov rsp, rbp
 pop r15
 pop r14
@@ -275,8 +289,11 @@ pop rsi
 pop rbp
 pop rbx
 cmp rax, -1
-je .Lresident_dispatch_halt
+je .Lresident_interception_callback_failed
 ret
+.Lresident_interception_callback_failed:
+mov qword ptr [r12 + {b_stop_result}], 0x4342
+jmp .Lresident_dispatch_halt
 .Lresident_dispatch_update_l2_reject:
 mov rax, 14
 mov rdi, qword ptr [r12 + {b_event_context}]
@@ -1287,6 +1304,7 @@ mov qword ptr [r9 + {control_cpu_stage}], 134
 lock bts qword ptr [r10 + {event_control_failed_mask}], r8
 .Lresident_control_off_vmcs_preserved:
 vmxoff
+jna .Lresident_platform_reset
 mov r11, qword ptr [r9 + {control_cpu_native_cr4}]
 mov cr4, r11
 mov r11, r8
@@ -1586,7 +1604,12 @@ mov qword ptr [rsp + 8], 0
 mov eax, 1
 resident_control_native_checkpoint 11
 invept rax, xmmword ptr [rsp]
+ja .Lresident_control_on_ept_invalidated
+mov qword ptr [rsp], 0
+mov eax, 2
+invept rax, xmmword ptr [rsp]
 jna .Lresident_control_on_invalidation_failed
+.Lresident_control_on_ept_invalidated:
 mov eax, {secondary_vm_exec_control}
 vmread rdx, rax
 jna .Lresident_control_on_invalidation_failed
@@ -1599,6 +1622,10 @@ mov qword ptr [rsp], rdx
 mov qword ptr [rsp + 8], 0
 mov eax, 1
 resident_control_native_checkpoint 12
+invvpid rax, xmmword ptr [rsp]
+ja .Lresident_control_on_invalidation_done
+mov qword ptr [rsp], 0
+mov eax, 2
 invvpid rax, xmmword ptr [rsp]
 jna .Lresident_control_on_invalidation_failed
 .Lresident_control_on_invalidation_done:
@@ -1659,7 +1686,9 @@ ja .Lresident_control_on_vmcs_preserved
 mov qword ptr [r9 + {control_cpu_stage}], 134
 lock bts qword ptr [r10 + {event_control_failed_mask}], r8
 .Lresident_control_on_vmcs_preserved:
+// Failed activation still uses the caller's CR3, without physical event mappings.
 vmxoff
+jna .Lresident_platform_reset_cf9
 .Lresident_control_on_native_failed:
 mov r11, qword ptr [r9 + {control_cpu_on_original_cr4}]
 mov cr4, r11
@@ -1713,6 +1742,7 @@ lock bts qword ptr [r15 + {event_control_failed_mask}], r14
 .Lresident_control_on_entry_vmcs_preserved:
 mov qword ptr [r12 + {b_root_vmx_active}], 0
 vmxoff
+jna .Lresident_platform_reset
 mov rdx, qword ptr [r13 + {control_cpu_on_native_cr3}]
 mov r11, qword ptr [r13 + {control_cpu_on_native_cr0}]
 mov cr0, r11
@@ -1988,6 +2018,8 @@ cmp rcx, 64
 jae .Lresident_control_rearm_done
 bt qword ptr [rdi + {event_control_rearm_mask}], rcx
 jnc .Lresident_control_rearm_done
+// Callback and telemetry helpers may clobber R11 before this transition.
+mov r11, qword ptr [r12 + {b_last_reason}]
 test r11d, 0x80000000
 jnz .Lresident_control_on_entry_failed
 lock btr qword ptr [rdi + {event_control_rearm_mask}], rcx

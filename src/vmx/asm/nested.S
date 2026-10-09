@@ -1442,8 +1442,13 @@ mov qword ptr [rsp], r11
 mov qword ptr [rsp + 8], 0
 mov eax, 1
 invept rax, xmmword ptr [rsp]
+ja .Lresident_nested_ept02_invalidated
+mov qword ptr [rsp], 0
+mov eax, 2
+invept rax, xmmword ptr [rsp]
+.Lresident_nested_ept02_invalidated:
 lea rsp, [rsp + 16]
-jna .Lresident_dispatch_halt
+jna .Lresident_invalidation_failed
 resident_telemetry_counter inc, {b_invept_exits}, {b_telemetry_active}
 ret
 // Re-read both EPT levels before retaining a cached leaf across an L1 invalidation.
@@ -3838,10 +3843,10 @@ call .Lresident_sync_ept_cache
 call .Lresident_nested_refresh_eptp_list
 call .Lresident_deliver_pending_nmi
 call .Lresident_profile_exit_handler
-call .Lresident_watchdog_resuming
 call .Lresident_nested_eptp_sync_enter
 call .Lresident_nested_prepare_full_msr_entry
 call .Lresident_pt_leave
+call .Lresident_watchdog_resuming
 pop rax
 pop rcx
 pop rdx
@@ -3929,10 +3934,10 @@ call .Lresident_sync_ept_cache
 call .Lresident_nested_refresh_eptp_list
 call .Lresident_deliver_pending_nmi
 call .Lresident_profile_exit_handler
-call .Lresident_watchdog_resuming
 call .Lresident_nested_eptp_sync_enter
 call .Lresident_nested_prepare_full_msr_entry
 call .Lresident_pt_leave
+call .Lresident_watchdog_resuming
 pop rax
 pop rcx
 pop rdx

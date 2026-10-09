@@ -1848,6 +1848,29 @@ mod telemetry {
     }
 
     #[test]
+    fn callback_identity_reports_the_retained_image_and_each_entry_point() {
+        let mut context = [0; 1024];
+        let mut shared = [0; 1024];
+        shared[offset("event_callback_image_base")] = 0x100000;
+        shared[offset("event_callback_image_bytes")] = 0x200000;
+        shared[offset("event_callback_image_version")] = 0x1234;
+        shared[offset("event_interception_entry")] = 0x101000;
+        shared[offset("event_memory_entry")] = 0x102000;
+        shared[offset("event_update_loader_physical")] = 0x103000;
+        shared[offset("event_callback_image_hash")..offset("event_callback_image_hash") + 4]
+            .copy_from_slice(&[1, 2, 3, 4]);
+        for (leaf, expected) in [
+            (0x610, [0x100000, 0, 0x200000, 0]),
+            (0x611, [0x1234, 0, 0x101000, 0]),
+            (0x612, [0x102000, 0, 0x103000, 0]),
+            (0x613, [1, 0, 2, 0]),
+            (0x614, [3, 0, 4, 0]),
+        ] {
+            assert_eq!(diagnostic(&mut context, &mut shared, leaf), expected);
+        }
+    }
+
+    #[test]
     fn telemetry_queries_do_not_advance_sequence_or_overwrite_last_guest() {
         let mut context = [0; 1024];
         context[offset("b_telemetry_enabled")] = 1;
@@ -1856,6 +1879,7 @@ mod telemetry {
         context[offset("b_watchdog_last_rip")] = 0x1234;
         unsafe {
             test_watchdog_begin(context.as_mut_ptr());
+            assert_eq!(context[offset("b_watchdog_phase")], 3);
             test_watchdog_complete(context.as_mut_ptr());
         }
         assert_eq!(context[offset("b_watchdog_sequence")], 0);
@@ -2238,7 +2262,8 @@ mod telemetry {
         context[offset("b_last_reason")] = 48;
         context[offset("b_last_qualification")] = 7;
         context[offset("b_last_guest_rip")] = 0x1122;
-        let before = context;
+        let mut before = context;
+        before[offset("b_watchdog_phase")] = 1;
         unsafe {
             test_watchdog_begin(context.as_mut_ptr());
             test_watchdog_complete(context.as_mut_ptr());
@@ -2257,7 +2282,9 @@ mod telemetry {
         diagnostic(&mut context, &mut shared, 0x203);
         assert_eq!(context[offset("b_watchdog_deadline")], 0);
         unsafe { test_watchdog_begin(context.as_mut_ptr()) };
-        let frozen = context;
+        assert_eq!(context[offset("b_watchdog_phase")], 3);
+        let mut frozen = context;
+        frozen[offset("b_watchdog_phase")] = 1;
         unsafe { test_watchdog_complete(context.as_mut_ptr()) };
         assert_eq!(context, frozen);
         assert_eq!(context[offset("b_watchdog_sequence")], 2);

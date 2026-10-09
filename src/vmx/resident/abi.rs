@@ -96,6 +96,11 @@ pub struct ResidentEventContext {
     pub tracking_context_physical: u64,
     pub interception_context_physical: u64,
     pub interception_entry_physical: u64,
+    pub callback_image_base: u64,
+    pub callback_image_bytes: u64,
+    pub callback_image_version: u64,
+    pub callback_image_hash: [u8; 32],
+    pub reset_io: u64,
 }
 
 #[repr(C, align(16))]

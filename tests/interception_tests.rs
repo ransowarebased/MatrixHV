@@ -25,6 +25,8 @@ struct Machine {
     failed_stores: BTreeMap<u64, usize>,
     failed_guards: BTreeMap<u64, usize>,
     failed_links: BTreeMap<u64, usize>,
+    budget_checks: std::cell::Cell<usize>,
+    budget_limit: usize,
 }
 
 impl Machine {
@@ -46,6 +48,8 @@ impl Machine {
             failed_stores: BTreeMap::new(),
             failed_guards: BTreeMap::new(),
             failed_links: BTreeMap::new(),
+            budget_checks: std::cell::Cell::new(0),
+            budget_limit: usize::MAX,
         };
         for page in [0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, GPA] {
             machine.pages.insert(page, Box::new([0; 4096]));
@@ -101,6 +105,11 @@ impl PhysicalMemory for Machine {
 }
 
 impl InterceptionMemory for Machine {
+    fn check_budget(&self) -> Result<(), Error> {
+        let checks = self.budget_checks.get();
+        self.budget_checks.set(checks + 1);
+        if checks >= self.budget_limit { Err(Error::Busy) } else { Ok(()) }
+    }
     fn syscall_context(&self) -> [u64; 3] {
         [0xffff800000400000, ROOT, self.syscall_cr4]
     }
@@ -260,6 +269,70 @@ fn syscall_request(machine: &mut Machine, token: u64) -> Vec<u8> {
         request[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     request
+}
+
+#[test]
+fn seeded_profile_packet_fuzzing_preserves_bounds_tokens_and_barrier_cleanup() {
+    for seed in [341049_u64, 0xab1015b, 0x5425cb8] {
+        let mut machine = Machine::new();
+        let mut session = session();
+        let mut random = seed;
+        let mut next = || {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            random >> 16
+        };
+        for iteration in 0..10_000 {
+            let token = unsafe { &*session.configuration.get() }.token;
+            let mut request = if next() & 1 == 0 {
+                cpuid_request()
+            } else {
+                syscall_request(&mut machine, token)
+            };
+            request[80..88].copy_from_slice(&token.to_le_bytes());
+            match next() % 8 {
+                0 => {}
+                1 => {
+                    request.truncate(HEADER_BYTES);
+                    let operation = [CPUID_CLEAR, SYSCALL_CLEAR, INTERCEPT_RELEASE][next() as usize % 3];
+                    request[12..16].copy_from_slice(&operation.to_le_bytes());
+                    request[36..40].copy_from_slice(&(HEADER_BYTES as u32).to_le_bytes());
+                }
+                2 => request.truncate(next() as usize % request.len()),
+                3 => request.resize(next() as usize % (BUFFER_BYTES + 64), 0),
+                _ => {
+                    for _ in 0..1 + next() % 8 {
+                        let offset = next() as usize % request.len();
+                        request[offset] ^= 1 << (next() % 8);
+                    }
+                }
+            }
+            let before = machine.events.len();
+            let _ = execute(&mut session, &mut machine, &mut request);
+            let context = format!("seed={seed:#x} iteration={iteration}");
+            if machine.events.len() > before {
+                assert_eq!(machine.events[before], "quiesce", "{context}");
+                assert_eq!(machine.events.last(), Some(&"resume"), "{context}");
+            }
+            let mut status = packet(&["hook", "status"]);
+            assert_eq!(execute(&mut session, &mut machine, &mut status), Ok(()), "{context}");
+            let configuration = unsafe { &*session.configuration.get() };
+            let cpuid = unsafe { &*session.cpuid.get() };
+            let syscall = unsafe { &*session.syscall.get() };
+            assert!(configuration.hook_count <= HOOK_MAX_PAGES, "{context}");
+            assert!(configuration.debug_count <= 4, "{context}");
+            assert!(cpuid.count <= CPUID_MAX_RECORDS, "{context}");
+            assert!(configuration.token >= token, "{context}");
+            if session.is_active() {
+                if cpuid.count != 0 {
+                    assert_eq!(cpuid.token, configuration.token, "{context}");
+                }
+                if syscall.entry != 0 {
+                    assert_eq!(syscall.token, configuration.token, "{context}");
+                    assert_eq!(configuration.debug_count, 1, "{context}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -1309,6 +1382,32 @@ fn repeated_unpublished_installation_failures_recover_their_base_tables() {
     let mut renew = packet(&["hook", "renew", "1"]);
     execute(&mut session, &mut machine, &mut renew).unwrap();
     assert_eq!(unsafe { &*session.configuration.get() }.base_pool_used, 2);
+}
+
+#[test]
+fn exhausted_installation_budget_restores_guards_and_releases_the_cpu_barrier() {
+    for active in [false, true] {
+        for remaining in [0, 1, 2, 40, 130, 300, 900] {
+            let mut machine = Machine::new();
+            let mut session = session();
+            let mut install = packet(&["hook", "install", "0x3000", "0x400008", "cc"]);
+            if active {
+                execute(&mut session, &mut machine, &mut install).unwrap();
+            }
+            machine.budget_limit = machine.budget_checks.get() + remaining;
+            let mut request = if active {
+                packet(&["hook", "add", "1", "0x400010", "c3"])
+            } else { install };
+            assert_eq!(execute(&mut session, &mut machine, &mut request), Err(Error::Busy));
+            assert!(!session.is_active());
+            assert_eq!(machine.leaf(machine.base_ept(), GPA).0 & 7, 7);
+            assert_eq!(&machine.events[machine.events.len() - 2..], ["flush", "resume"]);
+            machine.budget_limit = usize::MAX;
+            let mut retry = packet(&["hook", "install", "0x3000", "0x400008", "cc"]);
+            execute(&mut session, &mut machine, &mut retry).unwrap();
+            assert!(session.is_active());
+        }
+    }
 }
 
 #[test]

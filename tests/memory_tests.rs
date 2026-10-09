@@ -58,6 +58,58 @@ impl PhysicalMemory for Ram {
 }
 
 #[test]
+fn resident_instruction_fetch_walks_real_tables_and_stops_at_an_unmapped_page() {
+    let request = vec![0_u8; 64];
+    let (mut machine, mut environment, second, first) = Machine::setup(&request);
+    environment.caller_cr3 = environment.kernel_cr3;
+    machine.map(environment.caller_cr3, 0x1000, second, 7);
+    for index in 0..15 {
+        let address = if index < 6 { first + 4090 + index } else { second + index - 6 };
+        unsafe { (address as *mut u8).write((index + 1) as u8); }
+    }
+    let configuration = unsafe { std::mem::zeroed::<crate::memory::interception::RoadEptProfile>() };
+    let mut execution = [0; 15];
+    let mut original = [0; 15];
+    assert_eq!(access::resident::instruction_bytes_in(
+        &environment, &configuration, 4090, &mut execution, &mut original,
+    ), 15);
+    assert_eq!(execution, std::array::from_fn(|index| (index + 1) as u8));
+    assert_eq!(execution, original);
+    machine.map(environment.caller_cr3, 0x1000, 0, 0);
+    execution.fill(0);
+    original.fill(0);
+    assert_eq!(access::resident::instruction_bytes_in(
+        &environment, &configuration, 4090, &mut execution, &mut original,
+    ), 6);
+    assert_eq!(&execution[..6], &[1, 2, 3, 4, 5, 6]);
+    assert_eq!(&execution[6..], &[0; 9]);
+}
+
+#[test]
+fn resident_instruction_fetch_keeps_original_and_shadow_bytes_distinct() {
+    let request = vec![0_u8; 64];
+    let (_machine, mut environment, shadow, original_page) = Machine::setup(&request);
+    environment.caller_cr3 = environment.kernel_cr3;
+    let mut configuration = unsafe { std::mem::zeroed::<crate::memory::interception::RoadEptProfile>() };
+    configuration.hook_count = 1;
+    configuration.pages[0] = original_page;
+    configuration.pool_base = shadow - (INTERCEPT_TABLE_PAGES * 4096) as u64;
+    for index in 0..15 {
+        unsafe {
+            (original_page as *mut u8).add(index).write(0x90);
+            (shadow as *mut u8).add(index).write(0xcc);
+        }
+    }
+    let mut execution = [0; 15];
+    let mut original = [0; 15];
+    assert_eq!(access::resident::instruction_bytes_in(
+        &environment, &configuration, 0, &mut execution, &mut original,
+    ), 15);
+    assert_eq!(execution, [0xcc; 15]);
+    assert_eq!(original, [0x90; 15]);
+}
+
+#[test]
 fn batch_reads_noncontiguous_pages_and_reports_independent_failures() {
     let mut ram = Ram::mapped();
     ram.pages.get_mut(&0x10000).unwrap()[4094..].copy_from_slice(&[1, 2]);
@@ -898,7 +950,8 @@ fn resident_interception_transport_builds_a_private_root_in_validated_host_stora
     ]).unwrap();
     let installed = native_tracking_request(&environment, &[buffer], &install);
     assert_eq!(word(&installed, 40), 0);
-    assert_eq!(barrier.operations, [0, 1, 2]);
+    assert!(barrier.operations.contains(&3));
+    assert_eq!(barrier.operations.iter().copied().filter(|operation| *operation != 3).collect::<Vec<_>>(), [0, 1, 2]);
     let configuration = unsafe { &*session.configuration.get() };
     let shadow = unsafe { ept_pointer(configuration.ept, target, 12).read() } & 0x000f_ffff_ffff_f000;
     assert_eq!(unsafe { (shadow as *const u8).add(8).read() }, 0xcc);

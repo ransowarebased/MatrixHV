@@ -35,17 +35,22 @@ def main():
         for cpu in cpus:
             prefix = f"cpu.{cpu}."
             assert metadata[prefix + "state"] == "1", (directory, cpu, metadata)
-            assert metadata[prefix + "armed"] == "0", (directory, cpu, metadata)
+            circular = metadata.get(prefix + "circular") == "1"
+            assert circular or metadata[prefix + "armed"] == "0", (directory, cpu, metadata)
             status = int(metadata[prefix + "rtit_status"], 0)
             assert status & (1 << 4) == 0, (directory, cpu, status)
+            assert not circular or status & (1 << 5) == 0, (directory, cpu, status)
             generation = int(metadata[prefix + "generation"])
             if cpu in generations:
-                assert generation == generations[cpu] + 1, (directory, cpu, generation)
+                assert generation >= generations[cpu], (directory, cpu, generation)
             generations[cpu] = generation
             trace = directory / f"cpu-{cpu}.pt"
             data = trace.read_bytes()
             assert len(data) == int(metadata[prefix + "bytes"]) and 0 < len(data) <= 65536
-            assert data.startswith(bytes([0x02, 0x82]) * 8), (directory, cpu)
+            psb_offset = data.find(bytes([0x02, 0x82]) * 8)
+            assert psb_offset >= 0 and (circular or psb_offset == 0), (directory, cpu)
+            decode_trace = output / f"{directory.name}-cpu-{cpu}-synchronized.pt"
+            decode_trace.write_bytes(data[psb_offset:])
             signature = int(metadata[prefix + "cpuid_1_eax"], 0)
             family = (signature >> 8) & 15
             if family == 15:
@@ -55,7 +60,7 @@ def main():
                 model |= (signature >> 12) & 0xf0
             stepping = signature & 15
             decoded = subprocess.run([str(arguments.decoder.resolve()), "--lastip",
-                "--cpu", f"{family}/{model}/{stepping}", str(trace)],
+                "--cpu", f"{family}/{model}/{stepping}", str(decode_trace)],
                 capture_output=True, text=True, timeout=30)
             listing = output / f"{directory.name}-cpu-{cpu}.txt"
             listing.write_text(decoded.stdout + decoded.stderr)
@@ -68,10 +73,18 @@ def main():
                 r"\bip\s+([0-9a-f]{16})", decoded.stdout)]
             base = int(metadata[prefix + "code_base"], 0)
             length = int(metadata[prefix + "code_bytes"])
-            assert addresses and all(base <= address < base + length for address in addresses), listing
+            ranges = [(base, base + length)]
+            if "callbacks.image_base" in metadata:
+                callback_base = int(metadata["callbacks.image_base"], 0)
+                ranges.append((callback_base, callback_base + int(metadata["callbacks.image_bytes"])))
+                assert re.fullmatch(r"[0-9a-f]{64}", metadata["callbacks.sha256"]), metadata
+            assert addresses and all(any(start <= address < end for start, end in ranges)
+                                     for address in addresses), listing
             records.append({"capture": directory.name, "cpu": cpu, "bytes": len(data),
                 "sha256": hashlib.sha256(data).hexdigest(), "generation": generation,
                 "status": status, "stopped_at_capacity": bool(status & (1 << 5)),
+                "circular": circular, "discarded_prefix_bytes": psb_offset,
+                "callback_identity": metadata.get("callbacks.sha256", "unavailable"),
                 "packet_counts": dict(packets), "instruction_pointer_packets": len(addresses),
                 "root_code_base": base, "root_code_bytes": length, "decoder_exit": 0})
     result = {"result": "PASS", "captures": len(arguments.captures),

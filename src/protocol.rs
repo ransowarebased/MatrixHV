@@ -106,6 +106,9 @@ pub const MATRIXHV_INTEL_PT_CAPABILITY: u32 = 1 << 18;
 pub const MATRIXHV_INTEL_PT_SUBLEAF: u32 = 0x600;
 pub const MATRIXHV_INTEL_PT_DATA_SUBLEAF: u32 = 0x1000;
 pub const MATRIXHV_INTEL_PT_BUFFER_BYTES: usize = 64 * 1024;
+pub const MATRIXHV_CALLBACK_IDENTITY_CAPABILITY: u32 = 1 << 19;
+pub const MATRIXHV_CALLBACK_IDENTITY_SUBLEAF: u32 = 0x610;
+pub const MATRIXHV_INTEL_PT_RING_CAPABILITY: u32 = 1 << 20;
 pub const MATRIXHV_EXIT_TIMING_CAPABILITY: u32 = 1 << 17;
 pub const MATRIXHV_EXIT_TIMING_SUBLEAF: u32 = 55;
 // The resident L1 contract excludes legacy hardware task switching and SMX.

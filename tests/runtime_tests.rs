@@ -6,6 +6,22 @@ mod logger {
     use std::collections::VecDeque;
 
     #[test]
+    fn rust_serial_contention_is_bounded_and_preserves_the_other_owner() {
+        let lock = Box::leak(Box::new(AtomicU64::new(0xdead)));
+        SHARED_LOCK_ADDRESS.store(lock as *const AtomicU64 as u64, Ordering::Release);
+        assert!(SerialLockGuard::acquire().is_none());
+        assert_eq!(lock.load(Ordering::Acquire), 0xdead);
+        lock.store(0, Ordering::Release);
+        let guard = SerialLockGuard::acquire().expect("Idle serial lock must be acquired");
+        assert_eq!(lock.load(Ordering::Acquire), RUST_LOCK_OWNER);
+        assert!(SerialLockGuard::acquire().is_none());
+        assert_eq!(lock.load(Ordering::Acquire), RUST_LOCK_OWNER);
+        drop(guard);
+        assert_eq!(lock.load(Ordering::Acquire), 0);
+        SHARED_LOCK_ADDRESS.store(0, Ordering::Release);
+    }
+
+    #[test]
     fn firmware_console_requires_bsp_and_enabled_interrupts() {
         for bsp in [false, true] {
             for interrupts in [false, true] {

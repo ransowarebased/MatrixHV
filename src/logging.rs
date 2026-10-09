@@ -238,7 +238,9 @@ pub fn install_shared_lock(address: u64) {
 }
 
 pub fn write_line(message: &str) {
-    let _guard = SerialLockGuard::acquire();
+    let Some(_guard) = SerialLockGuard::acquire() else {
+        return;
+    };
     let mut writer = SerialWriter;
     let _ = writeln!(writer, "{message}");
 }
@@ -248,20 +250,23 @@ struct SerialLockGuard {
 }
 
 impl SerialLockGuard {
-    fn acquire() -> Self {
+    fn acquire() -> Option<Self> {
         let address = SHARED_LOCK_ADDRESS.load(Ordering::Acquire);
         let lock = if address == 0 {
             &FALLBACK_LOCK
         } else {
             unsafe { &*(address as *const AtomicU64) }
         };
-        while lock
-            .compare_exchange_weak(0, RUST_LOCK_OWNER, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        for _ in 0..TX_WAIT_LIMIT {
+            if lock
+                .compare_exchange_weak(0, RUST_LOCK_OWNER, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(Self { lock });
+            }
             core::hint::spin_loop();
         }
-        Self { lock }
+        None
     }
 }
 

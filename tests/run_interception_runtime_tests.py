@@ -29,10 +29,11 @@ for declaration, replacement in [
     ('fn page_byte(', 'fn page_byte(address: u64, value: Option<u8>) -> u8 { crate::hardware::page_byte(address, value) }'),
     ('fn clock()', 'fn clock() -> u64 { crate::hardware::clock() }'),
     ('fn syscall_msrs()', 'fn syscall_msrs() -> [u64; 2] { crate::hardware::syscall_msrs() }'),
-    ('fn fetch_instruction(', 'fn fetch_instruction(_: &ResidentBootContext, _: &RoadEptProfile, rip: u64, execution: &mut [u8; 15], original: &mut [u8; 15]) -> usize { crate::hardware::fetch_instruction(rip, execution, original) }'),
     ('fn original_value(', 'fn original_value(address: u64, width: usize, value: Option<u64>) -> u64 { crate::hardware::original_value(address, width, value) }'),
 ]:
     runtime = runtime.replace(item(runtime, declaration), replacement)
+runtime = runtime.replace('crate::memory::access::resident::instruction_bytes(',
+                          'crate::hardware::fetch_instruction(')
 start = runtime.index('        if !no_flush &&')
 end = runtime.index('        Ok(2)', start)
 runtime = runtime[:start] + '''        if !no_flush && read(SECONDARY_VM_EXEC_CONTROL)? & (1 << 5) != 0 {
@@ -69,8 +70,10 @@ pub mod vmx {
     }
     pub mod resident { pub mod abi {
 ''' + cpu + '''
+        #[repr(C)]
         #[derive(Default)]
         pub struct NestedState { pub active: u64, pub l2_active: u64, pub host_misc: u64 }
+        #[repr(C)]
         #[derive(Default)]
         pub struct ResidentBootContext {
             pub event_context: u64,
@@ -83,14 +86,80 @@ pub mod vmx {
             pub diagnostic_interval_tsc: u64,
             pub diagnostic_expired: u64,
             pub processor_number: u64,
+            pub sync_safe: u64,
+            pub sync_nmi: u64,
+            pub watchdog_phase: u64,
+            pub watchdog_sequence: u64,
+            pub stop_result: u64,
             pub nested: NestedState,
             pub interception: InterceptionCpuState,
         }
-        pub struct ResidentEventContext { pub interception_context_physical: u64 }
+        #[repr(C)]
+        pub struct ResidentEventContext {
+            pub interception_context_physical: u64,
+            pub interception_entry: u64,
+        }
     } }
 }
 '''
 (output / 'definitions.rs').write_text(definitions)
+control = (project / 'src/vmx/asm/control.S').read_text()
+sync = (project / 'src/vmx/asm/eptp_switch.S').read_text()
+exits = (project / 'src/vmx/asm/exits.S').read_text()
+bridge = control[control.index('.Lresident_interception_callback:'):control.index('.Lresident_dispatch_update_l2_reject:')]
+bridge += sync[sync.index('.Lresident_nested_eptp_sync_enter:'):sync.index('// The copied Rust callback')]
+bridge += exits[exits.index('.Lresident_interception_clock_commit:'):exits.index('// Separate emulated VMCS access')]
+bridge += '''
+.Lresident_nested_eptp_sync_return:
+.Lresident_nested_eptp_sync_poll:
+.Lresident_interception_safe_point_timer:
+ret
+.Lresident_watchdog_resuming:
+mov qword ptr [r12 + {b_watchdog_phase}], 1
+inc qword ptr [r12 + {b_watchdog_sequence}]
+ret
+.Lresident_memory_synchronize:
+jmp matrixhv_test_synchronize
+.Lresident_dispatch_halt:
+ud2
+.balign 8
+.Lresident_eptp_sync_owner:
+.quad 0
+.Lresident_eptp_sync_failure:
+.quad 0
+'''
+for name, target in [('callback', 'interception_callback'), ('gate', 'nested_eptp_sync_enter'), ('nmi', 'nested_eptp_sync_host_nmi')]:
+    bridge += f'''
+.globl matrixhv_test_{name}
+matrixhv_test_{name}:
+push r12
+mov r12, rcx
+call .Lresident_{target}
+pop r12
+ret
+'''
+bindings = {
+    'b_event_context': 'ResidentBootContext, event_context',
+    'event_interception_context': 'ResidentEventContext, interception_context_physical',
+    'event_interception_entry': 'ResidentEventContext, interception_entry',
+    'b_nested_eptp_sync_safe': 'ResidentBootContext, sync_safe',
+    'b_nested_eptp_sync_nmi': 'ResidentBootContext, sync_nmi',
+    'b_watchdog_phase': 'ResidentBootContext, watchdog_phase',
+    'b_watchdog_sequence': 'ResidentBootContext, watchdog_sequence',
+    'b_telemetry_active': 'ResidentBootContext, telemetry_active',
+    'b_last_reason': 'ResidentBootContext, last_reason',
+    'b_stop_result': 'ResidentBootContext, stop_result',
+}
+for name, field in {
+    'controls': 'controls_saved', 'debug_armed': 'debug_armed', 'ept': 'applied_ept',
+    'exit_ept': 'exit_ept', 'exit_step': 'exit_step', 'exit_vmfunc': 'exit_vmfunc',
+    'hook_count': 'hook_count', 'timing_saved': 'timing_saved',
+}.items():
+    bindings['b_interception_' + name] = 'ResidentBootContext, interception.' + field
+used = set(re.findall(r'\{(\w+)\}', bridge))
+assert used == set(bindings), (used - set(bindings), set(bindings) - used)
+(output / 'bridge.rs').write_text('core::arch::global_asm!(r#"' + bridge + '"#,\n' +
+    ''.join(f'{name} = const core::mem::offset_of!({field}),\n' for name, field in bindings.items()) + ');\n')
 binary = output / 'runtime.exe'
 host = next(line.removeprefix('host: ') for line in subprocess.check_output(['rustc', '-vV'], text=True).splitlines() if line.startswith('host: '))
 (output / 'Cargo.toml').write_text('''[package]

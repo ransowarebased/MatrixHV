@@ -7,6 +7,7 @@ struct Context {
     trace: TraceState,
     reason: u64,
     host_misc: u64,
+    stop_result: u64,
 }
 
 #[repr(C)]
@@ -24,6 +25,8 @@ struct Model {
     cpuid_max: u64,
     cpuid_leaf7_ebx: u64,
     cpuid_pt_ecx: u64,
+    fail_write_repeats: u64,
+    fatal_count: u64,
 }
 
 impl Default for Model {
@@ -42,6 +45,8 @@ impl Default for Model {
             cpuid_max: 0x1b,
             cpuid_leaf7_ebx: 0xf2bf67eb,
             cpuid_pt_ecx: 7,
+            fail_write_repeats: 0,
+            fatal_count: 0,
         }
     }
 }
@@ -66,6 +71,7 @@ fn context() -> Context {
         },
         reason: 10,
         host_misc: 0x7004c1e7,
+        stop_result: 0,
     }
 }
 
@@ -142,11 +148,55 @@ fn intervals_flush_packets_and_restore_every_borrowed_msr() {
         0x41
     );
     assert_eq!(model.msrs, original);
-    assert_eq!(context.trace.bytes, 320);
+    assert_eq!(context.trace.bytes, 65536);
     assert_eq!(context.trace.owned, 0);
     unsafe { test_enter(&mut context, &mut model, 0x202, 0) };
     assert_eq!(model.msrs[3] >> 32, 320);
     unsafe { test_leave(&mut context, &mut model, 0x202, 0) };
+}
+
+#[test]
+fn circular_snapshots_rotate_bytes_and_remain_immutable_while_tracing_continues() {
+    for offset in [0_u64, 1, 15, 320, 65535, 65536] {
+        let mut context = context();
+        let mut buffer: Vec<u8> = (0..65536).map(|index| (index % 251) as u8).collect();
+        let mut snapshot = vec![0_u8; 65536];
+        context.trace.buffer = buffer.as_mut_ptr() as u64;
+        context.trace.snapshot = snapshot.as_mut_ptr() as u64;
+        context.trace.bytes = 65536;
+        context.trace.output_pointer = (offset << 32) | 0x7f;
+        let mut model = Model { operation: 5, ..Default::default() };
+        let mut expected = buffer.clone();
+        expected.rotate_left(offset as usize % 65536);
+        unsafe { test_request(&mut context, &mut model) };
+        assert_eq!(snapshot, expected);
+        assert_eq!(context.trace.armed, 1);
+        assert_eq!(context.trace.snapshot_sequence, 1);
+        assert_eq!(context.trace.snapshot_pointer, offset);
+        buffer.fill(0xa5);
+        model.operation = 0x1000;
+        unsafe { test_request(&mut context, &mut model) };
+        let exported: Vec<_> = model.result.into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(exported, expected[..16]);
+        assert_eq!(snapshot, expected);
+        assert_eq!((model.reads, model.writes), (0, 0));
+    }
+}
+
+#[test]
+fn wrapped_output_offsets_keep_collection_armed() {
+    let mut context = context();
+    let mut model = Model::default();
+    for offset in [65000, 17, 40000, 0, 123] {
+        model.flush_bytes = offset;
+        unsafe {
+            test_enter(&mut context, &mut model, 0x202, 0);
+            test_leave(&mut context, &mut model, 0x202, 0);
+        }
+        assert_eq!(context.trace.armed, 1);
+        assert_eq!(context.trace.output_pointer >> 32, offset);
+        assert_eq!(context.trace.bytes, 65536);
+    }
 }
 
 #[test]
@@ -246,6 +296,53 @@ fn snapshot_read_fault_restores_the_external_state() {
     unsafe { test_leave(&mut context, &mut model, 0x202, 0) };
     assert_eq!(model.msrs, original);
     assert_eq!((context.trace.support, context.trace.armed, context.trace.owned), (4, 0, 0));
+}
+
+#[test]
+fn transient_restore_faults_disable_collection_and_restore_every_guest_msr() {
+    for msr in [0x570, 0x560, 0x561, 0x571] {
+        let mut context = context();
+        let mut model = Model::default();
+        let original = model.msrs;
+        unsafe { test_enter(&mut context, &mut model, 0x202, 0) };
+        model.fail_write = msr;
+        unsafe { test_leave(&mut context, &mut model, 0x202, 0) };
+        assert_eq!(model.msrs, original);
+        assert_eq!((context.trace.support, context.trace.armed, context.trace.owned), (4, 0, 0));
+        assert_eq!(model.fatal_count, 0);
+    }
+}
+
+#[test]
+fn permanent_restore_faults_take_the_terminal_path_after_one_retry() {
+    for msr in [0x570, 0x560, 0x561, 0x571] {
+        let mut context = context();
+        let mut model = Model::default();
+        unsafe { test_enter(&mut context, &mut model, 0x202, 0) };
+        model.fail_write = msr;
+        model.fail_write_repeats = 2;
+        unsafe { test_leave(&mut context, &mut model, 0x202, 0) };
+        assert_eq!(model.fatal_count, 1);
+        assert_eq!(context.stop_result, 0x5054);
+        assert_eq!((context.trace.support, context.trace.armed, context.trace.owned), (4, 0, 0));
+    }
+}
+
+#[test]
+fn malformed_snapshot_lengths_preserve_the_previous_export() {
+    for (bytes, offset) in [(65537, 0), (16, 32)] {
+        let mut context = context();
+        context.trace.bytes = bytes;
+        context.trace.output_pointer = (offset << 32) | 0x7f;
+        context.trace.snapshot_pointer = 123;
+        context.trace.snapshot_bytes = 8;
+        context.trace.snapshot_sequence = 9;
+        let mut model = Model { operation: 5, ..Default::default() };
+        unsafe { test_request(&mut context, &mut model) };
+        assert_eq!((context.trace.snapshot_pointer, context.trace.snapshot_bytes,
+                    context.trace.snapshot_sequence), (123, 8, 9));
+        assert_eq!(model.result, [0; 4]);
+    }
 }
 
 #[test]

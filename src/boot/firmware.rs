@@ -888,10 +888,10 @@ fn verify_control_bridge(
     }
     Ok(())
 }
-pub(crate) fn calibrate_reference_tsc() -> u64 {
+fn acpi_root() -> Option<usize> {
     use uefi::table::cfg::ConfigTableEntry;
 
-    let root = uefi::system::with_config_table(|entries| {
+    uefi::system::with_config_table(|entries| {
         entries
             .iter()
             .find(|entry| entry.guid == ConfigTableEntry::ACPI2_GUID)
@@ -901,8 +901,18 @@ pub(crate) fn calibrate_reference_tsc() -> u64 {
                     .find(|entry| entry.guid == ConfigTableEntry::ACPI_GUID)
             })
             .map(|entry| entry.address as usize)
-    });
-    let Some((port, mask)) = root.and_then(|address| unsafe { acpi_pm_timer(address) }) else {
+    })
+}
+
+pub(crate) fn resident_reset_io() -> u64 {
+    acpi_root()
+        .and_then(|address| unsafe { acpi_fadt(address) })
+        .and_then(acpi_reset_register)
+        .unwrap_or(0)
+}
+
+pub(crate) fn calibrate_reference_tsc() -> u64 {
+    let Some((port, mask)) = acpi_root().and_then(|address| unsafe { acpi_pm_timer(address) }) else {
         return 0;
     };
     crate::vmx::hyperv::calibrated_tsc_hz(|| {
@@ -934,6 +944,10 @@ pub(crate) fn calibrate_reference_tsc() -> u64 {
 
 // Only firmware-installed ACPI pointers are dereferenced, before VMXON/EBS.
 unsafe fn acpi_pm_timer(address: usize) -> Option<(u16, u32)> {
+    acpi_pm_timer_register(unsafe { acpi_fadt(address) }?)
+}
+
+unsafe fn acpi_fadt(address: usize) -> Option<&'static [u8]> {
     if address == 0 {
         return None;
     }
@@ -972,10 +986,25 @@ unsafe fn acpi_pm_timer(address: usize) -> Option<(u16, u32)> {
             continue;
         };
         if &child[..4] == b"FACP" {
-            return acpi_pm_timer_register(child);
+            return Some(child);
         }
     }
     None
+}
+
+fn acpi_reset_register(fadt: &[u8]) -> Option<u64> {
+    if fadt.len() < 129
+        || u32::from_le_bytes(fadt[112..116].try_into().ok()?) & (1 << 10) == 0
+        || fadt[116] != 1 || fadt[117] != 8 || fadt[118] != 0
+        || ![0, 1].contains(&fadt[119])
+    {
+        return None;
+    }
+    let port = u64::from_le_bytes(fadt[120..128].try_into().ok()?);
+    if port == 0 || port > u64::from(u16::MAX) {
+        return None;
+    }
+    Some(port | (u64::from(fadt[128]) << 16))
 }
 
 unsafe fn acpi_table(address: usize) -> Option<&'static [u8]> {
