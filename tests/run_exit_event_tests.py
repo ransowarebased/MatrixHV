@@ -39,6 +39,7 @@ fields = {
     "guest_pending_dbg_exceptions": 13,
     "guest_rip": 14,
     "guest_efer": 15,
+    "exit_intr_error_code": 16,
     "ept_violation_reason": 48,
 }
 
@@ -46,6 +47,8 @@ event = (
     section(EXITS, ".Lresident_dispatch_inject_gp_vmcs:", ".Lresident_advance_guest_rip:")
     + section(EXITS, ".Lresident_advance_guest_rip:", ".Lresident_dispatch_vmwrite_failed:")
     + section(EXITS, ".Lresident_retry_ept_event:", ".endm")
+    + section(EXITS, ".Lresident_interception_retry:", ".Lresident_interception_advance:")
+    + section(NESTED, ".Lresident_dispatch_reinject_exception:", ".Lresident_dispatch_nmi:")
 )
 event = re.sub(r"\{(\w+)\}", lambda match: str(fields[match[1]]), event)
 event = re.sub(
@@ -71,16 +74,16 @@ cpuid = re.sub(r"(?m)^resident_telemetry_counter[^\n]*", "", cpuid)
 cpuid = cpuid.replace("matrixhv_resident_hyperv_cpuid", "ud2")
 cpuid = re.sub(r"(?m)^cpuid$", "ud2", cpuid)
 cpuid = cpuid.replace("jmp .Lresident_dispatch_resume", "jmp .Ltest_cpuid_completed")
-cpuid = cpuid.replace("[rip + matrixhv_resident_island_log_backend]", "[r12 + 208]")
-cpuid = cpuid.replace("mov rax, cr3", "mov rax, [r12 + 192]")
+cpuid = cpuid.replace("[rip + matrixhv_resident_island_log_backend]", "[r12 + 224]")
+cpuid = cpuid.replace("mov rax, cr3", "mov rax, [r12 + 208]")
 cpuid_fields = dict(fields, b_cpuid_leaf0=32, b_nested_l2_active=48,
-                    b_telemetry_active=56, b_expected_host_cr3=200,
+                    b_telemetry_active=56, b_expected_host_cr3=216,
                     cpuid_reason=10, memory_leaf=0x4d48564d, matrixhv_status_leaf=0x4d485652,
                     matrixhv_status_signature_eax=0, matrixhv_status_signature_ebx=0,
                     matrixhv_status_signature_ecx=0, matrixhv_status_protocol=0)
 cpuid = re.sub(r"\{(\w+)\}", lambda match: str(cpuid_fields[match[1]]), cpuid)
 cpuid = cpuid.replace("vmread r11, rax",
-                      "inc qword ptr [r12 + 216]\nmov r11, [r12 + 64 + rax * 8]\ncmp r12, 0")
+                      "inc qword ptr [r12 + 232]\nmov r11, [r12 + 64 + rax * 8]\ncmp r12, 0")
 assert not re.search(r"(?m)^vm(?:read|write) ", cpuid)
 cpuid += """
 .Lresident_dispatch_full:
@@ -220,6 +223,23 @@ test_event_retry:
 push r12
 mov r12, rcx
 call .Lresident_retry_ept_event
+pop r12
+ret
+.globl test_event_interception_retry
+test_event_interception_retry:
+push r12
+mov r12, rcx
+call .Lresident_interception_retry
+pop r12
+ret
+.globl test_event_exception
+test_event_exception:
+push r12
+push r13
+mov r12, rcx
+mov r13, [r12 + 200]
+call .Lresident_dispatch_reinject_exception
+pop r13
 pop r12
 ret
 .globl test_host_arm_nmi_window

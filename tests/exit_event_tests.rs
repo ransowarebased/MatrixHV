@@ -10,7 +10,7 @@ struct EventContext {
     rip: u64,
     instruction_len: u64,
     reserved: [u64; 4],
-    vmcs: [u64; 16],
+    vmcs: [u64; 18],
     host_cr3: u64,
     expected_host_cr3: u64,
     log_backend: u64,
@@ -51,6 +51,8 @@ unsafe extern "C" {
     fn test_event_advance(context: &mut EventContext);
     fn test_cpuid_leaf0(context: &mut EventContext, registers: &mut [u64; 4]) -> u64;
     fn test_event_retry(context: &mut EventContext);
+    fn test_event_interception_retry(context: &mut EventContext);
+    fn test_event_exception(context: &mut EventContext);
     fn test_host_arm_nmi_window(context: &mut ArmContext);
     fn test_nested_nmi_window(context: &mut WindowContext);
     fn test_deliver_pending_nmi(context: &mut WindowContext);
@@ -231,6 +233,74 @@ fn retry_preserves_interrupted_event_metadata() {
     unsafe { test_event_retry(&mut context) };
     assert_eq!(context.vmcs[3], 0x8000_0403);
     assert_eq!(context.vmcs[7], 4);
+}
+
+#[test]
+fn interception_retry_restores_nmi_blocking_after_an_ept_exit_during_iret() {
+    let mut context = EventContext {
+        reason: 48,
+        qualification: 0x1000,
+        ..Default::default()
+    };
+    context.vmcs[1] = 0x20;
+    unsafe { test_event_interception_retry(&mut context) };
+    assert_eq!(context.vmcs[2], 8);
+}
+
+#[test]
+fn exception_reinjection_preserves_error_codes_and_discards_exit_only_bits() {
+    for event in [0x8000_0b0d, 0x8000_0b0e, 0x8000_1b0e] {
+        let mut context = EventContext::default();
+        context.vmcs[17] = event;
+        context.vmcs[16] = 0x1234;
+        context.vmcs[5] = 0xdead;
+        unsafe { test_event_exception(&mut context) };
+        assert_eq!(context.vmcs[3], event & 0x8000_0fff);
+        assert_eq!(context.vmcs[5], 0x1234);
+    }
+}
+
+#[test]
+fn software_exception_reinjection_preserves_the_original_instruction_length() {
+    for (event, length) in [(0x8000_0603, 1), (0x8000_0501, 1), (0x8000_0604, 2)] {
+        let mut context = EventContext::default();
+        context.vmcs[17] = event;
+        context.vmcs[6] = length;
+        context.vmcs[7] = 15;
+        unsafe { test_event_exception(&mut context) };
+        assert_eq!(context.vmcs[3], event);
+        assert_eq!(context.vmcs[7], length);
+    }
+}
+
+#[test]
+fn intercepted_fault_during_delivery_uses_the_double_fault_matrix() {
+    let mut context = EventContext::default();
+    context.vmcs[17] = 0x8000_0b0d;
+    context.vmcs[0] = 0x8000_0b0e;
+    context.vmcs[8] = 1;
+    unsafe { test_event_exception(&mut context) };
+    assert_eq!(context.vmcs[3], 0x8000_0b08);
+    assert_eq!(context.vmcs[5], 0);
+}
+
+#[test]
+fn exception_retry_restores_nmi_blocking_only_when_the_exit_reports_it() {
+    for (event, vectoring, pin, expected) in [
+        (0x8000_1301, 0, 0x20, 8),
+        (0x8000_0301, 0, 0x20, 0),
+        (0x8000_1301, 0x8000_0303, 0x20, 0),
+        (0x8000_1b08, 0, 0x20, 0),
+        (0x8000_1301, 0, 0, 0),
+    ] {
+        let mut context = EventContext::default();
+        context.vmcs[17] = event;
+        context.vmcs[0] = vectoring;
+        context.vmcs[1] = pin;
+        unsafe { test_event_exception(&mut context) };
+        assert_eq!(context.vmcs[2], expected);
+        assert_eq!(context.vmcs[3] & 0x1000, 0);
+    }
 }
 
 #[test]

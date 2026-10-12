@@ -4086,10 +4086,59 @@ je .Lresident_dispatch_invept_software_prepare
 cmp rax, qword ptr [r10 + {nested_invvpid_rip_offset}]
 je .Lresident_dispatch_invvpid_software_prepare
 .Lresident_dispatch_reinject_exception:
+// Exit bit 12 describes IRET NMI unblocking and is reserved on VM entry.
+// Reconstruct all event metadata before combining interrupted IDT delivery.
+mov r10d, r13d
+and r10d, 0x80000fff
+bt r10d, 11
+jnc .Lresident_dispatch_reinject_length
+mov eax, {exit_intr_error_code}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+mov eax, {vm_entry_exception_error_code}
+vmwrite rax, r11
+jna .Lresident_dispatch_vmwrite_failed
+.Lresident_dispatch_reinject_length:
+mov edx, r10d
+and edx, 0x700
+cmp edx, 0x500
+jb .Lresident_dispatch_reinject_info
+cmp edx, 0x600
+ja .Lresident_dispatch_reinject_info
+mov eax, {exit_instruction_len}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+mov eax, {vm_entry_instruction_len}
+vmwrite rax, r11
+jna .Lresident_dispatch_vmwrite_failed
+.Lresident_dispatch_reinject_info:
 mov rax, {vm_entry_intr_info_field}
-vmwrite rax, r13
-jc .Lresident_dispatch_vmwrite_failed
-jz .Lresident_dispatch_vmwrite_failed
+vmwrite rax, r10
+jna .Lresident_dispatch_vmwrite_failed
+test r13d, 0x1000
+jz .Lresident_dispatch_reinject_vectoring
+mov eax, r13d
+and eax, 0x7ff
+cmp eax, 0x308
+je .Lresident_dispatch_reinject_vectoring
+mov eax, {idt_vectoring_info_field}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+bt r11d, 31
+jc .Lresident_dispatch_reinject_vectoring
+mov eax, {pin_based_vm_exec_control}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+test r11d, 0x20
+jz .Lresident_dispatch_reinject_vectoring
+mov eax, {guest_interruptibility_info}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+bts r11, 3
+vmwrite rax, r11
+jna .Lresident_dispatch_vmwrite_failed
+.Lresident_dispatch_reinject_vectoring:
+call .Lresident_retry_interrupted_event
 jmp .Lresident_dispatch_resume
 .Lresident_dispatch_nmi:
 mov qword ptr [r12 + {b_nmi_pending}], 1

@@ -923,7 +923,7 @@ cmp eax, {preemption_timer_reason}
 je .Lresident_dispatch_boot_timer
 jmp .Lresident_dispatch_unsupported
 .Lresident_interception_retry:
-call .Lresident_retry_interrupted_event
+call .Lresident_retry_ept_event
 jmp .Lresident_dispatch_resume
 .Lresident_interception_advance:
 call .Lresident_advance_guest_rip
