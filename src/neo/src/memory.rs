@@ -307,6 +307,7 @@ pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
         crate::protocol::memory::INTERCEPT_CAUSE_LEASE => "lease-expired",
         crate::protocol::memory::INTERCEPT_CAUSE_MERGE => "page-merge-conflict",
         crate::protocol::memory::INTERCEPT_CAUSE_RUNTIME => "profile-runtime-failure",
+        crate::protocol::memory::INTERCEPT_CAUSE_PROGRESS => "instruction-progress-failed",
         _ => "unknown",
     };
     println!(

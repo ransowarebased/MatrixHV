@@ -198,7 +198,11 @@ mov eax, 1
 jmp .Lresident_memory_synchronize_return
 .Lresident_memory_synchronize_budget:
 call .Lresident_nested_eptp_sync_budget_expired
-xor eax, 1
+// A peer may abandon this epoch before the owner's own deadline. Optional
+// stores and profile publication must stop on either cancellation or expiry.
+or rax, qword ptr [rip + .Lresident_eptp_sync_failure]
+sete al
+movzx eax, al
 .Lresident_memory_synchronize_return:
 add rsp, 8
 pop r15

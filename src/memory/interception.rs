@@ -160,7 +160,10 @@ pub(crate) struct Session {
     cr3_targets: UnsafeCell<[Cr3Targets; 64]>,
     pub cpuid: UnsafeCell<CpuidProfile>,
     pub syscall: UnsafeCell<SyscallProfile>,
+    // Bit 0 retains the exit's DR ownership; upper bits retain an even TSC
+    // deadline without increasing the allocation used by hot updates.
     pub exit_debug: [AtomicU64; 64],
+    ept_progress: [AtomicU64; 64],
 }
 const _: () = assert!(core::mem::offset_of!(Session, active) == 0);
 // Hot updates preserve every existing field and use only the zeroed tail of
@@ -196,6 +199,9 @@ impl Session {
         *self.syscall.get_mut() = SyscallProfile::default();
         for owned in &self.exit_debug {
             owned.store(0, Ordering::Relaxed);
+        }
+        for progress in &self.ept_progress {
+            progress.store(0, Ordering::Relaxed);
         }
     }
 
@@ -1743,6 +1749,8 @@ pub(crate) mod runtime {
     use crate::vmx::vmcs::*;
 
     const PRIMARY_BITS: u64 = (1 << 15) | (1 << 23) | (1 << 27);
+    const EPT_RETRY_BITS: u32 = 7;
+    const EPT_RETRY_LIMIT: u64 = (1 << EPT_RETRY_BITS) - 1;
     type Synchronize = unsafe extern "efiapi" fn(u64, u64) -> u64;
 
     fn read(field: u64) -> Result<u64, ()> {
@@ -2053,6 +2061,23 @@ pub(crate) mod runtime {
         )
     }
 
+    fn close_data_window(configuration: &RoadEptProfile, cpu_index: usize, shared: bool) {
+        for pointer in data_leaves(configuration, cpu_index) {
+            entry_bits(*pointer, 0, 6);
+        }
+        if shared {
+            for index in 0..configuration.hook_count {
+                if configuration.base_leaves[index] == 0 {
+                    shared_entry(
+                        configuration.cpu_leaves[cpu_index][index],
+                        configuration.pages[index],
+                        0,
+                    );
+                }
+            }
+        }
+    }
+
     fn finish_step(
         session: &Session,
         boot: &mut ResidentBootContext,
@@ -2068,28 +2093,18 @@ pub(crate) mod runtime {
         let concurrent = configuration.options & INTERCEPT_CONCURRENT_WRITES != 0;
         let cooperative_data = boot.interception.cooperative_data;
         let cooperative_cr3 = boot.interception.cooperative_cr3;
+        // Close physical guards before any fallible VMCS operation can clear
+        // step ownership or cause recovery to release the refresh lock.
+        if reading || writing {
+            close_data_window(configuration, boot.processor_number as usize, shared);
+        }
         let result = (|| {
             reset_step(boot)?;
             base(boot)?;
             if reading {
-                for pointer in data_leaves(configuration, boot.processor_number as usize) {
-                    entry_bits(*pointer, 0, 6);
-                }
-                if shared {
-                    for index in 0..configuration.hook_count {
-                        if configuration.base_leaves[index] == 0 {
-                            let pointer =
-                                configuration.cpu_leaves[boot.processor_number as usize][index];
-                            shared_entry(pointer, configuration.pages[index], 0);
-                        }
-                    }
-                }
                 invalidate(data_root(configuration, boot.processor_number as usize))?;
             }
             if writing {
-                for pointer in data_leaves(configuration, boot.processor_number as usize) {
-                    entry_bits(*pointer, 0, 6);
-                }
                 if let Err(error) = refresh(configuration, boot, synchronize) {
                     session
                         .cause
@@ -2183,8 +2198,12 @@ pub(crate) mod runtime {
         }
         // Revocation can restore DRs before dispatch sees the queued #DB.
         // Capture ownership per CPU before lease checks or barrier callbacks.
-        session.exit_debug[boot.processor_number as usize]
-            .store(boot.interception.debug_armed, Ordering::Release);
+        let exit_debug = &session.exit_debug[boot.processor_number as usize];
+        if boot.interception.debug_armed != 0 {
+            exit_debug.fetch_or(1, Ordering::Release);
+        } else {
+            exit_debug.fetch_and(!1, Ordering::Release);
+        }
         boot.interception.exit_timer = boot.interception.timer_armed;
         if boot.interception.data_pending != 0 && read(GUEST_RIP)? != boot.interception.data_rip {
             boot.interception.data_pending = 0;
@@ -2267,6 +2286,9 @@ pub(crate) mod runtime {
         boot: &mut ResidentBootContext,
         synchronize: Synchronize,
     ) -> Result<(), ()> {
+        if boot.processor_number >= 64 {
+            return Err(());
+        }
         if boot.nested.l2_active != 0 {
             return Ok(());
         }
@@ -2303,8 +2325,8 @@ pub(crate) mod runtime {
             cache.generation = 0;
             cpu.primary_bits = primary & PRIMARY_BITS;
             cpu.exception_bit = exceptions & 2;
-            cpu.controls_saved = 1;
             cpu.cr3_target_count = read(CR3_TARGET_COUNT)?;
+            cpu.controls_saved = 1;
         }
         if cpu.controls_saved != 0 {
             write(
@@ -2358,6 +2380,12 @@ pub(crate) mod runtime {
         let selected = if active {
             let configuration = unsafe { &*session.configuration.get() };
             if configuration.hook_count != 0 {
+                if cpu.hook_token != configuration.token
+                    || cpu.hook_generation != configuration.generation
+                {
+                    session.ept_progress[boot.processor_number as usize]
+                        .store(0, Ordering::Relaxed);
+                }
                 cpu.hook_pages = configuration.pages;
                 cpu.hook_count = configuration.hook_count;
                 cpu.hook_token = configuration.token;
@@ -2372,11 +2400,13 @@ pub(crate) mod runtime {
                 let mut registers: [u64; 5] = cpu.guest_debug[..5].try_into().map_err(|_| ())?;
                 registers[0] = syscall.entry;
                 registers[4] &= !1;
+                // Physical DRs change before VMWRITE can fail. Keep the saved
+                // guest state owned until every part of the overlay is retired.
+                cpu.debug_armed = 1;
                 load_debug(&registers);
                 write(GUEST_DR7, (cpu.guest_debug[5] & !0x000f_0003) | 2)?;
                 cpu.debug_targets[0] = [syscall.entry, syscall.callback];
                 cpu.debug_targets[3] = [syscall.entry, u64::MAX];
-                cpu.debug_armed = 1;
                 cpu.debug_count = 1;
                 cpu.debug_token = configuration.token;
                 cpu.debug_generation = configuration.generation;
@@ -2395,9 +2425,9 @@ pub(crate) mod runtime {
                     dr7 |= 2 << (index * 2);
                 }
                 registers[4] = cpu.guest_debug[4] & !15;
+                cpu.debug_armed = 1;
                 load_debug(&registers);
                 write(GUEST_DR7, dr7)?;
-                cpu.debug_armed = 1;
                 cpu.debug_count = configuration.debug_count;
                 cpu.debug_token = configuration.token;
                 cpu.debug_generation = configuration.generation;
@@ -3062,7 +3092,10 @@ pub(crate) mod runtime {
         // the instruction window so original data and snapshots remain stable.
         let configuration = unsafe { &*session.configuration.get() };
         match emulate_scalar_read(boot, configuration, frame)? {
-            Emulation::Completed => return Ok(1),
+            Emulation::Completed => {
+                session.ept_progress[boot.processor_number as usize].store(0, Ordering::Relaxed);
+                return Ok(1);
+            }
             Emulation::Fatal => return Ok(u64::MAX),
             Emulation::Unsupported => {}
         }
@@ -3160,6 +3193,7 @@ pub(crate) mod runtime {
                         return Ok(u64::MAX);
                     }
                     if matches!(outcome, Emulation::Completed) {
+                        session.ept_progress[boot.processor_number as usize].store(0, Ordering::Relaxed);
                         if let Err(error) = refresh(configuration, boot, synchronize) {
                             session
                                 .cause
@@ -3256,6 +3290,7 @@ pub(crate) mod runtime {
                 boot.interception.data_qualification = boot.last_qualification;
                 match emulate_mixed(boot, frame, &instruction, length as u64)? {
                     Emulation::Completed => {
+                        session.ept_progress[cpu_index].store(0, Ordering::Relaxed);
                         session.data_exits.fetch_add(1, Ordering::Relaxed);
                         return Ok(1);
                     }
@@ -3288,12 +3323,16 @@ pub(crate) mod runtime {
         if boot.processor_number >= 64 {
             return Err(());
         }
-        let exit_armed = session.exit_debug[boot.processor_number as usize].swap(0, Ordering::AcqRel);
+        let exit_armed = session.exit_debug[boot.processor_number as usize]
+            .fetch_and(!1, Ordering::AcqRel) & 1;
         let armed = boot.interception.debug_armed != 0 || exit_armed != 0;
         let syscall_armed = armed && boot.interception.debug_count == 1
             && boot.interception.debug_targets[3][1] == u64::MAX;
         restore_debug(&mut boot.interception)?;
         let reason = boot.last_reason & 0xffff;
+        if reason != 48 && reason != 52 {
+            session.ept_progress[boot.processor_number as usize].store(0, Ordering::Relaxed);
+        }
         let stepped = boot.interception.exit_step != 0;
         finish_step(session, boot, synchronize)?;
         if reason == 10 && session.is_active() && boot.nested.active == 0 {
@@ -3347,6 +3386,35 @@ pub(crate) mod runtime {
                     invalidate(boot.cache_ept_pointer)?;
                     return Ok(1);
                 }
+                // A busy refresh owner can legitimately require many retries
+                // while VMware schedules another CPU's guest MTF window. Bound
+                // both attempts and elapsed time; timer exits renew neither.
+                let progress = &session.ept_progress[boot.processor_number as usize];
+                let exit_debug = &session.exit_debug[boot.processor_number as usize];
+                let rip = read(GUEST_RIP)? << EPT_RETRY_BITS;
+                let previous = progress.load(Ordering::Relaxed);
+                let retries = if previous & EPT_RETRY_LIMIT != 0
+                    && previous & !EPT_RETRY_LIMIT == rip
+                {
+                    ((previous & EPT_RETRY_LIMIT) + 1).min(EPT_RETRY_LIMIT)
+                } else {
+                    let ticks = if boot.watchdog_tsc_hz != 0 {
+                        (boot.watchdog_tsc_hz / 10).max(2)
+                    } else {
+                        800_000_000
+                    };
+                    let deadline = clock().wrapping_add(ticks) & !1;
+                    exit_debug.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+                        |value| Some(deadline | (value & 1))).map_err(|_| ())?;
+                    1
+                };
+                let deadline = exit_debug.load(Ordering::Relaxed) & !1;
+                if retries >= EPT_RETRY_LIMIT && clock().wrapping_sub(deadline) as i64 >= 0 {
+                    session.cause.store(u64::from(INTERCEPT_CAUSE_PROGRESS), Ordering::Release);
+                    revoke(session, boot, synchronize)?;
+                    return Ok(1);
+                }
+                progress.store(rip | retries, Ordering::Relaxed);
                 let pending = boot.interception.data_pending != 0
                     && read(GUEST_RIP)? == boot.interception.data_rip;
                 if (stepped || pending) && access & 4 != 0 {
@@ -3371,6 +3439,7 @@ pub(crate) mod runtime {
                     if !writing {
                         match emulate_scalar_read(boot, configuration, frame)? {
                             Emulation::Completed => {
+                                progress.store(0, Ordering::Relaxed);
                                 session.data_exits.fetch_add(1, Ordering::Relaxed);
                                 return Ok(1);
                             }
@@ -3498,12 +3567,21 @@ pub(crate) mod runtime {
                             GUEST_PENDING_DBG_EXCEPTIONS,
                             read(GUEST_PENDING_DBG_EXCEPTIONS)? & !15,
                         )?;
-                        if session.is_active()
+                        let current = session.is_active()
                             && boot.interception.debug_token == configuration.token
                             && boot.interception.debug_generation == configuration.generation
-                            && root_matches(configuration, read(GUEST_CR3)?)
-                        {
-                            write(GUEST_RIP, target[1])?;
+                            && root_matches(configuration, read(GUEST_CR3)?);
+                        // RF also protects a self-redirect or another owned
+                        // target so the next instruction can actually execute.
+                        let flags = read(GUEST_RFLAGS)?;
+                        write(GUEST_RFLAGS, flags | (1 << 16))?;
+                        if current {
+                            if write(GUEST_RIP, target[1]).is_err() {
+                                if write(GUEST_RFLAGS, flags).is_err() {
+                                    return Ok(u64::MAX);
+                                }
+                                return Err(());
+                            }
                             session.hits.fetch_add(1, Ordering::Relaxed);
                         }
                         return Ok(1);
@@ -3568,9 +3646,42 @@ pub(crate) mod runtime {
         synchronize: Synchronize,
         fx_state: *mut u8,
     ) -> u64 {
+        if boot.is_null()
+            || !(boot as usize).is_multiple_of(core::mem::align_of::<ResidentBootContext>())
+        {
+            return u64::MAX;
+        }
         let boot = unsafe { &mut *boot };
+        if boot.processor_number >= 64
+            || boot.event_context == 0
+            || !(boot.event_context as usize)
+                .is_multiple_of(core::mem::align_of::<ResidentEventContext>())
+        {
+            return u64::MAX;
+        }
         let event = unsafe { &*(boot.event_context as *const ResidentEventContext) };
+        if event.interception_context_physical == 0
+            || !(event.interception_context_physical as usize)
+                .is_multiple_of(core::mem::align_of::<Session>())
+        {
+            return u64::MAX;
+        }
         let session = unsafe { &*(event.interception_context_physical as *const Session) };
+        let configuration = unsafe { &*session.configuration.get() };
+        if configuration.hook_count > HOOK_MAX_PAGES
+            || configuration.debug_count > 4
+            || configuration.bank > 1
+            || boot.interception.hook_count > HOOK_MAX_PAGES
+            || boot.interception.debug_count > 4
+            || unsafe { &*session.cpuid.get() }.count > CPUID_MAX_RECORDS
+            || unsafe { &(*session.cr3_targets.get())[boot.processor_number as usize] }.count > 4
+            || phase == 0
+                && (frame.is_null() || !(frame as usize).is_multiple_of(8) || fx_state.is_null())
+        {
+            session.cause.store(u64::from(INTERCEPT_CAUSE_RUNTIME), Ordering::Release);
+            session.active.store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
+            return u64::MAX;
+        }
         diagnostic_attempt(boot, phase as usize);
         // The VMX preemption timer runs only in non-root. Charge callbacks to
         // the dispatcher's existing root budget before starting optional work.
@@ -3596,9 +3707,12 @@ pub(crate) mod runtime {
                 );
                 revoke(session, boot, synchronize).map(|()| 0)
             }
-            3 => reset_step(boot)
-                .and_then(|()| {
-                    release_refresh(session, boot);
+            3 => {
+                let configuration = unsafe { &*session.configuration.get() };
+                close_data_window(configuration, boot.processor_number as usize, true);
+                let reset = reset_step(boot);
+                release_refresh(session, boot);
+                reset.and_then(|()| {
                     let configuration = unsafe { &*session.configuration.get() };
                     configure_vmfunc(boot, configuration, false)?;
                     boot.interception.cooperative_data = 0;
@@ -3648,7 +3762,8 @@ pub(crate) mod runtime {
                             .store(epoch, Ordering::Release);
                     }
                     Ok(0)
-                }),
+                })
+            }
             4 => observe_exit(session, boot, synchronize).map(|()| 0),
             5 => compensate_timing(session, boot).map(|()| 0),
             _ => Err(()),

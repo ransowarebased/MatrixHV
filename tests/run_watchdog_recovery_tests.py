@@ -69,6 +69,33 @@ for name, path, instruction in paths:
     """
 
 diagnostics = (project / "src/asm/diagnostics.S").read_text()
+fault_sources = [
+    ((project / "src/vmx/asm/exits.S").read_text(), ".Lresident_host_exception:", "call .Lresident_pt_freeze"),
+    (diagnostics, ".Lresident_host_gp_fatal:", "call .Lresident_pt_freeze"),
+    (diagnostics, "matrixhv_resident_island_fatal:", "mov r8, qword ptr"),
+]
+for index, (source, label, first_context_use) in enumerate(fault_sources):
+    start = source.index(label) + len(label)
+    guard = source[start:source.index(first_context_use, start)].replace("cli", "nop")
+    guard = guard.replace(".Lresident_platform_reset_cf9", ".Ltest_fault_reset")
+    assembly += f"""
+.globl test_fault_guard_{index}
+test_fault_guard_{index}:
+mov qword ptr [rip + .Lresident_host_fault_active], rcx
+{guard}
+mov eax, 1
+ret
+"""
+assembly += """
+.Ltest_fault_reset:
+xor eax, eax
+ret
+.data
+.balign 8
+.Lresident_host_fault_active:
+.quad 0
+.text
+"""
 serial = diagnostics[diagnostics.index(".Lresident_serial_write:"):diagnostics.index("matrixhv_resident_nested_tables")]
 serial = serial.replace("{log_serial_sink}", "1").replace("{serial_status_port}", "0x3fd")
 serial = serial.replace("{serial_port}", "0x3f8").replace("{serial_transmit_empty}", "0x20")

@@ -12,7 +12,7 @@ unsafe extern "C" {
 #[test]
 fn dispatcher_rejects_corrupt_canaries_before_its_first_context_write() {
     for bad_canary in [None, Some(1), Some(2)] {
-        let mut context = [91, 0x4856424f4f544331, 0x4856424f4f544332, 0, 0, 0];
+        let mut context = [91, 0x4856424f4f544331, 0x4856424f4f544332, 0, 0, 0, 0];
         if let Some(index) = bad_canary {
             context[index] ^= 1;
         }
@@ -29,7 +29,7 @@ fn dispatcher_rejects_corrupt_canaries_before_its_first_context_write() {
 #[test]
 fn timing_sample_follows_canary_validation() {
     for valid in [true, false] {
-        let mut context = [91, 0x4856424f4f544331, 0x4856424f4f544332, 0, 1, 77];
+        let mut context = [91, 0x4856424f4f544331, 0x4856424f4f544332, 0, 1, 77, 0];
         if !valid {
             context[1] = 0;
         }
@@ -42,6 +42,17 @@ fn timing_sample_follows_canary_validation() {
         } else {
             assert_eq!(context[5], 77);
         }
+    }
+}
+
+#[test]
+fn dispatcher_rejects_out_of_range_cpu_slots_before_touching_per_cpu_state() {
+    for processor in [0, 63, 64, u64::MAX] {
+        let mut context = [91, 0x4856424f4f544331, 0x4856424f4f544332, 0, 0, 77, processor];
+        let valid = processor < 64;
+        assert_eq!(unsafe { test_dispatch_canaries(context.as_mut_ptr()) }, u32::from(valid));
+        assert_eq!(context[0], if valid { 0 } else { 91 });
+        assert_eq!(context[3], u64::from(valid));
     }
 }
 

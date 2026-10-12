@@ -48,6 +48,20 @@ unsafe extern "win64" {
     fn test_vmxoff_0(failure: u64) -> u64;
     fn test_vmxoff_1(failure: u64) -> u64;
     fn test_vmxoff_2(failure: u64) -> u64;
+    fn test_fault_guard_0(active: u64) -> u64;
+    fn test_fault_guard_1(active: u64) -> u64;
+    fn test_fault_guard_2(active: u64) -> u64;
+}
+
+#[test]
+fn recursive_host_faults_bypass_diagnostics_and_the_context_dependent_reset_tuple() {
+    let _guard = SERIAL_LOCK.lock().unwrap();
+    for operation in [test_fault_guard_0, test_fault_guard_1, test_fault_guard_2] {
+        assert_eq!(unsafe { operation(0) }, 1);
+        for active in [1, 3, u64::MAX] {
+            assert_eq!(unsafe { operation(active) }, 0);
+        }
+    }
 }
 
 #[test]

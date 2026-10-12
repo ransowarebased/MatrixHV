@@ -140,6 +140,229 @@ fn syscall_overlay_preserves_foreign_breakpoints_and_forwards_their_debug_causes
 }
 
 #[test]
+fn failed_debug_overlay_install_restores_all_guest_debug_registers() {
+    for syscall in [false, true] {
+        let mut scenario = if syscall { syscall_scenario() } else { Scenario::new() };
+        let registers = hardware::debug_registers();
+        let dr7 = hardware::read(GUEST_DR7).unwrap();
+        hardware::STATE.with(|state| { state.borrow_mut().fail_writes.insert(GUEST_DR7, 1); });
+        assert_eq!(scenario.call(1), 0);
+        assert!(!scenario.session.is_active());
+        assert_eq!(hardware::debug_registers(), registers, "syscall={syscall}");
+        assert_eq!(hardware::read(GUEST_DR7), Ok(dr7));
+        assert_eq!(scenario.boot.interception.debug_armed, 0);
+        assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
+    }
+}
+
+#[test]
+fn failed_control_snapshot_preserves_preexisting_cr3_targets() {
+    let mut scenario = Scenario::new();
+    hardware::write(CR3_TARGET_COUNT, 2).unwrap();
+    hardware::write(0x6008, 0x7000).unwrap();
+    hardware::write(0x600a, 0x8000).unwrap();
+    hardware::STATE.with(|state| { state.borrow_mut().fail_reads.insert(CR3_TARGET_COUNT, 1); });
+    assert_eq!(scenario.call(1), 0);
+    assert!(!scenario.session.is_active());
+    assert_eq!(hardware::read(CR3_TARGET_COUNT), Ok(2));
+    assert_eq!(hardware::read(0x6008), Ok(0x7000));
+    assert_eq!(hardware::read(0x600a), Ok(0x8000));
+}
+
+#[test]
+fn debug_redirects_and_stale_faults_suppress_the_next_execution_breakpoint() {
+    for stale in [false, true] {
+        let mut scenario = Scenario::new();
+        scenario.session.configuration.get_mut().debug[0].redirect = 0x400000;
+        hardware::write(GUEST_RFLAGS, 0x202).unwrap();
+        hardware::write(GUEST_RIP, 0x400000).unwrap();
+        hardware::write(VM_EXIT_INTR_INFO, 0x80000301).unwrap();
+        scenario.call(1);
+        if stale {
+            scenario.session.configuration.get_mut().generation += 1;
+        }
+        assert_eq!(scenario.exit(0, 1), 1);
+        assert_eq!(hardware::read(GUEST_RIP), Ok(0x400000));
+        assert_eq!(hardware::read(GUEST_RFLAGS), Ok(0x10202));
+    }
+}
+
+#[test]
+fn repeated_ept_faults_without_retirement_revoke_even_without_a_lease() {
+    let mut scenario = Scenario::new();
+    scenario.boot.watchdog_tsc_hz = 1000;
+    scenario.session.configuration.get_mut().options = protocol::memory::INTERCEPT_NO_LEASE;
+    hardware::write(GUEST_RIP, 0x401000).unwrap();
+    hardware::write(GUEST_PHYSICAL_ADDRESS, 0x800040).unwrap();
+    scenario.call(1);
+    for _ in 0..127 {
+        assert_eq!(scenario.exit(48, 1), 1);
+        scenario.call(1);
+        // The timer can interrupt a retry without completing the instruction.
+        scenario.boot.last_reason = 52;
+        scenario.call(4);
+        scenario.call(0);
+        scenario.call(1);
+    }
+    assert!(scenario.session.is_active());
+    hardware::STATE.with(|state| state.borrow_mut().clock = 99);
+    assert_eq!(scenario.exit(48, 1), 1);
+    scenario.call(1);
+    assert!(scenario.session.is_active());
+    hardware::STATE.with(|state| state.borrow_mut().clock = 100);
+    assert_eq!(scenario.exit(48, 1), 1);
+    assert!(!scenario.session.is_active());
+    assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
+    assert_eq!(hardware::read(GUEST_RIP), Ok(0x401000));
+    assert_eq!(scenario.session.cause.load(Ordering::Acquire), u64::from(protocol::memory::INTERCEPT_CAUSE_PROGRESS));
+    assert_eq!(scenario.boot.interception.step_active, 0);
+}
+
+#[test]
+fn retry_deadlines_preserve_debug_exit_ownership_and_saturate_without_wrapping() {
+    let mut scenario = Scenario::new();
+    scenario.boot.watchdog_tsc_hz = 1000;
+    hardware::write(GUEST_RIP, 0x401000).unwrap();
+    hardware::write(GUEST_PHYSICAL_ADDRESS, 0x800040).unwrap();
+    scenario.call(1);
+    for _ in 0..512 {
+        assert_eq!(scenario.exit(48, 1), 1);
+        scenario.call(1);
+        assert!(scenario.session.is_active());
+    }
+    assert_eq!(scenario.session.exit_debug[0].load(Ordering::Relaxed) & !1, 100);
+    hardware::STATE.with(|state| state.borrow_mut().clock = 100);
+    hardware::write(GUEST_RIP, 0x400000).unwrap();
+    hardware::write(VM_EXIT_INTR_INFO, 0x80000301).unwrap();
+    assert_eq!(scenario.exit(0, 1), 1);
+    assert_eq!(hardware::read(GUEST_RIP), Ok(0x400100));
+    assert_eq!(hardware::read(GUEST_RFLAGS).unwrap() & (1 << 16), 1 << 16);
+    assert!(scenario.session.is_active());
+}
+
+#[test]
+fn mtf_retirement_and_completed_emulation_allow_repeated_accesses_at_the_same_rip() {
+    for emulated in [false, true] {
+        let mut scenario = Scenario::new();
+        hardware::write(GUEST_PHYSICAL_ADDRESS, 0x800040).unwrap();
+        hardware::write(GUEST_LINEAR_ADDRESS, 0x400040).unwrap();
+        if emulated {
+            let mut code = [0x90; 15];
+            code[..3].copy_from_slice(&[0x8b, 0x41, 0x40]);
+            scenario.frame[1] = 0x400000;
+            hardware::STATE.with(|state| state.borrow_mut().instruction = Some((code, code)));
+        }
+        scenario.call(1);
+        for _ in 0..256 {
+            hardware::write(GUEST_RIP, 0x401000).unwrap();
+            assert_eq!(scenario.exit(48, 0x181), 1);
+            scenario.call(1);
+            if !emulated {
+                assert_eq!(scenario.exit(37, 0), 1);
+                scenario.call(1);
+            }
+            assert!(scenario.session.is_active(), "emulated={emulated}");
+        }
+    }
+}
+
+#[test]
+fn corrupt_runtime_lengths_reset_before_slicing_or_dereferencing_hooks() {
+    for corruption in 0..6 {
+        let mut scenario = Scenario::new();
+        match corruption {
+            0 => scenario.session.configuration.get_mut().hook_count = usize::MAX,
+            1 => scenario.session.configuration.get_mut().debug_count = 5,
+            2 => scenario.session.configuration.get_mut().bank = 2,
+            3 => scenario.boot.interception.hook_count = usize::MAX,
+            4 => scenario.boot.interception.debug_count = 5,
+            _ => scenario.session.cpuid.get_mut().count = protocol::memory::CPUID_MAX_RECORDS + 1,
+        }
+        for phase in 0..6 {
+            assert_eq!(scenario.call(phase), u64::MAX, "corruption={corruption}, phase={phase}");
+        }
+        assert!(!scenario.session.is_active());
+        assert_eq!(hardware::debug_registers(), [11, 22, 33, 44, 0xffff0ff0]);
+        assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
+        hardware::STATE.with(|state| assert!(state.borrow().sync.is_empty()));
+    }
+}
+
+#[test]
+fn runtime_rejects_invalid_cpu_slots_and_missing_contexts_before_using_them() {
+    let mut scenario = Scenario::new();
+    scenario.boot.processor_number = 64;
+    for phase in 0..6 {
+        assert_eq!(scenario.call(phase), u64::MAX);
+    }
+    scenario.boot.processor_number = 0;
+    scenario.event.interception_context_physical = 0;
+    assert_eq!(scenario.call(1), u64::MAX);
+    unsafe {
+        assert_eq!(interception_entry(core::ptr::null_mut(), 1, core::ptr::null_mut(), hardware::synchronize, core::ptr::null_mut()), u64::MAX);
+    }
+}
+
+#[test]
+fn failed_window_close_restores_write_guards_before_releasing_refresh_ownership() {
+    for phase in [3, 4] {
+        let mut scenario = Scenario::new();
+        let configuration = scenario.session.configuration.get_mut();
+        configuration.options = INTERCEPT_CONCURRENT_WRITES;
+        configuration.cpu_data[0] = 0x1805e;
+        configuration.cpu_leaves[0][0] = 0xa000;
+        hardware::write(GUEST_RIP, 0x401000).unwrap();
+        hardware::write(GUEST_PHYSICAL_ADDRESS, 0x800040).unwrap();
+        scenario.call(1);
+        assert_eq!(scenario.exit(48, 2), 1);
+        scenario.call(1);
+        assert_eq!(scenario.boot.interception.refresh_owned, 1);
+        hardware::STATE.with(|state| { state.borrow_mut().fail_writes.insert(CPU_BASED_VM_EXEC_CONTROL, 1); });
+        assert_eq!(scenario.call(phase), 0);
+        assert!(!scenario.session.is_active());
+        assert_eq!(scenario.boot.interception.refresh_owned, 0, "phase={phase}");
+        assert_eq!(scenario.boot.interception.step_active, 0);
+        assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
+        hardware::STATE.with(|state| assert_eq!(state.borrow().entries[&0xa000] & 6, 0, "phase={phase}"));
+    }
+}
+
+#[test]
+fn failed_debug_redirect_restores_flags_and_rip_before_retiring_the_overlay() {
+    for field in [GUEST_RFLAGS, GUEST_RIP] {
+        let mut scenario = Scenario::new();
+        hardware::write(GUEST_RIP, 0x400000).unwrap();
+        hardware::write(GUEST_RFLAGS, 0x202).unwrap();
+        hardware::write(VM_EXIT_INTR_INFO, 0x80000301).unwrap();
+        scenario.call(1);
+        hardware::STATE.with(|state| { state.borrow_mut().fail_writes.insert(field, 1); });
+        assert_eq!(scenario.exit(0, 1), 0);
+        assert!(!scenario.session.is_active());
+        assert_eq!(hardware::read(GUEST_RIP), Ok(0x400000));
+        assert_eq!(hardware::read(GUEST_RFLAGS), Ok(0x202));
+        assert_eq!(hardware::debug_registers(), [11, 22, 33, 44, 0xffff0ff0]);
+        assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
+    }
+}
+
+#[test]
+fn failed_debug_redirect_rollback_requests_reset_instead_of_a_partial_return() {
+    let mut scenario = Scenario::new();
+    hardware::write(GUEST_RIP, 0x400000).unwrap();
+    hardware::write(GUEST_RFLAGS, 0x202).unwrap();
+    hardware::write(VM_EXIT_INTR_INFO, 0x80000301).unwrap();
+    scenario.call(1);
+    hardware::STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.write_plan.insert(GUEST_RFLAGS, [true, false].into());
+        state.fail_writes.insert(GUEST_RIP, 1);
+    });
+    assert_eq!(scenario.exit(0, 1), u64::MAX);
+    assert!(!scenario.session.is_active());
+    assert_eq!(hardware::read(GUEST_RIP), Ok(0x400000));
+}
+
+#[test]
 fn syscall_overlay_requires_the_exact_gate_free_dr0_root_and_supported_entry() {
     for rejected in 0..7 {
         let mut scenario = syscall_scenario();
@@ -2117,6 +2340,7 @@ fn concurrent_windows_own_refresh_serialization_until_mtf_and_release_it_for_the
 #[test]
 fn competing_concurrent_writers_retry_with_their_guard_closed_until_the_owner_finishes() {
     let mut scenario = Scenario::new();
+    scenario.boot.watchdog_tsc_hz = 1000;
     let profile = scenario.session.configuration.get_mut();
     profile.options = protocol::memory::INTERCEPT_CONCURRENT_WRITES;
     profile.cpu_data[0] = 0xc05e;
@@ -2132,7 +2356,7 @@ fn competing_concurrent_writers_retry_with_their_guard_closed_until_the_owner_fi
     let owner = core::mem::take(&mut scenario.boot.interception);
     scenario.boot.processor_number = 1;
     scenario.call(1);
-    for _ in 0..8 {
+    for _ in 0..512 {
         assert_eq!(scenario.exit(48, 2), 1);
         assert_eq!(scenario.boot.interception.step_active, 0);
         assert_eq!(scenario.boot.interception.refresh_owned, 0);

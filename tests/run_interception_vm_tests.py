@@ -25,9 +25,17 @@ def main():
                         help="Use explicit-release sessions and skip watchdog expiry tests")
     parser.add_argument("--write-iterations", type=int, default=32,
                         help="Number of writes per CPU in the concurrent writer regression")
+    parser.add_argument("--debug-progress-only", action="store_true",
+                        help="Run self and cyclic debug-register redirects in isolation")
+    parser.add_argument("--refresh-fault-ida", type=Path,
+                        help="Inject a stranded refresh lock using headless IDA and test recovery")
+    parser.add_argument("--refresh-fault-baseline", type=Path,
+                        help="Current boot snapshot from collect_boot_state.py for lock injection")
     arguments = parser.parse_args()
     if arguments.write_iterations < 1:
         parser.error("--write-iterations must be positive")
+    if bool(arguments.refresh_fault_ida) != bool(arguments.refresh_fault_baseline):
+        parser.error("Refresh fault injection requires both IDA and the current boot baseline")
     project = Path(__file__).resolve().parents[1]
     output = arguments.output.resolve()
     output.relative_to(project / "builds")
@@ -35,6 +43,7 @@ def main():
     guest = r"C:\MatrixHVInterceptionValidation-" + uuid.uuid4().hex[:12]
     peer_directory = guest + r"\peer"
     peer_started = False
+    boot_before = None
     token = None
     sequence = 0
     results = []
@@ -114,6 +123,38 @@ def main():
         print("PASS", name, flush=True)
         (output / "results.json").write_text(json.dumps(results, indent=2))
 
+    def debug_progress():
+        nonlocal token
+        lease = ["--no-lease"] if arguments.no_lease else ["--lease-ms", "600000"]
+        rejected = neo("debug-registers", "set", root, fixture["first"], fixture["first"],
+                       *lease, expected=1)
+        assert "invalid range" in rejected, rejected
+        expect_execution(17)
+        text = neo("debug-registers", "set", root,
+                   fixture["first"], fixture["second"], fixture["second"], fixture["first"], *lease)
+        token = field(text, "token")
+        expect_execution(34)
+        assert field(neo("hook", "status"), "state") == "active"
+        release()
+        expect_execution(17)
+        passed("Self DR redirects are rejected; cyclic redirects progress on every CPU")
+
+    def refresh_fault(mode):
+        environment = os.environ.copy()
+        environment.update(MATRIXHV_EVIDENCE_ROOT=str(output),
+                           MATRIXHV_REFRESH_FAULT_MODE=mode,
+                           MATRIXHV_REFRESH_BASELINE=str(arguments.refresh_fault_baseline.resolve()))
+        ida_path = str(arguments.refresh_fault_ida.resolve()).replace("'", "''")
+        script_path = str(project / 'tests/interception_refresh_fault_vm.py').replace("'", "''")
+        log_path = str(output / f'refresh-fault-{mode}-idat.log').replace("'", "''")
+        source = (f"$process=Start-Process -FilePath '{ida_path}' -WindowStyle Hidden "
+                  f"-ArgumentList '-A','-t','-S\"{script_path}\"','-L\"{log_path}\"' -PassThru; "
+                  "$process.WaitForExit(); exit $process.ExitCode")
+        subprocess.run(['powershell.exe', '-NoProfile', '-Command', source],
+                       env=environment, check=True, timeout=45)
+        evidence = json.loads((output / f'refresh-fault-{mode}.json').read_text())
+        assert evidence.get('passed'), evidence
+
     guest_hash = script("(Get-FileHash -LiteralPath '" + arguments.guest_neo.replace("'", "''") + "' -Algorithm SHA256).Hash").strip()
     host_hash = hashlib.sha256(arguments.neo.read_bytes()).hexdigest()
     assert guest_hash.lower() == host_hash, "Guest Neo must match the supplied host binary"
@@ -129,6 +170,7 @@ def main():
                "try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }")
     detached(f"Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command \"& ''{guest}\\fixture.ps1'' -OutputDirectory ''{guest}'' *> ''{guest}\\fixture-out.log''\"'; exit 0")
     try:
+        boot_before = script('(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString("o")').strip()
         fixture = json.loads(script(f"for ($attempt=0; $attempt -lt 200; ++$attempt) {{ "
                                     f"if (Test-Path '{guest}\\fixture.json') {{ Get-Content -Raw '{guest}\\fixture.json'; exit 0 }}; "
                                     "Start-Sleep -Milliseconds 25 }; throw 'Fixture initialization timed out'"))
@@ -138,6 +180,34 @@ def main():
         expect_execution(17)
         expect_execution(34, 1)
         passed("Original execution on every CPU")
+
+        if arguments.debug_progress_only:
+            debug_progress()
+            return
+
+        if arguments.refresh_fault_ida:
+            install("--concurrent-writes")
+            expect_execution(51)
+            refresh_fault('strand')
+            fixture_command("write", offset=130, value=167)
+            status = neo("hook", "status")
+            assert field(status, "state") == "revoked", status
+            assert field(status, "revocation_cause") == "instruction-progress-failed", status
+            committed = neo("read", fixture["pid"], "auto", hex(int(fixture["first"], 0) + 130), "1")
+            assert field(committed, "data") == "a7", committed
+            expect_execution(17)
+            refresh_fault('release')
+            release()
+            install("--concurrent-writes")
+            fixture_command("write", offset=131, value=168)
+            committed = neo("read", fixture["pid"], "auto", hex(int(fixture["first"], 0) + 131), "1")
+            assert field(committed, "data") == "a8", committed
+            expect_execution(51)
+            assert field(neo("hook", "status"), "state") == "active"
+            release()
+            expect_execution(17)
+            passed("Stranded refresh lock revokes without a reboot and a fresh writer session succeeds")
+            return
 
         if arguments.expect_no_watchdog:
             before = neo("hook", "status")
@@ -267,6 +337,8 @@ def main():
         assert fixture_command("debug-all") == [17, 18, 19, 20] * fixture["processors"]
         passed("All four DR slots redirect independently and restore on every CPU")
 
+        debug_progress()
+
         install("--vmfunc")
         expect_execution(51)
         expect_execution(0xb8, 3)
@@ -336,11 +408,24 @@ def main():
                 script(f"Set-Content -LiteralPath '{directory}\\command.json' -Value '{{\"operation\":\"stop\"}}'")
             except Exception as error:
                 cleanup_errors.append(directory + ': ' + repr(error))
+        boot_after = None
+        try:
+            boot_after = script('(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString("o")').strip()
+            if boot_before != boot_after:
+                raise AssertionError("Guest rebooted during interception validation")
+            status = neo("matrix", "status")
+            if (field(status, "failed") != "0x0"
+                    or field(status, "active") != field(status, "expected")
+                    or field(status, "stopped") != "0x0"):
+                raise AssertionError("Resident CPU health changed: " + status)
+        except Exception as error:
+            cleanup_errors.append('Guest health: ' + repr(error))
         (output / 'run-status.json').write_text(json.dumps({
             'status': 'FAIL' if original_error or cleanup_errors else 'PASS',
             'error': repr(original_error) if original_error else None,
             'cleanup_errors': cleanup_errors, 'guest_directory': guest,
             'passed_scenarios': len(results),
+            'boot_before': boot_before, 'boot_after': boot_after,
         }, indent=2), encoding='utf-8')
         log.close()
         if cleanup_errors and original_error is None:

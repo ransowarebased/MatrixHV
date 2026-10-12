@@ -233,6 +233,7 @@ pub mod memory {
     pub const INTERCEPT_CAUSE_LEASE: u32 = 4;
     pub const INTERCEPT_CAUSE_MERGE: u32 = 5;
     pub const INTERCEPT_CAUSE_RUNTIME: u32 = 6;
+    pub const INTERCEPT_CAUSE_PROGRESS: u32 = 7;
     pub const EPT_DIAGNOSTIC_CAPABILITY: u32 = 1 << 16;
     pub const EPT_DIAGNOSTIC_SUBLEAF: u32 = 0x400;
     // Runtime words are (attempts, successes, failures) for dispatch, apply,

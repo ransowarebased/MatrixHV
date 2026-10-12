@@ -565,6 +565,8 @@ jmp .Lresident_host_exception
 .endr
 .Lresident_host_exception:
 cli
+lock bts qword ptr [rip + .Lresident_host_fault_active], 0
+jc .Lresident_platform_reset_cf9
 call .Lresident_pt_freeze
 mov r8, qword ptr [rip + matrixhv_resident_island_event_context]
 test r8, r8
@@ -699,6 +701,8 @@ jne matrixhv_resident_island_fatal
 mov rax, {boot_canary_end}
 cmp qword ptr [r12 + {b_canary_end}], rax
 jne matrixhv_resident_island_fatal
+cmp qword ptr [r12 + {b_processor_number}], 64
+jae matrixhv_resident_island_fatal
 cmp qword ptr [r12 + {b_interception_timing_saved}], 0
 je .Lresident_interception_clock_sampled
 lfence

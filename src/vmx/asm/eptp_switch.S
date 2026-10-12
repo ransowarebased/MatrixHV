@@ -1028,14 +1028,20 @@ mov rax, qword ptr [r12 + {b_last_guest_physical_address}]
 mov qword ptr [r12 + {b_interception_runtime_diagnostics} + 184], rax
 ret
 .Lresident_nested_eptp_sync_recover:
+mov rcx, qword ptr [r12 + {b_processor_number}]
+bt qword ptr [rip + .Lresident_eptp_sync_recovered], rcx
+jc .Lresident_nested_eptp_sync_return
+// A root owner may still hold an exclusive Rust borrow while building a new
+// profile. Peers cannot inspect that configuration until it releases ownership.
+// A guest MTF owner has already published the entry marker and no such borrow.
+call .Lresident_nested_eptp_sync_recovery_safe
+test eax, eax
+jz .Lresident_dispatch_halt
 mov r9, qword ptr [r12 + {b_event_context}]
 mov r9, qword ptr [r9 + {event_interception_context}]
 test r9, r9
 jz .Lresident_nested_eptp_sync_return
 mov qword ptr [r9], 2
-mov rcx, qword ptr [r12 + {b_processor_number}]
-bt qword ptr [rip + .Lresident_eptp_sync_recovered], rcx
-jc .Lresident_nested_eptp_sync_return
 mov edx, 2
 call .Lresident_interception_callback
 cmp rax, -1
@@ -1043,6 +1049,18 @@ je .Lresident_dispatch_halt
 call .Lresident_nested_eptp_sync_flush_local
 mov rcx, qword ptr [r12 + {b_processor_number}]
 lock bts qword ptr [rip + .Lresident_eptp_sync_recovered], rcx
+ret
+
+.Lresident_nested_eptp_sync_recovery_safe:
+mov rax, qword ptr [rip + .Lresident_eptp_sync_owner]
+test rax, rax
+jz .Lresident_nested_eptp_sync_recovery_allowed
+cmp rax, r12
+je .Lresident_nested_eptp_sync_recovery_allowed
+cmp qword ptr [rax + {b_nested_eptp_sync_safe}], 0
+je .Lresident_nested_eptp_sync_busy
+.Lresident_nested_eptp_sync_recovery_allowed:
+mov eax, 1
 ret
 
 .Lresident_nested_eptp_sync_clock:

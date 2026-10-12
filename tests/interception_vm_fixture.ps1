@@ -169,8 +169,55 @@ public static class InterceptionVmFixture {
         }
         return values;
     }
+    static volatile bool stressRunning;
+    static Thread[] stressThreads;
+    static long[] stressCounts;
+    static Exception stressError;
+    public static void StartStress(int expectedValue, int intervalMs) {
+        if (stressRunning || intervalMs < 1) throw new InvalidOperationException("Invalid stress state or interval");
+        stressCounts = new long[Environment.ProcessorCount];
+        stressThreads = new Thread[stressCounts.Length];
+        stressError = null;
+        stressRunning = true;
+        for (int cpu = 0; cpu < stressThreads.Length; ++cpu) {
+            int processorId = cpu;
+            stressThreads[cpu] = new Thread(() => {
+                UIntPtr previous = UIntPtr.Zero;
+                try {
+                    previous = SetThreadAffinityMask(GetCurrentThread(), (UIntPtr)(1UL << processorId));
+                    if (previous == UIntPtr.Zero) throw new Win32Exception();
+                    while (stressRunning) {
+                        Marshal.WriteByte(buffer, 128 + processorId, (byte)stressCounts[processorId]);
+                        if (first() != expectedValue) throw new InvalidOperationException("Writer execution changed");
+                        if (Marshal.ReadByte(buffer) != 0xb8 || Marshal.ReadByte(buffer, 1) != 17)
+                            throw new InvalidOperationException("Original data view changed");
+                        Interlocked.Increment(ref stressCounts[processorId]);
+                        Thread.Sleep(intervalMs);
+                    }
+                } catch (Exception error) {
+                    Interlocked.CompareExchange(ref stressError, error, null);
+                    stressRunning = false;
+                } finally {
+                    if (previous != UIntPtr.Zero) SetThreadAffinityMask(GetCurrentThread(), previous);
+                }
+            });
+            stressThreads[cpu].IsBackground = true;
+            stressThreads[cpu].Start();
+        }
+    }
+    public static object StressStatus() {
+        return new { running = stressRunning, counts = stressCounts,
+                     error = stressError == null ? null : stressError.ToString() };
+    }
+    public static void StopStress() {
+        stressRunning = false;
+        if (stressThreads != null)
+            foreach (Thread thread in stressThreads)
+                if (!thread.Join(5000)) throw new InvalidOperationException("Writer thread did not stop");
+    }
     public static void Write(int offset, byte value) { Marshal.WriteByte(buffer, offset, value); }
     public static void Release() {
+        StopStress();
         if (stressBuffer != IntPtr.Zero) VirtualFree(stressBuffer, UIntPtr.Zero, 0x8000);
         if (buffer != IntPtr.Zero) UnmapViewOfFile(buffer);
         if (mapping != IntPtr.Zero) CloseHandle(mapping);
@@ -205,6 +252,9 @@ try {
                     'execute' { [InterceptionVmFixture]::Execute($request.cpu, $request.function) }
                     'execute-all' { ,([InterceptionVmFixture]::ExecuteAll($request.function, $request.iterations)) }
                     'concurrent' { ,([InterceptionVmFixture]::Concurrent($request.function, $request.iterations, $request.writing)) }
+                    'start-stress' { [InterceptionVmFixture]::StartStress($request.expected, $request.interval_ms); 'started' }
+                    'stress-status' { [InterceptionVmFixture]::StressStatus() }
+                    'stop-stress' { [InterceptionVmFixture]::StopStress(); 'stopped' }
                     'debug-all' { ,([InterceptionVmFixture]::ExecuteTargets()) }
                     'execute-address' { ,([InterceptionVmFixture]::ExecuteAddress([Convert]::ToInt64($request.address.Replace('0x', ''), 16))) }
                     'stress-cycle' {

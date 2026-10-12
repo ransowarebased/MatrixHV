@@ -190,6 +190,11 @@ matrixhv_island_pt
 matrixhv_resident_code_end:
 matrixhv_resident_ept_cache_state
 matrixhv_resident_eptp_switch_state
+.balign 8
+// Fault reporting can itself fault on a corrupt context or framebuffer. A
+// second fault skips every context-dependent diagnostic and reset tuple.
+.Lresident_host_fault_active:
+.quad 0
 matrixhv_island_log_slot
 matrixhv_island_switch_slot
 matrixhv_island_visual_slot

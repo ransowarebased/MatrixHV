@@ -86,6 +86,7 @@ pub mod vmx {
             pub diagnostic_interval_tsc: u64,
             pub diagnostic_expired: u64,
             pub processor_number: u64,
+            pub watchdog_tsc_hz: u64,
             pub sync_safe: u64,
             pub sync_nmi: u64,
             pub watchdog_phase: u64,

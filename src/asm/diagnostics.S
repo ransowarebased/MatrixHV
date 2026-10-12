@@ -1649,6 +1649,8 @@ call .Lresident_visual_callback
 // Unhandled GP contract: rsp contains saved rdx, saved rax, error code and hardware RIP. r8 receives the retained event context. Atomically claims the diagnostic and transfers to terminal host-fault output; clobbers scratch GPRs and flags and never returns.
 .macro matrixhv_island_gp_diagnostic
 .Lresident_host_gp_fatal:
+lock bts qword ptr [rip + .Lresident_host_fault_active], 0
+jc .Lresident_platform_reset_cf9
 call .Lresident_pt_freeze
 mov r8, qword ptr [rip + matrixhv_resident_island_event_context]
 test r8, r8
@@ -1669,6 +1671,8 @@ jmp .Lresident_island_fatal_owned
 .globl matrixhv_resident_island_fatal
 matrixhv_resident_island_fatal:
 cli
+lock bts qword ptr [rip + .Lresident_host_fault_active], 0
+jc .Lresident_platform_reset_cf9
 mov r8, qword ptr [rip + matrixhv_resident_island_event_context]
 test r8, r8
 jz .Lresident_island_fatal_serial

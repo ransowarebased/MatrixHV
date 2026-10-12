@@ -2869,6 +2869,7 @@ def prepare_resident_visual(project: Path):
     ).replace("iretq", "jmp .Ltest_gp_return")
     assembly = (
         assembly.replace("cli", "nop")
+        .replace(".Lresident_platform_reset_cf9", ".Ltest_exception_return")
         .replace("mov rdx, cr2", "mov edx, 0x12345678")
         .replace("matrixhv_resident_island_fatal", ".Ltest_exception_return")
         .replace(".Lresident_island_fatal_owned", ".Ltest_exception_return")
@@ -3020,6 +3021,7 @@ def prepare_resident_visual(project: Path):
         ret
     .globl test_exception_frame
     test_exception_frame:
+        mov qword ptr [rip + .Lresident_host_fault_active], 0
         push rbx
         mov rbx, rdx
         mov qword ptr [rip + matrixhv_resident_island_event_context], rbx
@@ -3049,6 +3051,8 @@ def prepare_resident_visual(project: Path):
     .data
     .balign 8
     matrixhv_resident_island_event_context:
+        .quad 0
+    .Lresident_host_fault_active:
         .quad 0
     matrixhv_resident_original_get_variable:
         .quad 0
