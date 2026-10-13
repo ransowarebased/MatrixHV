@@ -3497,10 +3497,7 @@ pub(crate) mod runtime {
                 }
             }
         }
-        if reason == 28
-            && boot.last_qualification & 0x3f == 3
-            && boot.interception.controls_saved != 0
-        {
+        if reason == 28 && boot.last_qualification & 0x3f == 3 {
             boot.interception.cooperative_data = 0;
             if read(GUEST_IA32_EFER)? & 0x400 == 0 {
                 if session.is_active() {
@@ -3510,7 +3507,7 @@ pub(crate) mod runtime {
             }
             return cr3_write(boot, frame);
         }
-        if reason == 29 && boot.interception.controls_saved != 0 {
+        if reason == 29 {
             return debug_access(boot, frame);
         }
         if reason == 59 && boot.interception.exit_vmfunc != 0 {
@@ -3807,9 +3804,10 @@ pub(crate) mod runtime {
                     // A recovered EPT fault must reexecute on the restored base;
                     // forwarding it would reach the unexpected-violation reset.
                     1
-                } else if phase == 0 && boot.last_reason & 0xffff == 0 {
-                    // Retirement cannot discard an owned #DB or the guest's
-                    // single-step cause before generic exception reinjection.
+                } else if phase == 0 && matches!(boot.last_reason & 0xffff, 0 | 28 | 29 | 37 | 59) {
+                    // Complete intercepted controls on the retired view and
+                    // preserve queued #DB/MTF causes. Removing their controls
+                    // cannot turn an existing exit into unsupported.
                     dispatch(
                         session,
                         boot,

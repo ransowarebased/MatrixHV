@@ -243,7 +243,14 @@ cmp qword ptr [r12 + {b_interception_exit_step}], 0
 jne .Lresident_interception_callback_active
 cmp qword ptr [r12 + {b_interception_exit_vmfunc}], 0
 jne .Lresident_interception_callback_active
-cmp qword ptr [r12 + {b_last_reason}], 48
+// Retirement does not cancel a control-register instruction already exited.
+mov r11d, dword ptr [r12 + {b_last_reason}]
+and r11d, 0xffff
+cmp r11d, 28
+je .Lresident_interception_callback_active
+cmp r11d, 29
+je .Lresident_interception_callback_active
+cmp r11d, 48
 jne .Lresident_interception_callback_idle
 cmp qword ptr [r12 + {b_interception_hook_count}], 0
 jne .Lresident_interception_callback_active

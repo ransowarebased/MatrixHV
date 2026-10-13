@@ -1435,6 +1435,127 @@ fn exhausted_root_budget_consumes_a_stale_owned_debug_fault_after_retirement() {
 }
 
 #[test]
+fn cancelled_cr3_exit_completes_the_intercepted_write_after_retirement() {
+    let mut scenario = Scenario::new();
+    scenario.call(1);
+    scenario.frame[0] = 0x5007;
+    hardware::write(GUEST_RIP, 0x400000).unwrap();
+    hardware::STATE.with(|state| state.borrow_mut().budget_expired = true);
+    assert_eq!(scenario.exit(28, 3), 2);
+    assert!(!scenario.session.is_active());
+    assert_eq!(scenario.boot.interception.controls_saved, 0);
+    assert_eq!(hardware::read(GUEST_CR3), Ok(0x5007));
+    assert_eq!(hardware::read(GUEST_RIP), Ok(0x400000));
+    hardware::STATE.with(|state| assert_eq!(state.borrow().invalidated_vpids, [7]));
+}
+
+#[test]
+fn cancelled_debug_access_exit_completes_the_intercepted_read_after_retirement() {
+    let mut scenario = Scenario::new();
+    hardware::write(GUEST_DR7, 0x401).unwrap();
+    scenario.call(1);
+    hardware::write(GUEST_RIP, 0x400000).unwrap();
+    hardware::STATE.with(|state| state.borrow_mut().budget_expired = true);
+    assert_eq!(scenario.exit(29, 16), 2);
+    assert!(!scenario.session.is_active());
+    assert_eq!(scenario.boot.interception.controls_saved, 0);
+    assert_eq!(scenario.frame[0], 11);
+    assert_eq!(hardware::read(GUEST_RIP), Ok(0x400000));
+}
+
+#[test]
+fn cancelled_vmfunc_exit_injects_ud_after_retiring_its_execution_control() {
+    let mut scenario = Scenario::new();
+    scenario.enable_vmfunc();
+    scenario.call(1);
+    scenario.frame[1] = 2;
+    hardware::write(GUEST_RIP, 0x400000).unwrap();
+    hardware::STATE.with(|state| state.borrow_mut().budget_expired = true);
+    assert_eq!(scenario.exit(59, 0), 4);
+    assert!(!scenario.session.is_active());
+    assert_eq!(hardware::read(SECONDARY_VM_EXEC_CONTROL).unwrap() & (1 << 13), 0);
+    assert_eq!(hardware::read(GUEST_RIP), Ok(0x400000));
+}
+
+#[test]
+fn cancelled_mtf_exit_preserves_the_completed_single_step_after_retirement() {
+    let mut scenario = Scenario::new();
+    scenario.call(1);
+    hardware::write(GUEST_RIP, 0x401000).unwrap();
+    hardware::write(GUEST_RFLAGS, 0x10302).unwrap();
+    hardware::write(GUEST_PHYSICAL_ADDRESS, 0x800008).unwrap();
+    assert_eq!(scenario.exit(48, 1), 1);
+    scenario.call(1);
+    assert_ne!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+    hardware::write(GUEST_RIP, 0x401003).unwrap();
+    hardware::write(GUEST_RFLAGS, 0x302).unwrap();
+    hardware::write(GUEST_PENDING_DBG_EXCEPTIONS, 1 << 14).unwrap();
+    hardware::STATE.with(|state| state.borrow_mut().budget_expired = true);
+    assert_eq!(scenario.exit(37, 0), 1);
+    assert!(!scenario.session.is_active());
+    assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
+    assert_eq!(hardware::read(GUEST_RIP), Ok(0x401003));
+    assert_eq!(hardware::read(GUEST_PENDING_DBG_EXCEPTIONS), Ok(1 << 14));
+    assert_eq!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+}
+
+#[test]
+fn assembly_callback_services_control_exits_after_early_observer_recovery() {
+    for (reason, qualification) in [(28, 3), (29, 16)] {
+        let mut scenario = Scenario::new();
+        scenario.session.configuration.get_mut().hook_count = 0;
+        hardware::write(GUEST_DR7, 0x401).unwrap();
+        scenario.call(1);
+        scenario.boot.last_reason = reason;
+        scenario.boot.last_qualification = qualification;
+        scenario.frame[0] = 0x5007;
+        scenario.session.tsc_hz.store(1000, Ordering::Release);
+        scenario.session.lease_deadline.store(1, Ordering::Release);
+        hardware::STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.clock = 2;
+            state.fail_reads.insert(GUEST_DR7, 1);
+        });
+        assert_eq!(unsafe { matrixhv_test_callback(&mut scenario.boot, 4, scenario.frame.as_mut_ptr()) }, 0);
+        assert!(!scenario.session.is_active());
+        assert_eq!(scenario.boot.interception.controls_saved, 0);
+        assert_eq!(scenario.boot.interception.exit_ept, 0);
+        assert_eq!(scenario.session.exit_debug[0].load(Ordering::Acquire) & 1, 0);
+        assert_eq!(unsafe { matrixhv_test_callback(&mut scenario.boot, 0, scenario.frame.as_mut_ptr()) }, 2);
+        if reason == 28 {
+            assert_eq!(hardware::read(GUEST_CR3), Ok(0x5007));
+        } else {
+            assert_eq!(scenario.frame[0], 11);
+        }
+    }
+}
+
+#[test]
+fn cancelled_control_exits_preserve_fault_semantics_and_the_original_instruction() {
+    for (reason, qualification, value, dr7, cpl, expected) in [
+        (28, 3, 1 << 62, 0x400, 0, 3),
+        (29, 7, 1 << 32, 0x400, 0, 3),
+        (29, 16, 0, 0x400, 3, 3),
+        (29, 16, 0, 0x2400, 0, 5),
+    ] {
+        let mut scenario = Scenario::new();
+        hardware::write(GUEST_DR7, dr7).unwrap();
+        hardware::write(GUEST_SS_AR_BYTES, cpl << 5).unwrap();
+        hardware::write(GUEST_RIP, 0x400000).unwrap();
+        scenario.call(1);
+        scenario.frame[0] = value;
+        hardware::STATE.with(|state| state.borrow_mut().budget_expired = true);
+        assert_eq!(scenario.exit(reason, qualification), expected);
+        assert!(!scenario.session.is_active());
+        assert_eq!(hardware::read(GUEST_RIP), Ok(0x400000));
+        assert_eq!(hardware::read(GUEST_CR3), Ok(0x3007));
+        if expected == 5 {
+            assert_eq!(hardware::debug_registers()[4] & 0x12000, 0x12000);
+        }
+    }
+}
+
+#[test]
 fn exhausted_root_budget_preserves_the_guest_single_step_cause_after_retirement() {
     for qualification in [1 << 14, 1 | (1 << 14)] {
         let mut scenario = Scenario::new();
