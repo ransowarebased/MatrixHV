@@ -359,6 +359,7 @@ pub mod memory {
         }
     }
 
+    // Write errors 14/15 occur after the reported bytes reached original RAM.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u32)]
     pub enum Error {
@@ -376,6 +377,7 @@ pub mod memory {
         Capacity = 12,
         Remapped = 13,
         MergeConflict = 14,
+        WriteCommitted = 15,
     }
 
     pub fn word(bytes: &[u8], offset: usize) -> u32 {

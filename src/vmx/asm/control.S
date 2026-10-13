@@ -288,7 +288,9 @@ jz .Lresident_interception_callback_absent
 call rax
 jmp .Lresident_interception_callback_return
 .Lresident_interception_callback_absent:
-xor eax, eax
+// Active controls require their installed callback to retire or complete exits.
+// Resuming without it can leave writable EPT windows and owned #DB unhandled.
+mov rax, -1
 .Lresident_interception_callback_return:
 fxrstor64 [rsp + 48]
 cmp rax, -1

@@ -314,6 +314,10 @@ jna .Lresident_dispatch_vmwrite_failed
 mov eax, {guest_rflags}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
+// Successful emulation retires RF just as execution of the instruction does.
+btr r11, 16
+vmwrite rax, r11
+jna .Lresident_dispatch_vmwrite_failed
 mov r10d, r11d
 and r10d, 0x100
 mov eax, {guest_ia32_debugctl}
@@ -415,6 +419,16 @@ jmp .Lresident_retry_interrupted_event_done
 // when delivery of the first exception instead produces #DF or shutdown.
 mov edx, r10d
 and edx, 0x700
+cmp edx, 0x200
+jne .Lresident_retry_interrupted_event_exception_classes
+mov edx, r11d
+and edx, 0x700
+cmp edx, 0x200
+je .Lresident_retry_interrupted_event_done
+// A nested exception replaces the interrupted NMI delivery architecturally.
+mov qword ptr [r12 + {b_nmi_injected}], 0
+jmp .Lresident_retry_interrupted_event_done
+.Lresident_retry_interrupted_event_exception_classes:
 cmp edx, 0x300
 jne .Lresident_retry_interrupted_event_done
 mov edx, r11d
@@ -429,6 +443,11 @@ cmp eax, 8
 je .Lresident_retry_interrupted_event_first_double_fault
 cmp eax, 14
 je .Lresident_retry_interrupted_event_first_page_fault
+cmp eax, 20
+je .Lresident_retry_interrupted_event_first_page_fault
+// Intel classifies #CP with contributory faults and #VE with page faults.
+cmp eax, 21
+je .Lresident_retry_interrupted_event_second_contributory
 cmp eax, 0
 je .Lresident_retry_interrupted_event_second_contributory
 cmp eax, 10
@@ -440,6 +459,8 @@ mov eax, r11d
 and eax, 0xff
 cmp eax, 31
 ja .Lresident_dispatch_event_corrupt
+cmp eax, 21
+je .Lresident_retry_interrupted_event_make_double_fault
 cmp eax, 0
 je .Lresident_retry_interrupted_event_make_double_fault
 cmp eax, 10
@@ -453,6 +474,10 @@ and eax, 0xff
 cmp eax, 31
 ja .Lresident_dispatch_event_corrupt
 cmp eax, 14
+je .Lresident_retry_interrupted_event_make_double_fault
+cmp eax, 20
+je .Lresident_retry_interrupted_event_make_double_fault
+cmp eax, 21
 je .Lresident_retry_interrupted_event_make_double_fault
 cmp eax, 0
 je .Lresident_retry_interrupted_event_make_double_fault
@@ -481,6 +506,10 @@ jmp .Lresident_retry_interrupted_event_done
 mov eax, r11d
 and eax, 0xff
 cmp eax, 14
+je .Lresident_retry_interrupted_event_shutdown
+cmp eax, 20
+je .Lresident_retry_interrupted_event_shutdown
+cmp eax, 21
 je .Lresident_retry_interrupted_event_shutdown
 cmp eax, 0
 je .Lresident_retry_interrupted_event_shutdown
@@ -542,14 +571,13 @@ cmp r11d, 3
 je .Lresident_deliver_nmi_done
 xor eax, eax
 xchg qword ptr [r12 + {b_nmi_pending}], rax
+mov qword ptr [r12 + {b_nmi_injected}], 1
 mov eax, {vm_entry_intr_info_field}
 mov r11d, 0x80000202
 vmwrite rax, r11
 jna .Lresident_dispatch_vmwrite_failed
-mov eax, {guest_activity_state}
-xor r11d, r11d
-vmwrite rax, r11
-jna .Lresident_dispatch_vmwrite_failed
+// Event injection wakes HLT/shutdown during successful VM entry itself.
+// Keep the pre-entry activity state intact if entry is rejected.
 jmp .Lresident_deliver_nmi_done
 .Lresident_deliver_nmi_window:
 mov eax, {cpu_based_vm_exec_control}
@@ -563,6 +591,45 @@ je .Lresident_deliver_nmi_done
 mov qword ptr [r12 + {b_nested_vmcs02_control_cache_valid}], 0
 mov qword ptr [r12 + {b_nested_vmcs02_control_cache_valid} + 8], 0
 .Lresident_deliver_nmi_done:
+ret
+.Lresident_complete_nmi_entry:
+test dword ptr [r12 + {b_last_reason}], 0x80000000
+jnz .Lresident_restore_failed_nmi
+cmp qword ptr [r12 + {b_nmi_injected}], 0
+je .Lresident_complete_nmi_entry_done
+// An internal EPT or timer exit can interrupt the injected NMI's IDT delivery.
+// Keep ownership until retry succeeds or nested reflection hands it to L1.
+mov eax, {idt_vectoring_info_field}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+and r11d, 0x800007ff
+cmp r11d, 0x80000202
+je .Lresident_complete_nmi_entry_done
+mov qword ptr [r12 + {b_nmi_injected}], 0
+.Lresident_complete_nmi_entry_done:
+ret
+.Lresident_restore_failed_nmi:
+// VMfail and late entry failures leave an injected event undelivered.
+// Requeue only physical NMIs supplied by L0, preserving L1's own entry event.
+xor eax, eax
+xchg qword ptr [r12 + {b_nmi_injected}], rax
+test rax, rax
+jz .Lresident_restore_failed_nmi_done
+mov eax, {vm_entry_intr_info_field}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+// A direct fault injector may have replaced the event after an internal exit.
+mov eax, r11d
+and eax, 0x800007ff
+cmp eax, 0x80000202
+jne .Lresident_restore_failed_nmi_done
+mov qword ptr [r12 + {b_nmi_pending}], 1
+inc qword ptr [r12 + {b_nmi_entry_retries}]
+mov eax, {vm_entry_intr_info_field}
+btr r11, 31
+vmwrite rax, r11
+jna .Lresident_dispatch_vmwrite_failed
+.Lresident_restore_failed_nmi_done:
 ret
 .endm
 
@@ -641,6 +708,8 @@ push r14
 push r15
 mov r12, rax
 cld
+mov rdx, qword ptr [rsp + 120]
+call .Lresident_host_sync_nmi_entry_guard
 call .Lresident_nested_eptp_sync_host_nmi
 test eax, eax
 jnz .Lresident_host_sync_nmi_return
@@ -666,6 +735,41 @@ pop rbx
 pop rdx
 pop rcx
 jmp .Lresident_host_nmi_return
+.Lresident_host_sync_nmi_entry_guard:
+// The entry marker survives non-root execution. An NMI on the next VM exit
+// must defer callbacks until the dispatcher owns a complete exit snapshot.
+// RDX is the interrupted RIP from the IST frame; all GPRs are already saved.
+lea rax, [rip + matrixhv_resident_dispatch_entry]
+cmp rdx, rax
+jb .Lresident_host_sync_nmi_l1_failure_check
+lea rax, [rip + .Lresident_dispatch_entry_unsafe_done]
+cmp rdx, rax
+jb .Lresident_host_sync_nmi_entry_defer
+.Lresident_host_sync_nmi_l1_failure_check:
+lea rax, [rip + .Lresident_dispatch_l1_entry_failed]
+cmp rdx, rax
+jb .Lresident_host_sync_nmi_l2_launch_check
+lea rax, [rip + .Lresident_dispatch_l1_entry_unsafe_done]
+cmp rdx, rax
+jb .Lresident_host_sync_nmi_entry_defer
+.Lresident_host_sync_nmi_l2_launch_check:
+lea rax, [rip + .Lresident_nested_l2_launch_failed_registers]
+cmp rdx, rax
+jb .Lresident_host_sync_nmi_l2_resume_check
+lea rax, [rip + .Lresident_nested_l2_launch_entry_unsafe_done]
+cmp rdx, rax
+jb .Lresident_host_sync_nmi_entry_defer
+.Lresident_host_sync_nmi_l2_resume_check:
+lea rax, [rip + .Lresident_nested_l2_resume_failed_registers]
+cmp rdx, rax
+jb .Lresident_host_sync_nmi_entry_guard_done
+lea rax, [rip + .Lresident_nested_l2_resume_entry_unsafe_done]
+cmp rdx, rax
+jae .Lresident_host_sync_nmi_entry_guard_done
+.Lresident_host_sync_nmi_entry_defer:
+mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
+.Lresident_host_sync_nmi_entry_guard_done:
+ret
 .Lresident_host_arm_nmi_window:
 // A physical NMI may arrive after the dispatcher's final pending check.
 // Arming an exit here also covers the interval immediately before VMRESUME.
@@ -736,10 +840,12 @@ mov qword ptr [r12 + {b_interception_timing_start}], rax
 .Lresident_interception_clock_sampled:
 mov qword ptr [r12 + {b_root_vmx_active}], 1
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
+.Lresident_dispatch_entry_unsafe_done:
 mov rax, {exit_reason}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
 mov qword ptr [r12 + {b_last_reason}], r11
+call .Lresident_complete_nmi_entry
 mov eax, {guest_rip}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
@@ -998,6 +1104,7 @@ pop r13
 pop r14
 pop r15
 vmresume
+.Lresident_dispatch_l1_entry_failed:
 push r15
 push r14
 push r13
@@ -1018,6 +1125,7 @@ mov r12, qword ptr [rsp + 120]
 pushfq
 pop qword ptr [r12 + {b_vmresume_status_flags}]
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
+.Lresident_dispatch_l1_entry_unsafe_done:
 call .Lresident_flight_record_entry_failure
 call .Lresident_nested_restore_root_spec_ctrl
 matrixhv_island_control_resume_recovery

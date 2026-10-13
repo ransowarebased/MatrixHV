@@ -42,6 +42,9 @@ fields = {
     "exit_intr_error_code": 16,
     "guest_dr7": 18,
     "ept_violation_reason": 48,
+    "b_nmi_injected": 256,
+    "b_nmi_pending": 264,
+    "b_nmi_entry_retries": 272,
 }
 
 event = (
@@ -50,6 +53,9 @@ event = (
     + section(EXITS, ".Lresident_retry_ept_event:", ".endm")
     + section(EXITS, ".Lresident_interception_retry:", ".Lresident_interception_advance:")
     + section(NESTED, ".Lresident_dispatch_reinject_exception:", ".Lresident_dispatch_nmi:")
+    + section(EXITS, ".Lresident_complete_nmi_entry:", ".endm").replace(
+        ".Lresident_complete_nmi_entry", ".Ltest_event_complete_nmi_entry").replace(
+        ".Lresident_restore_failed_nmi", ".Ltest_event_restore_failed_nmi")
 )
 event = re.sub(r"\{(\w+)\}", lambda match: str(fields[match[1]]), event)
 event = re.sub(
@@ -160,6 +166,9 @@ window_fields = {
     "b_last_qualification": 48,
     "b_last_instruction_len": 56,
     "b_nested_vmcs02_control_cache_valid": 64,
+    "b_nmi_injected": 136,
+    "b_nested_eptp_sync_safe": 144,
+    "b_nmi_entry_retries": 152,
 }
 window = re.sub(r"\{(\w+)\}", lambda match: str(window_fields[match[1]]), window)
 window = window.replace("vmread r11, rax", "mov r11, [r12 + 88]\ncmp r12, 0")
@@ -173,6 +182,7 @@ delivery_fields = dict(
     guest_interruptibility_info=2,
     guest_pending_dbg_exceptions=3,
     guest_activity_state=4,
+    idt_vectoring_info_field=5,
 )
 delivery = re.sub(r"\{(\w+)\}", lambda match: str(delivery_fields[match[1]]), delivery)
 delivery = delivery.replace("vmread r11, rax", "mov r11, [r12 + 88 + rax * 8]\ncmp r12, 0")
@@ -183,7 +193,15 @@ entry = ""
 for label in (".Lresident_nested_l2_launch_registers:", ".Lresident_nested_l2_resume_registers:"):
     entry += section(NESTED, label, "pop rax") + "ret\n"
 
-assembly = ".text\n" + event + cpuid + arm + window + delivery + entry + """
+failure = ""
+for label in (".Lresident_nested_l2_launch_entry_failed:", ".Lresident_nested_l2_resume_entry_failed:"):
+    failure += section(NESTED, label, "call .Lresident_flight_record_entry_failure") + "ret\n"
+failure = re.sub(r"\{(\w+)\}", lambda match: str(delivery_fields[match[1]]), failure)
+handoff = section(NESTED, "// VMCS12 now owns any interrupted event reported to L1.", "vmptrld")
+handoff = ".Ltest_nested_l2_event_handoff:\n" + re.sub(
+    r"\{(\w+)\}", lambda match: str(delivery_fields[match[1]]), handoff) + "ret\n"
+
+assembly = ".text\n" + event + cpuid + arm + window + delivery + entry + failure + handoff + """
 .Lresident_dispatch_vmread_failed:
 .Lresident_dispatch_vmwrite_failed:
 .Lresident_dispatch_event_corrupt:
@@ -251,6 +269,20 @@ call .Lresident_dispatch_reinject_exception
 pop r13
 pop r12
 ret
+.globl test_event_complete_nmi
+test_event_complete_nmi:
+push r12
+mov r12, rcx
+call .Ltest_event_complete_nmi_entry
+pop r12
+ret
+.globl test_event_restore_failed_nmi
+test_event_restore_failed_nmi:
+push r12
+mov r12, rcx
+call .Ltest_event_restore_failed_nmi
+pop r12
+ret
 .globl test_host_arm_nmi_window
 test_host_arm_nmi_window:
 mov rax, rcx
@@ -282,6 +314,34 @@ test_nested_l2_resume_entry:
 push r12
 mov r12, rcx
 call .Lresident_nested_l2_resume_registers
+pop r12
+ret
+.globl test_complete_nmi_entry
+test_complete_nmi_entry:
+push r12
+mov r12, rcx
+call .Lresident_complete_nmi_entry
+pop r12
+ret
+.globl test_nested_l2_launch_failure
+test_nested_l2_launch_failure:
+push r12
+mov r12, rcx
+call .Lresident_nested_l2_launch_entry_failed
+pop r12
+ret
+.globl test_nested_l2_resume_failure
+test_nested_l2_resume_failure:
+push r12
+mov r12, rcx
+call .Lresident_nested_l2_resume_entry_failed
+pop r12
+ret
+.globl test_nested_l2_event_handoff
+test_nested_l2_event_handoff:
+push r12
+mov r12, rcx
+call .Ltest_nested_l2_event_handoff
 pop r12
 ret
 """

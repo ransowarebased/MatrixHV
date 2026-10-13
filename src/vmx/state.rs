@@ -301,7 +301,7 @@ impl ResidentHostSelectors {
             fs: host_selector(segments.fs.selector),
             gs: host_selector(segments.gs.selector),
         };
-        if selectors.cs == 0 || !selectors.fit_before_tss() {
+        if selectors.cs == 0 || !selectors.fit_gdt_layout() {
             return Err(HostTablesError::InvalidCodeLayout);
         }
         Ok(selectors)
@@ -318,10 +318,15 @@ impl ResidentHostSelectors {
         }
     }
 
-    fn fit_before_tss(self) -> bool {
+    fn fit_gdt_layout(self) -> bool {
+        let tss_index = usize::from(HOST_TSS_SELECTOR >> 3);
         [self.es, self.cs, self.ss, self.ds, self.fs, self.gs]
             .into_iter()
-            .all(|selector| selector == 0 || usize::from(selector >> 3) < TSS_OFFSET / 8)
+            .all(|selector| {
+                let index = usize::from(selector >> 3);
+                selector == 0
+                    || (index < TSS_OFFSET / 8 && !(tss_index..tss_index + 2).contains(&index))
+            })
     }
 }
 

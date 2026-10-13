@@ -428,7 +428,10 @@ xor ecx, ecx
 xor edx, edx
 jmp .Lresident_dispatch_cpuid_diagnostic_store
 .Lresident_dispatch_cpuid_diagnostic_zero:
+xor eax, eax
+xor ebx, ebx
 xor ecx, ecx
+xor edx, edx
 .Lresident_dispatch_cpuid_diagnostic_store:
 mov qword ptr [rsp], rax
 mov qword ptr [rsp + 24], rbx
@@ -1703,17 +1706,52 @@ out dx, al
 jmp .Lresident_platform_reset
 .Lresident_platform_reset:
 cli
+// R11 retains permission for the destructive fallback across reset I/O only.
+// Missing or invalid operation state never authorizes a deliberate triple fault.
+xor r11d, r11d
 // The ACPI I/O reset tuple is validated and retained before ExitBootServices.
 mov r8, qword ptr [rip + matrixhv_resident_island_event_context]
 test r8, r8
 jz .Lresident_platform_reset_cf9
+mov rax, {event_magic}
+cmp qword ptr [r8 + {event_magic_offset}], rax
+jne .Lresident_platform_reset_cf9
+mov rax, {event_canary}
+cmp qword ptr [r8 + {event_canary_offset}], rax
+jne .Lresident_platform_reset_cf9
+mov r10, qword ptr [r8 + {event_interception_context}]
+test r10, r10
+jz .Lresident_platform_reset_check_tracking
+cmp qword ptr [r10], {interception_active}
+je .Lresident_platform_reset_workload_active
+.Lresident_platform_reset_check_tracking:
+mov r10, qword ptr [r8 + {event_tracking_context}]
+test r10, r10
+jz .Lresident_platform_reset_check_update
+cmp dword ptr [r10 + {tracking_state}], {tracking_active}
+je .Lresident_platform_reset_workload_active
+.Lresident_platform_reset_check_update:
+mov eax, dword ptr [r8 + {event_update_status} + {update_status_phase}]
+cmp eax, {update_phase_recovering}
+je .Lresident_platform_reset_workload_active
+cmp eax, {update_phase_uploading}
+jb .Lresident_platform_reset_acpi
+cmp eax, {update_phase_activating}
+ja .Lresident_platform_reset_acpi
+.Lresident_platform_reset_workload_active:
+mov r11d, 1
+.Lresident_platform_reset_acpi:
 mov rax, qword ptr [r8 + {event_reset_io}]
 test ax, ax
-jz .Lresident_platform_reset_cf9
+jz .Lresident_platform_reset_cf9_with_policy
 mov dx, ax
 shr rax, 16
 out dx, al
+jmp .Lresident_platform_reset_cf9_with_policy
 .Lresident_platform_reset_cf9:
+// Recursive host faults and failed native transitions cannot validate activity.
+xor r11d, r11d
+.Lresident_platform_reset_cf9_with_policy:
 cli
 // Intel reset control is also understood by common VM platforms. Both writes
 // are required when an earlier reset request left RST_CPU asserted.
@@ -1735,9 +1773,15 @@ jmp .Lresident_platform_reset_triple_fault
 mov al, 0xfe
 out 0x64, al
 .Lresident_platform_reset_triple_fault:
+test r11d, r11d
+jz .Lresident_platform_reset_idle_halt
 lidt [rip + .Lresident_platform_reset_empty_idt]
 int3
 ud2
+.Lresident_platform_reset_idle_halt:
+cli
+hlt
+jmp .Lresident_platform_reset_idle_halt
 .Lresident_platform_reset_empty_idt:
 .word 0
 .quad 0

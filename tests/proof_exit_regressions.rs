@@ -186,6 +186,18 @@ mod vmx {
             }
 
             #[test]
+            fn successful_emulation_retires_resume_flag_and_preserves_single_step() {
+                for flags in [0x1_0002, 0x1_0302, 0x202, 0x302] {
+                    vmcs::reset();
+                    vmcs::vmwrite(GUEST_RFLAGS, flags).unwrap();
+                    advance_guest_rip(0x1000, 2).unwrap();
+                    assert_eq!(vmcs::vmread(GUEST_RFLAGS).unwrap(), flags & !(1 << 16));
+                    assert_eq!(vmcs::vmread(GUEST_PENDING_DBG_EXCEPTIONS).unwrap(),
+                        (flags & (1 << 8)) << 6);
+                }
+            }
+
+            #[test]
             fn cpuid_preserves_eip_above_16_bits_in_legacy_and_compatibility_modes() {
                 for efer in [0, 0x500] {
                     for cs_access_rights in [0, 1 << 14] {

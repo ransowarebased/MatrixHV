@@ -158,23 +158,25 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
             return Err("CR3 must contain a nonzero page-table root".into());
         }
         let mut operands = arguments[3..].to_vec();
-        let vmfunc = operands.last().is_some_and(|value| value == "--vmfunc");
-        if vmfunc {
+        let vmfunc = if let Some(index) = operands.iter().position(|value| value == "--vmfunc") {
             if operation != HOOK_INSTALL {
                 return Err("--vmfunc applies only to hook installation".into());
             }
-            operands.pop();
-        }
+            operands.remove(index);
+            true
+        } else {
+            false
+        };
         let mut alternate = 0;
         if let Some(index) = operands.iter().position(|value| value == "--alternate-cr3") {
-            if index + 2 != operands.len() {
-                return Err("--alternate-cr3 CR3 must be the final option".into());
+            if index + 1 >= operands.len() {
+                return Err("--alternate-cr3 requires a CR3 root".into());
             }
             alternate = number(&operands[index + 1])?;
             if alternate & !4095 == 0 {
                 return Err("alternate CR3 must contain a nonzero page-table root".into());
             }
-            operands.truncate(index);
+            operands.drain(index..index + 2);
         }
         let mut packet = if operation == HOOK_INSTALL {
             let items = parse_items(WRITE, &operands)?;
@@ -856,6 +858,7 @@ fn status_text(status: u32) -> &'static str {
         12 => "resident EPT table pool is exhausted",
         13 => "virtual page mapping changed during the session",
         14 => "original write committed; a page merge conflict revoked interception",
+        15 => "original write committed; interception refresh or retirement failed",
         ROAD_STATUS_DEMAND_ZERO => "DEMAND_ZERO (zero-filled read)",
         _ => "unknown status",
     }

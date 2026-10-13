@@ -25,7 +25,6 @@ struct Invalidation {
 }
 
 #[repr(C)]
-#[derive(Default)]
 struct Reset {
     io: u64,
     keyboard_busy: u64,
@@ -34,6 +33,34 @@ struct Reset {
     ports: [u64; 4],
     values: [u64; 4],
     triple_fault: u64,
+    magic: u64,
+    canary: u64,
+    interception: u64,
+    tracking: u64,
+    update_phase: u64,
+    halted: u64,
+    event_present: u64,
+}
+
+impl Default for Reset {
+    fn default() -> Self {
+        Self {
+            io: 0,
+            keyboard_busy: 0,
+            reads: 0,
+            writes: 0,
+            ports: [0; 4],
+            values: [0; 4],
+            triple_fault: 0,
+            magic: 0x4856_4556_454e_5431,
+            canary: 0x4856_4556_4341_4e59,
+            interception: 0,
+            tracking: 0,
+            update_phase: 0,
+            halted: 0,
+            event_present: 1,
+        }
+    }
 }
 
 unsafe extern "win64" {
@@ -42,6 +69,7 @@ unsafe extern "win64" {
     fn test_ept_nested(model: &mut Invalidation) -> u64;
     fn test_vpid(model: &mut Invalidation) -> u64;
     fn test_reset(model: &mut Reset);
+    fn test_reset_cf9(model: &mut Reset);
     fn test_serial(model: &mut Serial, character: u64) -> u64;
     fn test_retired_serial(model: &mut Serial, operation: u64) -> u64;
     fn test_serial_enabled() -> u64;
@@ -142,7 +170,7 @@ fn reset_uses_the_validated_acpi_port_before_fallbacks() {
     unsafe { test_reset(&mut model) };
     assert_eq!(model.ports, [1, 0xcf9, 0xcf9, 0x64]);
     assert_eq!(model.values, [6, 2, 6, 0xfe]);
-    assert_eq!(model.triple_fault, 1);
+    assert_eq!((model.triple_fault, model.halted), (0, 1));
 }
 
 #[test]
@@ -152,7 +180,79 @@ fn reset_without_acpi_never_waits_forever_for_a_busy_keyboard_controller() {
     assert_eq!(model.reads, 65536);
     assert_eq!(model.writes, 2);
     assert_eq!(&model.ports[..2], &[0xcf9, 0xcf9]);
-    assert_eq!(model.triple_fault, 1);
+    assert_eq!((model.triple_fault, model.halted), (0, 1));
+}
+
+#[test]
+fn inactive_operations_never_authorize_a_triple_fault() {
+    for interception_state in [0, 2, u64::MAX] {
+        for tracking_state in [0, 2, u64::MAX] {
+            for update_phase in [0, 5, 7, 8, u64::from(u32::MAX)] {
+                let tracking = [0, 0, 0, tracking_state];
+                let mut model = Reset {
+                    interception: &interception_state as *const u64 as u64,
+                    tracking: tracking.as_ptr() as u64,
+                    update_phase,
+                    ..Default::default()
+                };
+                unsafe { test_reset(&mut model) };
+                assert_eq!((model.triple_fault, model.halted), (0, 1));
+            }
+        }
+    }
+}
+
+#[test]
+fn active_operations_retain_the_triple_fault_fallback() {
+    for io in [0, 0x60001] {
+        for keyboard_busy in [0, 2] {
+            let interception = 1_u64;
+            let tracking = [0_u64, 0, 0, 1];
+            for operation in 0..7 {
+                let mut model = Reset { io, keyboard_busy, ..Default::default() };
+                match operation {
+                    0 => model.interception = &interception as *const u64 as u64,
+                    1 => model.tracking = tracking.as_ptr() as u64,
+                    _ => model.update_phase = [1, 2, 3, 4, 6][operation - 2],
+                }
+                unsafe { test_reset(&mut model) };
+                assert_eq!((model.triple_fault, model.halted), (1, 0));
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_or_invalid_event_context_cannot_authorize_a_triple_fault() {
+    let active = 1_u64;
+    for invalid in 0..3 {
+        let mut model = Reset {
+            interception: &active as *const u64 as u64,
+            tracking: u64::MAX,
+            ..Default::default()
+        };
+        match invalid {
+            0 => model.event_present = 0,
+            1 => model.magic = 0,
+            _ => model.canary = 0,
+        }
+        unsafe { test_reset(&mut model) };
+        assert_eq!((model.triple_fault, model.halted), (0, 1));
+        assert_eq!(&model.ports[..2], &[0xcf9, 0xcf9]);
+    }
+}
+
+#[test]
+fn context_independent_reset_discards_any_previous_triple_fault_permission() {
+    let mut model = Reset {
+        interception: u64::MAX,
+        tracking: u64::MAX,
+        update_phase: 4,
+        ..Default::default()
+    };
+    unsafe { test_reset_cf9(&mut model) };
+    assert_eq!((model.triple_fault, model.halted), (0, 1));
+    assert_eq!(&model.ports[..2], &[0xcf9, 0xcf9]);
 }
 
 thread_local! {

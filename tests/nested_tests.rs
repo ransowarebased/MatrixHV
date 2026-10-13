@@ -2436,8 +2436,8 @@ mod ept {
 
     #[repr(C)]
     struct SnapshotContext {
-        values: [u64; 9],
-        hardware: [u64; 9],
+        values: [u64; 11],
+        hardware: [u64; 11],
         reads: u64,
     }
 
@@ -2458,6 +2458,8 @@ mod ept {
         secondary_vm_exec_control = const 6,
         vm_exit_controls = const 7,
         ept_pointer = const 8,
+        guest_dr7 = const 9,
+        guest_ia32_debugctl = const 10,
         b_nested_inherited_l1_pat = const 0,
         b_nested_inherited_l1_efer = const 8,
         b_nested_inherited_l1_tsc_offset = const 16,
@@ -2467,6 +2469,8 @@ mod ept {
         b_nested_vmcs01_secondary_controls = const 48,
         b_nested_vmcs01_exit_controls = const 56,
         b_nested_ept01_pointer = const 64,
+        b_nested_inherited_l1_dr7 = const 72,
+        b_nested_inherited_l1_debugctl = const 80,
         test_hardware = const std::mem::offset_of!(SnapshotContext, hardware),
         test_reads = const std::mem::offset_of!(SnapshotContext, reads),
     );
@@ -2477,14 +2481,14 @@ mod ept {
     }
 
     fn snapshot_test_vmcs01(context: &mut SnapshotContext) {
-        // The nine fixed VMCS selectors index the two inline arrays.
+        // The fixed VMCS selectors index the two inline arrays.
         unsafe { snapshot_test_vmcs01_raw(context) }
     }
 
     #[test]
     fn vmcs01_snapshot_retains_controls_and_refreshes_live_l1_state() {
         let mut state = SnapshotContext {
-            values: [0; 9],
+            values: [0; 11],
             hardware: [
                 0x7040600070406,
                 0xd01,
@@ -2495,22 +2499,27 @@ mod ept {
                 0xa2,
                 0x36ffb,
                 0x1234501e,
+                0x400,
+                2,
             ],
             reads: 0,
         };
         snapshot_test_vmcs01(&mut state);
         assert_eq!(state.values, state.hardware);
-        assert_eq!(state.reads, 9);
-        let controls = state.values[4..].to_vec();
+        assert_eq!(state.reads, 11);
+        let controls = state.values[4..9].to_vec();
         // Mode changes and TSC adjustment must propagate despite the fixed controls.
         state.hardware[0] = 0x606060606060606;
         state.hardware[1] = 0;
         state.hardware[2] = u64::MAX - 100;
         state.hardware[3] &= !0x200;
+        state.hardware[9] = 0x401;
+        state.hardware[10] = 1;
         snapshot_test_vmcs01(&mut state);
         assert_eq!(state.values[..4], state.hardware[..4]);
-        assert_eq!(state.values[4..], controls);
-        assert_eq!(state.reads, 13);
+        assert_eq!(state.values[4..9], controls);
+        assert_eq!(state.values[9..], state.hardware[9..]);
+        assert_eq!(state.reads, 17);
     }
 
     core::arch::global_asm!(
@@ -4670,6 +4679,68 @@ mod ept {
         switches: u64,
         reads: u64,
     }
+
+    #[repr(C)]
+    struct DebugContext {
+        values: [u64; 117],
+        hardware: [u64; 117],
+        inherited_dr7: u64,
+        inherited_debugctl: u64,
+    }
+
+    core::arch::global_asm!(
+        ".text",
+        ".globl sync_test_debug_state",
+        "sync_test_debug_state:",
+        "push r12", "mov r12, rcx",
+        "call .Lresident_nested_sync_vmcs02_debug_state",
+        "pop r12", "ret",
+        ".globl capture_test_debug_state",
+        "capture_test_debug_state:",
+        "push r12", "mov r12, rcx",
+        "call .Lresident_nested_capture_vmcs02_debug_state",
+        "pop r12", "ret",
+        include_str!("../builds/nested-ept-tests/resident-debug.S"),
+        b_nested_vmcs12_extended_fields = const std::mem::offset_of!(DebugContext, values),
+        b_nested_vmcs12_vm_entry_controls = const std::mem::offset_of!(DebugContext, values) + 11 * 8,
+        b_nested_vmcs12_vm_exit_controls = const std::mem::offset_of!(DebugContext, values) + 4 * 8,
+        b_nested_inherited_l1_dr7 = const std::mem::offset_of!(DebugContext, inherited_dr7),
+        b_nested_inherited_l1_debugctl = const std::mem::offset_of!(DebugContext, inherited_debugctl),
+        test_hardware = const std::mem::offset_of!(DebugContext, hardware),
+        guest_dr7 = const 91,
+        guest_ia32_debugctl = const 24,
+    );
+
+    unsafe extern "win64" {
+        fn sync_test_debug_state(context: *mut DebugContext);
+        fn capture_test_debug_state(context: *mut DebugContext);
+    }
+
+    #[test]
+    fn nested_debug_controls_load_requested_state_or_inherit_l1() {
+        for controls in [0, 4] {
+            let mut state = DebugContext {
+                values: [0; 117],
+                hardware: [u64::MAX; 117],
+                inherited_dr7: 0x401,
+                inherited_debugctl: 1,
+            };
+            state.values[11] = controls;
+            state.values[91] = 0x402;
+            state.values[24] = 2;
+            // VMREAD and VMWRITE use bounded inline arrays instead of privileged instructions.
+            unsafe { sync_test_debug_state(&mut state) };
+            assert_eq!(state.hardware[91], if controls == 0 { 0x401 } else { 0x402 });
+            assert_eq!(state.hardware[24], if controls == 0 { 1 } else { 2 });
+            state.hardware[91] = 0x403;
+            state.hardware[24] = 0;
+            state.values[4] = controls;
+            unsafe { capture_test_debug_state(&mut state) };
+            assert_eq!(state.values[91], if controls == 0 { 0x402 } else { 0x403 });
+            assert_eq!(state.values[24], if controls == 0 { 2 } else { 0 });
+        }
+    }
+
     core::arch::global_asm!(
         ".text",
         ".globl sync_test_guest",
@@ -4681,7 +4752,7 @@ mod ept {
         ".globl capture_test_guest",
         "capture_test_guest:",
         "push r12", "push rsi", "mov r12, rcx",
-        "lea rsi, [rip + .Lresident_nested_guest_state_table]", "mov ecx, 50",
+        "lea rsi, [rip + .Lresident_nested_guest_state_table]", "mov ecx, 49",
         "call .Lresident_nested_capture_vmcs02_guest_state_loop",
         "pop rsi", "pop r12", "ret",
         ".globl materialize_test_guest",
@@ -4714,7 +4785,7 @@ mod ept {
         b_nested_vmcs02_rare_state_pending = const std::mem::offset_of!(GuestContext,rare_pending),
         nested_rare_guest_fields_low = const (0xff_u64 << 35) | (0x3ff_u64 << 50),
         nested_rare_guest_fields_high = const (0xffff_u64 << 1) | (1_u64 << 28),
-        nested_guest_state_table_count = const 50,
+        nested_guest_state_table_count = const 49,
     );
     unsafe extern "win64" {
         #[link_name = "sync_test_guest"]
@@ -4777,20 +4848,20 @@ mod ept {
             reads: 0,
         };
         sync_test_guest(&mut state);
-        assert_eq!(state.writes, 50);
+        assert_eq!(state.writes, 49);
         state.values[30] = 0x12345000;
         sync_test_guest(&mut state);
-        assert_eq!(state.writes, 55);
+        assert_eq!(state.writes, 54);
         assert_eq!(state.hardware[30], 0x12345000);
         state.hardware[30] = 0x87654000;
         state.cache[30] = state.hardware[30];
         state.values[30] = state.hardware[30];
         sync_test_guest(&mut state);
-        assert_eq!(state.writes, 59);
+        assert_eq!(state.writes, 58);
         assert_eq!(state.hardware[30], 0x87654000);
         state.valid = 0;
         sync_test_guest(&mut state);
-        assert_eq!(state.writes, 109);
+        assert_eq!(state.writes, 107);
     }
 
     #[test]
@@ -4822,12 +4893,12 @@ mod ept {
             .enumerate()
             .filter_map(|(index, value)| (*value != u64::MAX).then_some(index))
             .collect();
-        assert_eq!(fields.len(), 50);
+        assert_eq!(fields.len(), 49);
         for &index in &fields {
             state.hardware[index] = 0x10000 + index as u64;
         }
         capture_test_guest(&mut state);
-        assert_eq!(state.reads, 15);
+        assert_eq!(state.reads, 14);
         let pending = [
             (0xff_u64 << 35) | (0x3ff_u64 << 50),
             (0xffff_u64 << 1) | (1_u64 << 28),
@@ -4849,13 +4920,13 @@ mod ept {
         assert_eq!(state.rare_pending, pending);
         state.selected_vmcs = 2;
         sync_test_guest(&mut state);
-        assert_eq!(state.writes, 54);
+        assert_eq!(state.writes, 53);
         for &index in &fields {
             assert_eq!(state.hardware[index], 0x10000 + index as u64);
         }
         state.selected_vmcs = 1;
         materialize_test_guest(&mut state, 50, 0xfeed_dead_beef, 0x6806);
-        assert_eq!(state.reads, 16);
+        assert_eq!(state.reads, 15);
         assert_eq!(state.switches, 2);
         assert_eq!(state.selected_vmcs, 1);
         assert_eq!(state.rare_pending, [pending[0] & !(1 << 50), pending[1]]);
@@ -4869,13 +4940,13 @@ mod ept {
             assert_eq!(state.cache[index], expected);
         }
         materialize_test_guest(&mut state, 50, 0, 0x6806);
-        assert_eq!(state.reads, 16);
+        assert_eq!(state.reads, 15);
         assert_eq!(state.switches, 2);
         state.values[50] = 0x87654000;
         state.selected_vmcs = 2;
         sync_test_guest(&mut state);
         assert_eq!(state.hardware[50], 0x87654000);
-        assert_eq!(state.writes, 59);
+        assert_eq!(state.writes, 58);
         // A VMCS switch or clear must save even fields L1 has not read.
         for &index in &fields {
             state.hardware[index] = 0x20000 + index as u64;
@@ -4884,7 +4955,7 @@ mod ept {
         state.selected_vmcs = 1;
         materialize_test_all_guest(&mut state);
         materialize_test_all_guest(&mut state);
-        assert_eq!(state.reads, 66);
+        assert_eq!(state.reads, 64);
         assert_eq!(state.switches, 4);
         assert_eq!(state.selected_vmcs, 1);
         assert_eq!(state.rare_pending, [0; 2]);

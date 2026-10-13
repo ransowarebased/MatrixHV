@@ -208,12 +208,38 @@ def prepare_eptp_sync(project: Path):
     output = project / "builds" / "eptp-sync-tests"
     output.mkdir(parents=True, exist_ok=True)
     source = (project / "src/vmx/asm/eptp_switch.S").read_text()
+    for label, stage in (("begin_owner", 1), ("begin_reserved", 2)):
+        marker = f".Lresident_nested_eptp_sync_{label}:\n"
+        source = source.replace(
+            marker,
+            marker + f"cmp qword ptr [r12 + {{test_initialize_stage}}], {stage}\n"
+            f"jne .Ltest_initialize_{label}_ready\n"
+            "call .Ltest_pause_initialize\n"
+            f".Ltest_initialize_{label}_ready:\n",
+        )
+    source = source.replace(
+        ".Lresident_nested_eptp_sync_initializing:\n",
+        ".Lresident_nested_eptp_sync_initializing:\n"
+        "inc qword ptr [r12 + {test_initialization_observed}]\n",
+    )
     source = source.replace("call .Lresident_interception_callback", "call .Ltest_interception_callback")
     source = source.replace("call .Lresident_interception_clock_commit", "mov edx, 5\ncall .Ltest_interception_callback")
     source = source.replace("call .Lresident_watchdog_resuming", "mov qword ptr [r12 + {b_watchdog_phase}], 1\ninc qword ptr [r12 + {b_watchdog_sequence}]")
     start = source.index(".Lresident_nested_eptp_sync_acquire:")
     end = source.index(".endm", start)
     assembly = source[start:end]
+    root_start = source.index(".Lresident_nested_eptp_before_root_write:")
+    root_end = source.index(".Lresident_nested_vmfunc:", root_start)
+    root_write = source[root_start:root_end].replace(
+        "jnz .Lresident_dispatch_halt", "jnz .Ltest_root_write_abort"
+    ).replace(
+        ".Lresident_nested_eptp_root_write_restored:\n",
+        "jmp .Lresident_nested_eptp_root_write_restored\n"
+        ".Ltest_root_write_abort:\n"
+        "mov qword ptr [r12 + {test_terminal}], 1\n"
+        ".Lresident_nested_eptp_root_write_restored:\n",
+    )
+    assembly += root_write
     assembly = assembly.replace("jna .Lresident_invalidation_failed", "jna .Lresident_dispatch_halt")
     assembly = assembly.replace(
         "rdtsc",
@@ -323,6 +349,9 @@ def prepare_evmcs(project: Path):
     ''' + tsc + '\nmov rax, r11\npop r12\nret\n' + event
     completion = source.split('call .Lresident_nested_complete_vmcs02_msr_exit\n', 1)[1].split(
         'mov qword ptr [r12 + {b_nested_l2_active}], 0', 1)[0]
+    # This model contains only NestedVmxState. Physical NMI ownership belongs
+    # to ResidentBootContext and is exercised by the exit-event suite.
+    completion = completion.replace('mov qword ptr [r12 + {b_nmi_injected}], 0\n', '')
     completion = '.Ltest_complete_evmcs_exit:\n' + completion + 'ret\n'
     routing = source[source.index('.Lresident_nested_l2_route:'):
                      source.index('.Lresident_nested_l2_reflect:')]
@@ -900,6 +929,7 @@ def prepare_nested_ept(project: Path):
         '.Lresident_nested_eptp_sync_end:\n'
         'inc qword ptr [r12 + {test_sync_releases}]\nret\n'
         '.Lresident_nested_eptp_sync_poll:\nret\n'
+        '.Lresident_nested_eptp_sync_budget_expired:\nxor eax, eax\nret\n'
     )
     macro_start = source.index('.macro resident_telemetry_counter ')
     macro_end = source.index('.endm', macro_start) + len('.endm')
@@ -1023,6 +1053,22 @@ def prepare_nested_ept(project: Path):
         "mov eax, 1\ntest eax, eax",
     )
     (output / "resident-snapshot.S").write_text(snapshot_assembly)
+    debug_start = source.index('.Lresident_nested_sync_vmcs02_debug_state:')
+    debug_end = source.index('.Lresident_nested_sync_vmcs02_guest_fields:', debug_start)
+    debug_assembly = source[debug_start:debug_end]
+    debug_assembly = debug_assembly.replace(
+        'vmread r11, rax',
+        'mov r11, qword ptr [r12 + {test_hardware} + rax * 8]\n'
+        'push rax\nmov eax, 1\ntest eax, eax\npop rax',
+    ).replace(
+        'vmwrite rax, r11',
+        'mov qword ptr [r12 + {test_hardware} + rax * 8], r11\n'
+        'push rax\nmov eax, 1\ntest eax, eax\npop rax',
+    )
+    debug_assembly = debug_assembly.replace('.Lresident_dispatch_vmread_failed', '.Ltest_debug_state_failed')
+    debug_assembly = debug_assembly.replace('.Lresident_dispatch_vmwrite_failed', '.Ltest_debug_state_failed')
+    debug_assembly += '\n.Ltest_debug_state_failed:\nud2\n'
+    (output / "resident-debug.S").write_text(debug_assembly)
     success_start = source.index('.Lresident_nested_succeed:')
     success_end = source.index('.Lresident_nested_inject_pf_write:', success_start)
     success_assembly = source[success_start:success_end].strip()
@@ -1636,6 +1682,8 @@ def prepare_resident_control(project: Path):
     # This harness exercises dispatch routing; parking deadlines run separately
     # against the complete production synchronization assembly.
     entry = entry.replace("call .Lresident_nested_eptp_sync_budget_start", "nop")
+    # Entry-event ownership is exercised by the complete exit-event harness.
+    entry = entry.replace("call .Lresident_complete_nmi_entry", "nop")
     entry = entry.replace("call .Lresident_telemetry_begin", "nop")
     entry = entry.replace("call .Lresident_watchdog_begin", "nop")
     entry = re.sub(r"^resident_telemetry_counter[^\n]*\n", "", entry, flags=re.M)
@@ -2861,6 +2909,11 @@ def prepare_resident_visual(project: Path):
         + ".balign 16\n"
         + source[exception_start:exception_end]
     ).strip()
+    # Entry-window ownership runs in the interception runtime harness. These
+    # display tests have no dispatcher or nested VM-entry instruction ranges.
+    guard_start = assembly.index('.Lresident_host_sync_nmi_entry_guard:')
+    guard_end = assembly.index('.Lresident_host_arm_nmi_window:', guard_start)
+    assembly = assembly[:guard_start] + '.Lresident_host_sync_nmi_entry_guard:\nret\n' + assembly[guard_end:]
     assembly = assembly.replace(
         ".Lresident_host_nmi_return:\npop rax\niretq",
         ".Lresident_host_nmi_return:\npop rax\njmp .Ltest_nmi_return",
@@ -3133,6 +3186,23 @@ def prepare_boot_state(project: Path):
     namespace["append_u64_fields"](namespace["structure"](resident, "ResidentBootContext"), "")
     output = project / "builds/boot-state-tests"
     output.mkdir(parents=True, exist_ok=True)
+    legacy_abi = (project / "src/vmx/resident/abi.rs").read_text()
+    legacy_nested = (project / "src/vmx/nested.rs").read_text()
+    for field in ("inherited_l1_dr7", "inherited_l1_debugctl"):
+        declaration = f"    pub {field}: u64,\n"
+        initializer = f"            {field}: 0,\n"
+        assert legacy_nested.count(declaration) == legacy_nested.count(initializer) == 1
+        legacy_nested = legacy_nested.replace(declaration, "").replace(initializer, "")
+    legacy_nested = legacy_nested.replace('use super::vmcs12::', 'use crate::vmx::vmcs12::')
+    (output / "legacy-nested.rs").write_text(legacy_nested, encoding="utf-8")
+    legacy_abi = legacy_abi.replace('use crate::vmx::nested::NestedVmxState;',
+                                    'use crate::legacy_nested::NestedVmxState;')
+    for field in ("nmi_injected", "nmi_entry_retries"):
+        declaration = f"    pub {field}: u64,\n"
+        initializer = f"            {field}: 0,\n"
+        assert legacy_abi.count(declaration) == legacy_abi.count(initializer) == 1
+        legacy_abi = legacy_abi.replace(declaration, "").replace(initializer, "")
+    (output / "legacy-abi.rs").write_text(legacy_abi, encoding="utf-8")
     harness = "use std::mem::{offset_of, size_of};\n"
     harness += 'pub mod protocol { include!("../../src/protocol.rs"); }\n'
     harness += 'pub mod memory { pub mod host { pub const PAGE_SIZE: usize = 4096; } }\n'
@@ -3140,8 +3210,13 @@ def prepare_boot_state(project: Path):
     (output / "trace_state.rs").write_text(trace_source[trace_source.index("#[repr(C)]"):trace_source.index("pub(crate) fn supported")])
     harness += 'pub mod vmx { pub mod pt { include!("trace_state.rs"); } pub mod bridge { include!("../../src/vmx/bridge.rs"); } pub mod nested { include!("../../src/vmx/nested.rs"); } pub mod vmcs12 { include!("../../src/vmx/vmcs12.rs"); } }\n'
     harness += 'pub mod abi { include!("../../src/vmx/resident/abi.rs"); }\n'
+    harness += 'pub mod legacy_nested { include!("legacy-nested.rs"); }\n'
+    harness += 'pub mod legacy_abi { include!("legacy-abi.rs"); }\n'
     harness += "use abi::ResidentBootContext;\n"
     harness += "fn main() {\n"
+    harness += 'let nested_delta = size_of::<vmx::nested::NestedVmxState>() - size_of::<legacy_nested::NestedVmxState>();\n'
+    harness += 'assert_eq!(nested_delta, 2 * size_of::<u64>());\n'
+    harness += 'assert_eq!(size_of::<ResidentBootContext>() - size_of::<legacy_abi::ResidentBootContext>(), nested_delta + 2 * size_of::<u64>(), "new nested debug and NMI state must reject legacy live-update packages by boot_bytes");\n'
     for name, format_code in namespace["formats"].items():
         path = name
         displacement = ""
@@ -3150,6 +3225,8 @@ def prepare_boot_state(project: Path):
             element = "u64" if format_code == "<Q" else "u32"
             displacement = f" + {index} * size_of::<{element}>()"
         harness += f'println!("{name}={{}}", offset_of!(ResidentBootContext, {path}){displacement});\n'
+        if name not in ("nmi_injected", "nmi_entry_retries", "nested.inherited_l1_dr7", "nested.inherited_l1_debugctl"):
+            harness += f'assert_eq!(offset_of!(ResidentBootContext, {path}), offset_of!(legacy_abi::ResidentBootContext, {path}) + if offset_of!(ResidentBootContext, {path}) >= offset_of!(ResidentBootContext, original_gdtr) {{ nested_delta }} else {{ 0 }}, "legacy field offset changed: {name}");\n'
     harness += "}\n"
     source_path = output / "layout.rs"
     executable = output / "layout.exe"

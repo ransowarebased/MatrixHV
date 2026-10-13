@@ -405,11 +405,13 @@ pub fn capture_control(options: ControlTraceOptions) -> Result<(), String> {
         return Err("invalid control trace CPU or duration".into());
     }
     let mut affinity = CpuAffinity::current()?;
-    let observer_cpu = affinity
-        .allowed()
-        .iter()
-        .copied()
-        .find(|cpu| *cpu != options.cpu && *cpu < 64)
+    affinity.pin(affinity.allowed()[0])?;
+    verify_cpu(affinity.allowed()[0])?;
+    let registered = pair(diagnostic(36)).0;
+    let (observer_cpu, observer_processor_number) = affinity
+        .registered_routes(registered)?
+        .into_iter()
+        .find(|(_, resident_cpu)| *resident_cpu != options.cpu)
         .ok_or_else(|| {
             "control trace requires an observer CPU different from the target".to_string()
         })?;
@@ -434,7 +436,7 @@ pub fn capture_control(options: ControlTraceOptions) -> Result<(), String> {
         .map_err(|error| format!("failed to create {}: {error}", options.output.display()))?;
     writeln!(
         file,
-        "format=matrixhv-control-trace-v2\nobserver_cpu={observer_cpu}\ntarget_cpu={}\npolling_interval_ms=1\nnative_capture_supported={}\nnative_snapshot_encoding=little_endian_u64_header_and_raw_stack\n",
+        "format=matrixhv-control-trace-v2\nobserver_cpu={observer_cpu}\nobserver_processor_number={observer_processor_number}\ntarget_cpu={}\npolling_interval_ms=1\nnative_capture_supported={}\nnative_snapshot_encoding=little_endian_u64_header_and_raw_stack\n",
         options.cpu,
         native_layout.is_some(),
     )
@@ -656,18 +658,15 @@ pub fn intel_pt(operation: &str, output: Option<&std::path::Path>) -> Result<Str
         return Err("MatrixHV does not support runtime Intel PT diagnostics".into());
     }
     let registered = pair(diagnostic(36)).0;
-    let cpus: Vec<_> = allowed
-        .into_iter()
-        .filter(|cpu| *cpu < 64 && registered & (1_u64 << cpu) != 0)
-        .collect();
+    let cpus = affinity.registered_routes(registered)?;
     if cpus.is_empty() {
         return Err("no registered MatrixHV CPUs are available in this process affinity".into());
     }
     // Preflight every selected CPU before changing collection on any CPU.
     if operation == "start" {
-        for &cpu in &cpus {
-            affinity.pin(cpu)?;
-            verify_cpu(cpu)?;
+        for &(logical_cpu, cpu) in &cpus {
+            affinity.pin(logical_cpu)?;
+            verify_cpu(logical_cpu)?;
             let state = diagnostic(MATRIXHV_INTEL_PT_SUBLEAF);
             if !matches!(state.eax, 1 | 3) {
                 return Err(format!(
@@ -691,9 +690,9 @@ pub fn intel_pt(operation: &str, output: Option<&std::path::Path>) -> Result<Str
     append_callback_identity(&mut text);
     let mut started = Vec::new();
     let result = (|| {
-        for &cpu in &cpus {
-            affinity.pin(cpu)?;
-            verify_cpu(cpu)?;
+        for &(logical_cpu, cpu) in &cpus {
+            affinity.pin(logical_cpu)?;
+            verify_cpu(logical_cpu)?;
             let circular = diagnostic(34).eax & crate::protocol::MATRIXHV_INTEL_PT_RING_CAPABILITY != 0;
             let subleaf = match operation {
                 "start" => MATRIXHV_INTEL_PT_SUBLEAF + 1,
@@ -709,7 +708,7 @@ pub fn intel_pt(operation: &str, output: Option<&std::path::Path>) -> Result<Str
                     return Err(format!("Intel PT start rejected on CPU {cpu}"));
                 }
                 if !was_armed {
-                    started.push(cpu);
+                    started.push(logical_cpu);
                 }
                 // Force a normal exit so hardware ownership/fault checks run now.
                 std::arch::x86_64::__cpuid_count(0, 0);
@@ -725,6 +724,7 @@ pub fn intel_pt(operation: &str, output: Option<&std::path::Path>) -> Result<Str
                 return Err(format!("invalid Intel PT length on CPU {cpu}"));
             }
             let prefix = format!("cpu.{cpu}");
+            writeln!(text, "{prefix}.logical_processor_number={logical_cpu}").unwrap();
             writeln!(text, "{prefix}.state={}\n{prefix}.armed={}\n{prefix}.bytes={}\n{prefix}.rtit_status=0x{:x}", state.eax, state.ebx, state.ecx, state.edx).unwrap();
             if let Some(directory) = directory {
                 if !circular && state.ebx != 0 {
@@ -1064,6 +1064,52 @@ fn verify_cpu(cpu: u32) -> Result<(), String> {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+pub(crate) fn registered_cpu_routes(
+    allowed: &[u32],
+    registered: u64,
+    mut identify: impl FnMut(u32) -> Result<u32, String>,
+) -> Result<Vec<(u32, u32)>, String> {
+    let mut routes = Vec::new();
+    let mut observed = 0_u64;
+    for &logical_cpu in allowed {
+        let resident_cpu = identify(logical_cpu)?;
+        let mask = 1_u64.checked_shl(resident_cpu).ok_or_else(|| {
+            format!("invalid MatrixHV processor number {resident_cpu} on logical CPU {logical_cpu}")
+        })?;
+        if registered & mask == 0 {
+            continue;
+        }
+        if observed & mask != 0 {
+            return Err(format!(
+                "duplicate MatrixHV processor number {resident_cpu} in process CPU affinity"
+            ));
+        }
+        observed |= mask;
+        routes.push((logical_cpu, resident_cpu));
+    }
+    Ok(routes)
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+impl CpuAffinity {
+    fn registered_routes(&mut self, registered: u64) -> Result<Vec<(u32, u32)>, String> {
+        // EFI MP slots and operating-system affinity indices are independent.
+        // Query the pinned CPU before using its slot in captures or target selection.
+        registered_cpu_routes(&self.allowed().to_vec(), registered, |logical_cpu| {
+            self.pin(logical_cpu)?;
+            verify_cpu(logical_cpu)?;
+            Ok(diagnostic(34).ebx)
+        })
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 pub fn request_text(mode: u32, control: u32) -> Result<String, String> {
     let mode = Mode::from_u32(mode)?;
     let control = Control::from_u32(control)?;
@@ -1144,12 +1190,7 @@ fn benchmark_text() -> Result<String, String> {
     affinity.pin(observer_cpu)?;
     verify_cpu(observer_cpu)?;
     let registered_mask = pair(diagnostic(36)).0;
-    let cpus: Vec<u32> = affinity
-        .allowed()
-        .iter()
-        .copied()
-        .filter(|cpu| *cpu < 64 && registered_mask & (1u64 << cpu) != 0)
-        .collect();
+    let cpus = affinity.registered_routes(registered_mask)?;
     if cpus.is_empty() {
         return Err("no registered MatrixHV vCPUs are available in process CPU affinity".into());
     }
@@ -1157,9 +1198,9 @@ fn benchmark_text() -> Result<String, String> {
         "format=matrixhv-exit-benchmark-v1\nmode=benchmark\nscope=allowed_registered_vcpus\nprobe=cpuid\nprobe_leaf=0\nprobe_subleaf=0\nexit_reason=10\nmeasurement=guest_before_cpuid_to_guest_after_reentry\nunit=tsc_ticks\ncalibration=minimum_empty_bracket\ncalibrated_values=estimates\noutliers=retained\nwarmup_samples={WARMUP_SAMPLES}\ncpu_count={}\nregistered_cpu_mask=0x{registered_mask:016x}\n",
         cpus.len()
     );
-    for cpu in cpus {
-        affinity.pin(cpu)?;
-        verify_cpu(cpu)?;
+    for (logical_cpu, cpu) in cpus {
+        affinity.pin(logical_cpu)?;
+        verify_cpu(logical_cpu)?;
         if diagnostic(34).eax & MATRIXHV_EXIT_TIMING_CAPABILITY == 0 {
             return Err(format!(
                 "exit benchmark requires clock diagnostics on logical CPU {cpu}; update the hypervisor"
@@ -1193,7 +1234,7 @@ fn benchmark_text() -> Result<String, String> {
             samples.push(measure_exit_ticks(true));
         }
         let (compensation_after, tsc_hz_after) = pair(diagnostic(MATRIXHV_EXIT_TIMING_SUBLEAF));
-        verify_cpu(cpu)?;
+        verify_cpu(logical_cpu)?;
         if compensation_after != 0 || tsc_hz != tsc_hz_after {
             return Err(format!(
                 "guest TSC configuration changed during exit benchmark on logical CPU {cpu}"
@@ -1205,6 +1246,7 @@ fn benchmark_text() -> Result<String, String> {
             ));
         }
         let prefix = format!("cpu.{cpu}");
+        writeln!(text, "{prefix}.logical_processor_number={logical_cpu}").unwrap();
         writeln!(text, "{prefix}.telemetry_enabled={telemetry_enabled}\n{prefix}.tsc_compensation=0\n{prefix}.tsc_hz={tsc_hz}").unwrap();
         append_exit_benchmark(&mut text, &prefix, baseline, samples, tsc_hz)?;
     }

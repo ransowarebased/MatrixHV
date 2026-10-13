@@ -274,15 +274,25 @@ mov qword ptr [r12 + {b_last_efer_write}], r11
 call .Lresident_advance_guest_rip
 jmp .Lresident_dispatch_resume
 .Lresident_dispatch_wrmsr_debugctl:
-// Validate model-specific DEBUGCTL bits without retaining the guest value in root.
+// Probe model-specific bits with TR and BTS separated. Their combination would
+// write through the guest DS-area pointer using root page tables before restore.
 call .Lresident_guarded_rdmsr
 jc .Lresident_dispatch_inject_gp
 push rdx
 push rax
 mov eax, dword ptr [rsp + 16]
 mov edx, dword ptr [rsp + 32]
+and eax, -65
 call .Lresident_guarded_wrmsr
 jc .Lresident_dispatch_wrmsr_debugctl_invalid
+test byte ptr [rsp + 16], 0x40
+jz .Lresident_dispatch_wrmsr_debugctl_restore
+mov eax, dword ptr [rsp + 16]
+mov edx, dword ptr [rsp + 32]
+and eax, -129
+call .Lresident_guarded_wrmsr
+jc .Lresident_dispatch_wrmsr_debugctl_restore_invalid
+.Lresident_dispatch_wrmsr_debugctl_restore:
 pop rax
 pop rdx
 call .Lresident_guarded_wrmsr
@@ -298,6 +308,12 @@ call .Lresident_advance_guest_rip
 jmp .Lresident_dispatch_resume
 .Lresident_dispatch_wrmsr_debugctl_invalid:
 add rsp, 16
+jmp .Lresident_dispatch_inject_gp
+.Lresident_dispatch_wrmsr_debugctl_restore_invalid:
+pop rax
+pop rdx
+call .Lresident_guarded_wrmsr
+jc .Lresident_dispatch_halt
 jmp .Lresident_dispatch_inject_gp
 .Lresident_dispatch_wrmsr_fs_base:
 mov r10, {guest_fs_base}

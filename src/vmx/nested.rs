@@ -654,6 +654,8 @@ pub struct NestedVmxState {
     pub operand_linear_address: u64,
     pub operand_data: [u64; 2],
     pub l2_nmi_exit_pending: u64,
+    pub inherited_l1_dr7: u64,
+    pub inherited_l1_debugctl: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -856,6 +858,8 @@ impl NestedVmxState {
             operand_linear_address: 0,
             operand_data: [0; 2],
             l2_nmi_exit_pending: 0,
+            inherited_l1_dr7: 0,
+            inherited_l1_debugctl: 0,
         }
     }
 

@@ -16,6 +16,9 @@ struct EventContext {
     log_backend: u64,
     dispatch_vmreads: u64,
     cr2: u64,
+    injected: u64,
+    pending: u64,
+    entry_retries: u64,
 }
 
 #[repr(C)]
@@ -45,6 +48,10 @@ struct WindowContext {
     interruptibility: u64,
     pending_debug: u64,
     activity: u64,
+    vectoring: u64,
+    injected: u64,
+    sync_safe: u64,
+    entry_retries: u64,
 }
 
 unsafe extern "C" {
@@ -55,11 +62,17 @@ unsafe extern "C" {
     fn test_event_retry(context: &mut EventContext);
     fn test_event_interception_retry(context: &mut EventContext);
     fn test_event_exception(context: &mut EventContext);
+    fn test_event_complete_nmi(context: &mut EventContext);
+    fn test_event_restore_failed_nmi(context: &mut EventContext);
     fn test_host_arm_nmi_window(context: &mut ArmContext);
     fn test_nested_nmi_window(context: &mut WindowContext);
     fn test_deliver_pending_nmi(context: &mut WindowContext);
     fn test_nested_l2_launch_entry(context: &mut WindowContext);
     fn test_nested_l2_resume_entry(context: &mut WindowContext);
+    fn test_complete_nmi_entry(context: &mut WindowContext);
+    fn test_nested_l2_launch_failure(context: &mut WindowContext);
+    fn test_nested_l2_resume_failure(context: &mut WindowContext);
+    fn test_nested_l2_event_handoff(context: &mut WindowContext);
 }
 
 #[test]
@@ -196,6 +209,17 @@ fn completion_preserves_debug_causes_and_adds_single_step_only_without_btf() {
     context.vmcs[13] = 0x4000;
     unsafe { test_event_advance(&mut context) };
     assert_eq!(context.vmcs[13], 0x4000);
+}
+
+#[test]
+fn instruction_completion_retires_resume_flag_without_changing_other_flags() {
+    for flags in [0x10002, 0x10302, 0x202, 0x302] {
+        let mut context = EventContext::default();
+        context.vmcs[11] = flags;
+        unsafe { test_event_advance(&mut context) };
+        assert_eq!(context.vmcs[11], flags & !(1 << 16));
+        assert_eq!(context.vmcs[13] & (1 << 14), (flags & (1 << 8)) << 6);
+    }
 }
 
 #[test]
@@ -403,6 +427,31 @@ fn retry_combines_only_architectural_double_fault_pairs() {
 }
 
 #[test]
+fn interrupted_exception_delivery_uses_all_intel_exception_classes() {
+    let contributory = [0, 10, 11, 12, 13, 21];
+    let page_faults = [14, 20];
+    for first in 0_u64..32 {
+        for second in 0_u64..32 {
+            let mut context = EventContext { reason: 48, ..Default::default() };
+            context.vmcs[0] = 0x8000_0300 | first;
+            context.vmcs[3] = 0x8000_0b00 | second;
+            context.vmcs[8] = 1;
+            context.vmcs[5] = 0x1234;
+            unsafe { test_event_retry(&mut context) };
+            let second_fault = contributory.contains(&second) || page_faults.contains(&second);
+            let double_fault = contributory.contains(&first) && contributory.contains(&second)
+                || page_faults.contains(&first) && second_fault;
+            let shutdown = first == 8 && second_fault;
+            let expected_event = if shutdown { 0 } else if double_fault { 0x8000_0b08 }
+                else { 0x8000_0b00 | second };
+            assert_eq!((context.vmcs[3], context.vmcs[9]),
+                (expected_event, if shutdown { 2 } else { 0 }), "first={first} second={second}");
+            assert_eq!(context.vmcs[5], if double_fault { 0 } else { 0x1234 });
+        }
+    }
+}
+
+#[test]
 fn late_host_nmi_arms_exit_and_invalidates_l2_control_cache() {
     let mut context = ArmContext {
         l2_active: 1,
@@ -512,7 +561,7 @@ fn pending_nmi_is_injected_into_a_guest_without_an_l1_intercept() {
         unsafe { test_deliver_pending_nmi(&mut context) };
         assert_eq!(context.pending, 0);
         assert_eq!(context.entry_intr_info, 0x8000_0202);
-        assert_eq!(context.activity, 0);
+        assert_eq!(context.activity, 1);
     }
 }
 
@@ -557,4 +606,177 @@ fn no_pending_nmi_leaves_entry_state_and_controls_unchanged() {
     assert_eq!(context.entry_intr_info, 0);
     assert_eq!(context.primary_controls, (1 << 28) | (1 << 22));
     assert_eq!(context.control_cache_valid, [u64::MAX; 2]);
+}
+
+#[test]
+fn successful_entry_consumes_only_the_staged_physical_nmi() {
+    for pending in [0, 1] {
+        let mut context = WindowContext {
+            pending,
+            injected: 1,
+            reason: 48,
+            ..Default::default()
+        };
+        unsafe { test_complete_nmi_entry(&mut context) };
+        assert_eq!(context.injected, 0);
+        assert_eq!(context.pending, pending);
+        assert_eq!(context.entry_retries, 0);
+    }
+}
+
+#[test]
+fn late_entry_failure_requeues_the_undelivered_physical_nmi() {
+    for reason in [0x8000_0021, 0x8000_0022, 0x8000_0029] {
+        let mut context = WindowContext {
+            pending: 1,
+            reason,
+            ..Default::default()
+        };
+        unsafe { test_deliver_pending_nmi(&mut context) };
+        assert_eq!((context.pending, context.injected), (0, 1));
+        assert_eq!(context.entry_intr_info, 0x8000_0202);
+        unsafe { test_complete_nmi_entry(&mut context) };
+        assert_eq!((context.pending, context.injected), (1, 0));
+        assert_eq!(context.entry_retries, 1);
+        assert_eq!(context.entry_intr_info & (1 << 31), 0);
+        unsafe { test_deliver_pending_nmi(&mut context) };
+        assert_eq!((context.pending, context.injected), (0, 1));
+        assert_eq!(context.entry_intr_info, 0x8000_0202);
+    }
+}
+
+#[test]
+fn early_nested_vmfail_requeues_physical_nmi_on_both_entry_paths() {
+    for fail_entry in [
+        test_nested_l2_launch_failure as unsafe extern "C" fn(&mut WindowContext),
+        test_nested_l2_resume_failure as unsafe extern "C" fn(&mut WindowContext),
+    ] {
+        let mut context = WindowContext {
+            pending: 1,
+            l2_active: 1,
+            sync_safe: 1,
+            ..Default::default()
+        };
+        unsafe { test_deliver_pending_nmi(&mut context) };
+        unsafe { fail_entry(&mut context) };
+        assert_eq!((context.pending, context.injected, context.sync_safe), (1, 0, 0));
+        assert_eq!(context.entry_retries, 1);
+        assert_eq!(context.entry_intr_info & (1 << 31), 0);
+    }
+}
+
+#[test]
+fn entry_failure_preserves_an_event_supplied_by_l1() {
+    for event in [0x8000_0202, 0x8000_0b0e, 0x8000_0603] {
+        let mut context = WindowContext {
+            reason: 0x8000_0021,
+            entry_intr_info: event,
+            ..Default::default()
+        };
+        unsafe { test_complete_nmi_entry(&mut context) };
+        unsafe { test_nested_l2_launch_failure(&mut context) };
+        assert_eq!((context.pending, context.injected, context.entry_intr_info), (0, 0, event));
+    }
+}
+
+#[test]
+fn final_nmi_recheck_preserves_the_staged_event_and_a_later_physical_nmi() {
+    let mut context = WindowContext {
+        pending: 1,
+        ..Default::default()
+    };
+    unsafe { test_deliver_pending_nmi(&mut context) };
+    assert_eq!((context.pending, context.injected), (0, 1));
+    context.pending = 1;
+    unsafe { test_deliver_pending_nmi(&mut context) };
+    assert_eq!((context.pending, context.injected), (1, 1));
+    assert_eq!(context.entry_intr_info, 0x8000_0202);
+    assert_eq!(context.primary_controls & (1 << 22), 1 << 22);
+    unsafe { test_complete_nmi_entry(&mut context) };
+    assert_eq!((context.pending, context.injected), (1, 0));
+}
+
+#[test]
+fn interrupted_nmi_delivery_retains_ownership_until_reentry_succeeds() {
+    let mut context = EventContext {
+        reason: 48,
+        injected: 1,
+        ..Default::default()
+    };
+    context.vmcs[0] = 0x8000_1202;
+    context.vmcs[2] = 8;
+    unsafe { test_event_complete_nmi(&mut context) };
+    assert_eq!(context.injected, 1);
+    unsafe { test_event_retry(&mut context) };
+    assert_eq!(context.vmcs[3], 0x8000_0202);
+    assert_eq!(context.vmcs[2], 0);
+    unsafe { test_event_restore_failed_nmi(&mut context) };
+    assert_eq!((context.pending, context.injected), (1, 0));
+    assert_eq!(context.vmcs[3] & (1 << 31), 0);
+    assert_eq!(context.entry_retries, 1);
+}
+
+#[test]
+fn reflected_nmi_vectoring_transfers_ownership_to_l1() {
+    let mut context = WindowContext {
+        injected: 1,
+        l2_active: 1,
+        vectoring: 0x8000_0202,
+        ..Default::default()
+    };
+    unsafe { test_nested_l2_event_handoff(&mut context) };
+    assert_eq!((context.injected, context.l2_active), (0, 0));
+    context.reason = 0x8000_0021;
+    context.entry_intr_info = 0x8000_0b0e;
+    unsafe { test_complete_nmi_entry(&mut context) };
+    assert_eq!((context.pending, context.entry_intr_info), (0, 0x8000_0b0e));
+}
+
+#[test]
+fn nested_fault_replaces_the_interrupted_nmi_without_requeueing_it() {
+    let mut context = EventContext {
+        injected: 1,
+        ..Default::default()
+    };
+    context.vmcs[0] = 0x8000_0202;
+    context.vmcs[3] = 0x8000_0b0e;
+    unsafe { test_event_retry(&mut context) };
+    assert_eq!(context.injected, 0);
+    unsafe { test_event_restore_failed_nmi(&mut context) };
+    assert_eq!((context.pending, context.vmcs[3]), (0, 0x8000_0b0e));
+}
+
+#[test]
+fn staging_an_nmi_preserves_inactive_guest_state_when_entry_fails() {
+    for activity in [1, 2] {
+        let mut context = WindowContext {
+            pending: 1,
+            l2_active: 1,
+            activity,
+            ..Default::default()
+        };
+        unsafe { test_deliver_pending_nmi(&mut context) };
+        assert_eq!(context.entry_intr_info, 0x8000_0202);
+        assert_eq!(context.activity, activity);
+        unsafe { test_nested_l2_resume_failure(&mut context) };
+        assert_eq!(context.pending, 1);
+        assert_eq!(context.activity, activity);
+    }
+}
+
+#[test]
+fn failed_entry_preserves_a_fault_that_replaced_owned_nmi_vectoring() {
+    for event in [0x8000_0301, 0x8000_0b0d, 0x8000_0306, 0] {
+        let mut context = EventContext {
+            injected: 1,
+            ..Default::default()
+        };
+        context.vmcs[0] = 0x8000_0202;
+        unsafe { test_event_complete_nmi(&mut context) };
+        assert_eq!(context.injected, 1);
+        context.vmcs[3] = event;
+        unsafe { test_event_restore_failed_nmi(&mut context) };
+        assert_eq!((context.pending, context.injected, context.vmcs[3]), (0, 0, event));
+        assert_eq!(context.entry_retries, 0);
+    }
 }

@@ -44,12 +44,16 @@ def run_component(project, component, release=False):
         execute([sys.executable, str(project / "tests/run_flight_recorder_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_intel_pt_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_exit_guard_tests.py")], project)
+        execute([sys.executable, str(project / "tests/run_host_state_tests.py")], project)
+        execute([sys.executable, str(project / "tests/run_debugctl_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_exit_event_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_watchdog_recovery_tests.py")], project)
         proof_binary = project / "builds/tests/resident/proof_exit_regressions.exe"
         execute(["rustc", "--edition=2024", "-Dwarnings", "--test",
                  str(project / "tests/proof_exit_regressions.rs"), "-o", str(proof_binary)], project)
         execute([str(proof_binary)], project)
+    if component == "nested":
+        execute([sys.executable, str(project / "tests/run_nested_probe_tests.py")], project)
 
 
 def run_neo(project, release=False):

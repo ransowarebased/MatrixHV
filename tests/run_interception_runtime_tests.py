@@ -58,6 +58,10 @@ definitions = '''pub mod protocol { include!("../../src/protocol.rs"); }
 pub mod arch {
     pub struct Leaf { pub eax: u32 }
     pub fn leaf(_: u32) -> Leaf { Leaf { eax: 48 } }
+    pub fn leaf_with_subleaf(function: u32, subleaf: u32) -> Leaf {
+        assert_eq!((function, subleaf), (7, 1));
+        Leaf { eax: crate::hardware::STATE.with(|state| u32::from(state.borrow().lam_supported) << 26) }
+    }
 }
 pub mod memory { pub mod interception {
 ''' + engine + '''
@@ -110,10 +114,44 @@ exits = (project / 'src/vmx/asm/exits.S').read_text()
 bridge = control[control.index('.Lresident_interception_callback:'):control.index('.Lresident_dispatch_update_l2_reject:')]
 bridge += sync[sync.index('.Lresident_nested_eptp_sync_enter:'):sync.index('// The copied Rust callback')]
 bridge += exits[exits.index('.Lresident_interception_clock_commit:'):exits.index('// Separate emulated VMCS access')]
+bridge += exits[exits.index('.Lresident_host_sync_nmi_entry_guard:'):exits.index('.Lresident_host_arm_nmi_window:')]
+assert 'mov rdx, qword ptr [rsp + 120]\ncall .Lresident_host_sync_nmi_entry_guard\ncall .Lresident_nested_eptp_sync_host_nmi' in exits
+transitions = [
+    ('matrixhv_resident_dispatch_entry', '.Lresident_dispatch_entry_unsafe_done'),
+    ('.Lresident_dispatch_l1_entry_failed', '.Lresident_dispatch_l1_entry_unsafe_done'),
+    ('.Lresident_nested_l2_launch_failed_registers', '.Lresident_nested_l2_launch_entry_unsafe_done'),
+    ('.Lresident_nested_l2_resume_failed_registers', '.Lresident_nested_l2_resume_entry_unsafe_done'),
+]
+for first, last in transitions:
+    bridge += f"\n{first}:\nnop\nnop\n{last}:\nnop\n"
+bridge += "\n.balign 8\n.Ltest_transition_windows:\n" + "".join(
+    f".quad {first}, {last}\n" for first, last in transitions)
+bridge += r'''
+.globl matrixhv_test_transition_nmi
+matrixhv_test_transition_nmi:
+push r12
+mov r12, rcx
+shl rdx, 4
+lea rax, [rip + .Ltest_transition_windows]
+add rax, rdx
+mov rdx, qword ptr [rax]
+cmp r8, 0
+je .Ltest_transition_nmi_ready
+mov rdx, qword ptr [rax + 8]
+add rdx, r8
+sub rdx, 2
+.Ltest_transition_nmi_ready:
+call .Lresident_host_sync_nmi_entry_guard
+call .Lresident_nested_eptp_sync_host_nmi
+pop r12
+ret
+'''
+
 bridge += '''
 .Lresident_nested_eptp_sync_return:
 .Lresident_nested_eptp_sync_poll:
 .Lresident_interception_safe_point_timer:
+.Lresident_deliver_pending_nmi:
 ret
 .Lresident_watchdog_resuming:
 mov qword ptr [r12 + {b_watchdog_phase}], 1
@@ -122,11 +160,14 @@ ret
 .Lresident_memory_synchronize:
 jmp matrixhv_test_synchronize
 .Lresident_dispatch_halt:
-ud2
+mov rax, -1
+ret
 .balign 8
 .Lresident_eptp_sync_owner:
 .quad 0
 .Lresident_eptp_sync_failure:
+.quad 0
+.Lresident_eptp_sync_recovered:
 .quad 0
 '''
 for name, target in [('callback', 'interception_callback'), ('gate', 'nested_eptp_sync_enter'), ('nmi', 'nested_eptp_sync_host_nmi')]:

@@ -629,6 +629,7 @@ fn advance_guest_rip(guest_rip: u64, instruction_length: u32) -> Result<(), Vmcs
     };
     vmcs::vmwrite(GUEST_PENDING_DBG_EXCEPTIONS, next_pending_debug)?;
     vmcs::vmwrite(GUEST_INTERRUPTIBILITY_INFO, interruptibility & !3)?;
+    vmcs::vmwrite(GUEST_RFLAGS, rflags & !(1 << 16))?;
     vmcs::vmwrite(GUEST_RIP, next_rip)
 }
 

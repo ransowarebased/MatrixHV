@@ -267,6 +267,8 @@ mov qword ptr [r12 + {b_nested_vmcs12_launch_state}], {vmcs12_launch_state_launc
 .Lresident_nested_l2_launch_state_ready:
 // Publish the consumed event before L1 can reuse the shared eVMCS page.
 call .Lresident_hyperv_evmcs_store
+// VMCS12 now owns any interrupted event reported to L1.
+mov qword ptr [r12 + {b_nmi_injected}], 0
 mov qword ptr [r12 + {b_nested_l2_active}], 0
 vmptrld [r12 + {b_nested_vmcs01_region}]
 jna .Lresident_dispatch_halt
@@ -3201,6 +3203,14 @@ mov r11d, dword ptr [rip + matrixhv_resident_island_msr_switch_count]
 call .Lresident_nested_write_vmcs02_control
 ret
 .Lresident_nested_snapshot_vmcs01_effective_state:
+mov rax, {guest_dr7}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+mov qword ptr [r12 + {b_nested_inherited_l1_dr7}], r11
+mov rax, {guest_ia32_debugctl}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+mov qword ptr [r12 + {b_nested_inherited_l1_debugctl}], r11
 mov rax, {guest_pat}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
@@ -3286,6 +3296,7 @@ jnc .Lresident_nested_vmcs02_tsc_offset_ready
 add r11, qword ptr [r12 + {b_nested_vmcs12_tsc_offset}]
 .Lresident_nested_vmcs02_tsc_offset_ready:
 call .Lresident_nested_write_vmcs02_control
+call .Lresident_nested_sync_vmcs02_debug_state
 call .Lresident_nested_sync_vmcs02_guest_fields
 bt dword ptr [r12 + {b_nested_vmcs12_primary_control}], 31
 jnc .Lresident_nested_synthesize_vmcs02_pdptrs
@@ -3354,6 +3365,39 @@ vmwrite rax, r11
 jna .Lresident_dispatch_vmwrite_failed
 resident_telemetry_counter inc, {b_nested_guest_state_sync_count}, {b_telemetry_active}
 ret
+.Lresident_nested_sync_vmcs02_debug_state:
+// L0 always switches debug controls; an L1 entry without bit 2 inherits its live state.
+mov r11, qword ptr [r12 + {b_nested_inherited_l1_dr7}]
+bt dword ptr [r12 + {b_nested_vmcs12_vm_entry_controls}], 2
+jnc .Lresident_nested_vmcs02_dr7_ready
+mov r11, qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 91 * 8]
+.Lresident_nested_vmcs02_dr7_ready:
+mov rax, {guest_dr7}
+vmwrite rax, r11
+jna .Lresident_dispatch_vmwrite_failed
+mov r11, qword ptr [r12 + {b_nested_inherited_l1_debugctl}]
+bt dword ptr [r12 + {b_nested_vmcs12_vm_entry_controls}], 2
+jnc .Lresident_nested_vmcs02_debugctl_ready
+mov r11, qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 24 * 8]
+.Lresident_nested_vmcs02_debugctl_ready:
+mov rax, {guest_ia32_debugctl}
+vmwrite rax, r11
+jna .Lresident_dispatch_vmwrite_failed
+ret
+.Lresident_nested_capture_vmcs02_debug_state:
+// Saving is an L1 request, even though L0 captures hardware state on every exit.
+bt dword ptr [r12 + {b_nested_vmcs12_vm_exit_controls}], 2
+jnc .Lresident_nested_capture_vmcs02_debug_done
+mov rax, {guest_dr7}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+mov qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 91 * 8], r11
+mov rax, {guest_ia32_debugctl}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+mov qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 24 * 8], r11
+.Lresident_nested_capture_vmcs02_debug_done:
+ret
 .Lresident_nested_sync_vmcs02_guest_fields:
 lea rsi, [rip + .Lresident_nested_guest_state_table]
 mov ecx, {nested_guest_state_table_count}
@@ -3405,6 +3449,7 @@ and r11d, 0x200
 btr qword ptr [r12 + {b_nested_vmcs12_vm_entry_controls}], 9
 or qword ptr [r12 + {b_nested_vmcs12_vm_entry_controls}], r11
 .Lresident_nested_capture_vmcs02_entry_mode_done:
+call .Lresident_nested_capture_vmcs02_debug_state
 lea rsi, [rip + .Lresident_nested_guest_state_table]
 mov ecx, {nested_guest_state_table_count}
 .Lresident_nested_capture_vmcs02_guest_state_loop:
@@ -3863,6 +3908,7 @@ pop r13
 pop r14
 pop r15
 vmlaunch
+.Lresident_nested_l2_launch_failed_registers:
 push r15
 push r14
 push r13
@@ -3880,7 +3926,10 @@ push rcx
 push rax
 pushfq
 mov r12, qword ptr [rsp + 128]
+.Lresident_nested_l2_launch_entry_failed:
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
+.Lresident_nested_l2_launch_entry_unsafe_done:
+call .Lresident_restore_failed_nmi
 call .Lresident_flight_record_entry_failure
 call .Lresident_nested_restore_root_spec_ctrl
 mov r10, qword ptr [rsp]
@@ -3954,6 +4003,7 @@ pop r13
 pop r14
 pop r15
 vmresume
+.Lresident_nested_l2_resume_failed_registers:
 push r15
 push r14
 push r13
@@ -3971,7 +4021,10 @@ push rcx
 push rax
 pushfq
 mov r12, qword ptr [rsp + 128]
+.Lresident_nested_l2_resume_entry_failed:
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
+.Lresident_nested_l2_resume_entry_unsafe_done:
+call .Lresident_restore_failed_nmi
 call .Lresident_flight_record_entry_failure
 call .Lresident_nested_restore_root_spec_ctrl
 mov r10, qword ptr [rsp]
@@ -4213,10 +4266,15 @@ jc .Lresident_dispatch_vmread_failed
 jz .Lresident_dispatch_vmread_failed
 test r11b, 3
 jnz .Lresident_nested_inject_gp
-mov r10, qword ptr [r12 + {b_nested_vmxon_region}]
+mov r11, qword ptr [r12 + {b_nested_vmxon_region}]
+call .Lresident_ept01_page_is_readable
+test eax, eax
+jz .Lresident_dispatch_invept_origin
+mov r10, r11
 mov rax, qword ptr [r12 + {b_last_guest_rip}]
 cmp rax, qword ptr [r10 + {nested_invept_rip_offset}]
 je .Lresident_dispatch_invept_probe
+.Lresident_dispatch_invept_origin:
 mov eax, dword ptr [r12 + {b_last_reason}]
 and eax, 0xffff
 cmp eax, {invept_reason}
@@ -4229,7 +4287,6 @@ cmp qword ptr [rsp + 24], r11
 jne .Lresident_nested_invalid_invalidation_operand
 cmp qword ptr [rsp + 8], 1
 jne .Lresident_nested_invalid_invalidation_operand
-mov r10, qword ptr [r12 + {b_nested_vmxon_region}]
 mov r11, qword ptr [r10 + {nested_invept_descriptor_offset}]
 cmp r11, qword ptr [r12 + {b_nested_ept12_pointer}]
 jne .Lresident_nested_invalid_invalidation_operand
@@ -4346,10 +4403,15 @@ jc .Lresident_dispatch_vmread_failed
 jz .Lresident_dispatch_vmread_failed
 test r11b, 3
 jnz .Lresident_nested_inject_gp
-mov r10, qword ptr [r12 + {b_nested_vmxon_region}]
+mov r11, qword ptr [r12 + {b_nested_vmxon_region}]
+call .Lresident_ept01_page_is_readable
+test eax, eax
+jz .Lresident_dispatch_invvpid_origin
+mov r10, r11
 mov rax, qword ptr [r12 + {b_last_guest_rip}]
 cmp rax, qword ptr [r10 + {nested_invvpid_rip_offset}]
 je .Lresident_dispatch_invvpid_probe
+.Lresident_dispatch_invvpid_origin:
 mov eax, dword ptr [r12 + {b_last_reason}]
 and eax, 0xffff
 cmp eax, {invvpid_reason}
@@ -4362,7 +4424,6 @@ cmp qword ptr [rsp + 24], r11
 jne .Lresident_nested_invalid_invalidation_operand
 cmp qword ptr [rsp + 8], 1
 jne .Lresident_nested_invalid_invalidation_operand
-mov r10, qword ptr [r12 + {b_nested_vmxon_region}]
 mov r11, qword ptr [r10 + {nested_invvpid_descriptor_offset}]
 mov rax, r11
 shr rax, 16
@@ -4776,7 +4837,6 @@ matrixhv_hyperv_evmcs_field_map
 .long 85, 0; .quad 0x482a
 .long 86, 0; .quad 0x6824
 .long 87, 0; .quad 0x6826
-.long 91, 0; .quad 0x681a
 .long 92, 0; .quad 0x6822
 .long 111, 0; .quad 0x280a
 .long 112, 0; .quad 0x280c

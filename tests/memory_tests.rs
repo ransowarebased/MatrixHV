@@ -166,6 +166,38 @@ fn write_reports_partial_completion_when_the_next_page_is_absent() {
 }
 
 #[test]
+fn committed_write_failures_report_written_bytes_and_stop_before_the_next_page() {
+    struct CommittedRam {
+        ram: Ram,
+        error: Error,
+    }
+    impl PhysicalMemory for CommittedRam {
+        fn read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), Error> {
+            self.ram.read(address, bytes)
+        }
+        fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), Error> {
+            self.ram.write(address, bytes)?;
+            Err(self.error)
+        }
+    }
+    for error in [Error::MergeConflict, Error::WriteCommitted] {
+        let mut memory = CommittedRam { ram: Ram::mapped(), error };
+        let (done, result) = transfer(&mut memory, 0x1000, 4094, &mut [1, 2, 3, 4], false, 48, (true, false));
+        assert_eq!((done, result), (2, Err(error)));
+        assert_eq!(&memory.ram.pages[&0x10000][4094..], &[1, 2]);
+        assert_eq!(&memory.ram.pages[&0x12000][..2], &[0, 0]);
+
+        let mut memory = CommittedRam { ram: Ram::mapped(), error };
+        let mut request = packet(WRITE, 42, 0x1000, &[Item { address: 4094, bytes: vec![1, 2, 3, 4] }]).unwrap();
+        execute(&mut memory, &mut request, false, 48).unwrap();
+        assert_eq!(word(&request, HEADER_BYTES + 16), error as u32);
+        assert_eq!(word(&request, HEADER_BYTES + 20), 2);
+        assert_eq!(&memory.ram.pages[&0x10000][4094..], &[1, 2]);
+        assert_eq!(&memory.ram.pages[&0x12000][..2], &[0, 0]);
+    }
+}
+
+#[test]
 fn malformed_later_descriptor_prevents_all_writes() {
     for bad_offset in [0, HEADER_BYTES as u32, u32::MAX] {
         let mut ram = Ram::mapped();
@@ -635,6 +667,45 @@ fn resident_ad_bitmap_excludes_decoys_mmio_and_absent_pages() {
 }
 
 #[test]
+fn resident_ad_bitmap_excludes_pages_below_execute_only_ancestors() {
+    let address = 0x7f00_0000_0000;
+    for shift in [39, 30, 21, 12] {
+        let request = packet(INFO, 0, 0, &[]).unwrap();
+        let (mut machine, environment, buffer, _) = Machine::setup(&request);
+        machine.map(machine.ept, address, address, 0x337);
+        let pointer = ept_pointer(machine.ept, address, shift);
+        let entry = unsafe { pointer.read() };
+        unsafe { pointer.write((entry & !7) | 4); }
+        let response = resident_bitmap(&mut machine, environment, buffer, address, 1, true);
+        assert_eq!(word(&response, 40), 0);
+        assert_eq!(word(&response, 72), AD_ENABLED);
+        assert_eq!(&response[HEADER_BYTES..], &[0, 0]);
+        assert_eq!(unsafe { pointer.read() }, (entry & !7) | 4);
+    }
+}
+
+#[test]
+fn interception_options_preserve_the_same_packet_in_any_operand_order() {
+    let expected = crate::memory::interception_packet(&[
+        "hook".into(), "install".into(), "0x3000".into(), "0x400008".into(), "cc".into(),
+        "--alternate-cr3".into(), "0x7000".into(), "--vmfunc".into(),
+    ]).unwrap();
+    for operands in [
+        vec!["--vmfunc", "--alternate-cr3", "0x7000", "0x400008", "cc"],
+        vec!["--alternate-cr3", "0x7000", "0x400008", "cc", "--vmfunc"],
+        vec!["0x400008", "cc", "--vmfunc", "--alternate-cr3", "0x7000"],
+    ] {
+        let mut arguments = vec!["hook".into(), "install".into(), "0x3000".into()];
+        arguments.extend(operands.into_iter().map(str::to_owned));
+        assert_eq!(crate::memory::interception_packet(&arguments).unwrap(), expected);
+    }
+    assert!(crate::memory::interception_packet(&[
+        "hook".into(), "install".into(), "0x3000".into(), "0x400008".into(), "cc".into(),
+        "--alternate-cr3".into(),
+    ]).is_err());
+}
+
+#[test]
 fn resident_ad_bitmap_reports_conservative_large_leaf_coverage_across_boundaries() {
     for shift in [21, 30] {
         let page_size = 1u64 << shift;
@@ -926,6 +997,9 @@ fn resident_tracking_splits_large_ept_leaves_and_captures_exact_dirty_pages() {
 fn resident_interception_transport_builds_a_private_root_in_validated_host_storage() {
     let request = packet(INFO, 0, 0, &[]).unwrap();
     let (mut machine, mut environment, buffer, target) = Machine::setup(&request);
+    let unrelated = machine.allocate();
+    machine.map(environment.kernel_cr3, 0x1000, unrelated, 7);
+    machine.map(machine.ept, unrelated, unrelated, 0x37);
     machine.map(machine.ept, target, target, 0x37);
     let pool_bytes = intercept_storage_pages(1) * 4096;
     let pool_layout = std::alloc::Layout::from_size_align(pool_bytes, 4096).unwrap();
@@ -962,12 +1036,24 @@ fn resident_interception_transport_builds_a_private_root_in_validated_host_stora
     assert_eq!(unsafe { (target as *const u8).add(8).read() }, 0);
     assert_eq!(unsafe { (shadow as *const u8).add(8).read() }, 0xcc);
     assert_eq!(unsafe { (shadow as *const u8).add(9).read() }, 0x42);
+    barrier.operations.clear();
+    let plain = packet(WRITE, 0, environment.kernel_cr3, &[Item { address: 0x1000, bytes: vec![0x55] }]).unwrap();
+    let written = native_tracking_request(&environment, &[buffer], &plain);
+    assert_eq!(word(&written, HEADER_BYTES + 16), 0);
+    assert_eq!(unsafe { (unrelated as *const u8).read() }, 0x55);
+    assert!(barrier.operations.is_empty());
     let status = crate::memory::interception_packet(&["hook".into(), "status".into()]).unwrap();
     let response = native_tracking_request(&environment, &[buffer], &status);
     assert_eq!(word(&response, 104), 1);
     assert_eq!(word(&response, 44), 1);
     assert_eq!(quad(&response, 48), environment.caller_cr3);
     assert_eq!(word(&response, 112), INTERCEPT_ACTIVE);
+    let conflict = packet(WRITE, 0, environment.kernel_cr3, &[Item { address: 8, bytes: vec![0xc3] }]).unwrap();
+    let committed = native_tracking_request(&environment, &[buffer], &conflict);
+    assert_eq!(word(&committed, HEADER_BYTES + 16), Error::MergeConflict as u32);
+    assert_eq!(word(&committed, HEADER_BYTES + 20), 1);
+    assert_eq!(unsafe { (target as *const u8).add(8).read() }, 0xc3);
+    assert!(!session.is_active());
     let token = quad(&response, 80).to_string();
     let remove = crate::memory::interception_packet(&["hook".into(), "remove".into(), token]).unwrap();
     let removed = native_tracking_request(&environment, &[buffer], &remove);
@@ -1065,6 +1151,76 @@ fn resident_transport_denies_ept_decoys_mmio_and_read_only_target_pages() {
         assert_eq!(word(response, HEADER_BYTES + 20), 0);
         assert_eq!(unsafe { (target as *const u8).read() }, 101);
     }
+}
+
+#[test]
+fn idle_interception_session_keeps_plain_write_permissions_and_skips_the_barrier() {
+    for writable in [false, true] {
+        let mut request = packet(WRITE, 0, 0x1000, &[Item { address: 0, bytes: vec![9] }]).unwrap();
+        let (mut machine, mut environment, buffer, target) = Machine::setup(&request);
+        request[16..24].copy_from_slice(&environment.kernel_cr3.to_le_bytes());
+        machine.map(machine.ept, target, target, if writable { 0x37 } else { 0x35 });
+        let layout = std::alloc::Layout::new::<crate::memory::interception::Session>();
+        let mut session = unsafe {
+            Box::from_raw(std::alloc::alloc_zeroed(layout).cast::<crate::memory::interception::Session>())
+        };
+        session.initialize(0x1000_0000, 1);
+        environment.interception_session = &*session as *const _ as u64;
+        let response = native_tracking_request(&environment, &[buffer], &request);
+        assert_eq!(word(&response, HEADER_BYTES + 16), if writable { 0 } else { Error::Permission as u32 });
+        assert_eq!(word(&response, HEADER_BYTES + 20), u32::from(writable));
+        assert_eq!(unsafe { (target as *const u8).read() }, if writable { 9 } else { 101 });
+    }
+}
+
+#[test]
+fn resident_plain_write_cannot_race_an_interception_publication() {
+    struct BlockedBarrier {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    unsafe extern "efiapi" fn blocked_barrier(context: u64, operation: u64) -> u64 {
+        if operation != 0 {
+            return 1;
+        }
+        let barrier = unsafe { &*(context as *const BlockedBarrier) };
+        u64::from(barrier.entered.send(()).is_ok()
+            && barrier.release.recv_timeout(std::time::Duration::from_secs(5)).is_ok())
+    }
+    let release = crate::memory::interception_packet(&["hook".into(), "release".into(), "0".into()]).unwrap();
+    let (mut machine, mut environment, _, target) = Machine::setup(&release);
+    let second_buffer = machine.allocate();
+    machine.map(environment.caller_cr3, 0x2000, second_buffer, 7);
+    machine.map(machine.ept, second_buffer, second_buffer, 0x37);
+    machine.host_map_all();
+    let write = packet(WRITE, 0, environment.kernel_cr3, &[Item { address: 0, bytes: vec![9] }]).unwrap();
+    unsafe { std::ptr::copy_nonoverlapping(write.as_ptr(), second_buffer as *mut u8, write.len()); }
+    let layout = std::alloc::Layout::new::<crate::memory::interception::Session>();
+    let mut session = unsafe {
+        Box::from_raw(std::alloc::alloc_zeroed(layout).cast::<crate::memory::interception::Session>())
+    };
+    session.initialize(0x1000_0000, 1);
+    let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(0);
+    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+    let barrier = Box::new(BlockedBarrier { entered: entered_sender, release: release_receiver });
+    environment.interception_session = &*session as *const _ as u64;
+    environment.boot_context = &*barrier as *const _ as u64;
+    environment.synchronize = blocked_barrier as *const () as u64;
+    std::thread::scope(|scope| {
+        let owner = scope.spawn(move || {
+            let mut scratch = vec![0; BUFFER_BYTES];
+            unsafe { access::resident::memory_entry(scratch.as_mut_ptr(), 0x1000, release.len(), &environment) }
+        });
+        entered_receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let mut scratch = vec![0; BUFFER_BYTES];
+        let status = unsafe { access::resident::memory_entry(scratch.as_mut_ptr(), 0x2000, write.len(), &environment) };
+        release_sender.send(()).unwrap();
+        assert_eq!(owner.join().unwrap(), 0);
+        assert_eq!(status, Error::Busy as u64);
+        assert_eq!(word(&scratch, HEADER_BYTES + 16), Error::Busy as u32);
+        assert_eq!(word(&scratch, HEADER_BYTES + 20), 0);
+        assert_eq!(unsafe { (target as *const u8).read() }, 101);
+    });
 }
 
 #[test]

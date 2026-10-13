@@ -1567,15 +1567,21 @@ mod msr {
     #[derive(Default)]
     struct NmiContext {
         pending: u64,
+        injected: u64,
+        entry_retries: u64,
+        last_reason: u64,
         l2_active: u64,
         l1_pin: u64,
         control_cache: [u64; 2],
-        vmcs: [u64; 5],
+        vmcs: [u64; 6],
     }
 
     global_asm!(
         include_str!("../builds/resident-msr-tests/resident-nmi.S"),
         b_nmi_pending = const core::mem::offset_of!(NmiContext, pending),
+        b_nmi_injected = const core::mem::offset_of!(NmiContext, injected),
+        b_nmi_entry_retries = const core::mem::offset_of!(NmiContext, entry_retries),
+        b_last_reason = const core::mem::offset_of!(NmiContext, last_reason),
         b_nested_l2_active = const core::mem::offset_of!(NmiContext, l2_active),
         b_nested_vmcs12_pin_based_control = const core::mem::offset_of!(NmiContext, l1_pin),
         b_nested_vmcs02_control_cache_valid = const core::mem::offset_of!(NmiContext, control_cache),
@@ -1585,6 +1591,7 @@ mod msr {
         guest_activity_state = const 2,
         cpu_based_vm_exec_control = const 3,
         guest_pending_dbg_exceptions = const 4,
+        idt_vectoring_info_field = const 5,
     );
 
     unsafe extern "C" {
@@ -1596,7 +1603,7 @@ mod msr {
         for (event, blocking) in [(0x8000030e, 0), (0, 1), (0, 2), (0, 8)] {
             let mut context = NmiContext {
                 pending: 1,
-                vmcs: [event, blocking, 0, 0, 0],
+                vmcs: [event, blocking, 0, 0, 0, 0],
                 ..Default::default()
             };
             unsafe { test_deliver_nmi(&mut context) };
@@ -1611,7 +1618,7 @@ mod msr {
         for pending_debug in [1 << 12, 1 << 14, (1 << 12) | (1 << 14)] {
             let mut context = NmiContext {
                 pending: 1,
-                vmcs: [0, 0, 0, 0, pending_debug],
+                vmcs: [0, 0, 0, 0, pending_debug, 0],
                 ..Default::default()
             };
             unsafe { test_deliver_nmi(&mut context) };
@@ -1622,20 +1629,20 @@ mod msr {
     }
 
     #[test]
-    fn nmi_delivery_wakes_halted_guests_and_respects_wait_for_sipi() {
+    fn nmi_staging_preserves_activity_until_entry_and_respects_wait_for_sipi() {
         let mut context = NmiContext {
             pending: 1,
-            vmcs: [0, 0, 1, 0, 0],
+            vmcs: [0, 0, 1, 0, 0, 0],
             ..Default::default()
         };
         unsafe { test_deliver_nmi(&mut context) };
         assert_eq!(context.pending, 0);
-        assert_eq!(context.vmcs, [0x80000202, 0, 0, 0, 0]);
+        assert_eq!(context.vmcs, [0x80000202, 0, 1, 0, 0, 0]);
         context.pending = 1;
-        context.vmcs = [0, 0, 3, 0, 0];
+        context.vmcs = [0, 0, 3, 0, 0, 0];
         unsafe { test_deliver_nmi(&mut context) };
         assert_eq!(context.pending, 1);
-        assert_eq!(context.vmcs, [0, 0, 3, 0, 0]);
+        assert_eq!(context.vmcs, [0, 0, 3, 0, 0, 0]);
     }
 
     #[test]
@@ -1649,7 +1656,7 @@ mod msr {
         };
         unsafe { test_deliver_nmi(&mut context) };
         assert_eq!(context.pending, 1);
-        assert_eq!(context.vmcs, [0, 0, 0, 1 << 22, 0]);
+        assert_eq!(context.vmcs, [0, 0, 0, 1 << 22, 0, 0]);
         assert_eq!(context.control_cache, [0; 2]);
         context.l2_active = 0;
         unsafe { test_deliver_nmi(&mut context) };
@@ -2086,6 +2093,43 @@ mod telemetry {
             diagnostic(&mut context, &mut shared, (3 << 16) | 53),
             [0; 4]
         );
+    }
+
+    #[test]
+    fn absent_native_snapshot_queries_clear_every_result_register() {
+        let mut context = [0; 1024];
+        let mut shared = [0; 1024];
+        let state = offset("event_control_cpu_states");
+        for selector in [0x4000, 0x4001, 0x4005, 0x4077, 0x4078] {
+            assert_eq!(diagnostic(&mut context, &mut shared, selector), [0; 4]);
+        }
+        shared[state + 4] = 1;
+        for selector in [0x4000, 0x4001, 0x4004, 0x4005, 0x4077] {
+            assert_eq!(diagnostic(&mut context, &mut shared, selector), [0; 4]);
+        }
+    }
+
+    #[test]
+    fn native_snapshot_queries_preserve_present_pairs_and_clear_missing_records() {
+        let mut context = [0; 1024];
+        let mut shared = [0; 1024];
+        let state = offset("event_control_cpu_states");
+        let mut storage = [0_u64; 248];
+        for index in 0..10 {
+            storage[8 + index] = 0x1122_3344_0000_0000 | (index + 1) as u64;
+        }
+        shared[state + 4] = 1;
+        shared[state + 6] = storage.as_mut_ptr() as u64;
+        std::hint::black_box(&storage);
+        for pair in 0..5 {
+            assert_eq!(
+                diagnostic(&mut context, &mut shared, 0x4000 + pair),
+                [pair * 2 + 1, 0x1122_3344, pair * 2 + 2, 0x1122_3344]
+            );
+        }
+        for selector in [0x4005, 0x4006, 0x4009, 0x4077, 0x4078] {
+            assert_eq!(diagnostic(&mut context, &mut shared, selector), [0; 4]);
+        }
     }
 
     #[test]

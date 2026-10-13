@@ -225,7 +225,7 @@ pub(crate) trait InterceptionMemory: PhysicalMemory {
     fn split_reclamation_allowed(&self) -> bool;
     fn split_reclamation_ready(&self, epoch: u64, cpu_mask: u64) -> bool;
     fn vmfunc_available(&self) -> bool;
-    fn write_original(&mut self, address: u64, bytes: &[u8]) -> Result<(), Error>;
+    fn write_original(&mut self, address: u64, bytes: &[u8], require_write: bool) -> Result<(), Error>;
     fn clock(&self) -> u64;
     fn clock_hz(&self) -> u64;
     fn timer_rate(&self) -> u32;
@@ -621,9 +621,6 @@ fn cpu_views(
         for page_index in 0..count {
             let mut table = start;
             let page = configuration.pages[page_index];
-            if page == 0 {
-                continue;
-            }
             for shift in [39, 30, 21] {
                 let pointer = table + ((page >> shift) & 511) * 8;
                 let entry = memory.table_entry(pointer)?;
@@ -872,12 +869,19 @@ pub(crate) unsafe fn write_original(
     {
         return Err(Error::Busy);
     }
+    let mut write_committed = false;
     let result = (|| {
         let configuration = unsafe { &*session.configuration.get() };
+        if !session.is_active()
+            || !configuration.pages[..configuration.hook_count].contains(&(address & !4095))
+        {
+            return memory.write_original(address, bytes, true);
+        }
         if configuration.options & INTERCEPT_CONCURRENT_WRITES != 0 {
             lock_refresh(session)?;
             let result = (|| {
-                memory.write_original(address, bytes)?;
+                memory.write_original(address, bytes, false)?;
+                write_committed = true;
                 if session.is_active() {
                     if let Some(index) = configuration.pages[..configuration.hook_count]
                         .iter()
@@ -893,6 +897,8 @@ pub(crate) unsafe fn write_original(
                 session.cause.store(
                     u64::from(if error == Error::MergeConflict {
                         INTERCEPT_CAUSE_MERGE
+                    } else if error == Error::Busy {
+                        INTERCEPT_CAUSE_RENDEZVOUS
                     } else {
                         INTERCEPT_CAUSE_RUNTIME
                     }),
@@ -911,7 +917,8 @@ pub(crate) unsafe fn write_original(
         }
         memory.quiesce()?;
         let result = (|| {
-            memory.write_original(address, bytes)?;
+            memory.write_original(address, bytes, false)?;
+            write_committed = true;
             let configuration = unsafe { &*session.configuration.get() };
             if session.is_active() {
                 if let Some(index) = configuration.pages[..configuration.hook_count]
@@ -927,6 +934,8 @@ pub(crate) unsafe fn write_original(
             session.cause.store(
                 u64::from(if error == Error::MergeConflict {
                     INTERCEPT_CAUSE_MERGE
+                } else if error == Error::Busy {
+                    INTERCEPT_CAUSE_RENDEZVOUS
                 } else {
                     INTERCEPT_CAUSE_RUNTIME
                 }),
@@ -948,7 +957,13 @@ pub(crate) unsafe fn write_original(
         result
     })();
     session.lock.store(0, Ordering::Release);
-    result
+    result.map_err(|error| {
+        if write_committed && error != Error::MergeConflict {
+            Error::WriteCommitted
+        } else {
+            error
+        }
+    })
 }
 
 fn cpuid_profile(packet: &[u8], la57: bool) -> Result<CpuidProfile, Error> {
@@ -1144,13 +1159,24 @@ fn change_hooks(
         previous_count
     };
     pending[..count].copy_from_slice(&hooks[..count]);
-    if operation != HOOK_INSTALL && configuration.options & INTERCEPT_PRIVATE_SHARED_DATA != 0 {
-        if let Some(index) = configuration.base_leaves[..configuration.hook_count].iter().position(|pointer| *pointer == 0) {
-            let shadow = bank_base(configuration) + (INTERCEPT_TABLE_PAGES + index) as u64 * 4096;
-            if let Some(hook) = pending[..count].iter_mut().find(|hook| hook.address == 0x7ffe0000) {
-                for (index, bytes) in hook.bytes.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-                    *bytes = memory.table_entry(shadow + index as u64 * 8)?.to_le_bytes();
-                }
+    // Merges can adopt original writes inside no-op or converged patches.
+    // Rebuilding from the initial descriptor would resurrect stale bytes.
+    for page_index in 0..configuration.hook_count {
+        if !pending[..count].iter().any(|hook| hook.physical_address & !4095 == configuration.pages[page_index]) {
+            continue;
+        }
+        let shadow = bank_base(configuration) + (INTERCEPT_TABLE_PAGES + page_index) as u64 * 4096;
+        let mut bytes = [0; 4096];
+        for (chunk_index, chunk) in bytes.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            if chunk_index % 32 == 0 {
+                memory.check_budget()?;
+            }
+            *chunk = memory.table_entry(shadow + chunk_index as u64 * 8)?.to_le_bytes();
+        }
+        for hook in &mut pending[..count] {
+            if hook.physical_address & !4095 == configuration.pages[page_index] {
+                let offset = hook.physical_address as usize & 4095;
+                hook.bytes[..hook.length].copy_from_slice(&bytes[offset..offset + hook.length]);
             }
         }
     }
@@ -2205,8 +2231,20 @@ pub(crate) mod runtime {
             exit_debug.fetch_and(!1, Ordering::Release);
         }
         boot.interception.exit_timer = boot.interception.timer_armed;
-        if boot.interception.data_pending != 0 && read(GUEST_RIP)? != boot.interception.data_rip {
-            boot.interception.data_pending = 0;
+        let progress = &session.ept_progress[boot.processor_number as usize];
+        let previous = progress.load(Ordering::Relaxed);
+        if previous & EPT_RETRY_LIMIT != 0 || boot.interception.data_pending != 0 {
+            let rip = read(GUEST_RIP)?;
+            // Native loads can retire without MTF. A timer that observes a new
+            // RIP ends the old retry streak even if the guest later loops back.
+            if previous & EPT_RETRY_LIMIT != 0
+                && previous & !EPT_RETRY_LIMIT != rip << EPT_RETRY_BITS
+            {
+                progress.store(0, Ordering::Relaxed);
+            }
+            if boot.interception.data_pending != 0 && rip != boot.interception.data_rip {
+                boot.interception.data_pending = 0;
+            }
         }
         if boot.interception.vmfunc_armed != 0 {
             // VMFUNC changes EPTP without visiting the dispatcher. Snapshot it
@@ -2214,6 +2252,16 @@ pub(crate) mod runtime {
             let selected = read(EPT_POINTER)?;
             let configuration = unsafe { &*session.configuration.get() };
             let cpu = &mut boot.interception;
+            let applied = if cpu.applied_ept == 0 {
+                boot.cache_ept_pointer
+            } else {
+                cpu.applied_ept
+            };
+            if selected != applied {
+                // A hardware EPTP switch proves VMFUNC retired even when a loop
+                // has returned to the same RIP before this exit is observed.
+                progress.store(0, Ordering::Relaxed);
+            }
             cpu.exit_ept = selected;
             cpu.applied_ept = if selected == boot.cache_ept_pointer {
                 0
@@ -2297,6 +2345,12 @@ pub(crate) mod runtime {
             session
                 .cause
                 .store(u64::from(INTERCEPT_CAUSE_LEASE), Ordering::Release);
+            revoke(session, boot, synchronize)?;
+        }
+        if session.is_active() && read(GUEST_CR3)? & (3 << 61) != 0 {
+            // Tagged data pointers require address normalization outside this
+            // profile. Restore native execution before admitting that context.
+            session.cause.store(u64::from(INTERCEPT_CAUSE_CONTEXT), Ordering::Release);
             revoke(session, boot, synchronize)?;
         }
         let active = session.is_active() && boot.nested.active == 0;
@@ -2515,7 +2569,12 @@ pub(crate) mod runtime {
         Ok(())
     }
 
-    fn cr3_write(boot: &mut ResidentBootContext, frame: &mut [u64]) -> Result<u64, ()> {
+    fn cr3_write(
+        session: &Session,
+        boot: &mut ResidentBootContext,
+        frame: &mut [u64],
+        synchronize: Synchronize,
+    ) -> Result<u64, ()> {
         let qualification = boot.last_qualification;
         if qualification & 0x3f != 3 {
             return Ok(0);
@@ -2530,13 +2589,32 @@ pub(crate) mod runtime {
         } else {
             frame[offsets[register]]
         };
+        let value = if read(GUEST_CS_AR_BYTES)? & 0x2000 != 0 {
+            value
+        } else {
+            value as u32 as u64
+        };
         let physical_bits = crate::arch::leaf(0x8000_0008).eax & 255;
         let pcid = read(GUEST_CR4)? & (1 << 17) != 0;
         let no_flush = pcid && value >> 63 != 0;
-        let allowed =
-            ((1u64 << physical_bits) - 1) & !4095 | if pcid { 4095 | (1 << 63) } else { 0x18 };
+        // Without PCID, the low bits other than PWT/PCD are ignored rather
+        // than reserved. High LAM controls require the physical CPU feature.
+        let lam_bits = if value & (3 << 61) != 0
+            && crate::arch::leaf_with_subleaf(7, 1).eax & (1 << 26) != 0
+        {
+            3 << 61
+        } else {
+            0
+        };
+        let allowed = ((1u64 << physical_bits) - 1)
+            | if pcid { 1 << 63 } else { 0 }
+            | lam_bits;
         if value & !allowed != 0 {
             return Ok(3);
+        }
+        if value & lam_bits != 0 && session.is_active() {
+            session.cause.store(u64::from(INTERCEPT_CAUSE_CONTEXT), Ordering::Release);
+            revoke(session, boot, synchronize)?;
         }
         write(GUEST_CR3, value & !(1 << 63))?;
         if !no_flush && read(SECONDARY_VM_EXEC_CONTROL)? & (1 << 5) != 0 {
@@ -2725,8 +2803,7 @@ pub(crate) mod runtime {
             }
         }
         for (offset, width) in [(0x2e4, 4), (0x340, 8), (0x348, 8), (0x350, 8)] {
-            let source_offset = if offset == 0x350 { 0x348 } else { offset };
-            let value = original_value(source + source_offset, width, None);
+            let value = original_value(source + offset, width, None);
             original_value(destination + offset, width, Some(value));
         }
         session.refresh_lock.store(0, Ordering::Release);
@@ -3201,13 +3278,14 @@ pub(crate) mod runtime {
                                 .store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
                         }
                         release_refresh(session, boot);
-                        reset_step(boot)?;
+                        let reset = reset_step(boot);
                         if !concurrent {
                             unsafe {
                                 synchronize(boot as *mut _ as u64, 1);
                                 synchronize(boot as *mut _ as u64, 2);
                             }
                         }
+                        reset?;
                         if !session.is_active() {
                             revoke(session, boot, synchronize)?;
                         }
@@ -3217,12 +3295,13 @@ pub(crate) mod runtime {
             }
         }
         release_refresh(session, boot);
-        reset_step(boot)?;
+        let reset = reset_step(boot);
         if !concurrent {
             unsafe {
                 synchronize(boot as *mut _ as u64, 2);
             }
         }
+        reset?;
         session
             .cause
             .store(u64::from(INTERCEPT_CAUSE_MIXED_ACCESS), Ordering::Release);
@@ -3389,6 +3468,9 @@ pub(crate) mod runtime {
                 // the instruction at guest RIP. Retry them on the native view.
                 if boot.last_qualification & (1 << 16) != 0
                     || read(IDT_VECTORING_INFO_FIELD)? & (1 << 31) != 0
+                    || access & 4 != 0
+                        && configuration.pages[..configuration.hook_count].iter().enumerate()
+                            .any(|(index, page)| *page == gpa && configuration.base_leaves[index] == 0)
                 {
                     session.cause.store(u64::from(INTERCEPT_CAUSE_CONTEXT), Ordering::Release);
                     revoke(session, boot, synchronize)?;
@@ -3396,7 +3478,8 @@ pub(crate) mod runtime {
                 }
                 // A busy refresh owner can legitimately require many retries
                 // while VMware schedules another CPU's guest MTF window. Bound
-                // both attempts and elapsed time; timer exits renew neither.
+                // both attempts and elapsed time; timer exits without observed
+                // guest progress renew neither.
                 let progress = &session.ept_progress[boot.processor_number as usize];
                 let exit_debug = &session.exit_debug[boot.processor_number as usize];
                 let rip = read(GUEST_RIP)? << EPT_RETRY_BITS;
@@ -3500,12 +3583,17 @@ pub(crate) mod runtime {
         if reason == 28 && boot.last_qualification & 0x3f == 3 {
             boot.interception.cooperative_data = 0;
             if read(GUEST_IA32_EFER)? & 0x400 == 0 {
+                let primary = if boot.interception.controls_saved != 0 {
+                    boot.interception.primary_bits
+                } else {
+                    read(CPU_BASED_VM_EXEC_CONTROL)?
+                };
                 if session.is_active() {
                     revoke(session, boot, synchronize)?;
                 }
-                return Ok(1);
+                return Ok(u64::from(primary & (1 << 15) == 0));
             }
-            return cr3_write(boot, frame);
+            return cr3_write(session, boot, frame, synchronize);
         }
         if reason == 29 {
             return debug_access(boot, frame);
@@ -3730,8 +3818,11 @@ pub(crate) mod runtime {
                     if configuration.data_ept != 0 {
                         invalidate(configuration.data_ept)?;
                     }
-                    if configuration.options & INTERCEPT_CONCURRENT_WRITES != 0 {
-                        invalidate(data_root(configuration, boot.processor_number as usize))?;
+                    // Every profile has CPU-private data tables. Rebuilding a
+                    // bank must retire those translations even without writers.
+                    let private_data = configuration.cpu_data[boot.processor_number as usize];
+                    if private_data != 0 && private_data != configuration.data_ept {
+                        invalidate(private_data)?;
                     }
                     let epoch = session.split_epoch.load(Ordering::Acquire);
                     if boot.interception.split_flush_epoch.load(Ordering::Relaxed) != epoch {
@@ -3780,6 +3871,9 @@ pub(crate) mod runtime {
                     Ordering::AcqRel, Ordering::Acquire,
                 );
                 session.active.store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
+                // Terminal emulation errors can still own a writer barrier.
+                // Retire it, but never turn a failed rollback into guest reentry.
+                let _ = revoke(session, boot, synchronize);
                 u64::MAX
             }
             Ok(value) => value,

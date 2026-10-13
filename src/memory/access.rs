@@ -2,6 +2,7 @@ use crate::protocol::memory::*;
 
 pub trait PhysicalMemory {
     fn read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), Error>;
+    // MergeConflict and WriteCommitted report failure after the full slice was written.
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), Error>;
     fn access_dirty(&mut self, _address: u64) -> Result<(u8, u64), Error> {
         Err(Error::Unsupported)
@@ -145,8 +146,11 @@ pub fn transfer(
                 }
             },
         );
-        if result.is_err() {
-            return (done, result);
+        if let Err(error) = result {
+            if write && matches!(error, Error::MergeConflict | Error::WriteCommitted) {
+                done += count;
+            }
+            return (done, Err(error));
         }
         done += count;
     }
@@ -370,6 +374,9 @@ fn target_transfer(
                 },
             );
         if let Err(error) = result {
+            if write && matches!(error, Error::MergeConflict | Error::WriteCommitted) {
+                done += count;
+            }
             return (done, error as u32);
         }
         done += count;
@@ -790,7 +797,7 @@ pub(crate) mod resident {
                 let pointer = self.host_address(table + ((address >> shift) & 511) * 8, false)?;
                 let entry = unsafe { (pointer as *const u64).read_volatile() };
                 let page_size = 1u64 << shift;
-                if entry & 7 == 0 {
+                if entry & 1 == 0 {
                     return Ok((0, page_size));
                 }
                 if shift == 12 || (shift <= 30 && entry & 128 != 0) {
@@ -823,15 +830,9 @@ pub(crate) mod resident {
             if self.environment.interception_session != 0 {
                 let session = self.environment.interception_session
                     as *mut crate::memory::interception::Session;
-                let active = unsafe { &*session }.is_active();
-                let configuration = unsafe { &*(*session).configuration.get() };
-                if active
-                    && configuration.pages[..configuration.hook_count].contains(&(address & !4095))
-                {
-                    return unsafe {
-                        crate::memory::interception::write_original(session, self, address, bytes)
-                    };
-                }
+                return unsafe {
+                    crate::memory::interception::write_original(session, self, address, bytes)
+                };
             }
             let pointer = self.mapped(address, true)? as *mut u8;
             for (index, byte) in bytes.iter().enumerate() {
@@ -1100,11 +1101,16 @@ pub(crate) mod resident {
             }
             true
         }
-        fn write_original(&mut self, address: u64, bytes: &[u8]) -> Result<(), Error> {
+        fn write_original(
+            &mut self,
+            address: u64,
+            bytes: &[u8],
+            require_write: bool,
+        ) -> Result<(), Error> {
             if bytes.len() > 4096 - (address as usize & 4095) {
                 return Err(Error::Bounds);
             }
-            let pointer = self.mapped(address, false)?;
+            let pointer = self.mapped(address, require_write)?;
             self.host_address(pointer, true)?;
             for (index, byte) in bytes.iter().enumerate() {
                 unsafe {

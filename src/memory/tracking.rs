@@ -42,7 +42,7 @@ pub(crate) struct Session {
     lock: AtomicU64,
     next_id: u64,
     id: u64,
-    state: u32,
+    pub(crate) state: u32,
     count: u32,
     pid: u64,
     start_tsc: u64,

@@ -27,6 +27,41 @@ mod telemetry_cleanup {
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+mod cpu_routing {
+    use crate::telemetry::registered_cpu_routes;
+
+    #[test]
+    fn captures_keep_efi_slots_when_logical_processor_order_differs() {
+        let routes = registered_cpu_routes(&[0, 1], 3, |logical_cpu| Ok(1 - logical_cpu)).unwrap();
+        assert_eq!(routes, [(0, 1), (1, 0)]);
+        let observer = routes
+            .into_iter()
+            .find(|(_, resident_cpu)| *resident_cpu != 0)
+            .unwrap();
+        assert_eq!(observer, (0, 1));
+    }
+
+    #[test]
+    fn restricted_affinity_uses_the_actual_registered_slot() {
+        let routes = registered_cpu_routes(&[7, 9], 1 << 3, |logical_cpu| {
+            Ok(if logical_cpu == 7 { 3 } else { 4 })
+        })
+        .unwrap();
+        assert_eq!(routes, [(7, 3)]);
+    }
+
+    #[test]
+    fn invalid_or_duplicated_resident_slots_abort_before_local_controls() {
+        assert!(registered_cpu_routes(&[0], u64::MAX, |_| Ok(64)).is_err());
+        assert!(registered_cpu_routes(&[0, 1], 1, |_| Ok(0)).is_err());
+        assert!(registered_cpu_routes(&[0], 1, |_| Err("CPU offline".into())).is_err());
+    }
+}
+
 mod transport {
     use crate::server::protocol::{
         MAX_FRAME_SIZE, ProtocolError, Request, RequestKind, Response, read_request, read_response,

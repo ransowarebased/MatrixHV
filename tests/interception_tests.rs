@@ -211,7 +211,10 @@ impl InterceptionMemory for Machine {
     fn vmfunc_available(&self) -> bool {
         self.vmfunc_available
     }
-    fn write_original(&mut self, address: u64, bytes: &[u8]) -> Result<(), Error> {
+    fn write_original(&mut self, address: u64, bytes: &[u8], require_write: bool) -> Result<(), Error> {
+        if require_write && self.leaf(self.base_ept(), address).0 & 2 == 0 {
+            return Err(Error::Permission);
+        }
         self.write(address, bytes)
     }
 }
@@ -844,6 +847,8 @@ fn alternate_root_must_map_the_same_page_and_malformed_cli_never_invokes_transpo
             "0x3000",
             "--alternate-cr3",
             "0x4000",
+            "--alternate-cr3",
+            "0x5000",
             "1",
             "2",
         ],
@@ -2033,6 +2038,98 @@ fn a_no_op_patch_does_not_block_later_original_changes() {
     let shadow = machine.leaf(profile.ept, GPA).0 & MASK;
     assert_eq!(machine.pages[&shadow][8], 0xc3);
     assert!(session.is_active());
+}
+
+#[test]
+fn dynamic_hook_rebuilds_preserve_original_bytes_adopted_by_three_way_merges() {
+    for patch in ["90", "cc"] {
+        let mut machine = Machine::new();
+        let mut session = session();
+        let mut install = packet(&[
+            "hook", "install", "0x3000", "0x400008", patch, "--concurrent-writes",
+        ]);
+        execute(&mut session, &mut machine, &mut install).unwrap();
+        if patch == "cc" {
+            unsafe { interception::write_original(&mut *session, &mut machine, GPA + 8, &[0xcc]) }.unwrap();
+        }
+        unsafe { interception::write_original(&mut *session, &mut machine, GPA + 8, &[0xc3]) }.unwrap();
+        let mut add = packet(&["hook", "add", "1", "0x400100", "42"]);
+        execute(&mut session, &mut machine, &mut add).unwrap();
+        let profile = unsafe { &*session.configuration.get() };
+        let shadow = machine.leaf(profile.ept, GPA).0 & MASK;
+        assert_eq!(machine.pages[&shadow][8], 0xc3);
+        assert_eq!(machine.pages[&shadow][0x100], 0x42);
+        unsafe { interception::write_original(&mut *session, &mut machine, GPA + 8, &[0x41]) }.unwrap();
+        let mut drop = packet(&["hook", "remove", "1", "2"]);
+        execute(&mut session, &mut machine, &mut drop).unwrap();
+        let profile = unsafe { &*session.configuration.get() };
+        let shadow = machine.leaf(profile.ept, GPA).0 & MASK;
+        assert_eq!(machine.pages[&shadow][8], 0x41);
+        assert_eq!(machine.pages[&shadow][0x100], 0x90);
+        assert!(session.is_active());
+        assert_eq!(quad(&drop, 152), 1);
+    }
+}
+
+#[test]
+fn original_writes_distinguish_post_commit_refresh_failures_from_barrier_rejection() {
+    for concurrent in [false, true] {
+        let mut machine = Machine::new();
+        let mut session = session();
+        let mut arguments = vec!["hook", "install", "0x3000", "0x400008", "cc"];
+        if concurrent {
+            arguments.push("--concurrent-writes");
+        }
+        let mut install = packet(&arguments);
+        execute(&mut session, &mut machine, &mut install).unwrap();
+        machine.budget_limit = 0;
+        assert_eq!(
+            unsafe { interception::write_original(&mut *session, &mut machine, GPA + 9, &[0x42]) },
+            Err(Error::WriteCommitted)
+        );
+        assert_eq!(machine.pages[&GPA][9], 0x42);
+        assert_eq!(session.cause.load(core::sync::atomic::Ordering::Acquire), u64::from(INTERCEPT_CAUSE_RENDEZVOUS));
+        assert!(!session.is_active());
+        assert_eq!(machine.leaf(machine.base_ept(), GPA).0 & 7, 7);
+        assert_eq!(machine.events.last(), Some(&"resume"));
+    }
+    let mut machine = Machine::new();
+    let mut session = session();
+    let mut install = packet(&["hook", "install", "0x3000", "0x400008", "cc"]);
+    execute(&mut session, &mut machine, &mut install).unwrap();
+    machine.barrier = false;
+    assert_eq!(
+        unsafe { interception::write_original(&mut *session, &mut machine, GPA + 9, &[0x42]) },
+        Err(Error::Busy)
+    );
+    assert_eq!(machine.pages[&GPA][9], 0x90);
+    assert!(session.is_active());
+}
+
+#[test]
+fn physical_page_zero_receives_valid_private_data_leaves_on_every_enabled_cpu() {
+    let mut machine = Machine::new();
+    machine.map_hook_page(0, 0);
+    let mut session = session();
+    session.initialize(0x1000_0000, 1 | (1 << 3));
+    let mut install = packet(&[
+        "hook", "install", "0x3000", "0x400008", "cc", "--concurrent-writes",
+    ]);
+    execute(&mut session, &mut machine, &mut install).unwrap();
+    let profile = unsafe { &*session.configuration.get() };
+    assert_eq!(profile.pages[0], 0);
+    assert_eq!(profile.hook_count, 1);
+    let execution_leaf = machine.leaf(profile.ept, 0).0;
+    for cpu_index in [0, 3] {
+        let pointer = profile.cpu_leaves[cpu_index][0];
+        assert_ne!(pointer, 0);
+        assert_eq!(machine.table_entry(pointer).unwrap() & (MASK | 7), 1);
+    }
+    machine.store_entry(profile.cpu_leaves[0][0], 0x33).unwrap();
+    assert_eq!(machine.leaf(profile.cpu_data[0], 0).0 & 7, 3);
+    assert_eq!(machine.leaf(profile.cpu_data[3], 0).0 & 7, 1);
+    assert_eq!(machine.leaf(profile.ept, 0).0, execution_leaf);
+    assert_eq!(machine.pages[&(execution_leaf & MASK)][8], 0xcc);
 }
 
 #[test]
