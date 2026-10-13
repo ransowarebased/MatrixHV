@@ -151,6 +151,19 @@ fn unknown_vmcalls_reject_guest_callers_without_halting_when_hyperv_is_disabled(
 }
 
 #[test]
+fn captured_roblox_vmcall_inputs_inject_ud_without_modifying_guest_registers() {
+    let mut context = [0_u64; 12];
+    context[8..12].copy_from_slice(&[1, 0x2000, 0xd01, 3]);
+    let mut registers = [0x9e1a3fbb70, 0x90909090, 0x76543210, 0];
+    let before = registers;
+    assert_eq!(
+        unsafe { test_hypercall(context.as_mut_ptr(), registers.as_mut_ptr()) },
+        0
+    );
+    assert_eq!(registers, before);
+}
+
+#[test]
 fn calibration_uses_the_pm_clock_and_rejects_unstable_or_missing_samples() {
     assert_eq!(
         calibrated_tsc_hz(|| Some((2_500_000_000, 3_579_545))),

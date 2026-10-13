@@ -151,6 +151,7 @@ cmp qword ptr [r12 + {b_telemetry_probe_active}], 0
 je .Lresident_dispatch_inject_gp
 resident_private_vmcall {nested_probe_failed_magic}, .Lresident_dispatch_nested_probe_failed
 .Lresident_dispatch_vmcall_public:
+call .Lresident_capture_public_vmcall
 cmp eax, {vmware_hypervisor_magic}
 je .Lresident_dispatch_vmware_hypercall
 jmp .Lresident_dispatch_hyperv_hypercall
@@ -1078,6 +1079,7 @@ jne .Lresident_dispatch_resume_l1
 call .Lresident_nested_restore_internal_msr_entry
 jmp .Lresident_nested_l2_resume
 .Lresident_dispatch_resume_l1:
+call .Lresident_complete_public_vmcall
 call .Lresident_watchdog_handler_returned
 call .Lresident_sync_ept_cache
 call .Lresident_deliver_pending_nmi

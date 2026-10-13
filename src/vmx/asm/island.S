@@ -184,12 +184,14 @@ matrixhv_island_output
 matrixhv_resident_ept_cache
 matrixhv_resident_eptp_switch
 matrixhv_island_flight_recorder
+matrixhv_island_vmcall_snapshot
 matrixhv_island_pt
 .balign 4096
 .globl matrixhv_resident_code_end
 matrixhv_resident_code_end:
 matrixhv_resident_ept_cache_state
 matrixhv_resident_eptp_switch_state
+matrixhv_island_vmcall_snapshot_state
 .balign 8
 // Fault reporting can itself fault on a corrupt context or framebuffer. A
 // second fault skips every context-dependent diagnostic and reset tuple.

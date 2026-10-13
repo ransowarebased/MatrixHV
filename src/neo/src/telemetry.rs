@@ -2,6 +2,8 @@ use crate::protocol::{
     MATRIXHV_EXIT_TIMING_CAPABILITY, MATRIXHV_EXIT_TIMING_SUBLEAF,
     MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX,
     MATRIXHV_STATUS_SIGNATURE_ECX,
+    MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY, MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF,
+    MATRIXHV_VMCALL_SNAPSHOT_WORDS,
 };
 use crate::protocol::memory::{
     EPT_DIAGNOSTIC_CAPABILITY, EPT_DIAGNOSTIC_SUBLEAF, EPT_SYNC_DIAGNOSTIC_WORDS,
@@ -930,6 +932,82 @@ fn nested_vmcs_field_details(field: u64) -> Option<(&'static str, Option<&'stati
     }
 }
 
+pub(crate) fn append_vmcall_snapshot(
+    text: &mut String,
+    prefix: &str,
+    mut read: impl FnMut(u32) -> (u64, u64),
+) {
+    const NAMES: [&str; MATRIXHV_VMCALL_SNAPSHOT_WORDS] = [
+        "sequence", "tsc", "rip", "rsp", "cr3", "rflags", "cr0", "cr4", "efer",
+        "ss_ar_bytes", "instruction_length", "entry_event", "resume_rip", "resume_rax",
+        "vmread_failed", "interface_flags", "rax", "rcx", "rdx", "rbx", "rbp", "rsi",
+        "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "cpu",
+    ];
+    let mut words = [0_u64; MATRIXHV_VMCALL_SNAPSHOT_WORDS];
+    let mut coherent = false;
+    for _ in 0..3 {
+        let before = read(MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF).0;
+        for (index, pair) in words.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let (first, second) = read(MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF + index as u32);
+            *pair = [first, second];
+        }
+        coherent = before & 1 == 0
+            && before == words[0]
+            && before == read(MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF).0;
+        if coherent {
+            break;
+        }
+    }
+    writeln!(text, "{prefix}.vmcall.coherent={}", u8::from(coherent)).unwrap();
+    for (name, word) in NAMES.iter().zip(words) {
+        writeln!(text, "{prefix}.vmcall.{name}=0x{word:016x}").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod vmcall_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn coherent_snapshots_expose_inputs_and_the_guest_exception_response() {
+        let mut words = [0_u64; MATRIXHV_VMCALL_SNAPSHOT_WORDS];
+        words[0] = 2;
+        words[2] = 0x106fcda;
+        words[11] = 0x80000306;
+        words[16] = 0x123456;
+        words[17] = 0x90909090;
+        words[23] = 0x123456;
+        let mut text = String::new();
+        append_vmcall_snapshot(&mut text, "cpu.3", |subleaf| {
+            let offset = (subleaf - MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF) as usize * 2;
+            (words[offset], words[offset + 1])
+        });
+        assert!(text.contains("cpu.3.vmcall.coherent=1\n"));
+        assert!(text.contains("cpu.3.vmcall.entry_event=0x0000000080000306\n"));
+        assert!(text.contains("cpu.3.vmcall.rax=0x0000000000123456\n"));
+        assert!(text.contains("cpu.3.vmcall.r8=0x0000000000123456\n"));
+    }
+
+    #[test]
+    fn in_progress_or_replaced_records_are_never_reported_as_coherent() {
+        for replacing in [false, true] {
+            let mut sequence = 1;
+            let mut text = String::new();
+            append_vmcall_snapshot(&mut text, "cpu.0", |subleaf| {
+                if subleaf == MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF {
+                    if replacing {
+                        sequence += 1;
+                    }
+                    (sequence, 0)
+                } else {
+                    (0, 0)
+                }
+            });
+            assert!(text.contains("cpu.0.vmcall.coherent=0\n"));
+        }
+    }
+}
+
 #[cfg(all(
     test,
     target_arch = "x86_64",
@@ -1499,6 +1577,11 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
         }
         writeln!(text, "{prefix}.coherent={}", u8::from(coherent)).unwrap();
         text.push_str(&sample);
+        if mode == Mode::General
+            && diagnostic_cpu(34, cpu).eax & MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY != 0
+        {
+            append_vmcall_snapshot(&mut text, &prefix, |subleaf| pair(diagnostic_cpu(subleaf, cpu)));
+        }
         if protocol >= 5 && mode == Mode::General {
             append_nested_failure_trace(
                 &mut text,
@@ -1589,6 +1672,7 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
             )
             .unwrap();
         }
+        writeln!(text, "vmcall_snapshot={}", caps.eax & MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY != 0).unwrap();
         if caps.eax & VMX_HARDWARE_CAPABILITY != 0 {
             let (host_secondary, nested_secondary) = pair(diagnostic(47));
             let (host_misc, nested_misc) = pair(diagnostic(48));

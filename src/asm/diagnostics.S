@@ -63,6 +63,11 @@ mov ecx, dword ptr [r9 + {event_post_ebs_cpu_mask}]
 mov edx, dword ptr [r9 + {event_halted_cpu_mask}]
 jmp .Lresident_dispatch_cpuid_diagnostic_store
 .Lresident_dispatch_cpuid_diagnostic_extended:
+cmp ecx, {vmcall_snapshot_subleaf}
+jb .Lresident_dispatch_cpuid_vmcall_snapshot_done
+cmp ecx, {vmcall_snapshot_subleaf} + {vmcall_snapshot_words} / 2
+jb .Lresident_dispatch_cpuid_vmcall_snapshot
+.Lresident_dispatch_cpuid_vmcall_snapshot_done:
 cmp ecx, {callback_identity_subleaf}
 jb .Lresident_dispatch_cpuid_identity_done
 cmp ecx, {callback_identity_subleaf} + 5
@@ -170,6 +175,18 @@ jmp .Lresident_dispatch_cpuid_diagnostic_store
 sub ecx, {ept_diagnostic_subleaf} + {ept_runtime_diagnostic_pairs}
 lea r10, [r8 + {b_interception_sync_diagnostics}]
 jmp .Lresident_dispatch_cpuid_ept_diagnostic_pair
+.Lresident_dispatch_cpuid_vmcall_snapshot:
+sub ecx, {vmcall_snapshot_subleaf}
+mov r10, qword ptr [r8 + {b_processor_number}]
+cmp r10, 64
+jae .Lresident_dispatch_cpuid_diagnostic_zero
+imul r10, {vmcall_snapshot_words} * 8
+lea r9, [rip + .Lresident_vmcall_snapshots]
+add r10, r9
+shl ecx, 4
+mov rax, qword ptr [r10 + rcx]
+mov rdx, qword ptr [r10 + rcx + 8]
+jmp .Lresident_dispatch_cpuid_vmx_pair
 .Lresident_dispatch_cpuid_ept_stall_diagnostics:
 sub ecx, {ept_stall_diagnostic_subleaf}
 mov r10, qword ptr [r8 + {b_processor_number}]
@@ -2088,6 +2105,120 @@ call .Lresident_serial_state
 cmp qword ptr [r12 + {b_telemetry_active}], 0
 je .Lresident_dispatch_cpuid_advance
 mov qword ptr [r12 + {b_cpuid_leaf1_ecx}], r10
+.endm
+.macro matrixhv_island_vmcall_snapshot
+// Public L1 calls retain all input GPRs until the next public call on this CPU.
+// An odd sequence marks the in-progress handler; completion publishes it last.
+// The eight saved qwords and call return address precede the guest GPR frame.
+.Lresident_capture_public_vmcall:
+pushfq
+push rax
+push rcx
+push rdx
+push r8
+push r9
+push r10
+push r11
+cmp qword ptr [r12 + {b_telemetry_active}], 0
+je .Lresident_vmcall_snapshot_restore
+call .Lresident_vmcall_snapshot_address
+jc .Lresident_vmcall_snapshot_restore
+inc qword ptr [r10]
+mov qword ptr [r10 + 88], 0
+mov qword ptr [r10 + 96], 0
+mov qword ptr [r10 + 104], 0
+mov qword ptr [r10 + 112], 0
+rdtsc
+shl rdx, 32
+or rax, rdx
+mov qword ptr [r10 + 8], rax
+xor ecx, ecx
+.Lresident_vmcall_snapshot_gpr:
+mov rax, qword ptr [rsp + 72 + rcx * 8]
+mov qword ptr [r10 + 128 + rcx * 8], rax
+inc ecx
+cmp ecx, 15
+jb .Lresident_vmcall_snapshot_gpr
+mov rax, qword ptr [r12 + {b_processor_number}]
+mov qword ptr [r10 + 248], rax
+mov rax, qword ptr [r12 + {b_hyperv_timing_supported}]
+mov rdx, qword ptr [r12 + {b_nested_evmcs_enabled}]
+shl rdx, 1
+or rax, rdx
+mov qword ptr [r10 + 120], rax
+mov ecx, 2
+.Lresident_vmcall_snapshot_guest_state:
+lea r8, [rip + .Lresident_vmcall_snapshot_fields]
+mov eax, dword ptr [r8 + rcx * 4 - 8]
+call .Lresident_vmcall_snapshot_read
+mov qword ptr [r10 + rcx * 8], r11
+inc ecx
+cmp ecx, 11
+jb .Lresident_vmcall_snapshot_guest_state
+jmp .Lresident_vmcall_snapshot_restore
+.Lresident_complete_public_vmcall:
+pushfq
+push rax
+push rcx
+push rdx
+push r8
+push r9
+push r10
+push r11
+cmp qword ptr [r12 + {b_last_reason}], {vmcall_reason}
+jne .Lresident_vmcall_snapshot_restore
+call .Lresident_vmcall_snapshot_address
+jc .Lresident_vmcall_snapshot_restore
+test byte ptr [r10], 1
+jz .Lresident_vmcall_snapshot_restore
+mov eax, {vm_entry_intr_info_field}
+call .Lresident_vmcall_snapshot_read
+mov qword ptr [r10 + 88], r11
+mov eax, {guest_rip}
+call .Lresident_vmcall_snapshot_read
+mov qword ptr [r10 + 96], r11
+mov rax, qword ptr [rsp + 72]
+mov qword ptr [r10 + 104], rax
+mfence
+inc qword ptr [r10]
+.Lresident_vmcall_snapshot_restore:
+pop r11
+pop r10
+pop r9
+pop r8
+pop rdx
+pop rcx
+pop rax
+popfq
+ret
+.Lresident_vmcall_snapshot_address:
+mov r10, qword ptr [r12 + {b_processor_number}]
+cmp r10, 64
+jae .Lresident_vmcall_snapshot_address_invalid
+imul r10, {vmcall_snapshot_words} * 8
+lea r11, [rip + .Lresident_vmcall_snapshots]
+add r10, r11
+clc
+ret
+.Lresident_vmcall_snapshot_address_invalid:
+stc
+ret
+.Lresident_vmcall_snapshot_read:
+vmread r11, rax
+ja .Lresident_vmcall_snapshot_read_done
+mov r11, -1
+mov qword ptr [r10 + 112], 1
+.Lresident_vmcall_snapshot_read_done:
+ret
+.balign 4
+.Lresident_vmcall_snapshot_fields:
+.long {guest_rip}, {guest_rsp}, {guest_cr3}, {guest_rflags}
+.long {guest_cr0}, {guest_cr4}, {guest_efer}, {guest_ss_ar_bytes}, {exit_instruction_len}
+.endm
+.macro matrixhv_island_vmcall_snapshot_state
+.balign 64
+.Lresident_vmcall_snapshots:
+.zero 64 * {vmcall_snapshot_words} * 8
 .endm
 .macro matrixhv_island_flight_recorder
 // Single writer per vCPU. Commit the sequence last so stopped-machine readers

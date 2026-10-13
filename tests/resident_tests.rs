@@ -941,6 +941,12 @@ mod msr {
     }
 
     #[test]
+    fn captured_roblox_vmcall_rax_routes_to_the_public_guest_interface() {
+        let context = [1_u64, 0];
+        assert_eq!(unsafe { test_private_vmcall(context.as_ptr(), 0x9e1a3fbb70) }, 2);
+    }
+
+    #[test]
     fn probe_failure_vmcall_is_disabled_outside_the_startup_probe() {
         for denied in [false, true] {
             let context = [u64::from(denied), 0];

@@ -44,6 +44,7 @@ def run_component(project, component, release=False):
         execute([sys.executable, str(project / "tests/run_flight_recorder_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_intel_pt_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_exit_guard_tests.py")], project)
+        execute([sys.executable, str(project / "tests/run_vmcall_snapshot_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_host_state_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_debugctl_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_exit_event_tests.py")], project)

@@ -2481,6 +2481,8 @@ def prepare_resident_msr(project: Path):
     .Lresident_guest_privilege:
         bt qword ptr [r12], 0
         ret
+    .Lresident_capture_public_vmcall:
+        ret
     .Lresident_ap_ready:
     .Lresident_dispatch_start_checkpoint:
     .Lresident_dispatch_control_probe:
@@ -2733,6 +2735,7 @@ def prepare_resident_telemetry(project: Path):
         "ept_diagnostic_capabilities": 0x3ffff,
         "exit_timing_subleaf": 55,
         "callback_identity_subleaf": 0x610,
+        "vmcall_snapshot_subleaf": 0x620, "vmcall_snapshot_words": 32,
         "guest_rip": 0, "guest_rsp": 1, "guest_rflags": 2,
         "guest_cr0": 3, "guest_cr3": 4, "guest_cr4": 5, "guest_efer": 6,
         "control_cpu_state_size": 64, "control_cpu_stage": 0, "control_cpu_phase": 8,
@@ -2748,6 +2751,7 @@ def prepare_resident_telemetry(project: Path):
         (offsets if match[1] in offsets else constants)[match[1]]
     ), assembly)
     assembly = assembly.replace("rdtsc", "mov eax, 100\nxor edx, edx")
+    assembly += "\n.balign 64\n.Lresident_vmcall_snapshots:\n.zero 64 * 256\n"
     assembly = assembly.replace("vmread r11, rax",
         "lea r11, [rip + test_guest_state]\nmov r11, [r11 + rax * 8]\ncmp r12, 0")
     wrappers = """

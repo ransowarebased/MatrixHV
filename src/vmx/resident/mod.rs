@@ -1141,7 +1141,10 @@ global_asm!(
         | crate::protocol::MATRIXHV_EXIT_TIMING_CAPABILITY
         | crate::protocol::MATRIXHV_INTEL_PT_CAPABILITY
         | crate::protocol::MATRIXHV_CALLBACK_IDENTITY_CAPABILITY
-        | crate::protocol::MATRIXHV_INTEL_PT_RING_CAPABILITY,
+        | crate::protocol::MATRIXHV_INTEL_PT_RING_CAPABILITY
+        | crate::protocol::MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY,
+    vmcall_snapshot_subleaf = const crate::protocol::MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF,
+    vmcall_snapshot_words = const crate::protocol::MATRIXHV_VMCALL_SNAPSHOT_WORDS,
     exit_timing_subleaf = const crate::protocol::MATRIXHV_EXIT_TIMING_SUBLEAF,
     ept_runtime_diagnostic_pairs = const crate::protocol::memory::INTERCEPT_DIAGNOSTIC_WORDS / 2,
     ept_sync_diagnostic_pairs = const crate::protocol::memory::EPT_SYNC_DIAGNOSTIC_WORDS / 2,
