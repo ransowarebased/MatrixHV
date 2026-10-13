@@ -121,9 +121,32 @@ fn hypercalls_require_enabled_interface_protected_mode_and_kernel_privilege() {
         let before = registers;
         assert_eq!(
             unsafe { test_hypercall(context.as_mut_ptr(), registers.as_mut_ptr()) },
-            if invalid == 4 { 2 } else { 0 }
+            0
         );
         assert_eq!(registers, before);
+    }
+}
+
+#[test]
+fn unknown_vmcalls_reject_guest_callers_without_halting_when_hyperv_is_disabled() {
+    for privilege in 0..=3 {
+        for protected_mode in [0, 1] {
+            let mut context = [0_u64; 12];
+            context[8] = protected_mode;
+            context[9] = 0x2000;
+            context[10] = 0x400;
+            context[11] = privilege;
+            for code in [0, 8, 0xdead_beef, u64::MAX] {
+                let mut registers = [code, 0x10008, 0, 0x1234];
+                let before = registers;
+                assert_eq!(
+                    unsafe { test_hypercall(context.as_mut_ptr(), registers.as_mut_ptr()) },
+                    0,
+                    "privilege={privilege} protected_mode={protected_mode} code={code:#x}"
+                );
+                assert_eq!(registers, before);
+            }
+        }
     }
 }
 

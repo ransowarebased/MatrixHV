@@ -541,7 +541,9 @@ matrixhv_ept01_page_translation
 cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
 jne .Lresident_hyperv_hypercall_owned
 cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
-je .Lresident_dispatch_unsupported
+// VMCALL exits at every CPL. An unavailable guest interface must fault in
+// the guest rather than stopping the physical CPU and its clock interrupts.
+je .Lresident_dispatch_inject_ud
 .Lresident_hyperv_hypercall_owned:
 call .Lresident_guest_privilege
 jc .Lresident_dispatch_inject_ud
