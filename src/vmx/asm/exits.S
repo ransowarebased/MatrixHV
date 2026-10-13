@@ -655,7 +655,7 @@ jmp .Lresident_host_exception
 .Lresident_host_exception:
 cli
 lock bts qword ptr [rip + .Lresident_host_fault_active], 0
-jc .Lresident_platform_reset_cf9
+jc .Lresident_terminal_halt
 call .Lresident_pt_freeze
 mov r8, qword ptr [rip + matrixhv_resident_island_event_context]
 test r8, r8
@@ -798,7 +798,7 @@ ret
 matrixhv_island_host_fatal
 .endm
 
-// VM-exit entry contract: VMCS HOST_RSP points at a boot-context pointer on a 16-byte-aligned root stack. Saves all 15 guest GPRs (120 bytes); r12 identifies the context throughout dispatch. Helpers preserve that frame and either return, resume, reflect to L1, or reset the platform. Runtime Rust callbacks use the retained root image; firmware calls are excluded after EBS.
+// VM-exit entry contract: VMCS HOST_RSP points at a boot-context pointer on a 16-byte-aligned root stack. Saves all 15 guest GPRs (120 bytes); r12 identifies the context throughout dispatch. Helpers preserve that frame and either return, resume, reflect to L1, or halt the CPU. Runtime Rust callbacks use the retained root image; firmware calls are excluded after EBS.
 .macro matrixhv_island_dispatch
 .globl matrixhv_resident_dispatch_entry
 matrixhv_resident_dispatch_entry:
@@ -1167,7 +1167,7 @@ matrixhv_island_profile
 matrixhv_island_halt_observation
 .Lresident_dispatch_halt_now:
 mov qword ptr [r12 + {b_flight_frozen}], 1
-jmp .Lresident_platform_reset
+jmp .Lresident_terminal_halt
 .endm
 
 // CR0/CR4 and VPID contract: r12 is the boot context; rsp addresses the saved guest GPR frame. Validate architectural transitions against visible control registers and stage legacy PAE PDPTEs before writing guest state. Successful writes commit EFER/entry mode, retire translations and advance RIP; invalid values inject GP without changing state. Scratch GPRs and flags are clobbered. The TLB helper balances a 16-byte descriptor and preserves the guest frame.

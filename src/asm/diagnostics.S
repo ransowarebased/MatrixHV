@@ -1602,7 +1602,7 @@ call .Lresident_serial_state
 .endm
 
 // Terminal dispatch records the first failure without firmware calls. A corrupt
-// VMCS cannot certify a native handoff; reset the platform after bounded output.
+// VMCS cannot certify a native handoff; halt the CPU after bounded output.
 .macro matrixhv_island_halt_observation
 .Lresident_dispatch_halt:
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
@@ -1653,7 +1653,7 @@ call .Lresident_visual_callback
 .macro matrixhv_island_gp_diagnostic
 .Lresident_host_gp_fatal:
 lock bts qword ptr [rip + .Lresident_host_fault_active], 0
-jc .Lresident_platform_reset_cf9
+jc .Lresident_terminal_halt
 call .Lresident_pt_freeze
 mov r8, qword ptr [rip + matrixhv_resident_island_event_context]
 test r8, r8
@@ -1668,14 +1668,14 @@ mov qword ptr [r8 + {event_host_fault_vector}], 13
 jmp .Lresident_island_fatal_owned
 .endm
 
-// Host faults use retained diagnostics and request a platform reset. Recovery
+// Host faults use retained diagnostics and halt the CPU. Terminal handling
 // cannot depend on the failed VMCS, guest register frame, or firmware services.
 .macro matrixhv_island_host_fatal
 .globl matrixhv_resident_island_fatal
 matrixhv_resident_island_fatal:
 cli
 lock bts qword ptr [rip + .Lresident_host_fault_active], 0
-jc .Lresident_platform_reset_cf9
+jc .Lresident_terminal_halt
 mov r8, qword ptr [rip + matrixhv_resident_island_event_context]
 test r8, r8
 jz .Lresident_island_fatal_serial
@@ -1703,88 +1703,10 @@ mov dx, {serial_port}
 mov al, 0x21
 out dx, al
 1:
-jmp .Lresident_platform_reset
-.Lresident_platform_reset:
-cli
-// R11 retains permission for the destructive fallback across reset I/O only.
-// Missing or invalid operation state never authorizes a deliberate triple fault.
-xor r11d, r11d
-// The ACPI I/O reset tuple is validated and retained before ExitBootServices.
-mov r8, qword ptr [rip + matrixhv_resident_island_event_context]
-test r8, r8
-jz .Lresident_platform_reset_cf9
-mov rax, {event_magic}
-cmp qword ptr [r8 + {event_magic_offset}], rax
-jne .Lresident_platform_reset_cf9
-mov rax, {event_canary}
-cmp qword ptr [r8 + {event_canary_offset}], rax
-jne .Lresident_platform_reset_cf9
-mov r10, qword ptr [r8 + {event_interception_context}]
-test r10, r10
-jz .Lresident_platform_reset_check_tracking
-cmp qword ptr [r10], {interception_active}
-je .Lresident_platform_reset_workload_active
-.Lresident_platform_reset_check_tracking:
-mov r10, qword ptr [r8 + {event_tracking_context}]
-test r10, r10
-jz .Lresident_platform_reset_check_update
-cmp dword ptr [r10 + {tracking_state}], {tracking_active}
-je .Lresident_platform_reset_workload_active
-.Lresident_platform_reset_check_update:
-mov eax, dword ptr [r8 + {event_update_status} + {update_status_phase}]
-cmp eax, {update_phase_recovering}
-je .Lresident_platform_reset_workload_active
-cmp eax, {update_phase_uploading}
-jb .Lresident_platform_reset_acpi
-cmp eax, {update_phase_activating}
-ja .Lresident_platform_reset_acpi
-.Lresident_platform_reset_workload_active:
-mov r11d, 1
-.Lresident_platform_reset_acpi:
-mov rax, qword ptr [r8 + {event_reset_io}]
-test ax, ax
-jz .Lresident_platform_reset_cf9_with_policy
-mov dx, ax
-shr rax, 16
-out dx, al
-jmp .Lresident_platform_reset_cf9_with_policy
-.Lresident_platform_reset_cf9:
-// Recursive host faults and failed native transitions cannot validate activity.
-xor r11d, r11d
-.Lresident_platform_reset_cf9_with_policy:
-cli
-// Intel reset control is also understood by common VM platforms. Both writes
-// are required when an earlier reset request left RST_CPU asserted.
-mov dx, 0xcf9
-mov al, 2
-out dx, al
-mov al, 6
-out dx, al
-// A missing or busy legacy keyboard controller must never cause another stall.
-mov ecx, 65536
-.Lresident_platform_reset_keyboard_wait:
-in al, 0x64
-test al, 2
-jz .Lresident_platform_reset_keyboard
-pause
-loop .Lresident_platform_reset_keyboard_wait
-jmp .Lresident_platform_reset_triple_fault
-.Lresident_platform_reset_keyboard:
-mov al, 0xfe
-out 0x64, al
-.Lresident_platform_reset_triple_fault:
-test r11d, r11d
-jz .Lresident_platform_reset_idle_halt
-lidt [rip + .Lresident_platform_reset_empty_idt]
-int3
-ud2
-.Lresident_platform_reset_idle_halt:
+.Lresident_terminal_halt:
 cli
 hlt
-jmp .Lresident_platform_reset_idle_halt
-.Lresident_platform_reset_empty_idt:
-.word 0
-.quad 0
+jmp .Lresident_terminal_halt
 .endm
 
 // Boot sampling contract: r12 is the boot context, rsp retains the guest frame. Updates deadlines and retires the instrumentation timer when the framebuffer window expires. Clobbers scratch GPRs/flags and branches to the dispatcher event-retry path; it never advances guest RIP.

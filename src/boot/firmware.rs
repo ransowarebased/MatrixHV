@@ -904,13 +904,6 @@ fn acpi_root() -> Option<usize> {
     })
 }
 
-pub(crate) fn resident_reset_io() -> u64 {
-    acpi_root()
-        .and_then(|address| unsafe { acpi_fadt(address) })
-        .and_then(acpi_reset_register)
-        .unwrap_or(0)
-}
-
 pub(crate) fn calibrate_reference_tsc() -> u64 {
     let Some((port, mask)) = acpi_root().and_then(|address| unsafe { acpi_pm_timer(address) }) else {
         return 0;
@@ -990,21 +983,6 @@ unsafe fn acpi_fadt(address: usize) -> Option<&'static [u8]> {
         }
     }
     None
-}
-
-fn acpi_reset_register(fadt: &[u8]) -> Option<u64> {
-    if fadt.len() < 129
-        || u32::from_le_bytes(fadt[112..116].try_into().ok()?) & (1 << 10) == 0
-        || fadt[116] != 1 || fadt[117] != 8 || fadt[118] != 0
-        || ![0, 1].contains(&fadt[119])
-    {
-        return None;
-    }
-    let port = u64::from_le_bytes(fadt[120..128].try_into().ok()?);
-    if port == 0 || port > u64::from(u16::MAX) {
-        return None;
-    }
-    Some(port | (u64::from(fadt[128]) << 16))
 }
 
 unsafe fn acpi_table(address: usize) -> Option<&'static [u8]> {

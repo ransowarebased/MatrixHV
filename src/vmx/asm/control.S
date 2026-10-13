@@ -1323,7 +1323,7 @@ mov qword ptr [r9 + {control_cpu_stage}], 134
 lock bts qword ptr [r10 + {event_control_failed_mask}], r8
 .Lresident_control_off_vmcs_preserved:
 vmxoff
-jna .Lresident_platform_reset
+jna .Lresident_terminal_halt
 mov r11, qword ptr [r9 + {control_cpu_native_cr4}]
 mov cr4, r11
 mov r11, r8
@@ -1707,7 +1707,7 @@ lock bts qword ptr [r10 + {event_control_failed_mask}], r8
 .Lresident_control_on_vmcs_preserved:
 // Failed activation still uses the caller's CR3, without physical event mappings.
 vmxoff
-jna .Lresident_platform_reset_cf9
+jna .Lresident_terminal_halt
 .Lresident_control_on_native_failed:
 mov r11, qword ptr [r9 + {control_cpu_on_original_cr4}]
 mov cr4, r11
@@ -1761,7 +1761,7 @@ lock bts qword ptr [r15 + {event_control_failed_mask}], r14
 .Lresident_control_on_entry_vmcs_preserved:
 mov qword ptr [r12 + {b_root_vmx_active}], 0
 vmxoff
-jna .Lresident_platform_reset
+jna .Lresident_terminal_halt
 mov rdx, qword ptr [r13 + {control_cpu_on_native_cr3}]
 mov r11, qword ptr [r13 + {control_cpu_on_native_cr0}]
 mov cr0, r11

@@ -100,7 +100,6 @@ pub struct ResidentEventContext {
     pub callback_image_bytes: u64,
     pub callback_image_version: u64,
     pub callback_image_hash: [u8; 32],
-    pub reset_io: u64,
 }
 
 #[repr(C, align(16))]

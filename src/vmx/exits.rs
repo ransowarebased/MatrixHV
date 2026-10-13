@@ -29,7 +29,6 @@ pub fn reason_name(raw: u32) -> &'static str {
     match basic_reason(raw) {
         0 => "exception_or_nmi",
         1 => "external_interrupt",
-        2 => "triple_fault",
         10 => "cpuid",
         18 => "vmcall",
         31 => "rdmsr",

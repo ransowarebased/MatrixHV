@@ -1980,8 +1980,7 @@ def prepare_resident_control(project: Path):
     .Lresident_dispatch_vmread_failed:
     .Lresident_dispatch_vmwrite_failed:
     matrixhv_resident_island_fatal:
-    .Lresident_platform_reset:
-    .Lresident_platform_reset_cf9:
+    .Lresident_terminal_halt:
         ud2
     matrixhv_resident_set_variable:
         ud2
@@ -2923,7 +2922,7 @@ def prepare_resident_visual(project: Path):
     ).replace("iretq", "jmp .Ltest_gp_return")
     assembly = (
         assembly.replace("cli", "nop")
-        .replace(".Lresident_platform_reset_cf9", ".Ltest_exception_return")
+        .replace(".Lresident_terminal_halt", ".Ltest_exception_return")
         .replace("mov rdx, cr2", "mov edx, 0x12345678")
         .replace("matrixhv_resident_island_fatal", ".Ltest_exception_return")
         .replace(".Lresident_island_fatal_owned", ".Ltest_exception_return")

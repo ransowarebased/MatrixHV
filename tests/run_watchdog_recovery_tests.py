@@ -1,4 +1,4 @@
-"""Execute production invalidation and reset paths with modeled privileged I/O."""
+"""Execute production invalidation and terminal halt paths with modeled privileged I/O."""
 
 from pathlib import Path
 import re
@@ -77,7 +77,7 @@ fault_sources = [
 for index, (source, label, first_context_use) in enumerate(fault_sources):
     start = source.index(label) + len(label)
     guard = source[start:source.index(first_context_use, start)].replace("cli", "nop")
-    guard = guard.replace(".Lresident_platform_reset_cf9", ".Ltest_fault_reset")
+    guard = guard.replace(".Lresident_terminal_halt", ".Ltest_fault_halt")
     assembly += f"""
 .globl test_fault_guard_{index}
 test_fault_guard_{index}:
@@ -87,7 +87,7 @@ mov eax, 1
 ret
 """
 assembly += """
-.Ltest_fault_reset:
+.Ltest_fault_halt:
 xor eax, eax
 ret
 .data
@@ -159,18 +159,18 @@ control = (project / "src/vmx/asm/control.S").read_text()
 off_paths = re.findall(r"vmxoff\n[^\n]+", control)
 assert len(off_paths) == 3
 assert [path.splitlines()[1] for path in off_paths] == [
-    "jna .Lresident_platform_reset", "jna .Lresident_platform_reset_cf9", "jna .Lresident_platform_reset",
+    "jna .Lresident_terminal_halt", "jna .Lresident_terminal_halt", "jna .Lresident_terminal_halt",
 ]
 for index, body in enumerate(off_paths):
     body = body.replace("vmxoff", "test_off_status")
-    body = re.sub(r"\.Lresident_platform_reset(?:_cf9)?", f".Ltest_off_reset_{index}", body)
+    body = body.replace(".Lresident_terminal_halt", f".Ltest_off_halt_{index}")
     assembly += f"""
 .globl test_vmxoff_{index}
 test_vmxoff_{index}:
 {body}
 mov eax, 1
 ret
-.Ltest_off_reset_{index}:
+.Ltest_off_halt_{index}:
 xor eax, eax
 ret
 """
@@ -191,64 +191,13 @@ test eax, eax
 .Ltest_off_done\@:
 .endm
 """ + assembly
-reset = diagnostics[diagnostics.index(".Lresident_platform_reset:"):]
-reset = reset[:reset.index(".endm")]
-reset_constants = {
-    "event_reset_io": 0,
-    "event_magic": 0x48564556454e5431,
-    "event_canary": 0x4856455643414e59,
-    "event_magic_offset": 104,
-    "event_canary_offset": 112,
-    "event_interception_context": 120,
-    "event_tracking_context": 128,
-    "event_update_status": 136,
-    "update_status_phase": 0,
-    "tracking_state": 24,
-    "tracking_active": 1,
-    "interception_active": 1,
-    "update_phase_uploading": 1,
-    "update_phase_activating": 4,
-    "update_phase_recovering": 6,
-}
-for name, value in reset_constants.items():
-    reset = reset.replace("{" + name + "}", str(value))
-assert "{" not in reset
-reset = reset.replace("cli", "nop")
-reset = reset.replace(
-    "mov r8, qword ptr [rip + matrixhv_resident_island_event_context]",
-    "xor r8d, r8d\ncmp qword ptr [r12 + 152], 0\n"
-    "je .Ltest_reset_context_ready\nmov r8, r12\n.Ltest_reset_context_ready:",
-)
-reset = reset.replace("out dx, al", "test_reset_out")
-reset = reset.replace("out 0x64, al", "mov dx, 0x64\ntest_reset_out")
-reset = reset.replace("in al, 0x64", "inc qword ptr [r12 + 16]\nmov al, byte ptr [r12 + 8]")
-reset = reset.replace("lidt [rip + .Lresident_platform_reset_empty_idt]", "inc qword ptr [r12 + 96]")
-reset = reset.replace("int3", "jmp .Ltest_reset_done")
-reset = reset.replace("hlt", "inc qword ptr [r12 + 144]\njmp .Ltest_reset_done")
-assembly += """
-.macro test_reset_out
-mov r10, qword ptr [r12 + 24]
-movzx r9d, dx
-mov qword ptr [r12 + 32 + r10 * 8], r9
-movzx r9d, al
-mov qword ptr [r12 + 64 + r10 * 8], r9
-inc qword ptr [r12 + 24]
-.endm
-.globl test_reset
-test_reset:
-push r12
-mov r12, rcx
-jmp .Lresident_platform_reset
-.globl test_reset_cf9
-test_reset_cf9:
-push r12
-mov r12, rcx
-mov r11d, 1
-jmp .Lresident_platform_reset_cf9
-.Ltest_reset_done:
-pop r12
-ret
-""" + reset
+halt = diagnostics[diagnostics.index(".Lresident_terminal_halt:"):]
+halt = halt[:halt.index(".endm")]
+assert halt.splitlines() == [
+    ".Lresident_terminal_halt:", "cli", "hlt", "jmp .Lresident_terminal_halt",
+]
+halt = halt.replace("cli", "nop").replace("hlt", "mov eax, 1\nret")
+assembly += ".globl test_terminal_halt\ntest_terminal_halt:\n" + halt
 (output / "recovery.S").write_text(assembly)
 
 interception = (project / "src/memory/interception.rs").read_text()

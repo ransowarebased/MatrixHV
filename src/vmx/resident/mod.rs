@@ -673,7 +673,6 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
             callback_image_bytes: 0,
             callback_image_version: 0,
             callback_image_hash: [0; 32],
-            reset_io: crate::boot::firmware::resident_reset_io(),
         });
         for (index, state) in (*context).control_cpu_states.iter_mut().enumerate() {
             let address = native_storage_pages.physical_address()
@@ -1124,13 +1123,6 @@ global_asm!(
     memory_root_history_mask = const crate::protocol::memory::ROOT_HISTORY_COUNT - 1,
     event_memory_entry = const core::mem::offset_of!(ResidentEventContext, memory_entry_physical),
     event_tracking_context = const core::mem::offset_of!(ResidentEventContext, tracking_context_physical),
-    tracking_state = const core::mem::offset_of!(crate::memory::tracking::Session, state),
-    tracking_active = const crate::protocol::memory::TRACK_ACTIVE,
-    interception_active = const crate::protocol::memory::INTERCEPT_ACTIVE,
-    update_status_phase = const core::mem::offset_of!(crate::update::Status, phase),
-    update_phase_uploading = const crate::update::Phase::Uploading as u32,
-    update_phase_activating = const crate::update::Phase::Activating as u32,
-    update_phase_recovering = const crate::update::Phase::Recovering as u32,
     event_interception_context = const core::mem::offset_of!(ResidentEventContext, interception_context_physical),
     event_interception_entry = const core::mem::offset_of!(ResidentEventContext, interception_entry_physical),
     event_callback_image_base = const core::mem::offset_of!(ResidentEventContext, callback_image_base),
@@ -1663,7 +1655,6 @@ global_asm!(
     event_failed_exit_reason = const core::mem::offset_of!(ResidentEventContext, failed_exit_reason),
     event_failed_qualification = const core::mem::offset_of!(ResidentEventContext, failed_qualification),
     event_failed_stop_result = const core::mem::offset_of!(ResidentEventContext, failed_stop_result),
-    event_reset_io = const core::mem::offset_of!(ResidentEventContext, reset_io),
     event_control_expected_mask = const core::mem::offset_of!(ResidentEventContext, control_expected_mask),
     event_control_active_mask = const core::mem::offset_of!(ResidentEventContext, control_active_mask),
     event_control_stopped_mask = const core::mem::offset_of!(ResidentEventContext, control_stopped_mask),
