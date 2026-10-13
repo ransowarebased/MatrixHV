@@ -10,11 +10,12 @@ struct EventContext {
     rip: u64,
     instruction_len: u64,
     reserved: [u64; 4],
-    vmcs: [u64; 18],
+    vmcs: [u64; 19],
     host_cr3: u64,
     expected_host_cr3: u64,
     log_backend: u64,
     dispatch_vmreads: u64,
+    cr2: u64,
 }
 
 #[repr(C)]
@@ -48,6 +49,7 @@ struct WindowContext {
 
 unsafe extern "C" {
     fn test_event_gp(context: &mut EventContext);
+    fn test_event_debug(context: &mut EventContext);
     fn test_event_advance(context: &mut EventContext);
     fn test_cpuid_leaf0(context: &mut EventContext, registers: &mut [u64; 4]) -> u64;
     fn test_event_retry(context: &mut EventContext);
@@ -261,6 +263,37 @@ fn exception_reinjection_preserves_error_codes_and_discards_exit_only_bits() {
 }
 
 #[test]
+fn intercepted_page_fault_sets_cr2_even_when_delivery_combines_into_double_fault() {
+    for vectoring in [0, 0x8000_0b0e] {
+        let mut context = EventContext {
+            qualification: 0xffff_8000_1234_5000,
+            cr2: 0xdead_beef,
+            ..Default::default()
+        };
+        context.vmcs[17] = 0x8000_0b0e;
+        context.vmcs[0] = vectoring;
+        context.vmcs[8] = 1;
+        unsafe { test_event_exception(&mut context) };
+        assert_eq!(context.cr2, context.qualification);
+        assert_eq!(context.vmcs[3], if vectoring == 0 { 0x8000_0b0e } else { 0x8000_0b08 });
+    }
+}
+
+#[test]
+fn non_page_fault_reinjection_preserves_cr2() {
+    for event in [0x8000_0b0d, 0x8000_0301, 0x8000_0603] {
+        let mut context = EventContext {
+            qualification: u64::MAX,
+            cr2: 0x1234_5000,
+            ..Default::default()
+        };
+        context.vmcs[17] = event;
+        unsafe { test_event_exception(&mut context) };
+        assert_eq!(context.cr2, 0x1234_5000);
+    }
+}
+
+#[test]
 fn software_exception_reinjection_preserves_the_original_instruction_length() {
     for (event, length) in [(0x8000_0603, 1), (0x8000_0501, 1), (0x8000_0604, 2)] {
         let mut context = EventContext::default();
@@ -271,6 +304,49 @@ fn software_exception_reinjection_preserves_the_original_instruction_length() {
         assert_eq!(context.vmcs[3], event);
         assert_eq!(context.vmcs[7], length);
     }
+}
+
+#[test]
+fn debug_exception_reinjection_clears_general_detect_and_branch_debug_controls() {
+    for event in [0x8000_0301, 0x8000_0501] {
+        let mut context = EventContext::default();
+        context.vmcs[17] = event;
+        context.vmcs[18] = 0xf_2401;
+        context.vmcs[12] = 0x5fc3;
+        context.vmcs[11] = 0x302;
+        unsafe { test_event_exception(&mut context) };
+        assert_eq!((context.vmcs[18], context.vmcs[12]), (0xf_0401, 0x5fc0), "event={event:x}");
+        assert_eq!(context.vmcs[11], 0x302);
+        assert_eq!(context.vmcs[3], event);
+    }
+}
+
+#[test]
+fn other_exception_reinjection_preserves_guest_debug_controls() {
+    for event in [0x8000_0b0d, 0x8000_0603, 0x8000_0502] {
+        let mut context = EventContext::default();
+        context.vmcs[17] = event;
+        context.vmcs[18] = 0xf_2401;
+        context.vmcs[12] = 0x5fc3;
+        unsafe { test_event_exception(&mut context) };
+        assert_eq!(context.vmcs[18], 0xf_2401);
+        assert_eq!(context.vmcs[12], 0x5fc3);
+    }
+}
+
+#[test]
+fn emulated_general_detect_injects_debug_with_native_controls_and_unretired_rip() {
+    let mut context = EventContext::default();
+    context.vmcs[18] = 0x2400;
+    context.vmcs[12] = 0x5fc3;
+    context.vmcs[14] = 0x400000;
+    context.vmcs[11] = 0x302;
+    unsafe { test_event_debug(&mut context) };
+    assert_eq!(context.vmcs[3], 0x8000_0301);
+    assert_eq!(context.vmcs[18], 0x400);
+    assert_eq!(context.vmcs[12], 0x5fc0);
+    assert_eq!(context.vmcs[14], 0x400000);
+    assert_eq!(context.vmcs[11], 0x302);
 }
 
 #[test]

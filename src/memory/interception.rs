@@ -2571,15 +2571,14 @@ pub(crate) mod runtime {
         let mut register = (qualification & 7) as usize;
         if boot.interception.guest_debug[5] & (1 << 13) != 0 {
             boot.interception.guest_debug[5] &= !(1 << 13);
-            boot.interception.guest_debug[4] |= 1 << 13;
-            write(GUEST_DR7, boot.interception.guest_debug[5])?;
+            boot.interception.guest_debug[4] |= (1 << 13) | (1 << 16);
             load_debug(
                 boot.interception.guest_debug[..5]
                     .try_into()
                     .map_err(|_| ())?,
             );
-            write(VM_ENTRY_INTR_INFO_FIELD, 0x80000301)?;
-            return Ok(1);
+            // Resident assembly completes DR7/DEBUGCTL before injecting #DB.
+            return Ok(5);
         }
         if register == 4 || register == 5 {
             if read(GUEST_CR4)? & 8 != 0 {
@@ -2615,9 +2614,8 @@ pub(crate) mod runtime {
             } else {
                 value as u32 as u64
             };
-            if register >= 6 && value >> 32 != 0
-                || register < 4 && long_mode && !canonical(value, read(GUEST_CR4)? & (1 << 12) != 0)
-            {
+            // DR0-DR3 accept all 64 bits; DR6/DR7 reserve the high half.
+            if register >= 6 && value >> 32 != 0 {
                 return Ok(3);
             }
             boot.interception.guest_debug[debug_index] = if register == 7 {
@@ -3323,8 +3321,9 @@ pub(crate) mod runtime {
         if boot.processor_number >= 64 {
             return Err(());
         }
+        // Retain ownership until dispatch and any retirement retry complete.
         let exit_armed = session.exit_debug[boot.processor_number as usize]
-            .fetch_and(!1, Ordering::AcqRel) & 1;
+            .load(Ordering::Acquire) & 1;
         let armed = boot.interception.debug_armed != 0 || exit_armed != 0;
         let syscall_armed = armed && boot.interception.debug_count == 1
             && boot.interception.debug_targets[3][1] == u64::MAX;
@@ -3384,6 +3383,15 @@ pub(crate) mod runtime {
                 {
                     base(boot)?;
                     invalidate(boot.cache_ept_pointer)?;
+                    return Ok(1);
+                }
+                // IDT delivery and asynchronous engine accesses do not execute
+                // the instruction at guest RIP. Retry them on the native view.
+                if boot.last_qualification & (1 << 16) != 0
+                    || read(IDT_VECTORING_INFO_FIELD)? & (1 << 31) != 0
+                {
+                    session.cause.store(u64::from(INTERCEPT_CAUSE_CONTEXT), Ordering::Release);
+                    revoke(session, boot, synchronize)?;
                     return Ok(1);
                 }
                 // A busy refresh owner can legitimately require many retries
@@ -3592,11 +3600,10 @@ pub(crate) mod runtime {
                 .try_into()
                 .map_err(|_| ())?;
             registers[4] |= debug_status & if syscall_armed { 0xe00e } else if armed { 0xe000 } else { 0xe00f };
-            for bit in [11, 16] {
-                if debug_status & (1 << bit) != 0 {
-                    registers[4] &= !(1 << bit);
-                }
+            if debug_status & (1 << 11) != 0 {
+                registers[4] &= !(1 << 11);
             }
+            registers[4] = (registers[4] & !(1 << 16)) | (!debug_status & (1 << 16));
             boot.interception.guest_debug[4] = registers[4];
             load_debug(&registers);
         }
@@ -3769,7 +3776,7 @@ pub(crate) mod runtime {
             _ => Err(()),
         } };
         diagnostic_result(boot, phase as usize, result.as_ref().is_ok_and(|value| *value != u64::MAX));
-        match result {
+        let outcome = match result {
             Ok(u64::MAX) => {
                 let _ = session.cause.compare_exchange(
                     u64::from(INTERCEPT_CAUSE_NONE), u64::from(INTERCEPT_CAUSE_RUNTIME),
@@ -3800,10 +3807,24 @@ pub(crate) mod runtime {
                     // A recovered EPT fault must reexecute on the restored base;
                     // forwarding it would reach the unexpected-violation reset.
                     1
+                } else if phase == 0 && boot.last_reason & 0xffff == 0 {
+                    // Retirement cannot discard an owned #DB or the guest's
+                    // single-step cause before generic exception reinjection.
+                    dispatch(
+                        session,
+                        boot,
+                        unsafe { core::slice::from_raw_parts_mut(frame, 15) },
+                        synchronize,
+                        unsafe { &mut *fx_state.cast::<[u8; 512]>() },
+                    ).unwrap_or(u64::MAX)
                 } else {
                     0
                 }
             }
+        };
+        if phase == 0 && outcome != u64::MAX {
+            session.exit_debug[boot.processor_number as usize].fetch_and(!1, Ordering::AcqRel);
         }
+        outcome
     }
 }

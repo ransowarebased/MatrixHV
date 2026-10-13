@@ -1133,6 +1133,7 @@ def prepare_nested_regressions(project: Path):
         'guest_cs_ar_bytes': 4, 'guest_pat': 5, 'guest_efer': 6,
         'guest_ia32_debugctl': 7, 'guest_fs_base': 8, 'guest_gs_base': 9,
         'guest_sysenter_cs': 10, 'guest_sysenter_esp': 11, 'guest_sysenter_eip': 12,
+        'guest_dr7': 15,
         'vm_entry_msr_load_addr': 0, 'vm_entry_msr_load_count': 1,
         'vm_exit_msr_store_addr': 2, 'vm_exit_msr_store_count': 3,
         'vm_exit_msr_load_addr': 4, 'vm_exit_msr_load_count': 5,
@@ -1349,7 +1350,7 @@ def prepare_nested_regressions(project: Path):
     .text
     """
     assembly = wrapper + assembly
-    sizes = {'test_vmcs': 15, 'test_controls': 15, 'b_nested_operand_data': 2}
+    sizes = {'test_vmcs': 16, 'test_controls': 16, 'b_nested_operand_data': 2}
     offsets = {}
     cursor = 0
     for name in sorted(set(re.findall(r'\{((?:b_|test_)\w+)\}', assembly))):

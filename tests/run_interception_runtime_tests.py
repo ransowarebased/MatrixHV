@@ -49,7 +49,7 @@ engine = re.sub(r'const OPTIONS: u32 = .*?;', '', engine, flags=re.S)
 engine = engine.replace(item(source, 'struct BaseSplit'), 'struct BaseSplit { storage: [u64; 6] }')
 engine = engine.replace('        self.splits.get_mut().fill(BaseSplit::default());',
                         '        for split in self.splits.get_mut() { split.storage.fill(0); }')
-engine += '\n'.join(item(source, declaration) for declaration in ['fn canonical(', 'fn bank_base(', 'fn expired(', 'fn lock_refresh(', 'fn data_root(', 'fn data_leaves(', 'fn root_matches(', 'fn baseline_page(', 'fn merge_byte(', 'fn cpuid_values(']) + '\n' + runtime
+engine += '\n'.join(item(source, declaration) for declaration in ['fn bank_base(', 'fn expired(', 'fn lock_refresh(', 'fn data_root(', 'fn data_leaves(', 'fn root_matches(', 'fn baseline_page(', 'fn merge_byte(', 'fn cpuid_values(']) + '\n' + runtime
 abi = (project / 'src/vmx/resident/abi.rs').read_text()
 cpu = 'use core::sync::atomic::AtomicU64;\n#[repr(C)]\n#[derive(Default)]\n' + item(abi, 'pub struct InterceptionCpuState')
 vmcs = (project / 'src/vmx/vmcs.rs').read_text()
@@ -150,6 +150,8 @@ bindings = {
     'b_telemetry_active': 'ResidentBootContext, telemetry_active',
     'b_last_reason': 'ResidentBootContext, last_reason',
     'b_stop_result': 'ResidentBootContext, stop_result',
+    'b_processor_number': 'ResidentBootContext, processor_number',
+    'interception_exit_debug': 'Session, exit_debug',
 }
 for name, field in {
     'controls': 'controls_saved', 'debug_armed': 'debug_armed', 'ept': 'applied_ept',

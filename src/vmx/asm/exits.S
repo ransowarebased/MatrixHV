@@ -262,6 +262,28 @@ vmwrite rax, r10
 jc .Lresident_dispatch_vmwrite_failed
 jz .Lresident_dispatch_vmwrite_failed
 jmp .Lresident_dispatch_resume
+.Lresident_dispatch_inject_db:
+call .Lresident_prepare_debug_controls
+mov eax, {vm_entry_intr_info_field}
+mov r10d, 0x80000301
+vmwrite rax, r10
+jna .Lresident_dispatch_vmwrite_failed
+jmp .Lresident_dispatch_resume
+.Lresident_prepare_debug_controls:
+// VM-entry injection does not perform the DR7/DEBUGCTL updates of native #DB.
+mov eax, {guest_dr7}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+btr r11, 13
+vmwrite rax, r11
+jna .Lresident_dispatch_vmwrite_failed
+mov eax, {guest_ia32_debugctl}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+and r11, -4
+vmwrite rax, r11
+jna .Lresident_dispatch_vmwrite_failed
+ret
 .Lresident_advance_guest_rip:
 mov r10, qword ptr [r12 + {b_last_guest_rip}]
 add r10, qword ptr [r12 + {b_last_instruction_len}]
@@ -857,6 +879,8 @@ cmp eax, 3
 je .Lresident_dispatch_inject_gp
 cmp eax, 4
 je .Lresident_dispatch_inject_ud
+cmp eax, 5
+je .Lresident_dispatch_inject_db
 matrixhv_island_event_observation
 .Lresident_dispatch_reason:
 cmp qword ptr [r12 + {b_telemetry_active}], 0

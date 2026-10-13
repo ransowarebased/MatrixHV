@@ -40,6 +40,7 @@ fields = {
     "guest_rip": 14,
     "guest_efer": 15,
     "exit_intr_error_code": 16,
+    "guest_dr7": 18,
     "ept_violation_reason": 48,
 }
 
@@ -62,6 +63,7 @@ event = re.sub(
     event,
 )
 assert not re.search(r"(?m)^vm(?:read|write) ", event)
+event = event.replace("mov cr2, r11", "mov [r12 + 248], r11")
 
 # Execute the leaf-zero selector and handler against the same modeled VMCS as
 # instruction completion. A native CPUID in this path is a test failure.
@@ -74,16 +76,16 @@ cpuid = re.sub(r"(?m)^resident_telemetry_counter[^\n]*", "", cpuid)
 cpuid = cpuid.replace("matrixhv_resident_hyperv_cpuid", "ud2")
 cpuid = re.sub(r"(?m)^cpuid$", "ud2", cpuid)
 cpuid = cpuid.replace("jmp .Lresident_dispatch_resume", "jmp .Ltest_cpuid_completed")
-cpuid = cpuid.replace("[rip + matrixhv_resident_island_log_backend]", "[r12 + 224]")
-cpuid = cpuid.replace("mov rax, cr3", "mov rax, [r12 + 208]")
+cpuid = cpuid.replace("[rip + matrixhv_resident_island_log_backend]", "[r12 + 232]")
+cpuid = cpuid.replace("mov rax, cr3", "mov rax, [r12 + 216]")
 cpuid_fields = dict(fields, b_cpuid_leaf0=32, b_nested_l2_active=48,
-                    b_telemetry_active=56, b_expected_host_cr3=216,
+                    b_telemetry_active=56, b_expected_host_cr3=224,
                     cpuid_reason=10, memory_leaf=0x4d48564d, matrixhv_status_leaf=0x4d485652,
                     matrixhv_status_signature_eax=0, matrixhv_status_signature_ebx=0,
                     matrixhv_status_signature_ecx=0, matrixhv_status_protocol=0)
 cpuid = re.sub(r"\{(\w+)\}", lambda match: str(cpuid_fields[match[1]]), cpuid)
 cpuid = cpuid.replace("vmread r11, rax",
-                      "inc qword ptr [r12 + 232]\nmov r11, [r12 + 64 + rax * 8]\ncmp r12, 0")
+                      "inc qword ptr [r12 + 240]\nmov r11, [r12 + 64 + rax * 8]\ncmp r12, 0")
 assert not re.search(r"(?m)^vm(?:read|write) ", cpuid)
 cpuid += """
 .Lresident_dispatch_full:
@@ -212,6 +214,13 @@ call .Lresident_dispatch_inject_gp_vmcs
 pop r12
 ret
 .globl test_event_advance
+.globl test_event_debug
+test_event_debug:
+push r12
+mov r12, rcx
+call .Lresident_dispatch_inject_db
+pop r12
+ret
 test_event_advance:
 push r12
 mov r12, rcx

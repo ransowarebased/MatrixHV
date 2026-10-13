@@ -1147,6 +1147,7 @@ global_asm!(
     ept_stall_diagnostic_subleaf = const crate::protocol::memory::EPT_STALL_DIAGNOSTIC_SUBLEAF,
     b_interception_controls = const core::mem::offset_of!(ResidentBootContext, interception)
         + core::mem::offset_of!(abi::InterceptionCpuState, controls_saved),
+    interception_exit_debug = const core::mem::offset_of!(crate::memory::interception::Session, exit_debug),
     b_interception_debug_armed = const core::mem::offset_of!(ResidentBootContext, interception)
         + core::mem::offset_of!(abi::InterceptionCpuState, debug_armed),
     b_interception_ept = const core::mem::offset_of!(ResidentBootContext, interception)

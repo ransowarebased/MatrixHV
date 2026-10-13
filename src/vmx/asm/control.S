@@ -231,6 +231,12 @@ cmp qword ptr [r12 + {b_interception_ept}], 0
 jne .Lresident_interception_callback_active
 cmp edx, 0
 jne .Lresident_interception_callback_idle
+// Early observer recovery can retire every local control before queued #DB.
+mov r11, qword ptr [r12 + {b_processor_number}]
+cmp r11, 64
+jae .Lresident_interception_callback_active
+bt qword ptr [rax + r11 * 8 + {interception_exit_debug}], 0
+jc .Lresident_interception_callback_active
 cmp qword ptr [r12 + {b_interception_exit_ept}], 0
 jne .Lresident_interception_callback_active
 cmp qword ptr [r12 + {b_interception_exit_step}], 0

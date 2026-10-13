@@ -4088,6 +4088,21 @@ je .Lresident_dispatch_invvpid_software_prepare
 .Lresident_dispatch_reinject_exception:
 // Exit bit 12 describes IRET NMI unblocking and is reserved on VM entry.
 // Reconstruct all event metadata before combining interrupted IDT delivery.
+mov eax, r13d
+and eax, 0x7ff
+cmp eax, 0x30e
+jne .Lresident_dispatch_reinject_debug_check
+// Intercepted #PF leaves CR2 unchanged, including a nested delivery fault.
+mov r11, qword ptr [r12 + {b_last_qualification}]
+mov cr2, r11
+.Lresident_dispatch_reinject_debug_check:
+cmp eax, 0x301
+je .Lresident_dispatch_reinject_debug
+cmp eax, 0x501
+jne .Lresident_dispatch_reinject_metadata
+.Lresident_dispatch_reinject_debug:
+call .Lresident_prepare_debug_controls
+.Lresident_dispatch_reinject_metadata:
 mov r10d, r13d
 and r10d, 0x80000fff
 bt r10d, 11
