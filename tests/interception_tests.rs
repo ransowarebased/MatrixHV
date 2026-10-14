@@ -108,7 +108,11 @@ impl InterceptionMemory for Machine {
     fn check_budget(&self) -> Result<(), Error> {
         let checks = self.budget_checks.get();
         self.budget_checks.set(checks + 1);
-        if checks >= self.budget_limit { Err(Error::Busy) } else { Ok(()) }
+        if checks >= self.budget_limit {
+            Err(Error::Busy)
+        } else {
+            Ok(())
+        }
     }
     fn syscall_context(&self) -> [u64; 3] {
         [0xffff800000400000, ROOT, self.syscall_cr4]
@@ -211,7 +215,12 @@ impl InterceptionMemory for Machine {
     fn vmfunc_available(&self) -> bool {
         self.vmfunc_available
     }
-    fn write_original(&mut self, address: u64, bytes: &[u8], require_write: bool) -> Result<(), Error> {
+    fn write_original(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        require_write: bool,
+    ) -> Result<(), Error> {
         if require_write && self.leaf(self.base_ept(), address).0 & 2 == 0 {
             return Err(Error::Permission);
         }
@@ -243,16 +252,30 @@ fn execute(session: &mut Session, machine: &mut Machine, packet: &mut [u8]) -> R
 
 fn cpuid_request() -> Vec<u8> {
     let mut request = vec![0; HEADER_BYTES + CPUID_RECORD_BYTES];
-    for (offset, value) in [(0, MEMORY_MAGIC), (16, ROOT), (24, 0x7ffe0ff0),
-                          (144, 0xffff_ffff_f000_0040), (152, 0x40)] {
+    for (offset, value) in [
+        (0, MEMORY_MAGIC),
+        (16, ROOT),
+        (24, 0x7ffe0ff0),
+        (144, 0xffff_ffff_f000_0040),
+        (152, 0x40),
+    ] {
         request[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
     let length = request.len() as u32;
-    for (offset, value) in [(8, MEMORY_VERSION), (12, CPUID_SET), (32, 1), (36, length),
-                          (132, 100), (HEADER_BYTES, 1)] {
+    for (offset, value) in [
+        (8, MEMORY_VERSION),
+        (12, CPUID_SET),
+        (32, 1),
+        (36, length),
+        (132, 100),
+        (HEADER_BYTES, 1),
+    ] {
         request[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
-    for (index, value) in [656981_u32, 0x200800, 33221631, 3219913727].into_iter().enumerate() {
+    for (index, value) in [656981_u32, 0x200800, 33221631, 3219913727]
+        .into_iter()
+        .enumerate()
+    {
         let offset = HEADER_BYTES + 16 + index * 4;
         request[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
@@ -296,7 +319,8 @@ fn seeded_profile_packet_fuzzing_preserves_bounds_tokens_and_barrier_cleanup() {
                 0 => {}
                 1 => {
                     request.truncate(HEADER_BYTES);
-                    let operation = [CPUID_CLEAR, SYSCALL_CLEAR, INTERCEPT_RELEASE][next() as usize % 3];
+                    let operation =
+                        [CPUID_CLEAR, SYSCALL_CLEAR, INTERCEPT_RELEASE][next() as usize % 3];
                     request[12..16].copy_from_slice(&operation.to_le_bytes());
                     request[36..40].copy_from_slice(&(HEADER_BYTES as u32).to_le_bytes());
                 }
@@ -317,7 +341,11 @@ fn seeded_profile_packet_fuzzing_preserves_bounds_tokens_and_barrier_cleanup() {
                 assert_eq!(machine.events.last(), Some(&"resume"), "{context}");
             }
             let mut status = packet(&["hook", "status"]);
-            assert_eq!(execute(&mut session, &mut machine, &mut status), Ok(()), "{context}");
+            assert_eq!(
+                execute(&mut session, &mut machine, &mut status),
+                Ok(()),
+                "{context}"
+            );
             let configuration = unsafe { &*session.configuration.get() };
             let cpuid = unsafe { &*session.cpuid.get() };
             let syscall = unsafe { &*session.syscall.get() };
@@ -356,7 +384,12 @@ fn syscall_install_shares_the_owned_token_and_lease_with_cpuid_and_code_hooks() 
     assert_eq!(word(&request, 104), 1);
     assert_eq!(word(&request, 108), 1);
     assert_eq!(word(&request, 128) & INTERCEPT_SYSCALL, INTERCEPT_SYSCALL);
-    assert_eq!(session.lease_deadline.load(core::sync::atomic::Ordering::Acquire), 1100);
+    assert_eq!(
+        session
+            .lease_deadline
+            .load(core::sync::atomic::Ordering::Acquire),
+        1100
+    );
     let mut clear = request.clone();
     clear[12..16].copy_from_slice(&SYSCALL_CLEAR.to_le_bytes());
     execute(&mut session, &mut machine, &mut clear).unwrap();
@@ -380,9 +413,15 @@ fn syscall_install_rejects_unowned_tokens_and_generic_debug_cannot_replace_it() 
     execute(&mut session, &mut machine, &mut request).unwrap();
     let token = quad(&request, 80);
     let mut stale = syscall_request(&mut machine, token - 1);
-    assert_eq!(execute(&mut session, &mut machine, &mut stale), Err(Error::Session));
+    assert_eq!(
+        execute(&mut session, &mut machine, &mut stale),
+        Err(Error::Session)
+    );
     let mut generic = packet(&["debug-registers", "set", "0x3000", "0x400000", "0x400100"]);
-    assert_eq!(execute(&mut session, &mut machine, &mut generic), Err(Error::Busy));
+    assert_eq!(
+        execute(&mut session, &mut machine, &mut generic),
+        Err(Error::Busy)
+    );
     assert_eq!(session.syscall.get_mut().token, token);
     assert_eq!(session.syscall.get_mut().callback, 0x400000);
     let mut cpu = cpuid_request();
@@ -398,16 +437,44 @@ fn syscall_validation_refuses_unsupported_entry_cet_la57_and_nonexecutable_callb
         let mut session = session();
         let mut request = syscall_request(&mut machine, 0);
         let expected = match rejected {
-            0 => { machine.syscall_cr4 = 1 << 23; Error::Unsupported }
-            1 => { machine.syscall_cr4 = 1 << 12; Error::Unsupported }
-            2 => { machine.write(GPA, &[0x90]).unwrap(); Error::Unsupported }
-            3 => { machine.store_entry(0x6000, GPA | 3).unwrap(); Error::Permission }
-            4 => { machine.store_entry(0x6000, GPA | 7 | (1 << 63)).unwrap(); Error::Permission }
-            5 => { request[24..32].copy_from_slice(&0xffff800000400000_u64.to_le_bytes()); Error::Bounds }
-            6 => { request[48..56].copy_from_slice(&0xffff800000400001_u64.to_le_bytes()); Error::Bounds }
-            _ => { machine.store_entry(0x4000, 0x5003).unwrap(); Error::Permission }
+            0 => {
+                machine.syscall_cr4 = 1 << 23;
+                Error::Unsupported
+            }
+            1 => {
+                machine.syscall_cr4 = 1 << 12;
+                Error::Unsupported
+            }
+            2 => {
+                machine.write(GPA, &[0x90]).unwrap();
+                Error::Unsupported
+            }
+            3 => {
+                machine.store_entry(0x6000, GPA | 3).unwrap();
+                Error::Permission
+            }
+            4 => {
+                machine.store_entry(0x6000, GPA | 7 | (1 << 63)).unwrap();
+                Error::Permission
+            }
+            5 => {
+                request[24..32].copy_from_slice(&0xffff800000400000_u64.to_le_bytes());
+                Error::Bounds
+            }
+            6 => {
+                request[48..56].copy_from_slice(&0xffff800000400001_u64.to_le_bytes());
+                Error::Bounds
+            }
+            _ => {
+                machine.store_entry(0x4000, 0x5003).unwrap();
+                Error::Permission
+            }
         };
-        assert_eq!(execute(&mut session, &mut machine, &mut request), Err(expected), "case={rejected}");
+        assert_eq!(
+            execute(&mut session, &mut machine, &mut request),
+            Err(expected),
+            "case={rejected}"
+        );
         assert!(!session.is_active());
         assert_eq!(session.configuration.get_mut().debug_count, 0);
         assert_eq!(session.syscall.get_mut().entry, 0);
@@ -570,18 +637,35 @@ fn private_shared_data_rejects_partial_pages_other_addresses_and_vmfunc() {
     for (address, length, flags) in [
         ("0x400000", 4096, INTERCEPT_PRIVATE_SHARED_DATA),
         ("0x7ffe0000", 4095, INTERCEPT_PRIVATE_SHARED_DATA),
-        ("0x7ffe0000", 4096, INTERCEPT_PRIVATE_SHARED_DATA | INTERCEPT_VMFUNC),
-        ("0x7ffe0000", 4096, INTERCEPT_PRIVATE_SHARED_DATA | INTERCEPT_NO_LEASE),
+        (
+            "0x7ffe0000",
+            4096,
+            INTERCEPT_PRIVATE_SHARED_DATA | INTERCEPT_VMFUNC,
+        ),
+        (
+            "0x7ffe0000",
+            4096,
+            INTERCEPT_PRIVATE_SHARED_DATA | INTERCEPT_NO_LEASE,
+        ),
     ] {
         let mut machine = Machine::new();
-        machine.store_entry(0x4000 + ((0x7ffe0000_u64 >> 30) & 511) * 8, 0x5007).unwrap();
-        machine.store_entry(0x5000 + ((0x7ffe0000_u64 >> 21) & 511) * 8, 0x7007).unwrap();
-        machine.store_entry(0x7000 + ((0x7ffe0000_u64 >> 12) & 511) * 8, GPA | 5).unwrap();
+        machine
+            .store_entry(0x4000 + ((0x7ffe0000_u64 >> 30) & 511) * 8, 0x5007)
+            .unwrap();
+        machine
+            .store_entry(0x5000 + ((0x7ffe0000_u64 >> 21) & 511) * 8, 0x7007)
+            .unwrap();
+        machine
+            .store_entry(0x7000 + ((0x7ffe0000_u64 >> 12) & 511) * 8, GPA | 5)
+            .unwrap();
         let mut session = session();
         let native_leaf = machine.leaf(machine.base_ept(), GPA);
         let mut request = packet(&["hook", "install", "0x3000", address, &"33".repeat(length)]);
         request[128..132].copy_from_slice(&flags.to_le_bytes());
-        assert_eq!(execute(&mut session, &mut machine, &mut request), Err(Error::Format));
+        assert_eq!(
+            execute(&mut session, &mut machine, &mut request),
+            Err(Error::Format)
+        );
         assert!(!session.is_active());
         assert_eq!(machine.leaf(machine.base_ept(), GPA), native_leaf);
     }
@@ -597,11 +681,21 @@ fn cpuid_identity_is_scoped_gated_and_preserves_the_native_apic_id() {
     assert_eq!(word(&request, 112), INTERCEPT_ACTIVE);
     let configuration = unsafe { &*session.configuration.get() };
     let profile = unsafe { &*session.cpuid.get() };
-    let evaluate = |cr3, cpl, debug, selector| interception::cpuid_values(
-        configuration, profile, cr3, cpl, debug, selector, [7, 0xab12_3456, 9, 11],
+    let evaluate = |cr3, cpl, debug, selector| {
+        interception::cpuid_values(
+            configuration,
+            profile,
+            cr3,
+            cpl,
+            debug,
+            selector,
+            [7, 0xab12_3456, 9, 11],
+        )
+    };
+    assert_eq!(
+        evaluate(ROOT | 7, 3, [0x7ffe0ff0, 0x440], [1, 999]),
+        Some([656981, 0xab20_0800, 33221631, 3219913727])
     );
-    assert_eq!(evaluate(ROOT | 7, 3, [0x7ffe0ff0, 0x440], [1, 999]),
-               Some([656981, 0xab20_0800, 33221631, 3219913727]));
     for (cr3, cpl, debug, selector) in [
         (ROOT + 4096, 3, [0x7ffe0ff0, 0x440], [1, 0]),
         (ROOT, 0, [0x7ffe0ff0, 0x440], [1, 0]),
@@ -620,23 +714,37 @@ fn invalid_cpuid_records_cannot_replace_an_active_profile_or_hide_the_transport(
     let mut session = session();
     let mut install = cpuid_request();
     execute(&mut session, &mut machine, &mut install).unwrap();
-    for forbidden in [0_u32, 0x8000_0000, MEMORY_LEAF, crate::protocol::MATRIXHV_STATUS_LEAF] {
+    for forbidden in [
+        0_u32,
+        0x8000_0000,
+        MEMORY_LEAF,
+        crate::protocol::MATRIXHV_STATUS_LEAF,
+    ] {
         let mut invalid = cpuid_request();
         invalid[80..88].copy_from_slice(&1_u64.to_le_bytes());
         invalid[HEADER_BYTES..HEADER_BYTES + 4].copy_from_slice(&forbidden.to_le_bytes());
-        assert_eq!(execute(&mut session, &mut machine, &mut invalid), Err(Error::Format));
+        assert_eq!(
+            execute(&mut session, &mut machine, &mut invalid),
+            Err(Error::Format)
+        );
         assert_eq!(unsafe { &*session.cpuid.get() }.records[0].leaf, 1);
         assert_eq!(unsafe { &*session.configuration.get() }.token, 1);
     }
     let mut stale = cpuid_request();
-    assert_eq!(execute(&mut session, &mut machine, &mut stale), Err(Error::Session));
+    assert_eq!(
+        execute(&mut session, &mut machine, &mut stale),
+        Err(Error::Session)
+    );
     let mut overlap = cpuid_request();
     overlap.extend_from_within(HEADER_BYTES..);
     let length = overlap.len() as u32;
     overlap[32..36].copy_from_slice(&2_u32.to_le_bytes());
     overlap[36..40].copy_from_slice(&length.to_le_bytes());
     overlap[80..88].copy_from_slice(&1_u64.to_le_bytes());
-    assert_eq!(execute(&mut session, &mut machine, &mut overlap), Err(Error::Format));
+    assert_eq!(
+        execute(&mut session, &mut machine, &mut overlap),
+        Err(Error::Format)
+    );
     assert!(session.is_active());
 }
 
@@ -654,7 +762,11 @@ fn removing_hooks_preserves_cpuid_until_release_and_expired_profiles_cannot_reac
     assert!(session.is_active());
     let mut clear = vec![0; HEADER_BYTES];
     clear[..8].copy_from_slice(&MEMORY_MAGIC.to_le_bytes());
-    for (offset, value) in [(8, MEMORY_VERSION), (12, CPUID_CLEAR), (36, HEADER_BYTES as u32)] {
+    for (offset, value) in [
+        (8, MEMORY_VERSION),
+        (12, CPUID_CLEAR),
+        (36, HEADER_BYTES as u32),
+    ] {
         clear[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     clear[80..88].copy_from_slice(&2_u64.to_le_bytes());
@@ -669,7 +781,10 @@ fn removing_hooks_preserves_cpuid_until_release_and_expired_profiles_cannot_reac
     assert!(!session.is_active());
     assert_eq!(word(&status, 116), INTERCEPT_CAUSE_LEASE);
     let mut renew = packet(&["hook", "renew", "3"]);
-    assert_eq!(execute(&mut session, &mut machine, &mut renew), Err(Error::Session));
+    assert_eq!(
+        execute(&mut session, &mut machine, &mut renew),
+        Err(Error::Session)
+    );
 }
 
 #[test]
@@ -1402,11 +1517,19 @@ fn exhausted_installation_budget_restores_guards_and_releases_the_cpu_barrier() 
             machine.budget_limit = machine.budget_checks.get() + remaining;
             let mut request = if active {
                 packet(&["hook", "add", "1", "0x400010", "c3"])
-            } else { install };
-            assert_eq!(execute(&mut session, &mut machine, &mut request), Err(Error::Busy));
+            } else {
+                install
+            };
+            assert_eq!(
+                execute(&mut session, &mut machine, &mut request),
+                Err(Error::Busy)
+            );
             assert!(!session.is_active());
             assert_eq!(machine.leaf(machine.base_ept(), GPA).0 & 7, 7);
-            assert_eq!(&machine.events[machine.events.len() - 2..], ["flush", "resume"]);
+            assert_eq!(
+                &machine.events[machine.events.len() - 2..],
+                ["flush", "resume"]
+            );
             machine.budget_limit = usize::MAX;
             let mut retry = packet(&["hook", "install", "0x3000", "0x400008", "cc"]);
             execute(&mut session, &mut machine, &mut retry).unwrap();
@@ -1752,7 +1875,9 @@ fn default_and_persistent_profiles_isolate_read_execute_permissions_between_cpus
         assert_ne!(profile.cpu_data[0], profile.cpu_data[3]);
         assert_eq!(profile.cpu_data[1], 0);
         let private_leaf = profile.cpu_leaves[0][0];
-        machine.store_entry(private_leaf, original_leaf | 4).unwrap();
+        machine
+            .store_entry(private_leaf, original_leaf | 4)
+            .unwrap();
         assert_eq!(machine.leaf(profile.cpu_data[0], GPA).0 & 7, 5);
         assert_eq!(machine.leaf(profile.cpu_data[3], GPA).0, original_leaf);
         assert_eq!(machine.leaf(profile.data_ept, GPA).0, original_leaf);
@@ -2046,20 +2171,28 @@ fn dynamic_hook_rebuilds_preserve_original_bytes_adopted_by_three_way_merges() {
         let mut machine = Machine::new();
         let mut session = session();
         let mut install = packet(&[
-            "hook", "install", "0x3000", "0x400008", patch, "--concurrent-writes",
+            "hook",
+            "install",
+            "0x3000",
+            "0x400008",
+            patch,
+            "--concurrent-writes",
         ]);
         execute(&mut session, &mut machine, &mut install).unwrap();
         if patch == "cc" {
-            unsafe { interception::write_original(&mut *session, &mut machine, GPA + 8, &[0xcc]) }.unwrap();
+            unsafe { interception::write_original(&mut *session, &mut machine, GPA + 8, &[0xcc]) }
+                .unwrap();
         }
-        unsafe { interception::write_original(&mut *session, &mut machine, GPA + 8, &[0xc3]) }.unwrap();
+        unsafe { interception::write_original(&mut *session, &mut machine, GPA + 8, &[0xc3]) }
+            .unwrap();
         let mut add = packet(&["hook", "add", "1", "0x400100", "42"]);
         execute(&mut session, &mut machine, &mut add).unwrap();
         let profile = unsafe { &*session.configuration.get() };
         let shadow = machine.leaf(profile.ept, GPA).0 & MASK;
         assert_eq!(machine.pages[&shadow][8], 0xc3);
         assert_eq!(machine.pages[&shadow][0x100], 0x42);
-        unsafe { interception::write_original(&mut *session, &mut machine, GPA + 8, &[0x41]) }.unwrap();
+        unsafe { interception::write_original(&mut *session, &mut machine, GPA + 8, &[0x41]) }
+            .unwrap();
         let mut drop = packet(&["hook", "remove", "1", "2"]);
         execute(&mut session, &mut machine, &mut drop).unwrap();
         let profile = unsafe { &*session.configuration.get() };
@@ -2088,7 +2221,10 @@ fn original_writes_distinguish_post_commit_refresh_failures_from_barrier_rejecti
             Err(Error::WriteCommitted)
         );
         assert_eq!(machine.pages[&GPA][9], 0x42);
-        assert_eq!(session.cause.load(core::sync::atomic::Ordering::Acquire), u64::from(INTERCEPT_CAUSE_RENDEZVOUS));
+        assert_eq!(
+            session.cause.load(core::sync::atomic::Ordering::Acquire),
+            u64::from(INTERCEPT_CAUSE_RENDEZVOUS)
+        );
         assert!(!session.is_active());
         assert_eq!(machine.leaf(machine.base_ept(), GPA).0 & 7, 7);
         assert_eq!(machine.events.last(), Some(&"resume"));
@@ -2113,7 +2249,12 @@ fn physical_page_zero_receives_valid_private_data_leaves_on_every_enabled_cpu() 
     let mut session = session();
     session.initialize(0x1000_0000, 1 | (1 << 3));
     let mut install = packet(&[
-        "hook", "install", "0x3000", "0x400008", "cc", "--concurrent-writes",
+        "hook",
+        "install",
+        "0x3000",
+        "0x400008",
+        "cc",
+        "--concurrent-writes",
     ]);
     execute(&mut session, &mut machine, &mut install).unwrap();
     let profile = unsafe { &*session.configuration.get() };

@@ -638,9 +638,7 @@ pub(crate) mod resident {
         execution: &mut [u8; 15],
         original: &mut [u8; 15],
     ) -> usize {
-        let mut memory = Memory {
-            environment,
-        };
+        let mut memory = Memory { environment };
         let mut index = 0;
         while index < execution.len() {
             let Some(address) = rip.checked_add(index as u64) else {
@@ -658,7 +656,10 @@ pub(crate) mod resident {
             let count = (execution.len() - index).min(4096 - (address as usize & 4095));
             if !mapping.present
                 || memory
-                    .read(mapping.physical_address, &mut original[index..index + count])
+                    .read(
+                        mapping.physical_address,
+                        &mut original[index..index + count],
+                    )
                     .is_err()
             {
                 return index;
@@ -675,7 +676,8 @@ pub(crate) mod resident {
                         * 4096
                     + (mapping.physical_address & 4095);
                 for offset in 0..count {
-                    execution[index + offset] = unsafe { (shadow as *const u8).add(offset).read_volatile() };
+                    execution[index + offset] =
+                        unsafe { (shadow as *const u8).add(offset).read_volatile() };
                 }
             }
             index += count;
@@ -861,7 +863,11 @@ pub(crate) mod resident {
             }
         }
         fn syscall_context(&self) -> [u64; 3] {
-            [self.environment.syscall, self.environment.kernel_cr3, self.environment.guest_cr4]
+            [
+                self.environment.syscall,
+                self.environment.kernel_cr3,
+                self.environment.guest_cr4,
+            ]
         }
         fn timing_available(&self) -> bool {
             #[cfg(target_os = "uefi")]
@@ -872,7 +878,13 @@ pub(crate) mod resident {
                 let event = unsafe { &*(boot.event_context as *const ResidentEventContext) };
                 // Independent per-CPU offsets break Windows' common TSC clock
                 // even when Hyper-V reference time is not advertised.
-                if event.cpu_contexts.iter().filter(|address| **address != 0).count() > 1 {
+                if event
+                    .cpu_contexts
+                    .iter()
+                    .filter(|address| **address != 0)
+                    .count()
+                    > 1
+                {
                     return false;
                 }
                 for address in event.cpu_contexts.iter().filter(|address| **address != 0) {
@@ -1293,7 +1305,9 @@ pub(crate) mod resident {
                 } else {
                     0
                 } | if environment.interception_session != 0 {
-                    CPUID_PROFILE_CAPABILITY | PRIVATE_SHARED_DATA_CAPABILITY | SYSCALL_PROFILE_CAPABILITY
+                    CPUID_PROFILE_CAPABILITY
+                        | PRIVATE_SHARED_DATA_CAPABILITY
+                        | SYSCALL_PROFILE_CAPABILITY
                 } else {
                     0
                 },

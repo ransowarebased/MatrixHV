@@ -1,14 +1,12 @@
+use crate::protocol::memory::{
+    EPT_DIAGNOSTIC_CAPABILITY, EPT_DIAGNOSTIC_SUBLEAF, EPT_STALL_DIAGNOSTIC_SUBLEAF,
+    EPT_SYNC_DIAGNOSTIC_WORDS, INTERCEPT_DIAGNOSTIC_WORDS, INTERCEPT_RUNTIME_PHASES,
+};
 use crate::protocol::{
-    MATRIXHV_EXIT_TIMING_CAPABILITY, MATRIXHV_EXIT_TIMING_SUBLEAF,
-    MATRIXHV_STATUS_LEAF, MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX,
-    MATRIXHV_STATUS_SIGNATURE_ECX,
+    MATRIXHV_EXIT_TIMING_CAPABILITY, MATRIXHV_EXIT_TIMING_SUBLEAF, MATRIXHV_STATUS_LEAF,
+    MATRIXHV_STATUS_SIGNATURE_EAX, MATRIXHV_STATUS_SIGNATURE_EBX, MATRIXHV_STATUS_SIGNATURE_ECX,
     MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY, MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF,
     MATRIXHV_VMCALL_SNAPSHOT_WORDS,
-};
-use crate::protocol::memory::{
-    EPT_DIAGNOSTIC_CAPABILITY, EPT_DIAGNOSTIC_SUBLEAF, EPT_SYNC_DIAGNOSTIC_WORDS,
-    EPT_STALL_DIAGNOSTIC_SUBLEAF,
-    INTERCEPT_DIAGNOSTIC_WORDS, INTERCEPT_RUNTIME_PHASES,
 };
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -107,10 +105,15 @@ pub(crate) fn append_ept_diagnostics(
     writeln!(output, "{prefix}.interception.failure_phase={}\n{prefix}.interception.failure_phase_name={phase}\n{prefix}.interception.failure_rip=0x{:016x}\n{prefix}.interception.failure_gpa=0x{:016x}", details[0], details[1], details[2]).unwrap();
     let sync = &words[INTERCEPT_DIAGNOSTIC_WORDS..];
     for (name, value) in [
-        "attempts", "successes", "owner_contention", "transport_failures", "ack_timeouts", "icr_timeouts",
+        "attempts",
+        "successes",
+        "owner_contention",
+        "transport_failures",
+        "ack_timeouts",
+        "icr_timeouts",
     ]
-        .iter()
-        .zip(&sync[..6])
+    .iter()
+    .zip(&sync[..6])
     {
         writeln!(output, "{prefix}.ept_sync.{name}={value}").unwrap();
     }
@@ -124,7 +127,16 @@ pub(crate) fn append_ept_diagnostics(
         _ => "unknown",
     };
     writeln!(output, "{prefix}.ept_sync.failure_phase={}\n{prefix}.ept_sync.failure_phase_name={phase}\n{prefix}.ept_sync.pending_cpu_mask=0x{:016x}", sync[6], sync[7]).unwrap();
-    let names = ["phase", "owner", "epoch", "pending_cpu_mask", "rip", "gpa", "write_step", "tsc"];
+    let names = [
+        "phase",
+        "owner",
+        "epoch",
+        "pending_cpu_mask",
+        "rip",
+        "gpa",
+        "write_step",
+        "tsc",
+    ];
     for index in 0..4 {
         let (first, second) = read(EPT_STALL_DIAGNOSTIC_SUBLEAF + index as u32);
         for (name, value) in names[index * 2..index * 2 + 2].iter().zip([first, second]) {
@@ -627,7 +639,9 @@ fn diagnostic_cpu(subleaf: u32, cpu: u32) -> std::arch::x86_64::CpuidResult {
     any(target_os = "windows", target_os = "linux")
 ))]
 fn append_callback_identity(text: &mut String) {
-    use crate::protocol::{MATRIXHV_CALLBACK_IDENTITY_CAPABILITY, MATRIXHV_CALLBACK_IDENTITY_SUBLEAF};
+    use crate::protocol::{
+        MATRIXHV_CALLBACK_IDENTITY_CAPABILITY, MATRIXHV_CALLBACK_IDENTITY_SUBLEAF,
+    };
     if diagnostic(34).eax & MATRIXHV_CALLBACK_IDENTITY_CAPABILITY == 0 {
         text.push_str("callbacks.identity=unavailable\ncallbacks.validation=boot_required\n");
         return;
@@ -646,7 +660,10 @@ fn append_callback_identity(text: &mut String) {
     text.push('\n');
 }
 
-#[cfg(all(target_arch = "x86_64", any(target_os = "windows", target_os = "linux")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 pub fn intel_pt(operation: &str, output: Option<&std::path::Path>) -> Result<String, String> {
     use crate::protocol::{
         MATRIXHV_INTEL_PT_BUFFER_BYTES, MATRIXHV_INTEL_PT_CAPABILITY,
@@ -695,7 +712,8 @@ pub fn intel_pt(operation: &str, output: Option<&std::path::Path>) -> Result<Str
         for &(logical_cpu, cpu) in &cpus {
             affinity.pin(logical_cpu)?;
             verify_cpu(logical_cpu)?;
-            let circular = diagnostic(34).eax & crate::protocol::MATRIXHV_INTEL_PT_RING_CAPABILITY != 0;
+            let circular =
+                diagnostic(34).eax & crate::protocol::MATRIXHV_INTEL_PT_RING_CAPABILITY != 0;
             let subleaf = match operation {
                 "start" => MATRIXHV_INTEL_PT_SUBLEAF + 1,
                 "dump" if circular => MATRIXHV_INTEL_PT_SUBLEAF + 5,
@@ -747,7 +765,9 @@ pub fn intel_pt(operation: &str, output: Option<&std::path::Path>) -> Result<Str
                     || (circular && pair(diagnostic(MATRIXHV_INTEL_PT_SUBLEAF + 6)) != snapshot)
                     || pair(diagnostic(MATRIXHV_INTEL_PT_SUBLEAF + 4)).0 != generation
                 {
-                    return Err(format!("Intel PT capture changed during export on CPU {cpu}"));
+                    return Err(format!(
+                        "Intel PT capture changed during export on CPU {cpu}"
+                    ));
                 }
                 let (code_base, code_bytes) = pair(diagnostic(MATRIXHV_INTEL_PT_SUBLEAF + 3));
                 writeln!(text, "{prefix}.circular={}\n{prefix}.snapshot_sequence={}\n{prefix}.write_offset={}\n{prefix}.buffer_order={}\n{prefix}.coverage={}",
@@ -938,10 +958,38 @@ pub(crate) fn append_vmcall_snapshot(
     mut read: impl FnMut(u32) -> (u64, u64),
 ) {
     const NAMES: [&str; MATRIXHV_VMCALL_SNAPSHOT_WORDS] = [
-        "sequence", "tsc", "rip", "rsp", "cr3", "rflags", "cr0", "cr4", "efer",
-        "ss_ar_bytes", "instruction_length", "entry_event", "resume_rip", "resume_rax",
-        "vmread_failed", "interface_flags", "rax", "rcx", "rdx", "rbx", "rbp", "rsi",
-        "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "cpu",
+        "sequence",
+        "tsc",
+        "rip",
+        "rsp",
+        "cr3",
+        "rflags",
+        "cr0",
+        "cr4",
+        "efer",
+        "ss_ar_bytes",
+        "instruction_length",
+        "entry_event",
+        "resume_rip",
+        "resume_rax",
+        "vmread_failed",
+        "interface_flags",
+        "rax",
+        "rcx",
+        "rdx",
+        "rbx",
+        "rbp",
+        "rsi",
+        "rdi",
+        "r8",
+        "r9",
+        "r10",
+        "r11",
+        "r12",
+        "r13",
+        "r14",
+        "r15",
+        "cpu",
     ];
     let mut words = [0_u64; MATRIXHV_VMCALL_SNAPSHOT_WORDS];
     let mut coherent = false;
@@ -1580,7 +1628,9 @@ pub fn snapshot_text(mode: Mode) -> Result<String, String> {
         if mode == Mode::General
             && diagnostic_cpu(34, cpu).eax & MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY != 0
         {
-            append_vmcall_snapshot(&mut text, &prefix, |subleaf| pair(diagnostic_cpu(subleaf, cpu)));
+            append_vmcall_snapshot(&mut text, &prefix, |subleaf| {
+                pair(diagnostic_cpu(subleaf, cpu))
+            });
         }
         if protocol >= 5 && mode == Mode::General {
             append_nested_failure_trace(
@@ -1672,7 +1722,12 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
             )
             .unwrap();
         }
-        writeln!(text, "vmcall_snapshot={}", caps.eax & MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY != 0).unwrap();
+        writeln!(
+            text,
+            "vmcall_snapshot={}",
+            caps.eax & MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY != 0
+        )
+        .unwrap();
         if caps.eax & VMX_HARDWARE_CAPABILITY != 0 {
             let (host_secondary, nested_secondary) = pair(diagnostic(47));
             let (host_misc, nested_misc) = pair(diagnostic(48));

@@ -772,7 +772,9 @@ mod control_trace {
 
 #[test]
 fn ept_diagnostic_output_keeps_attempts_results_failure_context_and_pending_cpu_mask() {
-    use crate::protocol::memory::{EPT_DIAGNOSTIC_SUBLEAF, INTERCEPT_DIAGNOSTIC_WORDS, EPT_SYNC_DIAGNOSTIC_WORDS};
+    use crate::protocol::memory::{
+        EPT_DIAGNOSTIC_SUBLEAF, EPT_SYNC_DIAGNOSTIC_WORDS, INTERCEPT_DIAGNOSTIC_WORDS,
+    };
     let mut words = [0u64; INTERCEPT_DIAGNOSTIC_WORDS + EPT_SYNC_DIAGNOSTIC_WORDS + 8];
     words[3..6].copy_from_slice(&[7, 5, 2]);
     words[18..21].copy_from_slice(&[2, 2, 0]);
@@ -801,7 +803,10 @@ fn ept_diagnostic_output_keeps_attempts_results_failure_context_and_pending_cpu_
         "cpu.63.ept_sync.stall.epoch=0x0000000000000007",
         "cpu.63.ept_sync.stall.write_step=0x0000000000000002",
     ] {
-        assert!(output.lines().any(|actual| actual == line), "missing diagnostic: {line}");
+        assert!(
+            output.lines().any(|actual| actual == line),
+            "missing diagnostic: {line}"
+        );
     }
 }
 
@@ -882,7 +887,10 @@ mod elevation {
     fn elevated_update_quotes_spaces_embedded_quotes_and_trailing_backslashes() {
         let path = std::path::PathBuf::from("C:\\Matrix Updates\\quoted\" name\\");
         let expected = r#"--runtime-elevated 1234 5678 matrix update --binary "C:\Matrix Updates\quoted\" name\\""#;
-        assert_eq!(elevated_arguments(Command::Update(path), 1234, 5678), expected);
+        assert_eq!(
+            elevated_arguments(Command::Update(path), 1234, 5678),
+            expected
+        );
     }
 
     #[test]

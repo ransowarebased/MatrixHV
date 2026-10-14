@@ -1,9 +1,8 @@
 mod commands;
 mod matrix;
+#[path = "memory_cli.rs"]
 mod memory;
-mod symbols;
-#[path = "../../protocol.rs"]
-pub mod protocol;
+use neo::protocol;
 mod server;
 mod startup;
 mod telemetry;

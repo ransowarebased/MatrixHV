@@ -11,17 +11,17 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub(crate) fn default_kernel_image() -> Result<PathBuf, String> {
+pub fn default_kernel_image() -> Result<PathBuf, String> {
     let root = std::env::var_os("SystemRoot")
         .ok_or_else(|| "memory commands require Windows and a SystemRoot directory".to_string())?;
     Ok(PathBuf::from(root).join("System32/ntoskrnl.exe"))
 }
 
-pub(crate) fn default_cache() -> Result<PathBuf, String> {
+pub fn default_cache() -> Result<PathBuf, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     Ok(executable
         .parent()
-        .ok_or("neo executable has no directory")?
+        .ok_or("current executable has no directory")?
         .join("symbols"))
 }
 
@@ -33,31 +33,37 @@ fn bytes_at(bytes: &[u8], offset: usize, length: usize) -> Result<&[u8], String>
 
 fn short(bytes: &[u8], offset: usize) -> Result<u16, String> {
     Ok(u16::from_le_bytes(
-        bytes_at(bytes, offset, 2)?.try_into().unwrap(),
+        bytes_at(bytes, offset, 2)?
+            .try_into()
+            .map_err(|_| "invalid integer width")?,
     ))
 }
 
 fn word(bytes: &[u8], offset: usize) -> Result<u32, String> {
     Ok(u32::from_le_bytes(
-        bytes_at(bytes, offset, 4)?.try_into().unwrap(),
+        bytes_at(bytes, offset, 4)?
+            .try_into()
+            .map_err(|_| "invalid integer width")?,
     ))
 }
 
 fn quad(bytes: &[u8], offset: usize) -> Result<u64, String> {
     Ok(u64::from_le_bytes(
-        bytes_at(bytes, offset, 8)?.try_into().unwrap(),
+        bytes_at(bytes, offset, 8)?
+            .try_into()
+            .map_err(|_| "invalid integer width")?,
     ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Identity {
+pub struct Identity {
     pub guid: String,
     pub age: u32,
     pub name: String,
 }
 
 impl Identity {
-    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         if bytes_at(bytes, 0, 4)? != b"RSDS" {
             return Err("kernel has no RSDS debug identity".into());
         }
@@ -97,8 +103,7 @@ impl Identity {
         })
     }
 
-    #[cfg(any(target_os = "windows", test))]
-    pub(crate) fn key(&self) -> String {
+    pub fn key(&self) -> String {
         format!("{}{:X}", self.guid, self.age)
     }
 }
@@ -211,7 +216,6 @@ fn download(identity: &Identity, cache: &Path) -> Result<PathBuf, String> {
         identity.key(),
         identity.name
     );
-    eprintln!("Downloading matching kernel PDB: {url}");
     let response = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(180))
         .build()
@@ -452,7 +456,7 @@ fn layouts(
     Ok((process, kernel, name_bytes, soft, vad_layout))
 }
 
-pub(crate) struct Process {
+pub struct Process {
     object: u64,
     pub pid: u64,
     pub name: String,
@@ -460,7 +464,7 @@ pub(crate) struct Process {
     pub user_cr3: u64,
 }
 
-pub(crate) struct KernelSymbols {
+pub struct KernelSymbols {
     vad: VadLayout,
     image: ImageIdentity,
     initial_process: u32,
@@ -476,7 +480,7 @@ pub(crate) struct KernelSymbols {
 }
 
 impl KernelSymbols {
-    pub(crate) fn load(image_path: &Path, cache: &Path) -> Result<Self, String> {
+    pub fn load(image_path: &Path, cache: &Path) -> Result<Self, String> {
         let bytes = fs::read(image_path)
             .map_err(|error| format!("failed to read {}: {error}", image_path.display()))?;
         let image = ImageIdentity::parse(&bytes)?;
@@ -597,14 +601,14 @@ impl KernelSymbols {
                 )],
             )?;
             if Identity::parse(&record[0])? != self.image.identity {
-                return Err("loaded kernel GUID/age differs from the kernel file; use --kernel-image with the exact running image".into());
+                return Err("loaded kernel GUID/age differs from the kernel file; supply the exact running kernel image".into());
             }
             return Ok(base);
         }
-        Err("cannot locate and validate the loaded kernel from IA32_LSTAR; check --kernel-cr3 and --kernel-image (KPTI, pending updates, and syscall hooks can change this mapping)".into())
+        Err("cannot locate and validate the loaded kernel from IA32_LSTAR; check the kernel page-table root and image (KPTI, pending updates, and syscall hooks can change this mapping)".into())
     }
 
-    pub(crate) fn committed_protection(
+    pub fn committed_protection(
         &self,
         process: &Process,
         address: u64,
@@ -674,7 +678,7 @@ impl KernelSymbols {
         Err("VAD traversal exceeded its depth limit".into())
     }
 
-    pub(crate) fn resolve(
+    pub fn resolve(
         &self,
         selector: &str,
         target_cr3: u64,
@@ -691,11 +695,18 @@ impl KernelSymbols {
                     .map(|base| (*root, base))
             })
             .ok_or(
-                "no observed CR3 maps the matching running kernel; retry or supply --kernel-cr3",
+                "no observed CR3 maps the matching running kernel; retry or supply a kernel page-table root",
             )?;
         let initial = read_ranges(kernel_cr3, &[(base + u64::from(self.initial_process), 8)])?;
         let first = quad(&initial[0], 0)?;
-        let numeric = crate::memory::number(selector).ok();
+        let numeric = if let Some(hex) = selector
+            .strip_prefix("0x")
+            .or_else(|| selector.strip_prefix("0X"))
+        {
+            u64::from_str_radix(hex, 16).ok()
+        } else {
+            selector.parse::<u64>().ok()
+        };
         let mut visited = HashSet::new();
         let mut current = first;
         let mut matched = None;
@@ -747,7 +758,7 @@ impl KernelSymbols {
                     user_cr3: user_directory,
                 });
                 if numeric.is_some() {
-                    return Ok(matched.unwrap());
+                    return matched.ok_or_else(|| "matched process is unavailable".into());
                 }
             }
             let next_link = quad(row, self.links_offset)?;

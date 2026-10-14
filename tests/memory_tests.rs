@@ -1,8 +1,9 @@
 use crate::memory::access;
 
-use crate::memory::{Item, packet, parse_items};
+use crate::memory::parse_items;
 use crate::protocol::memory::*;
 use access::{PhysicalMemory, execute, transfer, translate};
+use neo::memory::{Item, packet};
 use std::collections::BTreeMap;
 
 #[derive(Default)]
@@ -64,23 +65,44 @@ fn resident_instruction_fetch_walks_real_tables_and_stops_at_an_unmapped_page() 
     environment.caller_cr3 = environment.kernel_cr3;
     machine.map(environment.caller_cr3, 0x1000, second, 7);
     for index in 0..15 {
-        let address = if index < 6 { first + 4090 + index } else { second + index - 6 };
-        unsafe { (address as *mut u8).write((index + 1) as u8); }
+        let address = if index < 6 {
+            first + 4090 + index
+        } else {
+            second + index - 6
+        };
+        unsafe {
+            (address as *mut u8).write((index + 1) as u8);
+        }
     }
-    let configuration = unsafe { std::mem::zeroed::<crate::memory::interception::RoadEptProfile>() };
+    let configuration =
+        unsafe { std::mem::zeroed::<crate::memory::interception::RoadEptProfile>() };
     let mut execution = [0; 15];
     let mut original = [0; 15];
-    assert_eq!(access::resident::instruction_bytes_in(
-        &environment, &configuration, 4090, &mut execution, &mut original,
-    ), 15);
+    assert_eq!(
+        access::resident::instruction_bytes_in(
+            &environment,
+            &configuration,
+            4090,
+            &mut execution,
+            &mut original,
+        ),
+        15
+    );
     assert_eq!(execution, std::array::from_fn(|index| (index + 1) as u8));
     assert_eq!(execution, original);
     machine.map(environment.caller_cr3, 0x1000, 0, 0);
     execution.fill(0);
     original.fill(0);
-    assert_eq!(access::resident::instruction_bytes_in(
-        &environment, &configuration, 4090, &mut execution, &mut original,
-    ), 6);
+    assert_eq!(
+        access::resident::instruction_bytes_in(
+            &environment,
+            &configuration,
+            4090,
+            &mut execution,
+            &mut original,
+        ),
+        6
+    );
     assert_eq!(&execution[..6], &[1, 2, 3, 4, 5, 6]);
     assert_eq!(&execution[6..], &[0; 9]);
 }
@@ -90,7 +112,8 @@ fn resident_instruction_fetch_keeps_original_and_shadow_bytes_distinct() {
     let request = vec![0_u8; 64];
     let (_machine, mut environment, shadow, original_page) = Machine::setup(&request);
     environment.caller_cr3 = environment.kernel_cr3;
-    let mut configuration = unsafe { std::mem::zeroed::<crate::memory::interception::RoadEptProfile>() };
+    let mut configuration =
+        unsafe { std::mem::zeroed::<crate::memory::interception::RoadEptProfile>() };
     configuration.hook_count = 1;
     configuration.pages[0] = original_page;
     configuration.pool_base = shadow - (INTERCEPT_TABLE_PAGES * 4096) as u64;
@@ -102,9 +125,16 @@ fn resident_instruction_fetch_keeps_original_and_shadow_bytes_distinct() {
     }
     let mut execution = [0; 15];
     let mut original = [0; 15];
-    assert_eq!(access::resident::instruction_bytes_in(
-        &environment, &configuration, 0, &mut execution, &mut original,
-    ), 15);
+    assert_eq!(
+        access::resident::instruction_bytes_in(
+            &environment,
+            &configuration,
+            0,
+            &mut execution,
+            &mut original,
+        ),
+        15
+    );
     assert_eq!(execution, [0xcc; 15]);
     assert_eq!(original, [0x90; 15]);
 }
@@ -181,14 +211,37 @@ fn committed_write_failures_report_written_bytes_and_stop_before_the_next_page()
         }
     }
     for error in [Error::MergeConflict, Error::WriteCommitted] {
-        let mut memory = CommittedRam { ram: Ram::mapped(), error };
-        let (done, result) = transfer(&mut memory, 0x1000, 4094, &mut [1, 2, 3, 4], false, 48, (true, false));
+        let mut memory = CommittedRam {
+            ram: Ram::mapped(),
+            error,
+        };
+        let (done, result) = transfer(
+            &mut memory,
+            0x1000,
+            4094,
+            &mut [1, 2, 3, 4],
+            false,
+            48,
+            (true, false),
+        );
         assert_eq!((done, result), (2, Err(error)));
         assert_eq!(&memory.ram.pages[&0x10000][4094..], &[1, 2]);
         assert_eq!(&memory.ram.pages[&0x12000][..2], &[0, 0]);
 
-        let mut memory = CommittedRam { ram: Ram::mapped(), error };
-        let mut request = packet(WRITE, 42, 0x1000, &[Item { address: 4094, bytes: vec![1, 2, 3, 4] }]).unwrap();
+        let mut memory = CommittedRam {
+            ram: Ram::mapped(),
+            error,
+        };
+        let mut request = packet(
+            WRITE,
+            42,
+            0x1000,
+            &[Item {
+                address: 4094,
+                bytes: vec![1, 2, 3, 4],
+            }],
+        )
+        .unwrap();
         execute(&mut memory, &mut request, false, 48).unwrap();
         assert_eq!(word(&request, HEADER_BYTES + 16), error as u32);
         assert_eq!(word(&request, HEADER_BYTES + 20), 2);
@@ -397,12 +450,12 @@ fn rsds_identity_uses_symbol_server_guid_and_hexadecimal_age() {
     bytes.extend_from_slice(&[2, 3, 4, 5, 6, 7, 8, 9]);
     bytes.extend_from_slice(&16u32.to_le_bytes());
     bytes.extend_from_slice(b"C:\\symbols\\ntkrnlmp.pdb\0");
-    let identity = crate::symbols::Identity::parse(&bytes).unwrap();
+    let identity = neo::symbols::Identity::parse(&bytes).unwrap();
     assert_eq!(identity.key(), "12345678ABCDEF01020304050607080910");
     assert_eq!(identity.name, "ntkrnlmp.pdb");
     bytes.truncate(24);
     bytes.extend_from_slice(b"..pdb\0");
-    assert!(crate::symbols::Identity::parse(&bytes).is_err());
+    assert!(neo::symbols::Identity::parse(&bytes).is_err());
 }
 
 #[test]
@@ -583,9 +636,8 @@ fn optional_installed_kernel_pdb_validation() {
     let Some(path) = std::env::var_os("NEO_TEST_KERNEL_IMAGE") else {
         return;
     };
-    let cache =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../builds/symbol-tests");
-    let symbols = crate::symbols::KernelSymbols::load(std::path::Path::new(&path), &cache).unwrap();
+    let cache = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../builds/symbol-tests");
+    let symbols = neo::symbols::KernelSymbols::load(std::path::Path::new(&path), &cache).unwrap();
     assert!(symbols.soft_layout.validate());
 }
 
@@ -606,7 +658,7 @@ fn resident_bitmap(
     count: usize,
     enabled: bool,
 ) -> Vec<u8> {
-    let request = crate::memory::bitmap_packet(start, count).unwrap();
+    let request = neo::memory::bitmap_packet(start, count).unwrap();
     assert!(request.len() <= 4096);
     unsafe {
         std::ptr::copy_nonoverlapping(request.as_ptr(), buffer as *mut u8, request.len());
@@ -675,7 +727,9 @@ fn resident_ad_bitmap_excludes_pages_below_execute_only_ancestors() {
         machine.map(machine.ept, address, address, 0x337);
         let pointer = ept_pointer(machine.ept, address, shift);
         let entry = unsafe { pointer.read() };
-        unsafe { pointer.write((entry & !7) | 4); }
+        unsafe {
+            pointer.write((entry & !7) | 4);
+        }
         let response = resident_bitmap(&mut machine, environment, buffer, address, 1, true);
         assert_eq!(word(&response, 40), 0);
         assert_eq!(word(&response, 72), AD_ENABLED);
@@ -687,9 +741,16 @@ fn resident_ad_bitmap_excludes_pages_below_execute_only_ancestors() {
 #[test]
 fn interception_options_preserve_the_same_packet_in_any_operand_order() {
     let expected = crate::memory::interception_packet(&[
-        "hook".into(), "install".into(), "0x3000".into(), "0x400008".into(), "cc".into(),
-        "--alternate-cr3".into(), "0x7000".into(), "--vmfunc".into(),
-    ]).unwrap();
+        "hook".into(),
+        "install".into(),
+        "0x3000".into(),
+        "0x400008".into(),
+        "cc".into(),
+        "--alternate-cr3".into(),
+        "0x7000".into(),
+        "--vmfunc".into(),
+    ])
+    .unwrap();
     for operands in [
         vec!["--vmfunc", "--alternate-cr3", "0x7000", "0x400008", "cc"],
         vec!["--alternate-cr3", "0x7000", "0x400008", "cc", "--vmfunc"],
@@ -697,12 +758,22 @@ fn interception_options_preserve_the_same_packet_in_any_operand_order() {
     ] {
         let mut arguments = vec!["hook".into(), "install".into(), "0x3000".into()];
         arguments.extend(operands.into_iter().map(str::to_owned));
-        assert_eq!(crate::memory::interception_packet(&arguments).unwrap(), expected);
+        assert_eq!(
+            crate::memory::interception_packet(&arguments).unwrap(),
+            expected
+        );
     }
-    assert!(crate::memory::interception_packet(&[
-        "hook".into(), "install".into(), "0x3000".into(), "0x400008".into(), "cc".into(),
-        "--alternate-cr3".into(),
-    ]).is_err());
+    assert!(
+        crate::memory::interception_packet(&[
+            "hook".into(),
+            "install".into(),
+            "0x3000".into(),
+            "0x400008".into(),
+            "cc".into(),
+            "--alternate-cr3".into(),
+        ])
+        .is_err()
+    );
 }
 
 #[test]
@@ -778,23 +849,23 @@ fn ad_bitmap_validates_ranges_sizes_and_padding_before_access() {
         (u64::MAX & !4095, 1),
         ((1 << 48) - 4096, 2),
     ] {
-        assert!(crate::memory::bitmap_packet(start, count).is_err());
+        assert!(neo::memory::bitmap_packet(start, count).is_err());
     }
     let mut ram = Ram::default();
-    let mut request = crate::memory::bitmap_packet(0, 9).unwrap();
+    let mut request = neo::memory::bitmap_packet(0, 9).unwrap();
     let malformed_length = (request.len() - 1) as u32;
     request[36..40].copy_from_slice(&malformed_length.to_le_bytes());
     assert_eq!(
         execute(&mut ram, &mut request, false, 48),
         Err(Error::Format)
     );
-    let mut request = crate::memory::bitmap_packet(0, 9).unwrap();
+    let mut request = neo::memory::bitmap_packet(0, 9).unwrap();
     request[32..36].copy_from_slice(&17u32.to_le_bytes());
     assert_eq!(
         execute(&mut ram, &mut request, false, 48),
         Err(Error::Bounds)
     );
-    let mut request = crate::memory::bitmap_packet(1 << 36, 1).unwrap();
+    let mut request = neo::memory::bitmap_packet(1 << 36, 1).unwrap();
     assert_eq!(
         execute(&mut ram, &mut request, false, 36),
         Err(Error::Bounds)
@@ -909,7 +980,9 @@ fn ept_pointer(root: u64, address: u64, level: u32) -> *mut u64 {
     let mut table = root;
     for shift in [39, 30, 21, 12] {
         let pointer = (table + ((address >> shift) & 511) * 8) as *mut u64;
-        if shift == level { return pointer; }
+        if shift == level {
+            return pointer;
+        }
         let entry = unsafe { pointer.read() };
         assert_eq!(entry & 128, 0);
         table = entry & 0x000f_ffff_ffff_f000;
@@ -917,17 +990,28 @@ fn ept_pointer(root: u64, address: u64, level: u32) -> *mut u64 {
     panic!("invalid EPT level");
 }
 
-fn native_tracking_request(environment: &access::resident::Environment, buffers: &[u64], request: &[u8]) -> Vec<u8> {
+fn native_tracking_request(
+    environment: &access::resident::Environment,
+    buffers: &[u64],
+    request: &[u8],
+) -> Vec<u8> {
     for (index, bytes) in request.chunks(4096).enumerate() {
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffers[index] as *mut u8, bytes.len()); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffers[index] as *mut u8, bytes.len());
+        }
     }
     let mut scratch = vec![0; BUFFER_BYTES];
-    assert_eq!(unsafe {
-        access::resident::memory_entry(scratch.as_mut_ptr(), 0x1000, request.len(), environment)
-    }, 0);
+    assert_eq!(
+        unsafe {
+            access::resident::memory_entry(scratch.as_mut_ptr(), 0x1000, request.len(), environment)
+        },
+        0
+    );
     let mut response = Vec::with_capacity(request.len());
     for (index, bytes) in request.chunks(4096).enumerate() {
-        response.extend_from_slice(unsafe { std::slice::from_raw_parts(buffers[index] as *const u8, bytes.len()) });
+        response.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(buffers[index] as *const u8, bytes.len())
+        });
     }
     response
 }
@@ -951,19 +1035,27 @@ fn resident_tracking_splits_large_ept_leaves_and_captures_exact_dirty_pages() {
         let attributes = 0x337 | (6 << 52) | (1 << 63);
         let large = ept_pointer(machine.ept, target, shift);
         let page_size = 1u64 << shift;
-        unsafe { large.write((target & !(page_size - 1)) | attributes | 128); }
+        unsafe {
+            large.write((target & !(page_size - 1)) | attributes | 128);
+        }
         let layout = std::alloc::Layout::new::<crate::memory::tracking::Session>();
-        let pointer = unsafe { std::alloc::alloc_zeroed(layout) as *mut crate::memory::tracking::Session };
+        let pointer =
+            unsafe { std::alloc::alloc_zeroed(layout) as *mut crate::memory::tracking::Session };
         assert!(!pointer.is_null());
         let mut session = unsafe { Box::from_raw(pointer) };
         session.initialize(pool_address, 2);
-        let mut barrier = TrackingBarrier { operations: Vec::new(), root: machine.ept, target };
+        let mut barrier = TrackingBarrier {
+            operations: Vec::new(),
+            root: machine.ept,
+            target,
+        };
         environment.ept |= 1 << 6;
         environment.tracking_session = pointer as u64;
         environment.boot_context = &mut barrier as *mut TrackingBarrier as u64;
         environment.synchronize = tracking_barrier as *const () as u64;
-        let mut start = crate::memory::tracking_packet(AD_START, 0, 1).unwrap();
-        start[HEADER_BYTES..HEADER_BYTES + 8].copy_from_slice(&environment.kernel_cr3.to_le_bytes());
+        let mut start = neo::memory::tracking_packet(AD_START, 0, 1).unwrap();
+        start[HEADER_BYTES..HEADER_BYTES + 8]
+            .copy_from_slice(&environment.kernel_cr3.to_le_bytes());
         let started = native_tracking_request(&environment, &[buffer], &start);
         assert_eq!(word(&started, 40), 0);
         assert_eq!(barrier.operations, [0, 1, 2]);
@@ -977,16 +1069,19 @@ fn resident_tracking_splits_large_ept_leaves_and_captures_exact_dirty_pages() {
             *leaf |= 0x300;
         }
         let id = quad(&started, 80);
-        let stop = crate::memory::tracking_packet(AD_STOP, id, 0).unwrap();
+        let stop = neo::memory::tracking_packet(AD_STOP, id, 0).unwrap();
         let stopped = native_tracking_request(&environment, &[buffer], &stop);
         assert_eq!(word(&stopped, 40), 0);
         assert_eq!(barrier.operations, [0, 1, 2, 0, 2]);
-        let fetch = crate::memory::tracking_packet(AD_FETCH, id, 1).unwrap();
+        let fetch = neo::memory::tracking_packet(AD_FETCH, id, 1).unwrap();
         let fetched = native_tracking_request(&environment, &[buffer, second_buffer], &fetch);
         assert_eq!(word(&fetched, 40), 0);
         let record = &fetched[HEADER_BYTES..];
         assert_eq!(quad(record, 16), target);
-        assert_eq!(word(record, 48), TRACK_ACCESSED | TRACK_DIRTY | TRACK_DUMP_VALID | TRACK_HASH_CHANGED);
+        assert_eq!(
+            word(record, 48),
+            TRACK_ACCESSED | TRACK_DIRTY | TRACK_DUMP_VALID | TRACK_HASH_CHANGED
+        );
         assert_eq!(record[120], 101);
         assert_eq!(record[TRACK_RECORD_BYTES - 1], 87);
         crate::memory::verify_dump(record).unwrap();
@@ -1012,32 +1107,70 @@ fn resident_interception_transport_builds_a_private_root_in_validated_host_stora
     machine.host_map_all();
     let session_layout = std::alloc::Layout::new::<crate::memory::interception::Session>();
     let mut session = unsafe {
-        Box::from_raw(std::alloc::alloc_zeroed(session_layout).cast::<crate::memory::interception::Session>())
+        Box::from_raw(
+            std::alloc::alloc_zeroed(session_layout).cast::<crate::memory::interception::Session>(),
+        )
     };
     session.initialize(pool as u64, 1);
-    let mut barrier = TrackingBarrier { operations: Vec::new(), root: machine.ept, target };
+    let mut barrier = TrackingBarrier {
+        operations: Vec::new(),
+        root: machine.ept,
+        target,
+    };
     environment.interception_session = &*session as *const _ as u64;
     environment.boot_context = &mut barrier as *mut _ as u64;
     environment.synchronize = tracking_barrier as *const () as u64;
     let install = crate::memory::interception_packet(&[
-        "hook".into(), "install".into(), format!("{:#x}", environment.kernel_cr3), "8".into(), "cc".into(),
-    ]).unwrap();
+        "hook".into(),
+        "install".into(),
+        format!("{:#x}", environment.kernel_cr3),
+        "8".into(),
+        "cc".into(),
+    ])
+    .unwrap();
     let installed = native_tracking_request(&environment, &[buffer], &install);
     assert_eq!(word(&installed, 40), 0);
     assert!(barrier.operations.contains(&3));
-    assert_eq!(barrier.operations.iter().copied().filter(|operation| *operation != 3).collect::<Vec<_>>(), [0, 1, 2]);
+    assert_eq!(
+        barrier
+            .operations
+            .iter()
+            .copied()
+            .filter(|operation| *operation != 3)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
     let configuration = unsafe { &*session.configuration.get() };
-    let shadow = unsafe { ept_pointer(configuration.ept, target, 12).read() } & 0x000f_ffff_ffff_f000;
+    let shadow =
+        unsafe { ept_pointer(configuration.ept, target, 12).read() } & 0x000f_ffff_ffff_f000;
     assert_eq!(unsafe { (shadow as *const u8).add(8).read() }, 0xcc);
     assert_eq!(unsafe { (target as *const u8).add(8).read() }, 0);
-    let edit = packet(WRITE, 0, environment.kernel_cr3, &[Item { address: 9, bytes: vec![0x42] }]).unwrap();
+    let edit = packet(
+        WRITE,
+        0,
+        environment.kernel_cr3,
+        &[Item {
+            address: 9,
+            bytes: vec![0x42],
+        }],
+    )
+    .unwrap();
     let edited = native_tracking_request(&environment, &[buffer], &edit);
     assert_eq!(word(&edited, HEADER_BYTES + 16), 0);
     assert_eq!(unsafe { (target as *const u8).add(8).read() }, 0);
     assert_eq!(unsafe { (shadow as *const u8).add(8).read() }, 0xcc);
     assert_eq!(unsafe { (shadow as *const u8).add(9).read() }, 0x42);
     barrier.operations.clear();
-    let plain = packet(WRITE, 0, environment.kernel_cr3, &[Item { address: 0x1000, bytes: vec![0x55] }]).unwrap();
+    let plain = packet(
+        WRITE,
+        0,
+        environment.kernel_cr3,
+        &[Item {
+            address: 0x1000,
+            bytes: vec![0x55],
+        }],
+    )
+    .unwrap();
     let written = native_tracking_request(&environment, &[buffer], &plain);
     assert_eq!(word(&written, HEADER_BYTES + 16), 0);
     assert_eq!(unsafe { (unrelated as *const u8).read() }, 0x55);
@@ -1048,18 +1181,33 @@ fn resident_interception_transport_builds_a_private_root_in_validated_host_stora
     assert_eq!(word(&response, 44), 1);
     assert_eq!(quad(&response, 48), environment.caller_cr3);
     assert_eq!(word(&response, 112), INTERCEPT_ACTIVE);
-    let conflict = packet(WRITE, 0, environment.kernel_cr3, &[Item { address: 8, bytes: vec![0xc3] }]).unwrap();
+    let conflict = packet(
+        WRITE,
+        0,
+        environment.kernel_cr3,
+        &[Item {
+            address: 8,
+            bytes: vec![0xc3],
+        }],
+    )
+    .unwrap();
     let committed = native_tracking_request(&environment, &[buffer], &conflict);
-    assert_eq!(word(&committed, HEADER_BYTES + 16), Error::MergeConflict as u32);
+    assert_eq!(
+        word(&committed, HEADER_BYTES + 16),
+        Error::MergeConflict as u32
+    );
     assert_eq!(word(&committed, HEADER_BYTES + 20), 1);
     assert_eq!(unsafe { (target as *const u8).add(8).read() }, 0xc3);
     assert!(!session.is_active());
     let token = quad(&response, 80).to_string();
-    let remove = crate::memory::interception_packet(&["hook".into(), "remove".into(), token]).unwrap();
+    let remove =
+        crate::memory::interception_packet(&["hook".into(), "remove".into(), token]).unwrap();
     let removed = native_tracking_request(&environment, &[buffer], &remove);
     assert_eq!(word(&removed, 112), INTERCEPT_DISABLED);
     drop(session);
-    unsafe { std::alloc::dealloc(pool, pool_layout); }
+    unsafe {
+        std::alloc::dealloc(pool, pool_layout);
+    }
 }
 
 #[test]
@@ -1156,20 +1304,46 @@ fn resident_transport_denies_ept_decoys_mmio_and_read_only_target_pages() {
 #[test]
 fn idle_interception_session_keeps_plain_write_permissions_and_skips_the_barrier() {
     for writable in [false, true] {
-        let mut request = packet(WRITE, 0, 0x1000, &[Item { address: 0, bytes: vec![9] }]).unwrap();
+        let mut request = packet(
+            WRITE,
+            0,
+            0x1000,
+            &[Item {
+                address: 0,
+                bytes: vec![9],
+            }],
+        )
+        .unwrap();
         let (mut machine, mut environment, buffer, target) = Machine::setup(&request);
         request[16..24].copy_from_slice(&environment.kernel_cr3.to_le_bytes());
-        machine.map(machine.ept, target, target, if writable { 0x37 } else { 0x35 });
+        machine.map(
+            machine.ept,
+            target,
+            target,
+            if writable { 0x37 } else { 0x35 },
+        );
         let layout = std::alloc::Layout::new::<crate::memory::interception::Session>();
         let mut session = unsafe {
-            Box::from_raw(std::alloc::alloc_zeroed(layout).cast::<crate::memory::interception::Session>())
+            Box::from_raw(
+                std::alloc::alloc_zeroed(layout).cast::<crate::memory::interception::Session>(),
+            )
         };
         session.initialize(0x1000_0000, 1);
         environment.interception_session = &*session as *const _ as u64;
         let response = native_tracking_request(&environment, &[buffer], &request);
-        assert_eq!(word(&response, HEADER_BYTES + 16), if writable { 0 } else { Error::Permission as u32 });
+        assert_eq!(
+            word(&response, HEADER_BYTES + 16),
+            if writable {
+                0
+            } else {
+                Error::Permission as u32
+            }
+        );
         assert_eq!(word(&response, HEADER_BYTES + 20), u32::from(writable));
-        assert_eq!(unsafe { (target as *const u8).read() }, if writable { 9 } else { 101 });
+        assert_eq!(
+            unsafe { (target as *const u8).read() },
+            if writable { 9 } else { 101 }
+        );
     }
 }
 
@@ -1184,36 +1358,69 @@ fn resident_plain_write_cannot_race_an_interception_publication() {
             return 1;
         }
         let barrier = unsafe { &*(context as *const BlockedBarrier) };
-        u64::from(barrier.entered.send(()).is_ok()
-            && barrier.release.recv_timeout(std::time::Duration::from_secs(5)).is_ok())
+        u64::from(
+            barrier.entered.send(()).is_ok()
+                && barrier
+                    .release
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_ok(),
+        )
     }
-    let release = crate::memory::interception_packet(&["hook".into(), "release".into(), "0".into()]).unwrap();
+    let release =
+        crate::memory::interception_packet(&["hook".into(), "release".into(), "0".into()]).unwrap();
     let (mut machine, mut environment, _, target) = Machine::setup(&release);
     let second_buffer = machine.allocate();
     machine.map(environment.caller_cr3, 0x2000, second_buffer, 7);
     machine.map(machine.ept, second_buffer, second_buffer, 0x37);
     machine.host_map_all();
-    let write = packet(WRITE, 0, environment.kernel_cr3, &[Item { address: 0, bytes: vec![9] }]).unwrap();
-    unsafe { std::ptr::copy_nonoverlapping(write.as_ptr(), second_buffer as *mut u8, write.len()); }
+    let write = packet(
+        WRITE,
+        0,
+        environment.kernel_cr3,
+        &[Item {
+            address: 0,
+            bytes: vec![9],
+        }],
+    )
+    .unwrap();
+    unsafe {
+        std::ptr::copy_nonoverlapping(write.as_ptr(), second_buffer as *mut u8, write.len());
+    }
     let layout = std::alloc::Layout::new::<crate::memory::interception::Session>();
     let mut session = unsafe {
-        Box::from_raw(std::alloc::alloc_zeroed(layout).cast::<crate::memory::interception::Session>())
+        Box::from_raw(
+            std::alloc::alloc_zeroed(layout).cast::<crate::memory::interception::Session>(),
+        )
     };
     session.initialize(0x1000_0000, 1);
     let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(0);
     let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
-    let barrier = Box::new(BlockedBarrier { entered: entered_sender, release: release_receiver });
+    let barrier = Box::new(BlockedBarrier {
+        entered: entered_sender,
+        release: release_receiver,
+    });
     environment.interception_session = &*session as *const _ as u64;
     environment.boot_context = &*barrier as *const _ as u64;
     environment.synchronize = blocked_barrier as *const () as u64;
     std::thread::scope(|scope| {
         let owner = scope.spawn(move || {
             let mut scratch = vec![0; BUFFER_BYTES];
-            unsafe { access::resident::memory_entry(scratch.as_mut_ptr(), 0x1000, release.len(), &environment) }
+            unsafe {
+                access::resident::memory_entry(
+                    scratch.as_mut_ptr(),
+                    0x1000,
+                    release.len(),
+                    &environment,
+                )
+            }
         });
-        entered_receiver.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        entered_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         let mut scratch = vec![0; BUFFER_BYTES];
-        let status = unsafe { access::resident::memory_entry(scratch.as_mut_ptr(), 0x2000, write.len(), &environment) };
+        let status = unsafe {
+            access::resident::memory_entry(scratch.as_mut_ptr(), 0x2000, write.len(), &environment)
+        };
         release_sender.send(()).unwrap();
         assert_eq!(owner.join().unwrap(), 0);
         assert_eq!(status, Error::Busy as u64);

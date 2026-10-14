@@ -4,21 +4,38 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "neo"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:colored", "dep:ed25519-dalek", "dep:sha2", "dep:shlex"]
+
 [[test]]
 name = "cli"
 path = "../../tests/neo_cli_tests.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "library"
+path = "../../tests/neo_library_tests.rs"
 
 [dependencies]
 pdb = "0.8.0"
-colored = "2.1"
-ed25519-dalek = { version = "2.2.0", default-features = false }
-sha2 = { version = "0.10.9", default-features = false }
+colored = { version = "2.1", optional = true }
+ed25519-dalek = { version = "2.2.0", default-features = false, optional = true }
+sha2 = { version = "0.10.9", default-features = false, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 ureq = "2.12.1"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-shlex = "1.3"
+shlex = { version = "1.3", optional = true }
 
 [profile.release]
 opt-level = 3

@@ -36,49 +36,47 @@ pub(crate) mod windows {
     const VARIABLE_GUID: &str = "{a830e824-19a4-42c4-9178-81ee63c135cc}";
     const CONTROL_MUTEX_NAME: &str = "Global\\MatrixHVRuntimeControl";
 
-    impl ControlProbeSnapshot {
-        fn checksum(self) -> u64 {
-            [
-                self.sequence,
-                self.guest_rip,
-                self.guest_rsp,
-                self.guest_rflags,
-                self.guest_cr0,
-                self.guest_cr3,
-                self.guest_cr4,
-                self.guest_efer,
-                self.guest_pat,
-                self.guest_gdtr_base,
-                self.guest_gdtr_limit,
-                self.guest_idtr_base,
-                self.guest_idtr_limit,
-                self.guest_cs_selector,
-                self.guest_ss_selector,
-                self.guest_tr_selector,
-                self.guest_tr_access,
-                self.guest_fs_base,
-                self.guest_gs_base,
-                self.guest_interruptibility,
-                self.idt_vectoring,
-                self.vm_entry_intr_info,
-                self.runtime_get_variable,
-                self.runtime_set_variable,
-                self.runtime_context,
-                self.guest_es_selector,
-                self.guest_ds_selector,
-                self.guest_fs_selector,
-                self.guest_gs_selector,
-                self.guest_ldtr_selector,
-                self.guest_dr7,
-                self.guest_cr4_read_shadow,
-                self.guest_tr_base,
-                self.guest_tr_limit,
-            ]
-            .into_iter()
-            .fold(0xcbf2_9ce4_8422_2325_u64, |value, word| {
-                value.wrapping_mul(0x100_0000_01b3) ^ word
-            })
-        }
+    fn probe_checksum(snapshot: ControlProbeSnapshot) -> u64 {
+        [
+            snapshot.sequence,
+            snapshot.guest_rip,
+            snapshot.guest_rsp,
+            snapshot.guest_rflags,
+            snapshot.guest_cr0,
+            snapshot.guest_cr3,
+            snapshot.guest_cr4,
+            snapshot.guest_efer,
+            snapshot.guest_pat,
+            snapshot.guest_gdtr_base,
+            snapshot.guest_gdtr_limit,
+            snapshot.guest_idtr_base,
+            snapshot.guest_idtr_limit,
+            snapshot.guest_cs_selector,
+            snapshot.guest_ss_selector,
+            snapshot.guest_tr_selector,
+            snapshot.guest_tr_access,
+            snapshot.guest_fs_base,
+            snapshot.guest_gs_base,
+            snapshot.guest_interruptibility,
+            snapshot.idt_vectoring,
+            snapshot.vm_entry_intr_info,
+            snapshot.runtime_get_variable,
+            snapshot.runtime_set_variable,
+            snapshot.runtime_context,
+            snapshot.guest_es_selector,
+            snapshot.guest_ds_selector,
+            snapshot.guest_fs_selector,
+            snapshot.guest_gs_selector,
+            snapshot.guest_ldtr_selector,
+            snapshot.guest_dr7,
+            snapshot.guest_cr4_read_shadow,
+            snapshot.guest_tr_base,
+            snapshot.guest_tr_limit,
+        ]
+        .into_iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |value, word| {
+            value.wrapping_mul(0x100_0000_01b3) ^ word
+        })
     }
 
     #[repr(C)]
@@ -698,7 +696,7 @@ pub(crate) mod windows {
                             snapshot.guest_ldtr_selector,
                             snapshot.guest_cr4_read_shadow,
                             snapshot.guest_tr_limit,
-                            snapshot.checksum(),
+                            probe_checksum(snapshot),
                         ));
                     }
                 }

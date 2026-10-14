@@ -1,7 +1,8 @@
 use crate::memory::access::{PhysicalMemory, execute, page_mapping};
-use crate::memory::{dump_tracking, tracking_packet, verify_dump};
-use crate::protocol::memory::*;
 use crate::memory::tracking::{Session, TablePool, TrackingMemory};
+use crate::memory::{dump_tracking, verify_dump};
+use crate::protocol::memory::*;
+use neo::memory::tracking_packet;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -384,7 +385,7 @@ fn output_directory(name: &str) -> std::path::PathBuf {
         .unwrap()
         .as_nanos();
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../builds/tracking-export-tests")
+        .join("../../builds/tracking-export-tests")
         .join(format!(
             "{name}-{}-{timestamp}-{sequence}",
             std::process::id()

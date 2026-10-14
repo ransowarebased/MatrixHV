@@ -208,7 +208,9 @@ pub mod memory {
     pub const INTERCEPT_CPU_TABLE_PAGES: usize = 1 + 3 * HOOK_MAX_PAGES;
     pub const INTERCEPT_CPU_VIEW_PAGES: usize = INTERCEPT_CPU_TABLE_PAGES + 1;
     pub const fn intercept_bank_pages(cpu_mask: u64) -> usize {
-        INTERCEPT_TABLE_PAGES + 2 * HOOK_MAX_PAGES + 1
+        INTERCEPT_TABLE_PAGES
+            + 2 * HOOK_MAX_PAGES
+            + 1
             + cpu_mask.count_ones() as usize * INTERCEPT_CPU_VIEW_PAGES
     }
 
