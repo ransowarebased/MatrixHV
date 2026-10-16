@@ -190,6 +190,29 @@ pub mod memory {
     // SYSRET64 state. Install carries callback at 24, LSTAR at 48 and token at 80.
     pub const SYSCALL_SET: u32 = 26;
     pub const SYSCALL_CLEAR: u32 = 27;
+    // Watch descriptors: address:u64, access:u32 (1=write, 3=read/write),
+    // length:u32 (1/2/4/8). Fetch selects CPU at 24 and exclusive sequence at 64.
+    pub const WATCH_SET: u32 = 28;
+    pub const WATCH_CLEAR: u32 = 29;
+    pub const WATCH_FETCH: u32 = 30;
+    // SET arms exit sampling; SNAPSHOT returns cached contexts for CPU at 24.
+    // STACK_WALK selects a cached sequence at 64 and returns bounded RBP frames.
+    // Exported contexts remain available until the next SNAPSHOT on that CPU.
+    pub const CONTEXT_SET: u32 = 31;
+    pub const CONTEXT_CLEAR: u32 = 32;
+    pub const CONTEXT_SNAPSHOT: u32 = 33;
+    pub const STACK_WALK: u32 = 34;
+    pub const WATCH_RECORD_BYTES: usize = 240;
+    pub const CONTEXT_RECORD_BYTES: usize = 208;
+    pub const WATCH_RING_RECORDS: usize = 64;
+    pub const CONTEXT_CPU_RECORDS: usize = 8;
+    pub const STACK_MAX_FRAMES: usize = 64;
+    pub const WATCH_POST_INSTRUCTION: u64 = 1;
+    pub const OBSERVATION_CAPABILITY: u32 = 1 << 4;
+    // Input descriptor +20 contains flags; installation replaces +16..24 with ID.
+    // Listing returns flags at +20. Data shadows map private read/execute bytes;
+    // guest writes retain native page-table permissions and never modify RAM.
+    pub const HOOK_DATA_SHADOW: u32 = 1;
     pub const SYSCALL_PROFILE_CAPABILITY: u32 = 1 << 3;
     pub const INTERCEPT_SYSCALL: u32 = 64;
     pub const CPUID_PROFILE_CAPABILITY: u32 = 1 << 1;

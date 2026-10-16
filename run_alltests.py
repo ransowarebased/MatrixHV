@@ -47,6 +47,7 @@ def run_component(project, component, release=False):
         execute([sys.executable, str(project / "tests/run_vmcall_snapshot_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_host_state_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_debugctl_tests.py")], project)
+        execute([sys.executable, str(project / "tests/run_cet_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_exit_event_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_watchdog_recovery_tests.py")], project)
         proof_binary = project / "builds/tests/resident/proof_exit_regressions.exe"

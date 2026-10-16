@@ -4,8 +4,8 @@ use uefi::Status;
 
 use super::vmxon::{self, VmxInstructionResult, VmxonError, VmxonReport};
 
-use crate::memory::host::{AddressConstraint, ResidentPages};
 use crate::logging;
+use crate::memory::host::{AddressConstraint, ResidentPages};
 
 pub const VIRTUAL_PROCESSOR_ID: u64 = 0x0000;
 pub const GUEST_ES_SELECTOR: u64 = 0x0800;
@@ -28,6 +28,12 @@ pub const VMCS_LINK_POINTER: u64 = 0x2800;
 pub const GUEST_IA32_DEBUGCTL: u64 = 0x2802;
 pub const GUEST_IA32_PAT: u64 = 0x2804;
 pub const GUEST_IA32_EFER: u64 = 0x2806;
+pub const GUEST_IA32_S_CET: u64 = 0x6828;
+pub const GUEST_SSP: u64 = 0x682a;
+pub const GUEST_INTERRUPT_SSP_TABLE: u64 = 0x682c;
+pub const HOST_IA32_S_CET: u64 = 0x6c18;
+pub const HOST_SSP: u64 = 0x6c1a;
+pub const HOST_INTERRUPT_SSP_TABLE: u64 = 0x6c1c;
 pub const VMX_PREEMPTION_TIMER_VALUE: u64 = 0x482e;
 pub const GUEST_PDPTR0: u64 = 0x280a;
 pub const GUEST_PDPTR1: u64 = 0x280c;

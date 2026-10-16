@@ -1,9 +1,9 @@
 include!("../builds/interception-runtime-tests/definitions.rs");
 
-use memory::interception::runtime::interception_entry;
-use memory::interception::{DebugTarget, Session};
-use memory::interception::{CpuidProfile, CpuidRecord};
 use memory::interception::SyscallProfile;
+use memory::interception::runtime::interception_entry;
+use memory::interception::{CpuidProfile, CpuidRecord};
+use memory::interception::{DebugTarget, Session};
 use protocol::memory::{INTERCEPT_ACTIVE, INTERCEPT_CONCURRENT_WRITES, INTERCEPT_REVOKED};
 use std::sync::atomic::Ordering;
 use vmx::resident::abi::{ResidentBootContext, ResidentEventContext};
@@ -38,8 +38,11 @@ fn mixed_add_scenario(cr3: u64) -> Scenario {
     hardware::STATE.with(|state| state.borrow_mut().instruction = Some((shadow, original)));
     scenario.frame[1] = 0x400040;
     for (field, value) in [
-        (GUEST_CR3, cr3), (GUEST_RIP, 0x400000), (GUEST_RFLAGS, 0x10202),
-        (GUEST_INTERRUPTIBILITY_INFO, 3), (GUEST_LINEAR_ADDRESS, 0x400040),
+        (GUEST_CR3, cr3),
+        (GUEST_RIP, 0x400000),
+        (GUEST_RFLAGS, 0x10202),
+        (GUEST_INTERRUPTIBILITY_INFO, 3),
+        (GUEST_LINEAR_ADDRESS, 0x400040),
         (GUEST_PHYSICAL_ADDRESS, 0x800040),
     ] {
         hardware::write(field, value).unwrap();
@@ -57,17 +60,28 @@ fn syscall_scenario() -> Scenario {
     let mut scenario = Scenario::new();
     let entry = 0xffff800000400000;
     *scenario.session.syscall.get_mut() = SyscallProfile {
-        entry, callback: 0x402000, token: 1,
+        entry,
+        callback: 0x402000,
+        token: 1,
     };
-    scenario.session.configuration.get_mut().debug[0] = DebugTarget { address: entry, redirect: 0x402000 };
-    hardware::STATE.with(|state| state.borrow_mut().syscall_msrs = [(0x23 << 48) | (0x10 << 32), entry]);
+    scenario.session.configuration.get_mut().debug_count = 0;
+    hardware::STATE
+        .with(|state| state.borrow_mut().syscall_msrs = [(0x23 << 48) | (0x10 << 32), entry]);
     for (field, value) in [
-        (GUEST_IA32_EFER, 0x401), (GUEST_CS_SELECTOR, 0x10), (GUEST_SS_SELECTOR, 0x18),
-        (GUEST_CS_AR_BYTES, 0xa09b), (GUEST_SS_AR_BYTES, 0xc093),
-        (GUEST_CS_LIMIT, 0xffffffff), (GUEST_SS_LIMIT, 0xffffffff),
-        (GUEST_RIP, entry), (GUEST_RFLAGS, 0x46), (GUEST_RSP, 0x700000),
-        (GUEST_GS_BASE, 0x7fff1000), (GUEST_FS_BASE, 0x7fff2000),
-        (GUEST_DR7, 0xf0440), (VM_EXIT_INTR_INFO, 0x80000301),
+        (GUEST_IA32_EFER, 0x401),
+        (GUEST_CS_SELECTOR, 0x10),
+        (GUEST_SS_SELECTOR, 0x18),
+        (GUEST_CS_AR_BYTES, 0xa09b),
+        (GUEST_SS_AR_BYTES, 0xc093),
+        (GUEST_CS_LIMIT, 0xffffffff),
+        (GUEST_SS_LIMIT, 0xffffffff),
+        (GUEST_RIP, entry),
+        (GUEST_RFLAGS, 0x46),
+        (GUEST_RSP, 0x700000),
+        (GUEST_GS_BASE, 0x7fff1000),
+        (GUEST_FS_BASE, 0x7fff2000),
+        (GUEST_DR7, 0xf0440),
+        (VM_EXIT_INTR_INFO, 0x80000301),
     ] {
         hardware::write(field, value).unwrap();
     }
@@ -85,16 +99,26 @@ fn syscall_return_restores_full_sysret64_state_and_preserves_user_stack_and_gs()
     let mut scenario = syscall_scenario();
     let frame = scenario.frame;
     assert_eq!(scenario.call(1), 0);
-    assert_eq!(hardware::debug_registers(), [0xffff800000400000, 22, 33, 0x7ffe0ff0, 0xffff0ff0]);
+    assert_eq!(
+        hardware::debug_registers(),
+        [0xffff800000400000, 22, 33, 0x7ffe0ff0, 0xffff0ff0]
+    );
     assert_eq!(hardware::read(GUEST_DR7), Ok(0x442));
     assert_eq!(scenario.exit(0, 1), 1);
     for (field, expected) in [
-        (GUEST_RIP, 0x402000), (GUEST_CS_SELECTOR, 0x33), (GUEST_SS_SELECTOR, 0x2b),
-        (GUEST_CS_AR_BYTES, 0xa0fb), (GUEST_SS_AR_BYTES, 0xc0f3),
-        (GUEST_CS_BASE, 0), (GUEST_SS_BASE, 0),
-        (GUEST_CS_LIMIT, 0xffffffff), (GUEST_SS_LIMIT, 0xffffffff),
-        (GUEST_RFLAGS, 0x3c7fd7 | 2), (GUEST_RSP, 0x700000),
-        (GUEST_GS_BASE, 0x7fff1000), (GUEST_FS_BASE, 0x7fff2000),
+        (GUEST_RIP, 0x402000),
+        (GUEST_CS_SELECTOR, 0x33),
+        (GUEST_SS_SELECTOR, 0x2b),
+        (GUEST_CS_AR_BYTES, 0xa0fb),
+        (GUEST_SS_AR_BYTES, 0xc0f3),
+        (GUEST_CS_BASE, 0),
+        (GUEST_SS_BASE, 0),
+        (GUEST_CS_LIMIT, 0xffffffff),
+        (GUEST_SS_LIMIT, 0xffffffff),
+        (GUEST_RFLAGS, 0x3c7fd7 | 2),
+        (GUEST_RSP, 0x700000),
+        (GUEST_GS_BASE, 0x7fff1000),
+        (GUEST_FS_BASE, 0x7fff2000),
     ] {
         assert_eq!(hardware::read(field), Ok(expected), "field={field:x}");
     }
@@ -103,7 +127,12 @@ fn syscall_return_restores_full_sysret64_state_and_preserves_user_stack_and_gs()
     assert_eq!(&scenario.frame[2..], &frame[2..]);
     assert_eq!(&scenario.fx_state[224..228], &0x26_u32.to_le_bytes());
     assert_eq!(&scenario.fx_state[228..240], &[0; 12]);
-    assert!(scenario.fx_state[..224].iter().chain(&scenario.fx_state[240..]).all(|byte| *byte == 0xaa));
+    assert!(
+        scenario.fx_state[..224]
+            .iter()
+            .chain(&scenario.fx_state[240..])
+            .all(|byte| *byte == 0xaa)
+    );
     assert_eq!(hardware::read(GUEST_DR7), Ok(0xf0440));
     assert_eq!(hardware::debug_registers()[3], 0x7ffe0ff0);
 }
@@ -143,10 +172,16 @@ fn syscall_overlay_preserves_foreign_breakpoints_and_forwards_their_debug_causes
 #[test]
 fn failed_debug_overlay_install_restores_all_guest_debug_registers() {
     for syscall in [false, true] {
-        let mut scenario = if syscall { syscall_scenario() } else { Scenario::new() };
+        let mut scenario = if syscall {
+            syscall_scenario()
+        } else {
+            Scenario::new()
+        };
         let registers = hardware::debug_registers();
         let dr7 = hardware::read(GUEST_DR7).unwrap();
-        hardware::STATE.with(|state| { state.borrow_mut().fail_writes.insert(GUEST_DR7, 1); });
+        hardware::STATE.with(|state| {
+            state.borrow_mut().fail_writes.insert(GUEST_DR7, 1);
+        });
         assert_eq!(scenario.call(1), 0);
         assert!(!scenario.session.is_active());
         assert_eq!(hardware::debug_registers(), registers, "syscall={syscall}");
@@ -162,7 +197,9 @@ fn failed_control_snapshot_preserves_preexisting_cr3_targets() {
     hardware::write(CR3_TARGET_COUNT, 2).unwrap();
     hardware::write(0x6008, 0x7000).unwrap();
     hardware::write(0x600a, 0x8000).unwrap();
-    hardware::STATE.with(|state| { state.borrow_mut().fail_reads.insert(CR3_TARGET_COUNT, 1); });
+    hardware::STATE.with(|state| {
+        state.borrow_mut().fail_reads.insert(CR3_TARGET_COUNT, 1);
+    });
     assert_eq!(scenario.call(1), 0);
     assert!(!scenario.session.is_active());
     assert_eq!(hardware::read(CR3_TARGET_COUNT), Ok(2));
@@ -215,7 +252,10 @@ fn repeated_ept_faults_without_retirement_revoke_even_without_a_lease() {
     assert!(!scenario.session.is_active());
     assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
     assert_eq!(hardware::read(GUEST_RIP), Ok(0x401000));
-    assert_eq!(scenario.session.cause.load(Ordering::Acquire), u64::from(protocol::memory::INTERCEPT_CAUSE_PROGRESS));
+    assert_eq!(
+        scenario.session.cause.load(Ordering::Acquire),
+        u64::from(protocol::memory::INTERCEPT_CAUSE_PROGRESS)
+    );
     assert_eq!(scenario.boot.interception.step_active, 0);
 }
 
@@ -231,7 +271,10 @@ fn retry_deadlines_preserve_debug_exit_ownership_and_saturate_without_wrapping()
         scenario.call(1);
         assert!(scenario.session.is_active());
     }
-    assert_eq!(scenario.session.exit_debug[0].load(Ordering::Relaxed) & !1, 100);
+    assert_eq!(
+        scenario.session.exit_debug[0].load(Ordering::Relaxed) & !1,
+        100
+    );
     hardware::STATE.with(|state| state.borrow_mut().clock = 100);
     hardware::write(GUEST_RIP, 0x400000).unwrap();
     hardware::write(VM_EXIT_INTR_INFO, 0x80000301).unwrap();
@@ -273,9 +316,13 @@ fn native_sse_reads_observed_by_timers_reset_retries_before_returning_to_the_sam
         let mut scenario = Scenario::new();
         scenario.boot.watchdog_tsc_hz = 1000;
         scenario.session.tsc_hz.store(1000, Ordering::Release);
-        scenario.session.lease_deadline.store(1_000_000, Ordering::Release);
+        scenario
+            .session
+            .lease_deadline
+            .store(1_000_000, Ordering::Release);
         if persistent {
-            scenario.session.configuration.get_mut().options = protocol::memory::INTERCEPT_PERSISTENT_DATA;
+            scenario.session.configuration.get_mut().options =
+                protocol::memory::INTERCEPT_PERSISTENT_DATA;
         }
         let mut code = [0x90; 15];
         code[..4].copy_from_slice(&[0xf3, 0x0f, 0x6f, 0x01]);
@@ -299,7 +346,10 @@ fn native_sse_reads_observed_by_timers_reset_retries_before_returning_to_the_sam
                 assert_eq!(scenario.exit(48, 4), 1);
                 assert_eq!(scenario.call(1), 0);
             }
-            assert!(scenario.session.is_active(), "persistent={persistent}, iteration={iteration}");
+            assert!(
+                scenario.session.is_active(),
+                "persistent={persistent}, iteration={iteration}"
+            );
             assert_eq!(hardware::read(EPT_POINTER), Ok(0x805e));
         }
     }
@@ -312,7 +362,10 @@ fn native_vmfunc_view_changes_reset_retries_when_timers_observe_the_same_rip() {
     scenario.session.configuration.get_mut().options = protocol::memory::INTERCEPT_PERSISTENT_DATA;
     scenario.boot.watchdog_tsc_hz = 1000;
     scenario.session.tsc_hz.store(1000, Ordering::Release);
-    scenario.session.lease_deadline.store(1_000_000, Ordering::Release);
+    scenario
+        .session
+        .lease_deadline
+        .store(1_000_000, Ordering::Release);
     let mut code = [0x90; 15];
     code[..4].copy_from_slice(&[0xf3, 0x0f, 0x6f, 0x01]);
     hardware::STATE.with(|state| state.borrow_mut().instruction = Some((code, code)));
@@ -328,7 +381,10 @@ fn native_vmfunc_view_changes_reset_retries_when_timers_observe_the_same_rip() {
         assert_eq!(scenario.boot.interception.step_active, 0);
         // Native SSE and VMFUNC retire before a loop returns to the faulting RIP.
         hardware::write(GUEST_RIP, 0x401004).unwrap();
-        assert_eq!(hardware::vmfunc(0, protocol::memory::INTERCEPT_EXECUTE_SLOT), 0);
+        assert_eq!(
+            hardware::vmfunc(0, protocol::memory::INTERCEPT_EXECUTE_SLOT),
+            0
+        );
         hardware::write(GUEST_RIP, 0x401000).unwrap();
         hardware::STATE.with(|state| state.borrow_mut().clock = (iteration + 1) * 101);
         assert_eq!(scenario.exit(52, 0), 1);
@@ -351,7 +407,11 @@ fn corrupt_runtime_lengths_reset_before_slicing_or_dereferencing_hooks() {
             _ => scenario.session.cpuid.get_mut().count = protocol::memory::CPUID_MAX_RECORDS + 1,
         }
         for phase in 0..6 {
-            assert_eq!(scenario.call(phase), u64::MAX, "corruption={corruption}, phase={phase}");
+            assert_eq!(
+                scenario.call(phase),
+                u64::MAX,
+                "corruption={corruption}, phase={phase}"
+            );
         }
         assert!(!scenario.session.is_active());
         assert_eq!(hardware::debug_registers(), [11, 22, 33, 44, 0xffff0ff0]);
@@ -371,7 +431,16 @@ fn runtime_rejects_invalid_cpu_slots_and_missing_contexts_before_using_them() {
     scenario.event.interception_context_physical = 0;
     assert_eq!(scenario.call(1), u64::MAX);
     unsafe {
-        assert_eq!(interception_entry(core::ptr::null_mut(), 1, core::ptr::null_mut(), hardware::synchronize, core::ptr::null_mut()), u64::MAX);
+        assert_eq!(
+            interception_entry(
+                core::ptr::null_mut(),
+                1,
+                core::ptr::null_mut(),
+                hardware::synchronize,
+                core::ptr::null_mut()
+            ),
+            u64::MAX
+        );
     }
 }
 
@@ -382,7 +451,13 @@ fn assembly_callback_fails_closed_when_an_active_handler_is_missing() {
         assert_eq!(scenario.call(1), 0);
         scenario.boot.sync_safe = 1;
         scenario.event.interception_entry = 0;
-        assert_eq!(unsafe { matrixhv_test_callback(&mut scenario.boot, phase, scenario.frame.as_mut_ptr()) }, u64::MAX, "phase={phase}");
+        assert_eq!(
+            unsafe {
+                matrixhv_test_callback(&mut scenario.boot, phase, scenario.frame.as_mut_ptr())
+            },
+            u64::MAX,
+            "phase={phase}"
+        );
         assert_eq!(scenario.boot.stop_result, 0x4342, "phase={phase}");
         assert_eq!(scenario.boot.sync_safe, 0, "phase={phase}");
     }
@@ -395,7 +470,13 @@ fn assembly_callback_skips_a_missing_handler_only_without_owned_controls() {
     scenario.event.interception_entry = 0;
     scenario.boot.sync_safe = 1;
     for phase in [0, 1, 4, 5] {
-        assert_eq!(unsafe { matrixhv_test_callback(&mut scenario.boot, phase, scenario.frame.as_mut_ptr()) }, 0, "phase={phase}");
+        assert_eq!(
+            unsafe {
+                matrixhv_test_callback(&mut scenario.boot, phase, scenario.frame.as_mut_ptr())
+            },
+            0,
+            "phase={phase}"
+        );
         assert_eq!(scenario.boot.stop_result, 0, "phase={phase}");
         assert_eq!(scenario.boot.sync_safe, 1, "phase={phase}");
     }
@@ -415,13 +496,19 @@ fn failed_window_close_restores_write_guards_before_releasing_refresh_ownership(
         assert_eq!(scenario.exit(48, 2), 1);
         scenario.call(1);
         assert_eq!(scenario.boot.interception.refresh_owned, 1);
-        hardware::STATE.with(|state| { state.borrow_mut().fail_writes.insert(CPU_BASED_VM_EXEC_CONTROL, 1); });
+        hardware::STATE.with(|state| {
+            state
+                .borrow_mut()
+                .fail_writes
+                .insert(CPU_BASED_VM_EXEC_CONTROL, 1);
+        });
         assert_eq!(scenario.call(phase), 0);
         assert!(!scenario.session.is_active());
         assert_eq!(scenario.boot.interception.refresh_owned, 0, "phase={phase}");
         assert_eq!(scenario.boot.interception.step_active, 0);
         assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
-        hardware::STATE.with(|state| assert_eq!(state.borrow().entries[&0xa000] & 6, 0, "phase={phase}"));
+        hardware::STATE
+            .with(|state| assert_eq!(state.borrow().entries[&0xa000] & 6, 0, "phase={phase}"));
     }
 }
 
@@ -433,7 +520,9 @@ fn failed_debug_redirect_retries_original_rip_with_rf_after_retiring_the_overlay
         hardware::write(GUEST_RFLAGS, 0x202).unwrap();
         hardware::write(VM_EXIT_INTR_INFO, 0x80000301).unwrap();
         scenario.call(1);
-        hardware::STATE.with(|state| { state.borrow_mut().fail_writes.insert(field, 1); });
+        hardware::STATE.with(|state| {
+            state.borrow_mut().fail_writes.insert(field, 1);
+        });
         assert_eq!(scenario.exit(0, 1), 1);
         assert!(!scenario.session.is_active());
         assert_eq!(hardware::read(GUEST_RIP), Ok(0x400000));
@@ -467,7 +556,7 @@ fn syscall_overlay_requires_the_exact_gate_free_dr0_root_and_supported_entry() {
         match rejected {
             0 => hardware::write(GUEST_CR3, 0x5000).unwrap(),
             1 => hardware::load_debug(&[11, 22, 33, 0x7ffe0ff1, 0xffff0ff0]),
-            2 => hardware::write(GUEST_DR7, 0xf0441).unwrap(),
+            2 => hardware::write(GUEST_DR7, 0xf04ff).unwrap(),
             3 => hardware::write(GUEST_DR7, 0xf2440).unwrap(),
             4 => hardware::write(GUEST_CR4, 1 << 23).unwrap(),
             5 => hardware::write(GUEST_CR4, 1 << 12).unwrap(),
@@ -489,10 +578,16 @@ fn in_flight_syscall_fault_after_clear_rotation_or_lease_retries_native_privileg
             0 => *scenario.session.syscall.get_mut() = SyscallProfile::default(),
             1 => scenario.session.configuration.get_mut().token += 1,
             2 => scenario.session.configuration.get_mut().generation += 1,
-            3 => scenario.session.active.store(u64::from(INTERCEPT_REVOKED), Ordering::Release),
+            3 => scenario
+                .session
+                .active
+                .store(u64::from(INTERCEPT_REVOKED), Ordering::Release),
             _ => {
                 scenario.session.tsc_hz.store(1000, Ordering::Release);
-                scenario.session.lease_deadline.store(1000, Ordering::Release);
+                scenario
+                    .session
+                    .lease_deadline
+                    .store(1000, Ordering::Release);
                 hardware::STATE.with(|state| state.borrow_mut().clock = 1001);
             }
         }
@@ -529,13 +624,24 @@ fn unsupported_syscall_entry_state_never_performs_a_partial_user_return() {
 
 #[test]
 fn syscall_vmcs_failure_rolls_back_every_completed_privilege_write_before_retiring() {
-    for failed in [GUEST_CS_SELECTOR, GUEST_SS_SELECTOR, GUEST_CS_BASE, GUEST_SS_BASE,
-        GUEST_CS_LIMIT, GUEST_SS_LIMIT, GUEST_CS_AR_BYTES, GUEST_SS_AR_BYTES,
-        GUEST_RFLAGS, GUEST_RIP] {
+    for failed in [
+        GUEST_CS_SELECTOR,
+        GUEST_SS_SELECTOR,
+        GUEST_CS_BASE,
+        GUEST_SS_BASE,
+        GUEST_CS_LIMIT,
+        GUEST_SS_LIMIT,
+        GUEST_CS_AR_BYTES,
+        GUEST_SS_AR_BYTES,
+        GUEST_RFLAGS,
+        GUEST_RIP,
+    ] {
         let mut scenario = syscall_scenario();
         scenario.call(1);
         let frame = scenario.frame;
-        hardware::STATE.with(|state| { state.borrow_mut().fail_writes.insert(failed, 1); });
+        hardware::STATE.with(|state| {
+            state.borrow_mut().fail_writes.insert(failed, 1);
+        });
         assert_eq!(scenario.exit(0, 1), 1, "field={failed:x}");
         assert_eq!(hardware::read(GUEST_CS_SELECTOR), Ok(0x10));
         assert_eq!(hardware::read(GUEST_SS_SELECTOR), Ok(0x18));
@@ -558,15 +664,27 @@ fn failed_privilege_rollback_halts_and_records_failure_without_touching_guest_re
     let frame = scenario.frame;
     hardware::STATE.with(|state| {
         let mut state = state.borrow_mut();
-        state.write_plan.insert(GUEST_CS_SELECTOR, [true, false].into());
+        state
+            .write_plan
+            .insert(GUEST_CS_SELECTOR, [true, false].into());
         state.fail_writes.insert(GUEST_SS_SELECTOR, 1);
     });
     assert_eq!(scenario.exit(0, 1), u64::MAX);
     assert_eq!(scenario.frame, frame);
     assert_eq!(scenario.fx_state, [0xaa; 512]);
-    assert_eq!(scenario.session.cause.load(Ordering::Acquire), u64::from(protocol::memory::INTERCEPT_CAUSE_RUNTIME));
-    assert_eq!(scenario.boot.interception.runtime_diagnostics[..3], [1, 0, 1]);
-    assert_eq!(scenario.boot.interception.runtime_diagnostics[protocol::memory::INTERCEPT_RUNTIME_PHASES * 3], 1);
+    assert_eq!(
+        scenario.session.cause.load(Ordering::Acquire),
+        u64::from(protocol::memory::INTERCEPT_CAUSE_RUNTIME)
+    );
+    assert_eq!(
+        scenario.boot.interception.runtime_diagnostics[..3],
+        [1, 0, 1]
+    );
+    assert_eq!(
+        scenario.boot.interception.runtime_diagnostics
+            [protocol::memory::INTERCEPT_RUNTIME_PHASES * 3],
+        1
+    );
     assert!(!scenario.session.is_active());
 }
 
@@ -594,7 +712,10 @@ fn private_shared_data_survives_code_write_windows_and_refreshes_at_any_page_ind
     assert_eq!(scenario.exit(37, 0), 1);
     assert_eq!(scenario.call(1), 0);
     assert_eq!(hardware::original_value(SHADOW + 9, 1, None), 0x42);
-    assert_eq!(hardware::original_value(private_shadow + 0xffc, 4, None), 0x13371337);
+    assert_eq!(
+        hardware::original_value(private_shadow + 0xffc, 4, None),
+        0x13371337
+    );
     hardware::original_value(0x900008, 4, Some(123));
     hardware::original_value(0x90000c, 4, Some(7));
     hardware::original_value(0x900010, 4, Some(7));
@@ -613,7 +734,8 @@ fn private_shared_data_survives_code_write_windows_and_refreshes_at_any_page_ind
 }
 
 #[test]
-fn private_shared_data_refreshes_clocks_preserves_identity_and_releases_without_zero_pointer_writes() {
+fn private_shared_data_refreshes_clocks_preserves_identity_and_releases_without_zero_pointer_writes()
+ {
     let mut scenario = Scenario::new();
     let configuration = scenario.session.configuration.get_mut();
     configuration.options = protocol::memory::INTERCEPT_PRIVATE_SHARED_DATA;
@@ -625,18 +747,38 @@ fn private_shared_data_refreshes_clocks_preserves_identity_and_releases_without_
         hardware::original_value(0x800000 + offset + 4, 4, Some(0xabcdef01));
         hardware::original_value(0x800000 + offset + 8, 4, Some(0xabcdef01));
     }
-    for (offset, width, value) in [(0x2e4, 4, 123), (0x340, 8, 456), (0x348, 8, 789), (0x350, 8, 999)] {
+    for (offset, width, value) in [
+        (0x2e4, 4, 123),
+        (0x340, 8, 456),
+        (0x348, 8, 789),
+        (0x350, 8, 999),
+    ] {
         hardware::original_value(0x800000 + offset, width, Some(value));
     }
     scenario.boot.interception.exit_timer = 1;
     scenario.boot.last_reason = 52;
     assert_eq!(scenario.call(0), 1);
     for offset in [0x8, 0x14, 0x320] {
-        assert_eq!(hardware::original_value(SHADOW + offset, 8, None), 0xabcdef0112345678);
-        assert_eq!(hardware::original_value(SHADOW + offset + 8, 4, None), 0xabcdef01);
+        assert_eq!(
+            hardware::original_value(SHADOW + offset, 8, None),
+            0xabcdef0112345678
+        );
+        assert_eq!(
+            hardware::original_value(SHADOW + offset + 8, 4, None),
+            0xabcdef01
+        );
     }
-    for (offset, width, value) in [(0x2e4, 4, 123), (0x340, 8, 456), (0x348, 8, 789), (0x350, 8, 999), (0xffc, 4, 0x13371337)] {
-        assert_eq!(hardware::original_value(SHADOW + offset, width, None), value);
+    for (offset, width, value) in [
+        (0x2e4, 4, 123),
+        (0x340, 8, 456),
+        (0x348, 8, 789),
+        (0x350, 8, 999),
+        (0xffc, 4, 0x13371337),
+    ] {
+        assert_eq!(
+            hardware::original_value(SHADOW + offset, width, None),
+            value
+        );
     }
     assert_eq!(hardware::original_value(0x800350, 8, None), 999);
     scenario.session.active.store(0, Ordering::Release);
@@ -660,7 +802,8 @@ fn executing_a_private_shared_page_retires_its_view_and_retries_native_fetch() {
         if stepped {
             let mut instruction = [0x90; 15];
             instruction[..2].copy_from_slice(&[0x8b, 0x01]);
-            hardware::STATE.with(|state| state.borrow_mut().instruction = Some((instruction, instruction)));
+            hardware::STATE
+                .with(|state| state.borrow_mut().instruction = Some((instruction, instruction)));
             hardware::write(GUEST_LINEAR_ADDRESS, 0x7ffe0000).unwrap();
             hardware::write(GUEST_CS_SELECTOR, 3).unwrap();
             hardware::write(GUEST_RFLAGS, 0x302).unwrap();
@@ -671,12 +814,18 @@ fn executing_a_private_shared_page_retires_its_view_and_retries_native_fetch() {
         }
         assert_eq!(scenario.exit(48, 4), 1, "stepped={stepped}");
         assert!(!scenario.session.is_active(), "stepped={stepped}");
-        assert_eq!(scenario.session.cause.load(Ordering::Acquire), u64::from(protocol::memory::INTERCEPT_CAUSE_CONTEXT));
+        assert_eq!(
+            scenario.session.cause.load(Ordering::Acquire),
+            u64::from(protocol::memory::INTERCEPT_CAUSE_CONTEXT)
+        );
         assert_eq!(hardware::read(GUEST_RIP), Ok(0x7ffe0000));
         assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
         assert_eq!(scenario.boot.interception.step_active, 0);
         assert_eq!(scenario.call(1), 0);
-        assert_eq!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+        assert_eq!(
+            hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27),
+            0
+        );
     }
 }
 
@@ -694,16 +843,31 @@ fn cpuid_dispatch_matches_the_intel_gate_and_zero_extends_only_output_registers(
         let mut scenario = Scenario::new();
         scenario.session.configuration.get_mut().debug_count = 0;
         scenario.session.configuration.get_mut().hook_count = 0;
+        hardware::STATE.with(|state| {
+            state
+                .borrow_mut()
+                .native_cpuid
+                .insert((1, 0), [0x0009_06e9, 0xa512_3456, 0xffff_ffff, 0]);
+        });
         let profile = scenario.session.cpuid.get_mut();
         *profile = CpuidProfile {
-            count: 1, dr3: 0x7ffe0ff0, dr7_mask: 0xffff_ffff_f000_0040,
-            dr7_value: 0x40, token: 1, ..CpuidProfile::default()
+            count: 1,
+            dr3: 0x7ffe0ff0,
+            dr7_mask: 0xffff_ffff_f000_0040,
+            dr7_value: 0x40,
+            token: 1,
+            ..CpuidProfile::default()
         };
         profile.records[0] = CpuidRecord {
-            leaf: 1, values: [656981, 0x200800, 33221631, 3219913727],
-            keep_masks: [0, 0xff00_0000, 0, 0], ..CpuidRecord::default()
+            leaf: 1,
+            values: [656981, 0x200800, 33221631, 3219913727],
+            keep_masks: [0, 0xff00_0000, 0, 0],
+            ..CpuidRecord::default()
         };
-        scenario.session.active.store(u64::from(active), Ordering::Release);
+        scenario
+            .session
+            .active
+            .store(u64::from(active), Ordering::Release);
         scenario.boot.nested.active = u64::from(nested);
         hardware::write(GUEST_CR3, cr3).unwrap();
         hardware::write(GUEST_CS_SELECTOR, cpl).unwrap();
@@ -716,9 +880,16 @@ fn cpuid_dispatch_matches_the_intel_gate_and_zero_extends_only_output_registers(
         let outcome = scenario.call(0);
         assert_eq!(outcome, if matched { 2 } else { 0 });
         if matched {
-            let native = core::arch::x86_64::__cpuid_count(1, 0);
-            assert_eq!(&scenario.frame[..4], &[656981, 33221631, 3219913727,
-                         u64::from(native.ebx & 0xff00_0000 | 0x200800)]);
+            let native = hardware::cpuid_count(1, 0);
+            assert_eq!(
+                &scenario.frame[..4],
+                &[
+                    656981,
+                    33221631,
+                    3219913727,
+                    u64::from(native.ebx & 0xff00_0000 | 0x200800)
+                ]
+            );
             assert_eq!(&scenario.frame[4..], &before[4..]);
             assert_eq!(scenario.session.hits.load(Ordering::Acquire), 1);
         } else {
@@ -750,10 +921,13 @@ fn private_shared_data_keeps_kernel_xstate_native_and_closes_each_cpu_window() {
             hardware::shared_entry(0xd000, 0x800000, 0);
             let mut instruction = [0x90; 15];
             instruction[..2].copy_from_slice(&[0x8b, 0x01]);
-            hardware::STATE.with(|state| state.borrow_mut().instruction = Some((instruction, instruction)));
+            hardware::STATE
+                .with(|state| state.borrow_mut().instruction = Some((instruction, instruction)));
             for (field, value) in [
-                (GUEST_CS_SELECTOR, cpl), (GUEST_RIP, 0x401000),
-                (GUEST_PHYSICAL_ADDRESS, 0x8003d8), (GUEST_LINEAR_ADDRESS, linear),
+                (GUEST_CS_SELECTOR, cpl),
+                (GUEST_RIP, 0x401000),
+                (GUEST_PHYSICAL_ADDRESS, 0x8003d8),
+                (GUEST_LINEAR_ADDRESS, linear),
             ] {
                 hardware::write(field, value).unwrap();
             }
@@ -762,9 +936,15 @@ fn private_shared_data_keeps_kernel_xstate_native_and_closes_each_cpu_window() {
             assert_eq!(scenario.boot.interception.step_active, 5);
             assert_eq!(scenario.call(1), 0);
             assert_eq!(hardware::read(EPT_POINTER), Ok(0xa05e));
-            assert_ne!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+            assert_ne!(
+                hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27),
+                0
+            );
             hardware::STATE.with(|state| {
-                assert_eq!(state.borrow().entries[&0xb000] & 0x000f_ffff_ffff_f007, target | if access == 2 { 3 } else { 1 });
+                assert_eq!(
+                    state.borrow().entries[&0xb000] & 0x000f_ffff_ffff_f007,
+                    target | if access == 2 { 3 } else { 1 }
+                );
                 assert_eq!(state.borrow().entries[&0xd000], 0x800000);
             });
             if cancelled {
@@ -773,8 +953,14 @@ fn private_shared_data_keeps_kernel_xstate_native_and_closes_each_cpu_window() {
             scenario.exit(exit_reason, 0);
             assert_eq!(scenario.boot.interception.step_active, 0);
             assert_eq!(scenario.call(1), 0);
-            assert_eq!(hardware::read(EPT_POINTER), Ok(if cancelled { 0x105e } else { 0x805e }));
-            assert_eq!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+            assert_eq!(
+                hardware::read(EPT_POINTER),
+                Ok(if cancelled { 0x105e } else { 0x805e })
+            );
+            assert_eq!(
+                hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27),
+                0
+            );
             hardware::STATE.with(|state| {
                 assert_eq!(state.borrow().entries[&0xb000], 0x800000);
                 assert_eq!(state.borrow().entries[&0xd000], 0x800000);
@@ -809,9 +995,13 @@ fn scalar_shared_data_reads_preserve_cpl_views_without_mtf_or_invalidation() {
         });
         scenario.frame[1] = linear;
         for (field, value) in [
-            (GUEST_CS_SELECTOR, cpl), (GUEST_RIP, 0x401000),
-            (GUEST_PHYSICAL_ADDRESS, 0x8003d8), (GUEST_LINEAR_ADDRESS, linear),
-        ] { hardware::write(field, value).unwrap(); }
+            (GUEST_CS_SELECTOR, cpl),
+            (GUEST_RIP, 0x401000),
+            (GUEST_PHYSICAL_ADDRESS, 0x8003d8),
+            (GUEST_LINEAR_ADDRESS, linear),
+        ] {
+            hardware::write(field, value).unwrap();
+        }
         assert_eq!(scenario.call(1), 0);
         hardware::STATE.with(|state| state.borrow_mut().invalidated_epts.clear());
         assert_eq!(scenario.exit(48, 0x181), 1);
@@ -836,8 +1026,10 @@ fn a_32_bit_private_shared_data_fault_retries_after_restoring_the_base_ept() {
     configuration.cpu_leaves[0][0] = 0xb000;
     scenario.boot.telemetry_active = 1;
     for (field, value) in [
-        (GUEST_CS_AR_BYTES, 0x4000), (GUEST_CS_SELECTOR, 3),
-        (GUEST_RIP, 0x401000), (GUEST_PHYSICAL_ADDRESS, 0x8003d8),
+        (GUEST_CS_AR_BYTES, 0x4000),
+        (GUEST_CS_SELECTOR, 3),
+        (GUEST_RIP, 0x401000),
+        (GUEST_PHYSICAL_ADDRESS, 0x8003d8),
         (GUEST_LINEAR_ADDRESS, 0x7ffe03d8),
     ] {
         hardware::write(field, value).unwrap();
@@ -850,9 +1042,18 @@ fn a_32_bit_private_shared_data_fault_retries_after_restoring_the_base_ept() {
     assert_eq!(hardware::read(GUEST_RIP), Ok(0x401000));
     assert_eq!(scenario.frame, frame);
     assert_eq!(scenario.boot.interception.step_active, 0);
-    assert_eq!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
-    assert_eq!(scenario.boot.interception.runtime_diagnostics[..3], [1, 0, 1]);
-    assert_eq!(scenario.boot.interception.runtime_diagnostics[18..21], [1, 1, 0]);
+    assert_eq!(
+        hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27),
+        0
+    );
+    assert_eq!(
+        scenario.boot.interception.runtime_diagnostics[..3],
+        [1, 0, 1]
+    );
+    assert_eq!(
+        scenario.boot.interception.runtime_diagnostics[18..21],
+        [1, 1, 0]
+    );
     assert_eq!(scenario.call(1), 0);
     assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
 }
@@ -863,6 +1064,7 @@ mod hardware {
 
     #[derive(Default)]
     pub struct State {
+        pub native_cpuid: BTreeMap<(u32, u32), [u32; 4]>,
         pub fields: BTreeMap<u64, u64>,
         pub debug: [u64; 5],
         pub invalidated_epts: Vec<u64>,
@@ -876,6 +1078,8 @@ mod hardware {
         pub bytes: BTreeMap<u64, u8>,
         pub clock: u64,
         pub syscall_msrs: [u64; 2],
+        pub user_cet: [u64; 2],
+        pub kernel_gs: u64,
         pub instruction: Option<([u8; 15], [u8; 15])>,
         pub fail_reads: BTreeMap<u64, u32>,
         pub fail_writes: BTreeMap<u64, u32>,
@@ -883,6 +1087,11 @@ mod hardware {
         pub fail_invalidations: BTreeMap<u64, u32>,
     }
     thread_local! { pub static STATE: RefCell<State> = RefCell::new(State::default()); }
+    pub fn cpuid_count(function: u32, subleaf: u32) -> core::arch::x86_64::CpuidResult {
+        let [eax, ebx, ecx, edx] =
+            STATE.with(|state| state.borrow().native_cpuid[&(function, subleaf)]);
+        core::arch::x86_64::CpuidResult { eax, ebx, ecx, edx }
+    }
     pub fn clock() -> u64 {
         let boot = crate::INTERRUPT_AT_CLOCK.with(|pointer| pointer.replace(core::ptr::null_mut()));
         if !boot.is_null() {
@@ -945,7 +1154,12 @@ mod hardware {
     pub fn write(field: u64, value: u64) -> Result<(), ()> {
         STATE.with(|state| {
             let mut state = state.borrow_mut();
-            if state.write_plan.get_mut(&field).and_then(|plan| plan.pop_front()) == Some(false) {
+            if state
+                .write_plan
+                .get_mut(&field)
+                .and_then(|plan| plan.pop_front())
+                == Some(false)
+            {
                 return Err(());
             }
             if let Some(remaining) = state.fail_writes.get_mut(&field) {
@@ -992,7 +1206,10 @@ mod hardware {
         STATE.with(|state| {
             let mut state = state.borrow_mut();
             let value = *state.entries.get(&pointer).unwrap_or(&0);
-            state.entries.insert(pointer, target | (value & !0x000f_ffff_ffff_f000 & !7) | permissions);
+            state.entries.insert(
+                pointer,
+                target | (value & !0x000f_ffff_ffff_f000 & !7) | permissions,
+            );
         });
     }
     pub fn page_byte(address: u64, value: Option<u8>) -> u8 {
@@ -1032,7 +1249,8 @@ mod hardware {
         if operation == 3 {
             return STATE.with(|state| u64::from(!state.borrow().budget_expired));
         }
-        let processor_number = unsafe { (*(boot as *const crate::ResidentBootContext)).processor_number };
+        let processor_number =
+            unsafe { (*(boot as *const crate::ResidentBootContext)).processor_number };
         STATE.with(|state| {
             let mut state = state.borrow_mut();
             state.sync.push(operation);
@@ -1331,7 +1549,10 @@ fn supported_lam_cr3_controls_commit_after_retiring_the_hook_profile() {
             assert_eq!(hardware::read(GUEST_CR3), Ok(lam | 0x5007));
             assert_eq!(hardware::read(GUEST_RIP), Ok(0x401000));
             assert!(!scenario.session.is_active());
-            assert_eq!(scenario.session.cause.load(Ordering::Acquire), u64::from(protocol::memory::INTERCEPT_CAUSE_CONTEXT));
+            assert_eq!(
+                scenario.session.cause.load(Ordering::Acquire),
+                u64::from(protocol::memory::INTERCEPT_CAUSE_CONTEXT)
+            );
             assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
             assert_eq!(scenario.call(1), 0);
             assert_eq!(scenario.boot.interception.controls_saved, 0);
@@ -1363,7 +1584,10 @@ fn activating_a_hook_profile_on_an_existing_lam_root_restores_native_execution()
         hardware::write(GUEST_CR3, lam | 0x3007).unwrap();
         assert_eq!(scenario.call(1), 0);
         assert!(!scenario.session.is_active());
-        assert_eq!(scenario.session.cause.load(Ordering::Acquire), u64::from(protocol::memory::INTERCEPT_CAUSE_CONTEXT));
+        assert_eq!(
+            scenario.session.cause.load(Ordering::Acquire),
+            u64::from(protocol::memory::INTERCEPT_CAUSE_CONTEXT)
+        );
         assert_eq!(hardware::read(GUEST_CR3), Ok(lam | 0x3007));
         assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
         assert_eq!(hardware::debug_registers(), [11, 22, 33, 44, 0xffff0ff0]);
@@ -1396,7 +1620,10 @@ fn retired_legacy_cr3_exits_do_not_retry_when_the_base_owns_the_exit() {
         hardware::write(CPU_BASED_VM_EXEC_CONTROL, 1 << 15).unwrap();
         assert_eq!(scenario.call(1), 0);
         if !active {
-            scenario.session.active.store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
+            scenario
+                .session
+                .active
+                .store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
             assert_eq!(scenario.call(1), 0);
         }
         hardware::write(GUEST_IA32_EFER, 0).unwrap();
@@ -1405,7 +1632,10 @@ fn retired_legacy_cr3_exits_do_not_retry_when_the_base_owns_the_exit() {
         assert!(!scenario.session.is_active());
         assert_eq!(hardware::read(GUEST_CR3), Ok(0x3007));
         assert_eq!(scenario.call(1), 0);
-        assert_ne!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 15), 0);
+        assert_ne!(
+            hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 15),
+            0
+        );
     }
 }
 
@@ -1418,7 +1648,10 @@ fn retiring_a_legacy_cr3_exit_retries_when_the_base_allows_native_execution() {
     assert_eq!(scenario.exit(28, 3), 1);
     assert!(!scenario.session.is_active());
     assert_eq!(scenario.call(1), 0);
-    assert_eq!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 15), 0);
+    assert_eq!(
+        hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 15),
+        0
+    );
     assert_eq!(hardware::read(GUEST_CR3), Ok(0x3007));
 }
 
@@ -1502,14 +1735,20 @@ fn repeated_ept_mtf_windows_preserve_all_4096_guest_single_steps() {
         assert_eq!(hardware::read(GUEST_RIP), Ok(rip));
         assert_eq!(hardware::read(GUEST_PENDING_DBG_EXCEPTIONS), Ok(0));
         scenario.call(1);
-        assert_ne!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+        assert_ne!(
+            hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27),
+            0
+        );
 
         hardware::write(GUEST_RIP, rip + 3).unwrap();
         hardware::write(GUEST_RFLAGS, 0x302).unwrap();
         hardware::write(GUEST_PENDING_DBG_EXCEPTIONS, 1 << 14).unwrap();
         assert_eq!(scenario.exit(37, 0), 1);
         scenario.call(1);
-        assert_eq!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+        assert_eq!(
+            hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27),
+            0
+        );
         assert_eq!(hardware::read(GUEST_PENDING_DBG_EXCEPTIONS), Ok(1 << 14));
         assert_eq!(hardware::read(GUEST_RIP), Ok(rip + 3));
 
@@ -1589,7 +1828,10 @@ fn guest_debug_address_registers_accept_all_64_bits_but_status_and_control_do_no
     for register in 0..4 {
         scenario.frame[0] = 0x0000_8000_0000_0000 + register;
         assert_eq!(scenario.exit(29, register), 2);
-        assert_eq!(hardware::debug_registers()[register as usize], scenario.frame[0]);
+        assert_eq!(
+            hardware::debug_registers()[register as usize],
+            scenario.frame[0]
+        );
     }
     for register in [6, 7] {
         scenario.frame[0] = 1 << 32;
@@ -1684,8 +1926,14 @@ fn exhausted_root_budget_revokes_before_dispatch_or_rearming() {
         hardware::write(GUEST_PHYSICAL_ADDRESS, 0x800008).unwrap();
         hardware::STATE.with(|state| state.borrow_mut().budget_expired = true);
         assert_eq!(scenario.call(phase), u64::from(phase == 0));
-        assert_eq!(scenario.session.active.load(Ordering::Acquire), u64::from(INTERCEPT_REVOKED));
-        assert_eq!(scenario.session.cause.load(Ordering::Acquire), u64::from(crate::protocol::memory::INTERCEPT_CAUSE_RENDEZVOUS));
+        assert_eq!(
+            scenario.session.active.load(Ordering::Acquire),
+            u64::from(INTERCEPT_REVOKED)
+        );
+        assert_eq!(
+            scenario.session.cause.load(Ordering::Acquire),
+            u64::from(crate::protocol::memory::INTERCEPT_CAUSE_RENDEZVOUS)
+        );
         assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
         assert_eq!(scenario.boot.interception.step_active, 0);
     }
@@ -1747,7 +1995,10 @@ fn cancelled_vmfunc_exit_injects_ud_after_retiring_its_execution_control() {
     hardware::STATE.with(|state| state.borrow_mut().budget_expired = true);
     assert_eq!(scenario.exit(59, 0), 4);
     assert!(!scenario.session.is_active());
-    assert_eq!(hardware::read(SECONDARY_VM_EXEC_CONTROL).unwrap() & (1 << 13), 0);
+    assert_eq!(
+        hardware::read(SECONDARY_VM_EXEC_CONTROL).unwrap() & (1 << 13),
+        0
+    );
     assert_eq!(hardware::read(GUEST_RIP), Ok(0x400000));
 }
 
@@ -1760,7 +2011,10 @@ fn cancelled_mtf_exit_preserves_the_completed_single_step_after_retirement() {
     hardware::write(GUEST_PHYSICAL_ADDRESS, 0x800008).unwrap();
     assert_eq!(scenario.exit(48, 1), 1);
     scenario.call(1);
-    assert_ne!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+    assert_ne!(
+        hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27),
+        0
+    );
     hardware::write(GUEST_RIP, 0x401003).unwrap();
     hardware::write(GUEST_RFLAGS, 0x302).unwrap();
     hardware::write(GUEST_PENDING_DBG_EXCEPTIONS, 1 << 14).unwrap();
@@ -1770,7 +2024,10 @@ fn cancelled_mtf_exit_preserves_the_completed_single_step_after_retirement() {
     assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
     assert_eq!(hardware::read(GUEST_RIP), Ok(0x401003));
     assert_eq!(hardware::read(GUEST_PENDING_DBG_EXCEPTIONS), Ok(1 << 14));
-    assert_eq!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+    assert_eq!(
+        hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27),
+        0
+    );
 }
 
 #[test]
@@ -1790,12 +2047,21 @@ fn assembly_callback_services_control_exits_after_early_observer_recovery() {
             state.clock = 2;
             state.fail_reads.insert(GUEST_DR7, 1);
         });
-        assert_eq!(unsafe { matrixhv_test_callback(&mut scenario.boot, 4, scenario.frame.as_mut_ptr()) }, 0);
+        assert_eq!(
+            unsafe { matrixhv_test_callback(&mut scenario.boot, 4, scenario.frame.as_mut_ptr()) },
+            0
+        );
         assert!(!scenario.session.is_active());
         assert_eq!(scenario.boot.interception.controls_saved, 0);
         assert_eq!(scenario.boot.interception.exit_ept, 0);
-        assert_eq!(scenario.session.exit_debug[0].load(Ordering::Acquire) & 1, 0);
-        assert_eq!(unsafe { matrixhv_test_callback(&mut scenario.boot, 0, scenario.frame.as_mut_ptr()) }, 2);
+        assert_eq!(
+            scenario.session.exit_debug[0].load(Ordering::Acquire) & 1,
+            0
+        );
+        assert_eq!(
+            unsafe { matrixhv_test_callback(&mut scenario.boot, 0, scenario.frame.as_mut_ptr()) },
+            2
+        );
         if reason == 28 {
             assert_eq!(hardware::read(GUEST_CR3), Ok(0x5007));
         } else {
@@ -1916,10 +2182,16 @@ fn mixed_add_uses_the_shadow_only_for_registered_cr3_roots() {
             assert_eq!(hardware::original_value(0x800040, 4, None), 11);
         }
         assert_eq!(scenario.call(1), 0);
-        assert_eq!(hardware::read(EPT_POINTER), Ok(if scoped { 0x805e } else { 0x105e }));
+        assert_eq!(
+            hardware::read(EPT_POINTER),
+            Ok(if scoped { 0x805e } else { 0x105e })
+        );
         assert!(scenario.session.is_active());
         assert_eq!(hardware::read(GUEST_RIP), Ok(0x400003));
-        assert_eq!(hardware::original_value(SHADOW + 0x40, 4, None), if scoped { 12 } else { 11 });
+        assert_eq!(
+            hardware::original_value(SHADOW + 0x40, 4, None),
+            if scoped { 12 } else { 11 }
+        );
     }
 }
 
@@ -1928,7 +2200,9 @@ fn mixed_add_vmcs_failures_restore_instruction_state_before_retrying() {
     for field in [GUEST_RFLAGS, GUEST_INTERRUPTIBILITY_INFO, GUEST_RIP] {
         let mut scenario = mixed_add_scenario(0x3007);
         let frame = scenario.frame;
-        hardware::STATE.with(|state| { state.borrow_mut().fail_writes.insert(field, 1); });
+        hardware::STATE.with(|state| {
+            state.borrow_mut().fail_writes.insert(field, 1);
+        });
         assert_eq!(scenario.exit(48, 4), 1, "field={field:x}");
         assert!(!scenario.session.is_active());
         assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
@@ -1945,7 +2219,10 @@ fn mixed_add_vmcs_failures_restore_instruction_state_before_retrying() {
 fn a_completed_mixed_add_recovery_retries_at_the_next_instruction() {
     let mut scenario = mixed_add_scenario(0x3007);
     hardware::STATE.with(|state| {
-        state.borrow_mut().write_plan.insert(CPU_BASED_VM_EXEC_CONTROL, [true, false].into());
+        state
+            .borrow_mut()
+            .write_plan
+            .insert(CPU_BASED_VM_EXEC_CONTROL, [true, false].into());
     });
     assert_eq!(scenario.exit(48, 4), 1);
     assert!(!scenario.session.is_active());
@@ -1983,11 +2260,18 @@ fn mixed_access_reset_failures_release_the_barrier_before_base_recovery() {
                     state.fail_writes.insert(CPU_BASED_VM_EXEC_CONTROL, 1);
                 }
             });
-            assert_eq!(scenario.call(0), 1, "completed={completed}, read_failure={read_failure}");
+            assert_eq!(
+                scenario.call(0),
+                1,
+                "completed={completed}, read_failure={read_failure}"
+            );
             assert!(!scenario.session.is_active());
             assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
             assert_eq!(scenario.boot.interception.step_active, 0);
-            assert_eq!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+            assert_eq!(
+                hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27),
+                0
+            );
             if completed {
                 assert_eq!(hardware::read(GUEST_RIP), Ok(0x400003));
                 assert_eq!(hardware::original_value(0x800040, 4, None), 12);
@@ -1995,7 +2279,14 @@ fn mixed_access_reset_failures_release_the_barrier_before_base_recovery() {
             hardware::STATE.with(|state| {
                 let state = state.borrow();
                 assert_eq!(state.sync_owner, None);
-                assert_eq!(state.sync, if completed { vec![0, 1, 2, 0, 1, 2] } else { vec![0, 2, 0, 1, 2] });
+                assert_eq!(
+                    state.sync,
+                    if completed {
+                        vec![0, 1, 2, 0, 1, 2]
+                    } else {
+                        vec![0, 2, 0, 1, 2]
+                    }
+                );
                 assert_eq!(state.entries[&0xa000] & 7, 1);
             });
         }
@@ -2013,10 +2304,16 @@ fn a_failed_emulation_rollback_halts_without_committing_guest_data() {
     });
     assert_eq!(scenario.exit(48, 4), u64::MAX);
     assert!(!scenario.session.is_active());
-    assert_eq!(scenario.session.cause.load(Ordering::Acquire), u64::from(protocol::memory::INTERCEPT_CAUSE_RUNTIME));
+    assert_eq!(
+        scenario.session.cause.load(Ordering::Acquire),
+        u64::from(protocol::memory::INTERCEPT_CAUSE_RUNTIME)
+    );
     assert_eq!(hardware::read(GUEST_RIP), Ok(0x400000));
     assert_eq!(hardware::original_value(0x800040, 4, None), 10);
-    assert_eq!(scenario.boot.interception.runtime_diagnostics[..3], [1, 0, 1]);
+    assert_eq!(
+        scenario.boot.interception.runtime_diagnostics[..3],
+        [1, 0, 1]
+    );
     assert_eq!(scenario.boot.interception.step_active, 0);
     hardware::STATE.with(|state| assert_eq!(state.borrow().sync_owner, None));
 }
@@ -2024,8 +2321,10 @@ fn a_failed_emulation_rollback_halts_without_committing_guest_data() {
 #[test]
 fn scalar_read_vmcs_failures_restore_rip_and_preserve_the_destination_register() {
     for (destination, field) in [
-        (0x01, GUEST_RFLAGS), (0x01, GUEST_INTERRUPTIBILITY_INFO),
-        (0x01, GUEST_RIP), (0x21, GUEST_RSP),
+        (0x01, GUEST_RFLAGS),
+        (0x01, GUEST_INTERRUPTIBILITY_INFO),
+        (0x01, GUEST_RIP),
+        (0x21, GUEST_RSP),
     ] {
         let mut scenario = Scenario::new();
         let mut shadow = [0x90; 15];
@@ -2034,8 +2333,11 @@ fn scalar_read_vmcs_failures_restore_rip_and_preserve_the_destination_register()
         scenario.frame[0] = 0x12345678;
         scenario.frame[1] = 0x400040;
         for (field, value) in [
-            (GUEST_RIP, 0x400000), (GUEST_RSP, 0x700000), (GUEST_RFLAGS, 0x10202),
-            (GUEST_INTERRUPTIBILITY_INFO, 3), (GUEST_LINEAR_ADDRESS, 0x400040),
+            (GUEST_RIP, 0x400000),
+            (GUEST_RSP, 0x700000),
+            (GUEST_RFLAGS, 0x10202),
+            (GUEST_INTERRUPTIBILITY_INFO, 3),
+            (GUEST_LINEAR_ADDRESS, 0x400040),
             (GUEST_PHYSICAL_ADDRESS, 0x800040),
         ] {
             hardware::write(field, value).unwrap();
@@ -2043,7 +2345,9 @@ fn scalar_read_vmcs_failures_restore_rip_and_preserve_the_destination_register()
         hardware::original_value(0x800040, 4, Some(10));
         let frame = scenario.frame;
         assert_eq!(scenario.call(1), 0);
-        hardware::STATE.with(|state| { state.borrow_mut().fail_writes.insert(field, 1); });
+        hardware::STATE.with(|state| {
+            state.borrow_mut().fail_writes.insert(field, 1);
+        });
         assert_eq!(scenario.exit(48, 0x181), 1, "field={field:x}");
         assert!(!scenario.session.is_active());
         assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
@@ -2072,12 +2376,18 @@ fn cancellation_closes_a_committed_write_and_releases_its_lock_even_when_a_peer_
         scenario.call(1);
         hardware::page_byte(0x800082, Some(0xa7));
         hardware::STATE.with(|state| state.borrow_mut().sync_busy = true);
-        scenario.session.active.store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
+        scenario
+            .session
+            .active
+            .store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
         assert_eq!(scenario.call(2), 0);
         assert_eq!(scenario.call(1), 0);
         assert_eq!(scenario.boot.interception.step_active, 0);
         assert_eq!(scenario.boot.interception.refresh_owned, 0);
-        assert_eq!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 0);
+        assert_eq!(
+            hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27),
+            0
+        );
         assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
         hardware::STATE.with(|state| {
             let state = state.borrow();
@@ -2199,7 +2509,10 @@ fn unchanged_read_only_mixed_instructions_use_private_mtf_without_parked_peers_o
         });
         scenario.call(1);
         assert_eq!(hardware::read(EPT_POINTER), Ok(0xc05e));
-        assert_eq!(hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27), 1 << 27);
+        assert_eq!(
+            hardware::read(CPU_BASED_VM_EXEC_CONTROL).unwrap() & (1 << 27),
+            1 << 27
+        );
         assert_eq!(scenario.exit(37, 0), 1);
         scenario.call(1);
         assert_eq!(scenario.boot.interception.step_active, 0);
@@ -2217,9 +2530,15 @@ fn unchanged_read_only_mixed_instructions_use_private_mtf_without_parked_peers_o
 fn synchronization_recovery_preserves_the_original_revocation_cause() {
     let mut scenario = Scenario::new();
     scenario.call(1);
-    scenario.session.cause.store(u64::from(protocol::memory::INTERCEPT_CAUSE_RENDEZVOUS), Ordering::Release);
+    scenario.session.cause.store(
+        u64::from(protocol::memory::INTERCEPT_CAUSE_RENDEZVOUS),
+        Ordering::Release,
+    );
     assert_eq!(scenario.call(2), 0);
-    assert_eq!(scenario.session.cause.load(Ordering::Acquire), u64::from(protocol::memory::INTERCEPT_CAUSE_RENDEZVOUS));
+    assert_eq!(
+        scenario.session.cause.load(Ordering::Acquire),
+        u64::from(protocol::memory::INTERCEPT_CAUSE_RENDEZVOUS)
+    );
     assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
 }
 
@@ -2289,16 +2608,25 @@ fn assembly_callback_excludes_sync_nmi_during_rust_timing_and_restores_the_prior
         scenario.boot.telemetry_active = 1;
         scenario.boot.sync_safe = safe;
         hardware::write(TSC_OFFSET, 1000).unwrap();
-        assert_eq!(unsafe { matrixhv_test_callback(&mut scenario.boot, 1, scenario.frame.as_mut_ptr()) }, 0);
+        assert_eq!(
+            unsafe { matrixhv_test_callback(&mut scenario.boot, 1, scenario.frame.as_mut_ptr()) },
+            0
+        );
         assert_eq!(scenario.boot.sync_safe, safe);
         scenario.boot.interception.timing_start = 100;
         hardware::STATE.with(|state| state.borrow_mut().clock = 160);
         INTERRUPT_AT_CLOCK.with(|pointer| pointer.set(&mut scenario.boot));
-        assert_eq!(unsafe { matrixhv_test_callback(&mut scenario.boot, 5, scenario.frame.as_mut_ptr()) }, 0);
+        assert_eq!(
+            unsafe { matrixhv_test_callback(&mut scenario.boot, 5, scenario.frame.as_mut_ptr()) },
+            0
+        );
         assert_eq!(INTERRUPT_RESULT.with(|result| result.get()), (0, 1));
         assert_eq!(scenario.boot.sync_nmi, 0);
         assert_eq!(scenario.boot.sync_safe, safe);
-        assert_eq!(scenario.boot.interception.runtime_diagnostics[3..6], [1, 1, 0]);
+        assert_eq!(
+            scenario.boot.interception.runtime_diagnostics[3..6],
+            [1, 1, 0]
+        );
         assert_eq!(hardware::read(TSC_OFFSET), Ok(940));
         scenario.boot.interception.timing_start = 200;
         hardware::STATE.with(|state| state.borrow_mut().clock = 230);
@@ -2312,9 +2640,13 @@ fn assembly_callback_excludes_sync_nmi_during_rust_timing_and_restores_the_prior
 #[test]
 fn private_shared_data_timer_uses_fast_cadence_only_while_the_target_root_runs() {
     let mut scenario = Scenario::new();
-    scenario.session.configuration.get_mut().options = protocol::memory::INTERCEPT_PRIVATE_SHARED_DATA;
+    scenario.session.configuration.get_mut().options =
+        protocol::memory::INTERCEPT_PRIVATE_SHARED_DATA;
     scenario.session.tsc_hz.store(32_000_000, Ordering::Release);
-    scenario.session.lease_deadline.store(32_000_100, Ordering::Release);
+    scenario
+        .session
+        .lease_deadline
+        .store(32_000_100, Ordering::Release);
     scenario.session.configuration.get_mut().timer_rate = 5;
     hardware::STATE.with(|state| state.borrow_mut().clock = 100);
     for (root, expected) in [(0x3007, 1000), (0x5000, 1_000_000), (0x4000, 1000)] {
@@ -2503,8 +2835,10 @@ fn ept_during_idt_delivery_retires_without_executing_the_interrupted_instruction
         scenario.call(1);
         scenario.frame[0] = 0xdead_beef;
         for (field, value) in [
-            (GUEST_RIP, 0x400000), (GUEST_RFLAGS, 0x10202),
-            (GUEST_PHYSICAL_ADDRESS, 0x800008), (GUEST_LINEAR_ADDRESS, 0x400008),
+            (GUEST_RIP, 0x400000),
+            (GUEST_RFLAGS, 0x10202),
+            (GUEST_PHYSICAL_ADDRESS, 0x800008),
+            (GUEST_LINEAR_ADDRESS, 0x400008),
             (IDT_VECTORING_INFO_FIELD, event),
         ] {
             hardware::write(field, value).unwrap();
@@ -2518,7 +2852,11 @@ fn ept_during_idt_delivery_retires_without_executing_the_interrupted_instruction
         });
         assert_eq!(scenario.exit(48, 0x181), 1);
         assert_eq!(
-            (hardware::read(GUEST_RIP).unwrap(), scenario.frame[0], hardware::read(GUEST_RFLAGS).unwrap()),
+            (
+                hardware::read(GUEST_RIP).unwrap(),
+                scenario.frame[0],
+                hardware::read(GUEST_RFLAGS).unwrap()
+            ),
             (0x400000, 0xdead_beef, 0x10202),
         );
         assert!(!scenario.session.is_active());
@@ -2535,8 +2873,10 @@ fn asynchronous_ept_access_never_completes_the_current_guest_instruction() {
     scenario.call(1);
     scenario.frame[0] = 0xdead_beef;
     for (field, value) in [
-        (GUEST_RIP, 0x400000), (GUEST_RFLAGS, 0x10202),
-        (GUEST_PHYSICAL_ADDRESS, 0x800008), (GUEST_LINEAR_ADDRESS, 0x400008),
+        (GUEST_RIP, 0x400000),
+        (GUEST_RFLAGS, 0x10202),
+        (GUEST_PHYSICAL_ADDRESS, 0x800008),
+        (GUEST_LINEAR_ADDRESS, 0x400008),
     ] {
         hardware::write(field, value).unwrap();
     }
@@ -2572,16 +2912,29 @@ fn assembly_callback_dispatches_queued_debug_causes_after_early_observer_recover
             state.clock = 2;
             state.fail_writes.insert(GUEST_DR7, 1);
         });
-        assert_eq!(unsafe { matrixhv_test_callback(&mut scenario.boot, 4, scenario.frame.as_mut_ptr()) }, 0);
+        assert_eq!(
+            unsafe { matrixhv_test_callback(&mut scenario.boot, 4, scenario.frame.as_mut_ptr()) },
+            0
+        );
         assert!(!scenario.session.is_active());
         assert_eq!(scenario.boot.interception.controls_saved, 0);
         assert_eq!(scenario.boot.interception.debug_armed, 0);
         assert_eq!(scenario.boot.interception.exit_ept, 0);
-        assert_ne!(scenario.session.exit_debug[0].load(Ordering::Acquire) & 1, 0);
-        let outcome = unsafe { matrixhv_test_callback(&mut scenario.boot, 0, scenario.frame.as_mut_ptr()) };
+        assert_ne!(
+            scenario.session.exit_debug[0].load(Ordering::Acquire) & 1,
+            0
+        );
+        let outcome =
+            unsafe { matrixhv_test_callback(&mut scenario.boot, 0, scenario.frame.as_mut_ptr()) };
         assert_eq!(outcome, u64::from(qualification == 1));
-        assert_eq!(hardware::debug_registers()[4] & 0x4001, qualification & 0x4000);
-        assert_eq!(scenario.session.exit_debug[0].load(Ordering::Acquire) & 1, 0);
+        assert_eq!(
+            hardware::debug_registers()[4] & 0x4001,
+            qualification & 0x4000
+        );
+        assert_eq!(
+            scenario.session.exit_debug[0].load(Ordering::Acquire) & 1,
+            0
+        );
         assert_eq!(hardware::read(GUEST_RIP), Ok(0x400000));
     }
 }
@@ -2617,12 +2970,19 @@ fn exact_cr3_targets_cache_only_equivalent_views_and_restore_original_targets() 
     hardware::write(GUEST_PHYSICAL_ADDRESS, 0x800009).unwrap();
     scenario.exit(48, 1);
     scenario.call(1);
-    assert_eq!(hardware::read(CR3_TARGET_COUNT), Ok(0), "data view must still observe reloads");
+    assert_eq!(
+        hardware::read(CR3_TARGET_COUNT),
+        Ok(0),
+        "data view must still observe reloads"
+    );
     scenario.session.active.store(0, Ordering::Release);
     scenario.call(1);
     assert_eq!(hardware::read(CR3_TARGET_COUNT), Ok(2));
     for index in 0..4 {
-        assert_eq!(hardware::read(0x6008 + index * 2), Ok(0xaa000 + index * 4096));
+        assert_eq!(
+            hardware::read(0x6008 + index * 2),
+            Ok(0xaa000 + index * 4096)
+        );
     }
 }
 
@@ -2916,7 +3276,15 @@ fn transient_vmcs_failures_retire_the_profile_and_restore_controls_before_reentr
 
 #[test]
 fn recovery_requests_retry_only_for_ept_dispatch_and_forwards_other_phases() {
-    for (phase, reason, expected) in [(0, 48, 1), (0, 10, 0), (1, 48, 0), (2, 48, 0), (3, 48, 0), (4, 48, 0), (5, 48, 0)] {
+    for (phase, reason, expected) in [
+        (0, 48, 1),
+        (0, 10, 0),
+        (1, 48, 0),
+        (2, 48, 0),
+        (3, 48, 0),
+        (4, 48, 0),
+        (5, 48, 0),
+    ] {
         let mut scenario = Scenario::new();
         scenario.boot.telemetry_active = 1;
         assert_eq!(scenario.call(1), 0);
@@ -2944,10 +3312,17 @@ fn recovery_requests_retry_only_for_ept_dispatch_and_forwards_other_phases() {
                 state.fail_reads.insert(field, 1);
             }
         });
-        assert_eq!(scenario.call(phase), expected, "phase={phase}, reason={reason}");
+        assert_eq!(
+            scenario.call(phase),
+            expected,
+            "phase={phase}, reason={reason}"
+        );
         assert!(!scenario.session.is_active());
         assert_eq!(hardware::read(EPT_POINTER), Ok(0x105e));
-        assert_eq!(scenario.boot.interception.runtime_diagnostics[18..21], [1, 1, 0]);
+        assert_eq!(
+            scenario.boot.interception.runtime_diagnostics[18..21],
+            [1, 1, 0]
+        );
     }
 }
 
@@ -3138,10 +3513,19 @@ fn profile_flush_invalidates_private_data_roots_without_concurrent_writes_or_spl
         assert_eq!(scenario.call(1), 0);
         hardware::STATE.with(|state| state.borrow_mut().invalidated_epts.clear());
         assert_eq!(scenario.call(3), 0);
-        assert_eq!(scenario.boot.interception.split_flush_epoch.load(Ordering::Acquire), 0);
+        assert_eq!(
+            scenario
+                .boot
+                .interception
+                .split_flush_epoch
+                .load(Ordering::Acquire),
+            0
+        );
         hardware::STATE.with(|state| {
-            assert!(state.borrow().invalidated_epts.contains(&0xa05e),
-                "profile replacement left a CPU-private root cached with options={options}");
+            assert!(
+                state.borrow().invalidated_epts.contains(&0xa05e),
+                "profile replacement left a CPU-private root cached with options={options}"
+            );
         });
     }
 }
@@ -3195,7 +3579,10 @@ fn a_sync_nmi_during_vm_exit_cannot_retire_an_unobserved_debug_breakpoint() {
             hardware::write(VM_EXIT_INTR_INFO, 0x80000301).unwrap();
             hardware::write(GUEST_RIP, 0x400000).unwrap();
             hardware::write(GUEST_RFLAGS, 0x202).unwrap();
-            assert_eq!(unsafe { matrixhv_test_transition_nmi(&mut scenario.boot, window, edge) }, 1);
+            assert_eq!(
+                unsafe { matrixhv_test_transition_nmi(&mut scenario.boot, window, edge) },
+                1
+            );
             assert_eq!(scenario.boot.sync_safe, 0);
             assert_eq!(scenario.boot.interception.debug_armed, 1);
             assert_eq!(scenario.exit(0, 1), 1);
@@ -3213,9 +3600,15 @@ fn nmi_entry_guard_keeps_callbacks_enabled_outside_transition_prologues() {
         scenario.boot.sync_safe = 1;
         scenario.boot.sync_nmi = 1;
         scenario.boot.telemetry_active = 1;
-        assert_eq!(unsafe { matrixhv_test_transition_nmi(&mut scenario.boot, window, 2) }, 1);
+        assert_eq!(
+            unsafe { matrixhv_test_transition_nmi(&mut scenario.boot, window, 2) },
+            1
+        );
         assert_eq!(scenario.boot.sync_safe, 1);
-        assert_eq!(scenario.boot.interception.runtime_diagnostics[3..6], [1, 1, 0]);
+        assert_eq!(
+            scenario.boot.interception.runtime_diagnostics[3..6],
+            [1, 1, 0]
+        );
     }
 }
 
@@ -3245,3 +3638,6 @@ fn fatal_mixed_instruction_retires_owned_windows_before_terminal_return() {
         });
     }
 }
+
+#[path = "observation_runtime_tests.rs"]
+mod observation_runtime_tests;

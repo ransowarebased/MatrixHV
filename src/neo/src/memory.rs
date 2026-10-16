@@ -25,30 +25,58 @@ pub struct InterceptionRequest {
     pub items: Vec<Item>,
     pub redirects: Vec<(u64, u64)>,
     pub contexts: Vec<u64>,
+    pub hook_flags: Vec<u32>,
+    pub watchpoints: Vec<(u64, u32, u32)>,
+    pub callback: u64,
+    pub syscall_entry: u64,
+    pub cpu: u32,
+    pub cursor: u64,
+    pub count: usize,
 }
 
 pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, String> {
     use crate::protocol::memory::{
-        DEBUG_CLEAR, DEBUG_SET, HOOK_ADD, HOOK_DROP, HOOK_INSTALL, HOOK_LIST, HOOK_MAX_PATCHES,
-        HOOK_REMOVE, INTERCEPT_CONTEXT_ADD, INTERCEPT_CONTEXT_LIST, INTERCEPT_CONTEXT_REMOVE,
-        INTERCEPT_MAX_LEASE_MS, INTERCEPT_NO_LEASE, INTERCEPT_RELEASE, INTERCEPT_RENEW,
-        INTERCEPT_STATUS,
+        CONTEXT_CLEAR, CONTEXT_CPU_RECORDS, CONTEXT_RECORD_BYTES, CONTEXT_SET, CONTEXT_SNAPSHOT,
+        DEBUG_CLEAR, DEBUG_SET, HOOK_ADD, HOOK_DATA_SHADOW, HOOK_DROP, HOOK_INSTALL, HOOK_LIST,
+        HOOK_MAX_PATCHES, HOOK_REMOVE, INTERCEPT_CONTEXT_ADD, INTERCEPT_CONTEXT_LIST,
+        INTERCEPT_CONTEXT_REMOVE, INTERCEPT_MAX_LEASE_MS, INTERCEPT_NO_LEASE, INTERCEPT_RELEASE,
+        INTERCEPT_RENEW, INTERCEPT_STATUS, STACK_MAX_FRAMES, STACK_WALK, SYSCALL_CLEAR,
+        SYSCALL_SET, WATCH_CLEAR, WATCH_FETCH, WATCH_RECORD_BYTES, WATCH_RING_RECORDS, WATCH_SET,
     };
     let operation = request.operation;
     if request.lease_ms > INTERCEPT_MAX_LEASE_MS
-        || request.lease_ms != 0 && !matches!(operation, HOOK_INSTALL | DEBUG_SET | INTERCEPT_RENEW)
+        || request.lease_ms != 0
+            && !matches!(
+                operation,
+                HOOK_INSTALL | DEBUG_SET | WATCH_SET | CONTEXT_SET | SYSCALL_SET | INTERCEPT_RENEW
+            )
         || request.flags & INTERCEPT_NO_LEASE != 0
-            && (request.lease_ms != 0 || !matches!(operation, HOOK_INSTALL | DEBUG_SET))
+            && (request.lease_ms != 0
+                || !matches!(
+                    operation,
+                    HOOK_INSTALL | DEBUG_SET | WATCH_SET | CONTEXT_SET | SYSCALL_SET
+                ))
     {
         return Err("invalid interception lease configuration".into());
     }
-    if matches!(operation, HOOK_INSTALL | DEBUG_SET) && request.cr3 & !4095 == 0
+    if matches!(
+        operation,
+        HOOK_INSTALL | DEBUG_SET | WATCH_SET | CONTEXT_SET | SYSCALL_SET
+    ) && request.cr3 & !4095 == 0
         || request.alternate_cr3 != 0 && request.alternate_cr3 & !4095 == 0
     {
         return Err("CR3 must contain a nonzero page-table root".into());
     }
     let mut bytes = match operation {
         HOOK_INSTALL | HOOK_ADD => {
+            if !request.hook_flags.is_empty() && request.hook_flags.len() != request.items.len()
+                || request
+                    .hook_flags
+                    .iter()
+                    .any(|flags| flags & !HOOK_DATA_SHADOW != 0)
+            {
+                return Err("invalid per-descriptor hook flags".into());
+            }
             if request.items.len() > HOOK_MAX_PATCHES {
                 return Err("hook capacity exceeded".into());
             }
@@ -57,7 +85,7 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
                     return Err("each patch must fit inside one 4 KiB page".into());
                 }
             }
-            packet(
+            let mut bytes = packet(
                 WRITE,
                 0,
                 if operation == HOOK_INSTALL {
@@ -66,7 +94,12 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
                     0
                 },
                 &request.items,
-            )?
+            )?;
+            for (index, flags) in request.hook_flags.iter().enumerate() {
+                let offset = HEADER_BYTES + index * ITEM_BYTES + 20;
+                bytes[offset..offset + 4].copy_from_slice(&flags.to_le_bytes());
+            }
+            bytes
         }
         DEBUG_SET => {
             if request.redirects.is_empty() || request.redirects.len() > 4 {
@@ -81,6 +114,43 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
                 bytes[offset + 8..offset + 16].copy_from_slice(&redirect.to_le_bytes());
             }
             bytes
+        }
+        WATCH_SET => {
+            if request.watchpoints.is_empty() || request.watchpoints.len() > 4 {
+                return Err("watch requires 1..4 ADDRESS ACCESS LENGTH triples".into());
+            }
+            let mut bytes = vec![0; HEADER_BYTES + request.watchpoints.len() * 16];
+            bytes[32..36].copy_from_slice(&(request.watchpoints.len() as u32).to_le_bytes());
+            for (index, (address, access, length)) in request.watchpoints.iter().enumerate() {
+                if !matches!(access, 1 | 3)
+                    || !matches!(length, 1 | 2 | 4 | 8)
+                    || address & (u64::from(*length) - 1) != 0
+                {
+                    return Err("watch access must be write or read/write and length must be aligned 1/2/4/8".into());
+                }
+                let offset = HEADER_BYTES + index * 16;
+                bytes[offset..offset + 8].copy_from_slice(&address.to_le_bytes());
+                bytes[offset + 8..offset + 12].copy_from_slice(&access.to_le_bytes());
+                bytes[offset + 12..offset + 16].copy_from_slice(&length.to_le_bytes());
+            }
+            bytes
+        }
+        WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK => {
+            let (maximum, record_bytes) = match operation {
+                WATCH_FETCH => (WATCH_RING_RECORDS, WATCH_RECORD_BYTES),
+                CONTEXT_SNAPSHOT => (CONTEXT_CPU_RECORDS, CONTEXT_RECORD_BYTES),
+                _ => (STACK_MAX_FRAMES, 16),
+            };
+            if request.count == 0 || request.count > maximum || request.cpu >= 64 {
+                return Err("invalid observation CPU or record count".into());
+            }
+            let mut bytes = vec![0; HEADER_BYTES + request.count * record_bytes];
+            bytes[24..32].copy_from_slice(&u64::from(request.cpu).to_le_bytes());
+            bytes[32..36].copy_from_slice(&(request.count as u32).to_le_bytes());
+            bytes
+        }
+        CONTEXT_SET | CONTEXT_CLEAR | WATCH_CLEAR | SYSCALL_SET | SYSCALL_CLEAR => {
+            vec![0; HEADER_BYTES]
         }
         INTERCEPT_CONTEXT_ADD | INTERCEPT_CONTEXT_REMOVE => {
             if request.contexts.is_empty() || request.contexts.len() > ROOT_HISTORY_COUNT - 2 {
@@ -106,6 +176,16 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
     let length = bytes.len() as u32;
     bytes[36..40].copy_from_slice(&length.to_le_bytes());
     bytes[64..72].copy_from_slice(&request.alternate_cr3.to_le_bytes());
+    if matches!(operation, WATCH_SET | CONTEXT_SET | SYSCALL_SET) {
+        bytes[16..24].copy_from_slice(&request.cr3.to_le_bytes());
+    }
+    if operation == SYSCALL_SET {
+        bytes[24..32].copy_from_slice(&request.callback.to_le_bytes());
+        bytes[48..56].copy_from_slice(&request.syscall_entry.to_le_bytes());
+    }
+    if matches!(operation, WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK) {
+        bytes[64..72].copy_from_slice(&request.cursor.to_le_bytes());
+    }
     bytes[80..88].copy_from_slice(&request.token.to_le_bytes());
     bytes[128..132].copy_from_slice(&request.flags.to_le_bytes());
     bytes[132..136].copy_from_slice(&request.lease_ms.to_le_bytes());

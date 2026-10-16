@@ -43,6 +43,10 @@ pub(crate) const MSR_DRAM_ENERGY_STATUS: u32 = 0x619;
 pub(crate) const MSR_PP0_ENERGY_STATUS: u32 = 0x639;
 pub(crate) const MSR_PP1_ENERGY_STATUS: u32 = 0x641;
 const IA32_TSC_DEADLINE_MSR: u32 = 0x6e0;
+const IA32_U_CET_MSR: u32 = 0x6a0;
+const IA32_S_CET_MSR: u32 = 0x6a2;
+const IA32_PL0_SSP_MSR: u32 = 0x6a4;
+const IA32_INTERRUPT_SSP_TABLE_ADDR_MSR: u32 = 0x6a8;
 pub(crate) const IA32_HWP_REQUEST_MSR: u32 = 0x774;
 pub(crate) const IA32_XSS_MSR: u32 = 0xda0;
 pub(crate) const AMD_SEV_STATUS_MSR: u32 = 0xc001_0131;
@@ -162,6 +166,14 @@ pub(crate) fn allocate_bitmap() -> Result<ResidentPages, Status> {
             allow_low_msr_passthrough(bitmap, IA32_SYSENTER_CS_MSR);
             allow_low_msr_passthrough(bitmap, IA32_SYSENTER_ESP_MSR);
             allow_low_msr_passthrough(bitmap, IA32_SYSENTER_EIP_MSR);
+            // VMCS CET loads replace root-mode WRMSR changes on every entry.
+            // Native guest accesses also retain the processor's fault checks.
+            allow_low_msr_passthrough(bitmap, IA32_U_CET_MSR);
+            allow_low_msr_passthrough(bitmap, IA32_S_CET_MSR);
+            for index in IA32_PL0_SSP_MSR..IA32_PL0_SSP_MSR + 4 {
+                allow_low_msr_passthrough(bitmap, index);
+            }
+            allow_low_msr_passthrough(bitmap, IA32_INTERRUPT_SSP_TABLE_ADDR_MSR);
             // Resident CPUs own their physical APIC. Keep TSC synchronization and its
             // deadline timer in the same clock domain; L1 bitmap intercepts still apply to L2.
             for index in [IA32_TSC_MSR, IA32_TSC_ADJUST_MSR, IA32_TSC_DEADLINE_MSR] {

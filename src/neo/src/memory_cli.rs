@@ -10,6 +10,10 @@ pub(crate) mod tracking;
 #[path = "../../memory/interception.rs"]
 pub(crate) mod interception;
 
+#[cfg(test)]
+#[path = "../../memory/observation.rs"]
+pub(crate) mod observation;
+
 use crate::protocol::memory::{
     AD_CANCEL, AD_ENABLED, AD_LARGE_PAGE, AD_RELEASE, AD_STATUS, AD_STOP, BUFFER_BYTES,
     HEADER_BYTES, ITEM_BYTES, MAX_ITEMS, READ, ROOT_HISTORY_COUNT, TRACK_ACCESSED, TRACK_DIRTY,
@@ -45,6 +49,13 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
     } else {
         false
     };
+    let data_shadow =
+        if let Some(index) = arguments.iter().position(|value| value == "--data-shadow") {
+            arguments.remove(index);
+            true
+        } else {
+            false
+        };
     let mut modes = 0;
     for (option, flag) in [
         (
@@ -129,6 +140,9 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
         flags: modes,
         ..Default::default()
     };
+    if data_shadow && !matches!(operation, HOOK_INSTALL | HOOK_ADD) {
+        return Err("--data-shadow applies to hook installation or add".into());
+    }
     if no_lease {
         request.flags |= crate::protocol::memory::INTERCEPT_NO_LEASE;
     }
@@ -195,7 +209,144 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
             request.patch_id = number(&arguments[3])?;
         }
     }
+    if data_shadow {
+        request.hook_flags = vec![crate::protocol::memory::HOOK_DATA_SHADOW; request.items.len()];
+    }
     neo::memory::interception_packet(&request)
+}
+
+pub(crate) fn run_observation(arguments: &[String]) -> Result<i32, String> {
+    use crate::protocol::memory::*;
+    let mut operands = arguments.to_vec();
+    let no_lease = if let Some(index) = operands.iter().position(|value| value == "--no-lease") {
+        operands.remove(index);
+        true
+    } else {
+        false
+    };
+    let mut request = InterceptionRequest::default();
+    let command = operands.first().map(String::as_str).unwrap_or("");
+    let action = operands.get(1).map(String::as_str).unwrap_or("");
+    request.operation = match (command, action) {
+        ("watch", "set") => WATCH_SET, ("watch", "fetch") => WATCH_FETCH, ("watch", "clear") => WATCH_CLEAR,
+        ("context", "set") => CONTEXT_SET, ("context", "clear") => CONTEXT_CLEAR,
+        ("context", "snapshot") => CONTEXT_SNAPSHOT, ("context", "stack") => STACK_WALK,
+        ("syscall", "set") => SYSCALL_SET, ("syscall", "clear") => SYSCALL_CLEAR,
+        _ => return Err("usage: neo watch set CR3 TOKEN ADDRESS write|rw LENGTH [...] [--no-lease]; watch fetch TOKEN CPU CURSOR COUNT; watch clear TOKEN; context set CR3 TOKEN [--no-lease]; context snapshot TOKEN CPU CURSOR COUNT; context stack TOKEN CPU SEQUENCE COUNT (RBP chain); context clear TOKEN; syscall set CR3 TOKEN CALLBACK LSTAR [--no-lease]; syscall clear TOKEN".into()),
+    };
+    if no_lease {
+        if !matches!(request.operation, WATCH_SET | CONTEXT_SET | SYSCALL_SET) {
+            return Err("--no-lease requires set".into());
+        }
+        request.flags |= INTERCEPT_NO_LEASE;
+    }
+    let value = |index: usize| number(operands.get(index).ok_or("missing observation operand")?);
+    match request.operation {
+        WATCH_SET | CONTEXT_SET | SYSCALL_SET => {
+            request.cr3 = value(2)?;
+            request.token = value(3)?;
+            if request.operation == WATCH_SET {
+                if operands.len() <= 4 || !(operands.len() - 4).is_multiple_of(3) {
+                    return Err("watch set requires ADDRESS write|rw LENGTH triples".into());
+                }
+                for triple in operands[4..].as_chunks::<3>().0 {
+                    let access = match triple[1].as_str() {
+                        "write" => 1,
+                        "rw" => 3,
+                        _ => return Err("watch access must be write or rw".into()),
+                    };
+                    let length =
+                        u32::try_from(number(&triple[2])?).map_err(|_| "invalid watch length")?;
+                    request
+                        .watchpoints
+                        .push((number(&triple[0])?, access, length));
+                }
+            } else if request.operation == SYSCALL_SET && operands.len() == 6 {
+                request.callback = value(4)?;
+                request.syscall_entry = value(5)?;
+            } else if request.operation != CONTEXT_SET || operands.len() != 4 {
+                return Err("invalid setup operands".into());
+            }
+        }
+        WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK => {
+            if operands.len() != 6 {
+                return Err("fetch requires TOKEN CPU CURSOR COUNT".into());
+            }
+            request.token = value(2)?;
+            request.cpu = u32::try_from(value(3)?).map_err(|_| "invalid CPU")?;
+            request.cursor = value(4)?;
+            request.count = usize::try_from(value(5)?).map_err(|_| "invalid record count")?;
+        }
+        _ => {
+            if operands.len() != 3 {
+                return Err("clear requires TOKEN".into());
+            }
+            request.token = value(2)?;
+        }
+    }
+    let mut bytes = neo::memory::interception_packet(&request)?;
+    invoke(&mut bytes)?;
+    if matches!(
+        request.operation,
+        WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK
+    ) {
+        let size = match request.operation {
+            WATCH_FETCH => WATCH_RECORD_BYTES,
+            CONTEXT_SNAPSHOT => CONTEXT_RECORD_BYTES,
+            _ => 16,
+        };
+        println!(
+            "records={} next={} oldest={} dropped={} walk_status={}",
+            word(&bytes, 32),
+            quad(&bytes, 88),
+            quad(&bytes, 96),
+            quad(&bytes, 120),
+            word(&bytes, 72)
+        );
+        for index in 0..word(&bytes, 32) as usize {
+            let record = &bytes[HEADER_BYTES + index * size..HEADER_BYTES + (index + 1) * size];
+            if request.operation == STACK_WALK {
+                println!("rip={:#x} rsp={:#x}", quad(record, 0), quad(record, 8));
+            } else {
+                println!(
+                    "sequence={} tsc={} cr3={:#x} rip={:#x} rsp={:#x} rbp={:#x} rflags={:#x} gs_base={:#x} thread_teb={:#x} cpu={} cpl={}",
+                    quad(record, 0),
+                    quad(record, 8),
+                    quad(record, 16),
+                    quad(record, 24),
+                    quad(record, 32),
+                    quad(record, 40),
+                    quad(record, 48),
+                    quad(record, 56),
+                    quad(record, 64),
+                    quad(record, 192),
+                    quad(record, 200)
+                );
+                for (reg, name) in [
+                    "rax", "rcx", "rdx", "rbx", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11",
+                    "r12", "r13", "r14", "r15",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    print!("{name}={:#x} ", quad(record, 72 + reg * 8));
+                }
+                println!();
+                if request.operation == WATCH_FETCH {
+                    println!(
+                        "address={:#x} hit_count={} slot={} post_instruction={}",
+                        quad(record, 208),
+                        quad(record, 216),
+                        quad(record, 224),
+                        quad(record, 232) & WATCH_POST_INSTRUCTION != 0
+                    );
+                }
+            }
+        }
+    } else {
+        println!("token={} state={}", quad(&bytes, 80), word(&bytes, 112));
+    }
+    Ok(0)
 }
 
 pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {

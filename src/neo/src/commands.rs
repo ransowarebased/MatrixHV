@@ -46,6 +46,12 @@ struct RemoteStatus {
 pub fn run(arguments: Vec<String>) -> Result<i32, String> {
     if matches!(
         arguments.first().map(String::as_str),
+        Some("watch" | "context" | "syscall")
+    ) {
+        return crate::memory::run_observation(&arguments);
+    }
+    if matches!(
+        arguments.first().map(String::as_str),
         Some("hook" | "debug-registers")
     ) {
         return crate::memory::run_interception(&arguments);
@@ -770,7 +776,7 @@ fn print_usage() {
         "neo telemetry --benchmark [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nBenchmark measures CPUID leaf 0 from guest to guest, including VM exit, handling and reentry.\nIt pins each available registered CPU and reports raw/calibrated TSC ticks, nanoseconds and min/mean/p50/p95/p99/max.\nCollection settings stay unchanged; compare telemetry disabled/enabled in separate runs.\nAn invariant TSC and clock diagnostics are required; release profiles using TSC compensation first.\nWith --remote, the benchmark runs on the remote server.\n"
     );
     println!(
-        "neo hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo hook add TOKEN ADDRESS HEX [...] | hook remove TOKEN [ID] | hook list TOKEN\nneo hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN\nneo hook renew TOKEN [--lease-ms MS] | hook watch TOKEN [--lease-ms MS] | hook release TOKEN | hook status\nneo debug-registers set CR3 ADDRESS REDIRECT_RIP [...] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo debug-registers clear TOKEN | debug-registers status\nVMFUNC uses EAX=0 and ECX=0 (execute) or 1 (original data) from unhooked code.\nOne profile admits the primary CR3 and validated aliases. Conflicting original writes revoke the profile.\nThe default lease is 30 seconds; watch renews it until the process exits. --no-lease requires explicit release and does not need a VMX preemption timer.\nTSC compensation is CPU-local and requires an invariant TSC without Hyper-V Reference TSC or scaling. Guest CPU migration can expose clock skew.\n"
+        "neo hook install CR3 ADDRESS HEX [...] [--alternate-cr3 CR3] [--vmfunc] [--concurrent-writes] [--persistent-data] [--data-shadow] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo hook add TOKEN ADDRESS HEX [...] [--data-shadow] | hook remove TOKEN [ID] | hook list TOKEN\nneo hook context-add TOKEN CR3 [...] | hook context-remove TOKEN CR3 [...] | hook context-list TOKEN\nneo hook renew TOKEN [--lease-ms MS] | hook watch TOKEN [--lease-ms MS] | hook release TOKEN | hook status\nneo debug-registers set CR3 ADDRESS REDIRECT_RIP [...] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo debug-registers clear TOKEN | debug-registers status\nneo watch set CR3 TOKEN ADDRESS write|rw LENGTH [...] [--no-lease]\nneo watch fetch TOKEN CPU CURSOR COUNT | watch clear TOKEN\nneo context set CR3 TOKEN [--no-lease] | context snapshot TOKEN CPU CURSOR COUNT\nneo context stack TOKEN CPU SEQUENCE COUNT | context clear TOKEN\nneo syscall set CR3 TOKEN CALLBACK LSTAR [--no-lease] | syscall clear TOKEN\nUse TOKEN=0 for a new profile; successful setup returns the shared current token.\nWatch RIP is the post-access PC. Context stack follows a bounded RBP chain; optimized frames may be omitted.\nVMFUNC uses EAX=0 and ECX=0 (execute) or 1 (data) from unhooked code.\nData shadows keep private page contents, including guest writes allowed by the original PTE.\nOne profile admits the primary CR3 and validated aliases. Conflicting original writes revoke the profile.\nThe default lease is 30 seconds; hook watch renews it until the process exits. --no-lease requires explicit release and does not need a VMX preemption timer.\nTSC compensation is CPU-local and requires an invariant TSC without Hyper-V Reference TSC or scaling. Guest CPU migration can expose clock skew.\n"
     );
     if cfg!(target_os = "windows") {
         println!(

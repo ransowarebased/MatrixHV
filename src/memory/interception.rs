@@ -2,6 +2,9 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::memory::access::{PhysicalMemory, page_mapping};
+#[cfg(target_os = "uefi")]
+use crate::memory::observation::ContextRecord;
+use crate::memory::observation::Observation;
 use crate::protocol::memory::*;
 
 const MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -164,6 +167,7 @@ pub(crate) struct Session {
     // deadline without increasing the allocation used by hot updates.
     pub exit_debug: [AtomicU64; 64],
     ept_progress: [AtomicU64; 64],
+    pub observation: u64,
 }
 const _: () = assert!(core::mem::offset_of!(Session, active) == 0);
 // Hot updates preserve every existing field and use only the zeroed tail of
@@ -203,16 +207,51 @@ impl Session {
         for progress in &self.ept_progress {
             progress.store(0, Ordering::Relaxed);
         }
+        self.observation = 0;
     }
 
     pub(crate) fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire) == u64::from(INTERCEPT_ACTIVE)
+    }
+
+    pub(crate) fn observer(&self) -> Option<&Observation> {
+        if self.observation == 0 {
+            None
+        } else {
+            Some(unsafe { &*(self.observation as *const Observation) })
+        }
+    }
+
+    unsafe fn observer_mut(&self) -> Result<&mut Observation, Error> {
+        if self.observation == 0 {
+            Err(Error::Unsupported)
+        } else {
+            Ok(unsafe { &mut *(self.observation as *mut Observation) })
+        }
+    }
+
+    fn debug_slots(&self, configuration: &RoadEptProfile) -> usize {
+        configuration.debug_count
+            + usize::from(unsafe { &*self.syscall.get() }.entry != 0)
+            + self.observer().map_or(0, |observer| observer.watch_count)
+    }
+
+    fn has_features(&self, configuration: &RoadEptProfile) -> bool {
+        configuration.hook_count != 0
+            || self.debug_slots(configuration) != 0
+            || unsafe { &*self.cpuid.get() }.count != 0
+            || self
+                .observer()
+                .is_some_and(|observer| observer.context_enabled)
     }
 }
 
 pub(crate) trait InterceptionMemory: PhysicalMemory {
     fn check_budget(&self) -> Result<(), Error>;
     fn syscall_context(&self) -> [u64; 3];
+    fn syscall_cet_available(&self) -> bool {
+        false
+    }
     fn quiesce(&mut self) -> Result<(), Error>;
     fn flush(&mut self);
     fn resume(&mut self);
@@ -305,7 +344,7 @@ fn lease_duration(
         return if word(packet, 132) == 0
             && matches!(
                 word(packet, 12),
-                HOOK_INSTALL | DEBUG_SET | CPUID_SET | SYSCALL_SET
+                HOOK_INSTALL | DEBUG_SET | CPUID_SET | SYSCALL_SET | WATCH_SET | CONTEXT_SET
             ) {
             Ok((0, 0))
         } else {
@@ -669,6 +708,7 @@ fn install(
     memory: &mut impl InterceptionMemory,
     splits: &mut [BaseSplit; INTERCEPT_BASE_TABLE_PAGES],
     hooks: &[Hook],
+    hook_flags: &[u32],
     flags: u32,
     la57: bool,
     physical_bits: u32,
@@ -712,11 +752,15 @@ fn install(
         clone_root(memory, configuration, memory.base_ept() & MASK)? | (memory.base_ept() & !MASK);
     configuration.patch_mask.fill([0; 64]);
     let mut page_count = 0;
-    for hook in hooks {
+    for (hook, hook_flags) in hooks.iter().zip(hook_flags) {
         memory.check_budget()?;
         let address = hook.address;
         let length = hook.length;
         let private_page = private_data && address == 0x7ffe0000;
+        let data_shadow = hook_flags & HOOK_DATA_SHADOW != 0;
+        if private_page && data_shadow {
+            return Err(Error::Format);
+        }
         let mapping = page_mapping(memory, configuration.roots[0], address, la57, physical_bits)?;
         if !mapping.present {
             return Err(Error::Unmapped);
@@ -729,7 +773,12 @@ fn install(
             .iter()
             .position(|page| *page == gpa);
         if let Some(index) = existing_page {
-            if (configuration.base_leaves[index] == 0) != private_page {
+            if (configuration.base_leaves[index] == 0) != (private_page || data_shadow) {
+                return Err(Error::Format);
+            }
+            if configuration.base_leaves[index] == 0
+                && (memory.table_entry(configuration.data_leaves[index])? & 1 != 0) != data_shadow
+            {
                 return Err(Error::Format);
             }
         }
@@ -769,7 +818,15 @@ fn install(
             // Trap accesses so kernel XSTATE initialization uses native features.
             memory.store_entry(
                 execute_leaf,
-                shadow | (entry & !MASK & !7) | if private_page { 0 } else { 4 },
+                shadow
+                    | (entry & !MASK & !7)
+                    | if private_page {
+                        0
+                    } else if data_shadow {
+                        7
+                    } else {
+                        4
+                    },
             )?;
             let data_leaf = leaf(
                 memory,
@@ -782,14 +839,16 @@ fn install(
             let entry = memory.table_entry(data_leaf)?;
             memory.store_entry(
                 data_leaf,
-                if private_page {
+                if data_shadow {
+                    shadow | (entry & !MASK & !7) | 7
+                } else if private_page {
                     gpa | (entry & !MASK & !7)
                 } else {
                     (entry & !7) | 1
                 },
             )?;
             configuration.data_leaves[page_count] = data_leaf;
-            configuration.base_leaves[page_count] = if private_page {
+            configuration.base_leaves[page_count] = if private_page || data_shadow {
                 0
             } else {
                 leaf(memory, configuration, splits, gpa, memory.base_ept(), true)?
@@ -1129,9 +1188,7 @@ fn syscall_profile(
     }
     let [entry, kernel_cr3, cr4] = memory.syscall_context();
     let callback = quad(packet, 24);
-    if cr4 & ((1 << 12) | (1 << 23)) != 0 {
-        // CET changes SSP across SYSCALL/SYSRET. This profile supports the
-        // recovered four-level, non-CET kernel entry only.
+    if cr4 & (1 << 12) != 0 || cr4 & (1 << 23) != 0 && !memory.syscall_cet_available() {
         return Err(Error::Unsupported);
     }
     if entry != quad(packet, 48)
@@ -1229,6 +1286,12 @@ fn change_hooks(
         }
     }
     let mut next_id = session.next_id.load(Ordering::Relaxed);
+    let mut pending_flags = session
+        .observer()
+        .map_or([0; HOOK_MAX_PATCHES], |observer| observer.hook_flags);
+    if operation == HOOK_INSTALL {
+        pending_flags.fill(0);
+    }
     let added = if operation == HOOK_DROP {
         if packet.len() != HEADER_BYTES {
             return Err(Error::Bounds);
@@ -1238,6 +1301,7 @@ fn change_hooks(
             .position(|hook| hook.id == quad(packet, 144))
             .ok_or(Error::Session)?;
         pending.copy_within(index + 1..count, index);
+        pending_flags.copy_within(index + 1..count, index);
         count -= 1;
         0
     } else {
@@ -1253,6 +1317,13 @@ fn change_hooks(
             let address = quad(packet, descriptor);
             let offset = word(packet, descriptor + 8) as usize;
             let length = word(packet, descriptor + 12) as usize;
+            let hook_flags = word(packet, descriptor + 20);
+            if hook_flags & !HOOK_DATA_SHADOW != 0 {
+                return Err(Error::Format);
+            }
+            if hook_flags != 0 && session.observer().is_none() {
+                return Err(Error::Unsupported);
+            }
             if !canonical(address, la57)
                 || length == 0
                 || length > 4096 - (address as usize & 4095)
@@ -1281,6 +1352,7 @@ fn change_hooks(
             hook.address = address;
             hook.physical_address = physical;
             hook.length = length;
+            pending_flags[count] = hook_flags;
             hook.bytes[..length].copy_from_slice(&packet[offset..offset + length]);
             count += 1;
         }
@@ -1333,6 +1405,7 @@ fn change_hooks(
             memory,
             unsafe { &mut *session.splits.get() },
             &pending[..count],
+            &pending_flags[..count],
             flags,
             la57,
             physical_bits,
@@ -1369,6 +1442,18 @@ fn change_hooks(
     }
     *configuration = *staged;
     configuration.generation = generation;
+    if session.observer().is_some() {
+        let observer = unsafe { session.observer_mut()? };
+        observer.hook_flags = pending_flags;
+        observer.data_count = 0;
+        for (hook, flags) in pending[..count].iter().zip(pending_flags) {
+            let page = hook.physical_address & !4095;
+            if flags & HOOK_DATA_SHADOW != 0 && !observer.data_shadow(page) {
+                observer.data_pages[observer.data_count] = page;
+                observer.data_count += 1;
+            }
+        }
+    }
     (unsafe { &mut *session.hooks.get() })[..count].copy_from_slice(&pending[..count]);
     session.hook_records.store(count as u64, Ordering::Relaxed);
     session.next_id.store(next_id, Ordering::Relaxed);
@@ -1426,6 +1511,7 @@ pub(crate) unsafe fn execute(
         if operation != INTERCEPT_STATUS
             && operation != HOOK_LIST
             && operation != INTERCEPT_CONTEXT_LIST
+            && !matches!(operation, WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK)
         {
             memory.quiesce()?;
             let mut result = (|| {
@@ -1439,7 +1525,13 @@ pub(crate) unsafe fn execute(
                 }
                 if matches!(
                     operation,
-                    HOOK_INSTALL | HOOK_ADD | DEBUG_SET | CPUID_SET | SYSCALL_SET
+                    HOOK_INSTALL
+                        | HOOK_ADD
+                        | DEBUG_SET
+                        | CPUID_SET
+                        | SYSCALL_SET
+                        | WATCH_SET
+                        | CONTEXT_SET
                 ) && !memory.available()
                 {
                     return Err(Error::Unsupported);
@@ -1465,46 +1557,80 @@ pub(crate) unsafe fn execute(
                         .store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
                 }
                 match operation {
-                    HOOK_INSTALL | DEBUG_SET | CPUID_SET | SYSCALL_SET => {
+                    HOOK_INSTALL | DEBUG_SET | CPUID_SET | SYSCALL_SET | WATCH_SET
+                    | CONTEXT_SET => {
                         let cpuid = if operation == CPUID_SET {
                             Some(cpuid_profile(packet, la57)?)
                         } else {
                             None
                         };
-                        if matches!(operation, CPUID_SET | SYSCALL_SET)
+                        if matches!(operation, CPUID_SET | SYSCALL_SET | WATCH_SET | CONTEXT_SET)
                             && session.is_active()
                             && quad(packet, 80) != configuration.token
                         {
                             return Err(Error::Session);
                         }
                         let syscall = if operation == SYSCALL_SET {
-                            if session.is_active()
-                                && configuration.debug_count != 0
-                                && unsafe { &*session.syscall.get() }.token != configuration.token
-                            {
-                                return Err(Error::Busy);
-                            }
                             Some(syscall_profile(packet, memory, physical_bits)?)
                         } else {
-                            if operation == DEBUG_SET
-                                && session.is_active()
-                                && unsafe { &*session.syscall.get() }.entry != 0
-                            {
-                                return Err(Error::Busy);
-                            }
                             None
                         };
+                        let watch = if operation == WATCH_SET {
+                            if session.observer().is_none() {
+                                return Err(Error::Unsupported);
+                            }
+                            Some(Observation::watch_targets(packet, la57)?)
+                        } else {
+                            None
+                        };
+                        if operation == CONTEXT_SET
+                            && (packet.len() != HEADER_BYTES || word(packet, 32) != 0)
+                        {
+                            return Err(Error::Bounds);
+                        }
+                        if operation == CONTEXT_SET && session.observer().is_none() {
+                            return Err(Error::Unsupported);
+                        }
+                        let debug_count = if operation == DEBUG_SET {
+                            word(packet, 32) as usize
+                        } else if session.is_active() {
+                            configuration.debug_count
+                        } else {
+                            0
+                        };
+                        let syscall_count = usize::from(
+                            syscall.is_some()
+                                || session.is_active()
+                                    && unsafe { &*session.syscall.get() }.entry != 0,
+                        );
+                        let watch_count = watch.as_ref().map_or_else(
+                            || {
+                                if session.is_active() {
+                                    session
+                                        .observer()
+                                        .map_or(0, |observer| observer.watch_count)
+                                } else {
+                                    0
+                                }
+                            },
+                            |(_, count)| *count,
+                        );
+                        if debug_count + syscall_count + watch_count > 4 {
+                            return Err(Error::Capacity);
+                        }
                         let (duration, ticks) =
                             lease_duration(packet, memory, INTERCEPT_DEFAULT_LEASE_MS)?;
                         let token = configuration.token.checked_add(1).ok_or(Error::Capacity)?;
                         let flags = word(packet, 128);
                         if flags & !OPTIONS != 0
-                            || matches!(operation, DEBUG_SET | CPUID_SET | SYSCALL_SET)
-                                && flags
-                                    & (INTERCEPT_VMFUNC
-                                        | INTERCEPT_CONCURRENT_WRITES
-                                        | INTERCEPT_PERSISTENT_DATA)
-                                    != 0
+                            || matches!(
+                                operation,
+                                DEBUG_SET | CPUID_SET | SYSCALL_SET | WATCH_SET | CONTEXT_SET
+                            ) && flags
+                                & (INTERCEPT_VMFUNC
+                                    | INTERCEPT_CONCURRENT_WRITES
+                                    | INTERCEPT_PERSISTENT_DATA)
+                                != 0
                             || operation == SYSCALL_SET
                                 && flags & !(INTERCEPT_TSC_OFFSET | INTERCEPT_NO_LEASE) != 0
                         {
@@ -1529,6 +1655,15 @@ pub(crate) unsafe fn execute(
                             configuration.roots = roots;
                             configuration.hook_count = 0;
                             configuration.debug_count = 0;
+                            if session.observer().is_some() {
+                                let observer = unsafe { session.observer_mut()? };
+                                observer.watch_count = 0;
+                                observer.context_enabled = false;
+                                observer.data_count = 0;
+                                observer.hook_flags.fill(0);
+                                observer.reset_watch();
+                                observer.reset_contexts();
+                            }
                             unsafe {
                                 *session.cpuid.get() = CpuidProfile::default();
                             }
@@ -1555,12 +1690,6 @@ pub(crate) unsafe fn execute(
                                 physical_bits,
                             )?;
                         } else if let Some(syscall) = syscall {
-                            configuration.debug.fill(DebugTarget::default());
-                            configuration.debug[0] = DebugTarget {
-                                address: syscall.entry,
-                                redirect: syscall.callback,
-                            };
-                            configuration.debug_count = 1;
                             unsafe {
                                 *session.syscall.get() = syscall;
                             }
@@ -1574,6 +1703,21 @@ pub(crate) unsafe fn execute(
                             if flags & INTERCEPT_TSC_OFFSET != 0 {
                                 configuration.timing = 1;
                             }
+                        } else if let Some((targets, count)) = watch {
+                            let observer = unsafe { session.observer_mut()? };
+                            observer.watch = targets;
+                            observer.watch_count = count;
+                            observer.reset_watch();
+                        } else if operation == CONTEXT_SET {
+                            let observer = unsafe { session.observer_mut()? };
+                            observer.context_enabled = true;
+                            let clock_hz = memory.clock_hz();
+                            observer.sample_ticks = if memory.lease_available() && clock_hz != 0 {
+                                (clock_hz / 1000).max(2)
+                            } else {
+                                0
+                            };
+                            observer.reset_contexts();
                         } else {
                             set_debug(configuration, packet, la57)?;
                             if flags & INTERCEPT_TSC_OFFSET != 0 {
@@ -1623,10 +1767,7 @@ pub(crate) unsafe fn execute(
                                 la57,
                                 physical_bits,
                             )?;
-                            if configuration.hook_count == 0
-                                && configuration.debug_count == 0
-                                && unsafe { &*session.cpuid.get() }.count == 0
-                            {
+                            if !session.has_features(configuration) {
                                 session.active.store(0, Ordering::Release);
                             }
                         }
@@ -1686,7 +1827,8 @@ pub(crate) unsafe fn execute(
                         configuration.extra_roots = roots;
                         configuration.generation = generation;
                     }
-                    HOOK_REMOVE | DEBUG_CLEAR | CPUID_CLEAR | SYSCALL_CLEAR | INTERCEPT_RELEASE => {
+                    HOOK_REMOVE | DEBUG_CLEAR | CPUID_CLEAR | SYSCALL_CLEAR | WATCH_CLEAR
+                    | CONTEXT_CLEAR | INTERCEPT_RELEASE => {
                         if packet.len() != HEADER_BYTES || quad(packet, 80) != configuration.token {
                             return Err(Error::Session);
                         }
@@ -1695,16 +1837,34 @@ pub(crate) unsafe fn execute(
                             configuration.hook_count = 0;
                             configuration.vmfunc = 0;
                             session.hook_records.store(0, Ordering::Relaxed);
+                            if session.observer().is_some() {
+                                let observer = unsafe { session.observer_mut()? };
+                                observer.data_count = 0;
+                                observer.hook_flags.fill(0);
+                            }
                         }
-                        if matches!(operation, DEBUG_CLEAR | SYSCALL_CLEAR | INTERCEPT_RELEASE) {
+                        if matches!(operation, SYSCALL_CLEAR | INTERCEPT_RELEASE) {
                             if operation == SYSCALL_CLEAR
                                 && unsafe { &*session.syscall.get() }.entry == 0
                             {
                                 return Err(Error::Session);
                             }
-                            configuration.debug_count = 0;
                             unsafe {
                                 *session.syscall.get() = SyscallProfile::default();
+                            }
+                        }
+                        if matches!(operation, DEBUG_CLEAR | INTERCEPT_RELEASE) {
+                            configuration.debug_count = 0;
+                        }
+                        if matches!(operation, WATCH_CLEAR | CONTEXT_CLEAR)
+                            || operation == INTERCEPT_RELEASE && session.observer().is_some()
+                        {
+                            let observer = unsafe { session.observer_mut()? };
+                            if matches!(operation, WATCH_CLEAR | INTERCEPT_RELEASE) {
+                                observer.watch_count = 0;
+                            }
+                            if matches!(operation, CONTEXT_CLEAR | INTERCEPT_RELEASE) {
+                                observer.context_enabled = false;
                             }
                         }
                         if operation == CPUID_CLEAR || operation == INTERCEPT_RELEASE {
@@ -1712,10 +1872,7 @@ pub(crate) unsafe fn execute(
                                 *session.cpuid.get() = CpuidProfile::default();
                             }
                         }
-                        if configuration.hook_count == 0
-                            && configuration.debug_count == 0
-                            && unsafe { &*session.cpuid.get() }.count == 0
-                        {
+                        if !session.has_features(configuration) {
                             session.active.store(0, Ordering::Release);
                         }
                         if operation == HOOK_REMOVE || operation == INTERCEPT_RELEASE {
@@ -1744,6 +1901,18 @@ pub(crate) unsafe fn execute(
             memory.resume();
             result?;
         } else {
+            if matches!(operation, WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK) {
+                if quad(packet, 80) != unsafe { &*session.configuration.get() }.token {
+                    return Err(Error::Session);
+                }
+                let observer = session.observer().ok_or(Error::Unsupported)?;
+                if operation == STACK_WALK {
+                    observer.stack_walk(memory, packet, la57, physical_bits)?;
+                } else {
+                    observer.fetch(packet)?;
+                }
+                return Ok(());
+            }
             if operation == INTERCEPT_STATUS && packet.len() != HEADER_BYTES {
                 return Err(Error::Bounds);
             }
@@ -1764,6 +1933,12 @@ pub(crate) unsafe fn execute(
                         .copy_from_slice(&hook.address.to_le_bytes());
                     packet[descriptor + 16..descriptor + 20]
                         .copy_from_slice(&(hook.length as u32).to_le_bytes());
+                    packet[descriptor + 20..descriptor + 24].copy_from_slice(
+                        &session
+                            .observer()
+                            .map_or(0, |observer| observer.hook_flags[index])
+                            .to_le_bytes(),
+                    );
                 }
                 packet[32..36].copy_from_slice(&(count as u32).to_le_bytes());
             }
@@ -1894,6 +2069,38 @@ pub(crate) mod runtime {
         }
     }
 
+    fn user_cet() -> [u64; 2] {
+        unsafe { [crate::arch::read_msr(0x6a0), crate::arch::read_msr(0x6a7)] }
+    }
+
+    fn kernel_gs() -> u64 {
+        unsafe { crate::arch::read_msr(0xc000_0102) }
+    }
+
+    fn context_record(boot: &ResidentBootContext, frame: &[u64]) -> Result<ContextRecord, ()> {
+        let gs_base = read(GUEST_GS_BASE)?;
+        let cpl = read(GUEST_CS_SELECTOR)? & 3;
+        let thread_teb = if cpl == 0 && gs_base >> 63 != 0 {
+            kernel_gs()
+        } else {
+            gs_base
+        };
+        Ok(ContextRecord {
+            sequence: 0,
+            tsc: clock(),
+            cr3: read(GUEST_CR3)? & MASK,
+            rip: read(GUEST_RIP)?,
+            rsp: read(GUEST_RSP)?,
+            rbp: frame[4],
+            rflags: read(GUEST_RFLAGS)?,
+            gs_base,
+            thread_teb,
+            gprs: frame.try_into().map_err(|_| ())?,
+            cpu: boot.processor_number,
+            cpl,
+        })
+    }
+
     fn syscall_gate(registers: &[u64; 6]) -> bool {
         registers[3] == 0x7ffe_0ff0 && registers[5] & 0xffff_ffff_f000_0040 == 0x40
     }
@@ -1907,7 +2114,8 @@ pub(crate) mod runtime {
         let kernel_cs = (star >> 32) as u16 & !3;
         if lstar != profile.entry
             || read(GUEST_RIP)? != lstar
-            || read(GUEST_CR4)? & ((1 << 12) | (1 << 23)) != 0
+            || read(GUEST_CR4)? & (1 << 12) != 0
+            || read(GUEST_CR4)? & (1 << 23) != 0 && read(VM_ENTRY_CONTROLS)? & (1 << 20) == 0
             || read(GUEST_IA32_EFER)? & 0x401 != 0x401
             || read(GUEST_CS_SELECTOR)? != u64::from(kernel_cs)
             || read(GUEST_SS_SELECTOR)? != u64::from(kernel_cs.wrapping_add(8))
@@ -1931,7 +2139,7 @@ pub(crate) mod runtime {
             return Ok(1);
         }
         let user_selector = (star >> 48) as u16;
-        let values = [
+        let mut values = [
             (
                 GUEST_CS_SELECTOR,
                 u64::from(user_selector.wrapping_add(16) | 3),
@@ -1948,8 +2156,21 @@ pub(crate) mod runtime {
             (GUEST_SS_AR_BYTES, 0xc0f3),
             (GUEST_RFLAGS, (frame[10] & 0x3c7fd7) | 2),
             (GUEST_RIP, profile.callback),
+            (GUEST_SSP, 0),
         ];
-        let mut saved = [0; 10];
+        let mut transition_count = 10;
+        if read(GUEST_CR4)? & (1 << 23) != 0 {
+            let [cet, ssp] = user_cet();
+            if cet & 1 != 0 {
+                if ssp >> 47 != 0 || ssp & 7 != 0 {
+                    return Err(());
+                }
+                values[10].1 = ssp;
+                transition_count = 11;
+            }
+        }
+        let values = &values[..transition_count];
+        let mut saved = [0; 11];
         for (index, (field, _)) in values.iter().enumerate() {
             saved[index] = read(*field)?;
         }
@@ -2014,20 +2235,36 @@ pub(crate) mod runtime {
         if boot.diagnostic_expired != 0 {
             cpu.timer_pin = 0;
         }
-        if active && session.tsc_hz.load(Ordering::Acquire) != 0 {
+        let configuration = unsafe { &*session.configuration.get() };
+        let sampling = session
+            .observer()
+            .filter(|observer| observer.context_enabled)
+            .map_or(0, |observer| observer.sample_ticks);
+        let sampling = if active && sampling != 0 && root_matches(configuration, read(GUEST_CR3)?) {
+            sampling
+        } else {
+            0
+        };
+        if active && (session.tsc_hz.load(Ordering::Acquire) != 0 || sampling != 0) {
             if cpu.timer_saved == 0 {
                 cpu.timer_pin = pin & (1 << 6);
                 cpu.timer_value = read(VMX_PREEMPTION_TIMER_VALUE)?;
                 cpu.timer_saved = 1;
             }
-            let remaining = session
-                .lease_deadline
-                .load(Ordering::Acquire)
-                .wrapping_sub(clock());
+            let remaining = if session.tsc_hz.load(Ordering::Acquire) != 0 {
+                session
+                    .lease_deadline
+                    .load(Ordering::Acquire)
+                    .wrapping_sub(clock())
+            } else {
+                sampling
+            };
             let remaining = if remaining as i64 <= 0 { 2 } else { remaining };
-            let rate = unsafe { &*session.configuration.get() }.timer_rate;
+            let rate = configuration.timer_rate;
             let mut ticks = (remaining >> rate).clamp(2, u64::from(u32::MAX));
-            let configuration = unsafe { &*session.configuration.get() };
+            if sampling != 0 {
+                ticks = ticks.min((sampling >> rate).max(2));
+            }
             if configuration.options & INTERCEPT_PRIVATE_SHARED_DATA != 0
                 && root_matches(configuration, read(GUEST_CR3)?)
             {
@@ -2203,13 +2440,22 @@ pub(crate) mod runtime {
         )
     }
 
-    fn close_data_window(configuration: &RoadEptProfile, cpu_index: usize, shared: bool) {
+    fn close_data_window(
+        session: &Session,
+        configuration: &RoadEptProfile,
+        cpu_index: usize,
+        shared: bool,
+    ) {
         for pointer in data_leaves(configuration, cpu_index) {
             entry_bits(*pointer, 0, 6);
         }
         if shared {
             for index in 0..configuration.hook_count {
-                if configuration.base_leaves[index] == 0 {
+                if configuration.base_leaves[index] == 0
+                    && !session
+                        .observer()
+                        .is_some_and(|observer| observer.data_shadow(configuration.pages[index]))
+                {
                     shared_entry(
                         configuration.cpu_leaves[cpu_index][index],
                         configuration.pages[index],
@@ -2238,7 +2484,12 @@ pub(crate) mod runtime {
         // Close physical guards before any fallible VMCS operation can clear
         // step ownership or cause recovery to release the refresh lock.
         if reading || writing {
-            close_data_window(configuration, boot.processor_number as usize, shared);
+            close_data_window(
+                session,
+                configuration,
+                boot.processor_number as usize,
+                shared,
+            );
         }
         let result = (|| {
             reset_step(boot)?;
@@ -2522,7 +2773,7 @@ pub(crate) mod runtime {
             let mut exception_bit = cpu.exception_bit;
             if active {
                 bits |= 1 << 15;
-                if configuration.debug_count != 0 {
+                if session.debug_slots(configuration) != 0 {
                     bits |= 1 << 23;
                     exception_bit |= 2;
                 }
@@ -2577,52 +2828,84 @@ pub(crate) mod runtime {
                 cpu.hook_generation = configuration.generation;
             }
             let syscall = unsafe { &*session.syscall.get() };
-            if target
-                && syscall.entry != 0
-                && syscall.token == configuration.token
-                && syscall_gate(&cpu.guest_debug)
-                && cpu.guest_debug[5] & 0x2003 == 0
-                && syscall_msrs()[1] == syscall.entry
-                && read(GUEST_CR4)? & ((1 << 12) | (1 << 23)) == 0
+            let observer = session.observer();
+            let mut desired = [(0u64, 0u64, 0u64, 0u8); 4];
+            let mut needed = 0;
+            if target {
+                for debug in &configuration.debug[..configuration.debug_count] {
+                    desired[needed] = (debug.address, debug.redirect, 0, 1);
+                    needed += 1;
+                }
+                if syscall.entry != 0
+                    && syscall.token == configuration.token
+                    && syscall_gate(&cpu.guest_debug)
+                    && syscall_msrs()[1] == syscall.entry
+                    && read(GUEST_CR4)? & (1 << 12) == 0
+                    && (read(GUEST_CR4)? & (1 << 23) == 0
+                        || read(VM_ENTRY_CONTROLS)? & (1 << 20) != 0)
+                {
+                    if needed >= 4 {
+                        return Err(());
+                    }
+                    desired[needed] = (syscall.entry, syscall.callback, 0, 2);
+                    needed += 1;
+                }
+                if let Some(observer) = observer {
+                    for (slot, watch) in observer.watch[..observer.watch_count].iter().enumerate() {
+                        if needed >= 4 {
+                            return Err(());
+                        }
+                        desired[needed] = (watch.address, 0, watch.control, 3 + slot as u8);
+                        needed += 1;
+                    }
+                }
+            }
+            let free = (0..4)
+                .filter(|slot| cpu.guest_debug[5] & (3 << (slot * 2)) == 0)
+                .count();
+            if needed != 0
+                && free >= needed
+                && cpu.guest_debug[5] & (1 << 13) == 0
+                && (cpu.guest_debug[5] & 0xff == 0 || syscall_gate(&cpu.guest_debug))
             {
                 let mut registers: [u64; 5] = cpu.guest_debug[..5].try_into().map_err(|_| ())?;
-                registers[0] = syscall.entry;
-                registers[4] &= !1;
-                // Physical DRs change before VMWRITE can fail. Keep the saved
-                // guest state owned until every part of the overlay is retired.
+                let mut dr7 = cpu.guest_debug[5];
+                let mut kinds = [0; 4];
+                let mut next = 0;
+                cpu.debug_targets.fill([0; 2]);
+                for slot in 0..4 {
+                    if next == needed {
+                        break;
+                    }
+                    if dr7 & (3 << (slot * 2)) != 0 {
+                        continue;
+                    }
+                    let (address, redirect, control, kind) = desired[next];
+                    registers[slot] = address;
+                    registers[4] &= !(1 << slot);
+                    cpu.debug_targets[slot] = [address, redirect];
+                    kinds[slot] = kind;
+                    dr7 = (dr7 & !(15 << (16 + slot * 4)))
+                        | (control << (16 + slot * 4))
+                        | (2 << (slot * 2));
+                    next += 1;
+                }
+                if let Some(observer) = observer {
+                    observer.set_overlay(boot.processor_number as usize, kinds);
+                } else if let Some(slot) = kinds.iter().position(|kind| *kind == 2) {
+                    // The syscall gate reserves guest DR3, leaving this target
+                    // entry available to retain the owned slot across revocation.
+                    cpu.debug_targets[3] = [slot as u64, u64::MAX];
+                }
                 cpu.debug_armed = 1;
-                load_debug(&registers);
-                write(GUEST_DR7, (cpu.guest_debug[5] & !0x000f_0003) | 2)?;
-                cpu.debug_targets[0] = [syscall.entry, syscall.callback];
-                cpu.debug_targets[3] = [syscall.entry, u64::MAX];
-                cpu.debug_count = 1;
+                cpu.debug_count = kinds
+                    .iter()
+                    .rposition(|kind| *kind != 0)
+                    .map_or(0, |index| index + 1);
                 cpu.debug_token = configuration.token;
                 cpu.debug_generation = configuration.generation;
-            } else if target
-                && syscall.entry == 0
-                && configuration.debug_count != 0
-                && cpu.guest_debug[5] & 0x20ff == 0
-            {
-                // Existing guest breakpoints and general-detect own their registers.
-                // Suspend our overlay until the guest releases those resources.
-                let mut registers = [0; 5];
-                let mut dr7 = 0x400;
-                cpu.debug_targets.fill([0; 2]);
-                for (index, debug) in configuration.debug[..configuration.debug_count]
-                    .iter()
-                    .enumerate()
-                {
-                    registers[index] = debug.address;
-                    cpu.debug_targets[index] = [debug.address, debug.redirect];
-                    dr7 |= 2 << (index * 2);
-                }
-                registers[4] = cpu.guest_debug[4] & !15;
-                cpu.debug_armed = 1;
                 load_debug(&registers);
                 write(GUEST_DR7, dr7)?;
-                cpu.debug_count = configuration.debug_count;
-                cpu.debug_token = configuration.token;
-                cpu.debug_generation = configuration.generation;
             }
             if cpu.step_active != 0 && cpu.step_cr3 == cr3 && configuration.hook_count != 0 {
                 data_root(configuration, boot.processor_number as usize)
@@ -2924,7 +3207,14 @@ pub(crate) mod runtime {
         }
         let Some(index) = configuration.base_leaves[..configuration.hook_count]
             .iter()
-            .position(|pointer| *pointer == 0)
+            .enumerate()
+            .find_map(|(index, pointer)| {
+                (*pointer == 0
+                    && !session
+                        .observer()
+                        .is_some_and(|observer| observer.data_shadow(configuration.pages[index])))
+                .then_some(index)
+            })
         else {
             session.refresh_lock.store(0, Ordering::Release);
             return;
@@ -3590,13 +3880,44 @@ pub(crate) mod runtime {
         let exit_armed =
             session.exit_debug[boot.processor_number as usize].load(Ordering::Acquire) & 1;
         let armed = boot.interception.debug_armed != 0 || exit_armed != 0;
-        let syscall_armed = armed
-            && boot.interception.debug_count == 1
-            && boot.interception.debug_targets[3][1] == u64::MAX;
+        let kinds = if armed {
+            if let Some(observer) = session.observer() {
+                observer.overlay(boot.processor_number as usize)
+            } else {
+                core::array::from_fn(|index| {
+                    let target = boot.interception.debug_targets[index];
+                    if index < boot.interception.debug_count && target != [0; 2] {
+                        if boot.interception.debug_targets[3][1] == u64::MAX
+                            && boot.interception.debug_targets[3][0] == index as u64
+                        {
+                            2
+                        } else {
+                            1
+                        }
+                    } else {
+                        0
+                    }
+                })
+            }
+        } else {
+            [0; 4]
+        };
         restore_debug(&mut boot.interception)?;
         let reason = boot.last_reason & 0xffff;
         if reason != 48 && reason != 52 {
             session.ept_progress[boot.processor_number as usize].store(0, Ordering::Relaxed);
+        }
+        if session.is_active() && boot.nested.active == 0 {
+            if let Some(observer) = session
+                .observer()
+                .filter(|observer| observer.context_enabled)
+            {
+                if root_matches(unsafe { &*session.configuration.get() }, read(GUEST_CR3)?)
+                    && read(GUEST_IA32_EFER)? & 0x400 != 0
+                {
+                    observer.capture(context_record(boot, frame)?, None);
+                }
+            }
         }
         let stepped = boot.interception.exit_step != 0;
         finish_step(session, boot, synchronize)?;
@@ -3825,88 +4146,76 @@ pub(crate) mod runtime {
         if reason == 0 && read(VM_EXIT_INTR_INFO)? & 0x800007ff == 0x80000301 {
             let configuration = unsafe { &*session.configuration.get() };
             let rip = read(GUEST_RIP)?;
-            // An intercepted #DB leaves hardware DR6 unchanged. VMX reports
-            // breakpoint and single-step causes in the exit qualification.
             let debug_status = boot.last_qualification;
-            if armed && debug_status & 0x1e800 == 0 {
-                for (index, target) in boot.interception.debug_targets
-                    [..boot.interception.debug_count]
-                    .iter()
-                    .enumerate()
-                {
-                    if debug_status & (1 << index) != 0 && rip == target[0] {
-                        let syscall = unsafe { &*session.syscall.get() };
-                        if syscall_armed {
-                            // Foreign breakpoint causes still belong to the guest.
-                            if debug_status & 14 != 0 {
-                                break;
-                            }
-                            write(
-                                GUEST_PENDING_DBG_EXCEPTIONS,
-                                read(GUEST_PENDING_DBG_EXCEPTIONS)? & !1,
-                            )?;
-                            if session.is_active()
-                                && syscall.token == configuration.token
-                                && syscall.entry == target[0]
-                                && syscall.callback == target[1]
-                                && boot.interception.debug_token == configuration.token
-                                && boot.interception.debug_generation == configuration.generation
-                                && root_matches(configuration, read(GUEST_CR3)?)
-                                && syscall_gate(&boot.interception.guest_debug)
-                            {
-                                let outcome = route_syscall(syscall, frame, fx_state)?;
-                                if outcome == u64::MAX {
-                                    session.cause.store(
-                                        u64::from(INTERCEPT_CAUSE_RUNTIME),
-                                        Ordering::Release,
-                                    );
-                                    session
-                                        .active
-                                        .store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
-                                } else {
-                                    session.hits.fetch_add(1, Ordering::Relaxed);
-                                }
-                                return Ok(outcome);
-                            }
-                            write(GUEST_RFLAGS, read(GUEST_RFLAGS)? | (1 << 16))?;
-                            return Ok(1);
-                        }
-                        write(
-                            GUEST_PENDING_DBG_EXCEPTIONS,
-                            read(GUEST_PENDING_DBG_EXCEPTIONS)? & !15,
-                        )?;
-                        let current = session.is_active()
-                            && boot.interception.debug_token == configuration.token
-                            && boot.interception.debug_generation == configuration.generation
-                            && root_matches(configuration, read(GUEST_CR3)?);
-                        // RF also protects a self-redirect or another owned
-                        // target so the next instruction can actually execute.
-                        let flags = read(GUEST_RFLAGS)?;
-                        write(GUEST_RFLAGS, flags | (1 << 16))?;
-                        if current {
-                            if write(GUEST_RIP, target[1]).is_err() {
-                                if write(GUEST_RFLAGS, flags).is_err() {
-                                    return Ok(u64::MAX);
-                                }
-                                return Err(());
-                            }
+            let owned_mask = kinds.iter().enumerate().fold(0u64, |mask, (index, kind)| {
+                mask | if *kind != 0 { 1 << index } else { 0 }
+            });
+            let owned_hits = debug_status & owned_mask;
+            let guest_causes = debug_status & 0xe00f & !owned_mask;
+            let current = session.is_active()
+                && boot.interception.debug_token == configuration.token
+                && boot.interception.debug_generation == configuration.generation
+                && root_matches(configuration, read(GUEST_CR3)?);
+            if owned_hits != 0 {
+                write(
+                    GUEST_PENDING_DBG_EXCEPTIONS,
+                    read(GUEST_PENDING_DBG_EXCEPTIONS)? & !owned_hits,
+                )?;
+                let flags = read(GUEST_RFLAGS)?;
+                write(GUEST_RFLAGS, flags | (1 << 16))?;
+                for (index, kind) in kinds.iter().enumerate() {
+                    if owned_hits & (1 << index) == 0 {
+                        continue;
+                    }
+                    let target = boot.interception.debug_targets[index];
+                    if *kind >= 3 && current {
+                        if let Some(observer) = session.observer() {
+                            observer.capture(
+                                context_record(boot, frame)?,
+                                Some(usize::from(*kind - 3)),
+                            );
                             session.hits.fetch_add(1, Ordering::Relaxed);
                         }
-                        return Ok(1);
+                    } else if *kind == 1 && current && guest_causes == 0 && rip == target[0] {
+                        if write(GUEST_RIP, target[1]).is_err() {
+                            if write(GUEST_RFLAGS, flags).is_err() {
+                                return Ok(u64::MAX);
+                            }
+                            return Err(());
+                        }
+                        session.hits.fetch_add(1, Ordering::Relaxed);
+                    } else if *kind == 2 && current && guest_causes == 0 && rip == target[0] {
+                        let syscall = unsafe { &*session.syscall.get() };
+                        if syscall.token == configuration.token
+                            && syscall.entry == target[0]
+                            && syscall.callback == target[1]
+                            && syscall_gate(&boot.interception.guest_debug)
+                        {
+                            let outcome = route_syscall(syscall, frame, fx_state)?;
+                            if outcome == u64::MAX {
+                                session
+                                    .cause
+                                    .store(u64::from(INTERCEPT_CAUSE_RUNTIME), Ordering::Release);
+                                session
+                                    .active
+                                    .store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
+                            } else {
+                                session.hits.fetch_add(1, Ordering::Relaxed);
+                            }
+                            return Ok(outcome);
+                        }
                     }
                 }
+                if guest_causes == 0 {
+                    return Ok(1);
+                }
             }
+            // Data breakpoints can coincide with a guest TF trap or breakpoint.
+            // Consume only our physical slots and preserve every guest cause.
             let mut registers: [u64; 5] = boot.interception.guest_debug[..5]
                 .try_into()
                 .map_err(|_| ())?;
-            registers[4] |= debug_status
-                & if syscall_armed {
-                    0xe00e
-                } else if armed {
-                    0xe000
-                } else {
-                    0xe00f
-                };
+            registers[4] |= guest_causes;
             if debug_status & (1 << 11) != 0 {
                 registers[4] &= !(1 << 11);
             }
@@ -4032,7 +4341,7 @@ pub(crate) mod runtime {
                 }
                 3 => {
                     let configuration = unsafe { &*session.configuration.get() };
-                    close_data_window(configuration, boot.processor_number as usize, true);
+                    close_data_window(session, configuration, boot.processor_number as usize, true);
                     let reset = reset_step(boot);
                     release_refresh(session, boot);
                     reset

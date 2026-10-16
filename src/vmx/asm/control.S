@@ -739,6 +739,10 @@ resident_control_off_vmread {guest_idtr_limit}, {probe_guest_idtr_limit}
 resident_control_off_vmread {guest_fs_base}, {probe_guest_fs_base}
 resident_control_off_vmread {guest_gs_base}, {probe_guest_gs_base}
 resident_control_off_vmread {guest_cr4}, {probe_guest_cr4}
+// The native firmware return trampoline has no supervisor shadow-stack frame.
+// Keep the resident core active instead of returning with a mismatched SSP.
+test qword ptr [r10 + {probe_guest_cr4}], 0x800000
+jnz .Lresident_control_off_failed
 resident_control_off_vmread {cr4_read_shadow}, {probe_guest_cr4_read_shadow}
 resident_control_off_vmread {guest_dr7}, {probe_guest_dr7}
 mov r11, qword ptr [r10 + {probe_guest_cr4}]

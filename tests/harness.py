@@ -1044,7 +1044,7 @@ def prepare_nested_ept(project: Path):
     address_assembly = source[address_start:address_end].strip()
     (output / "resident-address.S").write_text(address_assembly)
     snapshot_start = source.index('.Lresident_nested_snapshot_vmcs01_effective_state:')
-    snapshot_end = source.index('.Lresident_nested_sync_vmcs02_guest_state:')
+    snapshot_end = source.index('.Lresident_nested_select_vmcs_inherit_cet:', snapshot_start)
     snapshot_assembly = source[snapshot_start:snapshot_end].strip()
     snapshot_assembly = snapshot_assembly.replace(
         "vmread r11, rax",
@@ -1180,6 +1180,7 @@ def prepare_nested_regressions(project: Path):
         'guest_ia32_debugctl': 7, 'guest_fs_base': 8, 'guest_gs_base': 9,
         'guest_sysenter_cs': 10, 'guest_sysenter_esp': 11, 'guest_sysenter_eip': 12,
         'guest_dr7': 15,
+        'guest_s_cet': 16, 'guest_interrupt_ssp_table': 17,
         'vm_entry_msr_load_addr': 0, 'vm_entry_msr_load_count': 1,
         'vm_exit_msr_store_addr': 2, 'vm_exit_msr_store_count': 3,
         'vm_exit_msr_load_addr': 4, 'vm_exit_msr_load_count': 5,
@@ -1396,7 +1397,7 @@ def prepare_nested_regressions(project: Path):
     .text
     """
     assembly = wrapper + assembly
-    sizes = {'test_vmcs': 16, 'test_controls': 16, 'b_nested_operand_data': 2}
+    sizes = {'test_vmcs': 18, 'test_controls': 18, 'b_nested_operand_data': 2}
     offsets = {}
     cursor = 0
     for name in sorted(set(re.findall(r'\{((?:b_|test_)\w+)\}', assembly))):

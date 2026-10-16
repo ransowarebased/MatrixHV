@@ -516,7 +516,10 @@ mod hyperv_time {
             assert_eq!(scenario.msr(8, 0).0, 0);
             assert_eq!(scenario.msr(9, 1).0, 0);
             scenario.shared[8] = 1;
-            assert_eq!(scenario.features(0x4000_0003), [features | (1 << 15), 0, 0, 0]);
+            assert_eq!(
+                scenario.features(0x4000_0003),
+                [features | (1 << 15), 0, 0, 0]
+            );
             assert_eq!(scenario.msr(8, 0), (1, 0));
             assert_eq!(scenario.msr(9, 0).0, 1);
         }
@@ -908,7 +911,10 @@ mod msr {
                     );
                 }
                 for index in [0, 0x808, 0x3fff_ffff, 0x4000_1000, 0xc000_0080, u32::MAX] {
-                    assert_eq!(unsafe { test_parent_msr_access(context.as_ptr(), index) }, 1);
+                    assert_eq!(
+                        unsafe { test_parent_msr_access(context.as_ptr(), index) },
+                        1
+                    );
                 }
             }
         }
@@ -936,14 +942,20 @@ mod msr {
             for code in [0, 8, u64::MAX] {
                 assert_eq!(unsafe { test_private_vmcall(context.as_ptr(), code) }, 2);
             }
-            assert_eq!(unsafe { test_private_vmcall(context.as_ptr(), 0x564d_5868) }, 3);
+            assert_eq!(
+                unsafe { test_private_vmcall(context.as_ptr(), 0x564d_5868) },
+                3
+            );
         }
     }
 
     #[test]
     fn captured_roblox_vmcall_rax_routes_to_the_public_guest_interface() {
         let context = [1_u64, 0];
-        assert_eq!(unsafe { test_private_vmcall(context.as_ptr(), 0x9e1a3fbb70) }, 2);
+        assert_eq!(
+            unsafe { test_private_vmcall(context.as_ptr(), 0x9e1a3fbb70) },
+            2
+        );
     }
 
     #[test]
@@ -1044,7 +1056,11 @@ mod msr {
 
     #[test]
     fn hyperv_icr_preserves_full_x2apic_destinations_and_broadcast() {
-        for (destination, native_destination) in [(0x12, 0x12), (0xffff_ffff, 0xffff_ffff), (0x1234_00a5, 0x1234_00a5)] {
+        for (destination, native_destination) in [
+            (0x12, 0x12),
+            (0xffff_ffff, 0xffff_ffff),
+            (0x1234_00a5, 0x1234_00a5),
+        ] {
             let mut context = [1, 0xfee0_0c00, 0, 0, 0];
             let mut registers = [0x45, 0x4000_0071, destination];
             assert_eq!(
@@ -1062,7 +1078,10 @@ mod msr {
         for value in [1, 0xff, u32::MAX as u64] {
             let mut context = [1, 0xfee0_0c00, 0, u64::MAX, 0];
             let mut registers = [value, 0x4000_0070, 0];
-            assert_eq!(unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) }, 1);
+            assert_eq!(
+                unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
+                1
+            );
             assert_eq!(&context[2..4], &[0x80b, 0]);
         }
     }
@@ -1073,7 +1092,12 @@ mod msr {
             for write in [0, 1] {
                 let mut context = [1, base | 0x800, 0, 0, base];
                 let mut registers = [0, 0x4000_0072, 0];
-                assert_eq!(unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), write) }, 0);
+                assert_eq!(
+                    unsafe {
+                        test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), write)
+                    },
+                    0
+                );
                 assert_eq!(context[2], 0);
             }
         }
@@ -1083,7 +1107,10 @@ mod msr {
     fn hyperv_x2apic_logical_icr_keeps_cluster_and_processor_mask() {
         let mut context = [1, 0xfee0_0c00, 0, 0, 0];
         let mut registers = [0x845, 0x4000_0071, 0x1234_a005];
-        assert_eq!(unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) }, 1);
+        assert_eq!(
+            unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) },
+            1
+        );
         assert_eq!(context[3], 0x1234_a005_0000_0845);
     }
 
@@ -1142,6 +1169,22 @@ mod msr {
         }
     }
 
+    #[test]
+    fn cet_state_uses_native_guest_access_checks_and_vmcs_saves() {
+        let bitmap = clock_bitmap();
+        for index in [0x6a0, 0x6a2, 0x6a4, 0x6a5, 0x6a6, 0x6a7, 0x6a8] {
+            for write in [false, true] {
+                assert!(
+                    !bitmap.intercepts(index, write),
+                    "CET MSR {index:#x}, write={write}"
+                );
+            }
+        }
+        for index in [0x69f, 0x6a1, 0x6a3, 0x6a9] {
+            assert!(bitmap.intercepts(index, true));
+        }
+    }
+
     global_asm!(include_str!(
         "../builds/resident-msr-tests/resident-msr-bitmap.S"
     ));
@@ -1167,17 +1210,30 @@ mod msr {
         for phase in 0_u32..=8 {
             let mut l0 = ResidentPages::new();
             let bitmap_slot = l0.bytes.as_mut_ptr() as u64;
-            assert_eq!(unsafe { test_update_msr_policy(&bitmap_slot, &phase) }, 0x1234);
+            assert_eq!(
+                unsafe { test_update_msr_policy(&bitmap_slot, &phase) },
+                0x1234
+            );
             for (offset, byte) in l0.bytes.iter().copied().enumerate() {
-                let expected = if phase == 5 && offset == 0x8ee { 0xef } else { 0xff };
+                let expected = if phase == 5 && offset == 0x8ee {
+                    0xef
+                } else {
+                    0xff
+                };
                 assert_eq!(byte, expected, "phase={phase}, bitmap offset={offset:#x}");
             }
             for requested in [false, true] {
                 let mut l1 = [0_u8; 4096];
-                if requested { l1[0x8ee] = 1 << 4; }
+                if requested {
+                    l1[0x8ee] = 1 << 4;
+                }
                 let mut composed = ResidentPages::new();
                 unsafe {
-                    test_merge_msr_bitmaps(l0.bytes.as_ptr(), composed.bytes.as_mut_ptr(), l1.as_ptr());
+                    test_merge_msr_bitmaps(
+                        l0.bytes.as_ptr(),
+                        composed.bytes.as_mut_ptr(),
+                        l1.as_ptr(),
+                    );
                 }
                 assert_eq!(composed.intercepts(0x774, true), phase != 5 || requested);
                 assert!(composed.intercepts(0x774, false));
@@ -1988,7 +2044,10 @@ mod telemetry {
             diagnostic(&mut context, &mut shared, (2 << 16) | 55),
             [1, 0, 0x55667788, 0x11223344]
         );
-        assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 55), [0; 4]);
+        assert_eq!(
+            diagnostic(&mut context, &mut shared, (3 << 16) | 55),
+            [0; 4]
+        );
         assert_ne!(diagnostic(&mut context, &mut shared, 34)[0] & (1 << 17), 0);
         assert_eq!(remote[offset("b_interception_timing_saved")], 1);
     }
@@ -2030,10 +2089,18 @@ mod telemetry {
         remote[offset("b_interception_sync_diagnostics") + 6] = 4;
         remote[offset("b_interception_sync_diagnostics") + 7] = 1 << 63;
         std::hint::black_box(&remote);
-        assert_eq!(diagnostic(&mut context, &mut shared, (64 << 16) | 0x400),
-            [0x9abcdef0, 0x12345678, 0x76543210, 0xfedcba98]);
-        assert_eq!(diagnostic(&mut context, &mut shared, (64 << 16) | 0x40f), [4, 0, 0, 0x80000000]);
-        assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 0x400), [0; 4]);
+        assert_eq!(
+            diagnostic(&mut context, &mut shared, (64 << 16) | 0x400),
+            [0x9abcdef0, 0x12345678, 0x76543210, 0xfedcba98]
+        );
+        assert_eq!(
+            diagnostic(&mut context, &mut shared, (64 << 16) | 0x40f),
+            [4, 0, 0, 0x80000000]
+        );
+        assert_eq!(
+            diagnostic(&mut context, &mut shared, (3 << 16) | 0x400),
+            [0; 4]
+        );
         assert_eq!(diagnostic(&mut context, &mut shared, 0x410), [0; 4]);
         assert_ne!(diagnostic(&mut context, &mut shared, 34)[0] & (1 << 16), 0);
     }

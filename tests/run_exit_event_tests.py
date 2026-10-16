@@ -197,7 +197,7 @@ failure = ""
 for label in (".Lresident_nested_l2_launch_entry_failed:", ".Lresident_nested_l2_resume_entry_failed:"):
     failure += section(NESTED, label, "call .Lresident_flight_record_entry_failure") + "ret\n"
 failure = re.sub(r"\{(\w+)\}", lambda match: str(delivery_fields[match[1]]), failure)
-handoff = section(NESTED, "// VMCS12 now owns any interrupted event reported to L1.", "vmptrld")
+handoff = section(NESTED, "// VMCS12 now owns any interrupted event reported to L1.", "lea rdi, [r12 + {b_nested_vmcs01_region}]")
 handoff = ".Ltest_nested_l2_event_handoff:\n" + re.sub(
     r"\{(\w+)\}", lambda match: str(delivery_fields[match[1]]), handoff) + "ret\n"
 

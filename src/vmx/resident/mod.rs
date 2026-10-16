@@ -428,7 +428,8 @@ fn prepare_runtime_update(
         (*event).callback_image_bytes = source_bytes as u64;
         (*event).callback_image_version = core_version();
         (*event).callback_image_hash = crate::update::hash(core::slice::from_raw_parts(
-            root_image.pointer().as_ptr(), source_bytes,
+            root_image.pointer().as_ptr(),
+            source_bytes,
         ));
     }
     let mut state_pages = allocate(size_of::<RuntimeContext>(), RESIDENT_EVENT_MEMORY_TYPE)?;
@@ -456,7 +457,9 @@ fn prepare_runtime_update(
     let interception_cpu_mask = crate::boot::smp::enabled_application_processors()
         .map_err(ResidentProbeError::Allocation)?
         .into_iter()
-        .fold(1u64, |mask, processor_number| mask | (1u64 << processor_number));
+        .fold(1u64, |mask, processor_number| {
+            mask | (1u64 << processor_number)
+        });
     let mut interception_pages = allocate(
         size_of::<crate::memory::interception::Session>(),
         RESIDENT_EVENT_MEMORY_TYPE,
@@ -465,12 +468,24 @@ fn prepare_runtime_update(
         crate::protocol::memory::intercept_storage_pages(interception_cpu_mask) * PAGE_SIZE,
         RESIDENT_EVENT_MEMORY_TYPE,
     )?;
+    let mut observation_pages = allocate(
+        size_of::<crate::memory::observation::Observation>(),
+        RESIDENT_EVENT_MEMORY_TYPE,
+    )?;
     unsafe {
         (&mut *interception_pages
             .pointer()
             .as_ptr()
             .cast::<crate::memory::interception::Session>())
-            .initialize(interception_tables.physical_address(), interception_cpu_mask);
+            .initialize(
+                interception_tables.physical_address(),
+                interception_cpu_mask,
+            );
+        (*interception_pages
+            .pointer()
+            .as_ptr()
+            .cast::<crate::memory::interception::Session>())
+        .observation = observation_pages.physical_address();
         (*event).interception_context_physical = interception_pages.physical_address();
         (*event).interception_entry_physical = root_image.physical_address()
             + crate::memory::interception::runtime::interception_entry as *const () as u64
@@ -555,6 +570,7 @@ fn prepare_runtime_update(
     tracking_tables.preserve();
     interception_pages.preserve();
     interception_tables.preserve();
+    observation_pages.preserve();
     Ok(())
 }
 
@@ -927,6 +943,9 @@ global_asm!(
     guest_sysenter_cs = const GUEST_SYSENTER_CS,
     guest_sysenter_esp = const GUEST_SYSENTER_ESP,
     guest_sysenter_eip = const GUEST_SYSENTER_EIP,
+    guest_s_cet = const GUEST_IA32_S_CET,
+    guest_ssp = const GUEST_SSP,
+    guest_interrupt_ssp_table = const GUEST_INTERRUPT_SSP_TABLE,
     tsc_offset = const TSC_OFFSET,
     ept_pointer = const EPT_POINTER,
     msr_bitmap = const MSR_BITMAP,

@@ -5,6 +5,25 @@ use std::time::{Duration, Instant};
 
 struct ServerProcess(Child);
 
+struct TelemetryState<'a> {
+    executable: &'a std::path::Path,
+    address: String,
+    enabled: bool,
+}
+
+impl Drop for TelemetryState<'_> {
+    fn drop(&mut self) {
+        let _ = Command::new(self.executable)
+            .args([
+                "--remote",
+                &self.address,
+                "telemetry",
+                if self.enabled { "enable" } else { "disable" },
+            ])
+            .output();
+    }
+}
+
 impl Drop for ServerProcess {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -45,6 +64,14 @@ fn one_neo_binary_serves_remote_status_and_ping() {
     assert!(status_text.contains("binary_fingerprint="));
     assert!(status_text.contains("capabilities="));
     assert!(status_text.contains("logical_processor_count="));
+    let telemetry_state =
+        status_text
+            .contains("telemetry_control=true\n")
+            .then(|| TelemetryState {
+                executable: std::path::Path::new(executable),
+                address: address.to_string(),
+                enabled: status_text.contains("telemetry_enabled=1\n"),
+            });
     let protocol = status_text
         .lines()
         .find_map(|line| line.strip_prefix("matrixhv_protocol="))
@@ -185,5 +212,6 @@ fn one_neo_binary_serves_remote_status_and_ping() {
             .contains("must not exceed 5000 ms")
     );
 
+    drop(telemetry_state);
     drop(server);
 }

@@ -1,7 +1,9 @@
 use core::arch::asm;
 
 use crate::arch::{self, CR4_VMXE};
-use crate::vmx::nested::{IA32_VMX_MISC_MSR, VMX_SECONDARY_VMCS_SHADOWING, native_vmcs_shadowing_available};
+use crate::vmx::nested::{
+    IA32_VMX_MISC_MSR, VMX_SECONDARY_VMCS_SHADOWING, native_vmcs_shadowing_available,
+};
 
 use super::vmcs::*;
 
@@ -86,9 +88,7 @@ pub fn configure() -> Result<VmxControls, VmxControlsError> {
             | VM_EXIT_LOAD_IA32_PAT
             | VM_EXIT_SAVE_IA32_EFER
             | VM_EXIT_LOAD_IA32_EFER,
-        vm_entry: VM_ENTRY_LOAD_DEBUG_CONTROLS
-            | VM_ENTRY_LOAD_IA32_PAT
-            | VM_ENTRY_LOAD_IA32_EFER,
+        vm_entry: VM_ENTRY_LOAD_DEBUG_CONTROLS | VM_ENTRY_LOAD_IA32_PAT | VM_ENTRY_LOAD_IA32_EFER,
         exception_bitmap: 1 << 6,
         msr_bitmap: None,
         ept_pointer: None,
@@ -121,9 +121,7 @@ pub fn configure_resident_boot(
             | VM_EXIT_LOAD_IA32_PAT
             | VM_EXIT_SAVE_IA32_EFER
             | VM_EXIT_LOAD_IA32_EFER,
-        vm_entry: VM_ENTRY_LOAD_DEBUG_CONTROLS
-            | VM_ENTRY_LOAD_IA32_PAT
-            | VM_ENTRY_LOAD_IA32_EFER,
+        vm_entry: VM_ENTRY_LOAD_DEBUG_CONTROLS | VM_ENTRY_LOAD_IA32_PAT | VM_ENTRY_LOAD_IA32_EFER,
         exception_bitmap: 1 << 6,
         msr_bitmap: Some(msr_bitmap),
         ept_pointer: Some(ept_pointer),
@@ -318,11 +316,32 @@ fn configure_internal(requested: RequestedControls) -> Result<VmxControls, VmxCo
     if secondary_processor_based & VMX_SECONDARY_VMCS_SHADOWING != 0 {
         return Err(VmxControlsError::VmcsShadowingUnexpectedlyRequired);
     }
+    let cet = arch::leaf_with_subleaf(7, 0).ecx & (1 << 7) != 0
+        && arch::read_cr4() & (1 << 23) == 0
+        && unsafe { arch::read_msr(exit_msr) } & (1 << (32 + 28)) != 0
+        && unsafe { arch::read_msr(entry_msr) } & (1 << (32 + 20)) != 0;
     let vm_exit = adjust_control(
-        VM_EXIT_HOST_ADDRESS_SPACE_SIZE | requested.vm_exit,
+        VM_EXIT_HOST_ADDRESS_SPACE_SIZE | requested.vm_exit | if cet { 1 << 28 } else { 0 },
         exit_msr,
     );
-    let vm_entry = adjust_control(VM_ENTRY_IA32E_MODE_GUEST | requested.vm_entry, entry_msr);
+    let vm_entry = adjust_control(
+        VM_ENTRY_IA32E_MODE_GUEST | requested.vm_entry | if cet { 1 << 20 } else { 0 },
+        entry_msr,
+    );
+    if cet {
+        // Firmware enters with CET disabled. VMX subsequently saves guest CET
+        // state while every root entry loads disabled supervisor CET state.
+        for field in [
+            GUEST_IA32_S_CET,
+            GUEST_SSP,
+            GUEST_INTERRUPT_SSP_TABLE,
+            HOST_IA32_S_CET,
+            HOST_SSP,
+            HOST_INTERRUPT_SSP_TABLE,
+        ] {
+            vmwrite(field, 0)?;
+        }
+    }
 
     if vm_exit & VM_EXIT_HOST_ADDRESS_SPACE_SIZE == 0 {
         return Err(VmxControlsError::HostAddressSpaceSizeUnavailable);

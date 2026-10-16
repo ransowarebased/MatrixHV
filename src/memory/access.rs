@@ -421,6 +421,13 @@ pub fn execute(
             | CPUID_CLEAR
             | SYSCALL_SET
             | SYSCALL_CLEAR
+            | WATCH_SET
+            | WATCH_CLEAR
+            | WATCH_FETCH
+            | CONTEXT_SET
+            | CONTEXT_CLEAR
+            | CONTEXT_SNAPSHOT
+            | STACK_WALK
     ) {
         return memory.intercept(packet, la57, physical_bits);
     }
@@ -855,6 +862,17 @@ pub(crate) mod resident {
     }
 
     impl crate::memory::interception::InterceptionMemory for Memory<'_> {
+        fn syscall_cet_available(&self) -> bool {
+            #[cfg(target_os = "uefi")]
+            {
+                crate::vmx::vmcs::vmread(crate::vmx::vmcs::VM_ENTRY_CONTROLS)
+                    .is_ok_and(|value| value & (1 << 20) != 0)
+            }
+            #[cfg(not(target_os = "uefi"))]
+            {
+                false
+            }
+        }
         fn check_budget(&self) -> Result<(), Error> {
             if self.environment.synchronize != 0 && self.synchronize(3) == 0 {
                 Err(Error::Busy)
@@ -1308,6 +1326,17 @@ pub(crate) mod resident {
                     CPUID_PROFILE_CAPABILITY
                         | PRIVATE_SHARED_DATA_CAPABILITY
                         | SYSCALL_PROFILE_CAPABILITY
+                        | if unsafe {
+                            &*(environment.interception_session
+                                as *const crate::memory::interception::Session)
+                        }
+                        .observation
+                            != 0
+                        {
+                            OBSERVATION_CAPABILITY
+                        } else {
+                            0
+                        }
                 } else {
                     0
                 },

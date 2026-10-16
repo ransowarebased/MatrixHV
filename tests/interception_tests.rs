@@ -16,9 +16,11 @@ struct Machine {
     vmfunc_available: bool,
     barrier: bool,
     clock: u64,
+    clock_hz: u64,
     lease_available: bool,
     timing_available: bool,
     syscall_cr4: u64,
+    syscall_cet: bool,
     denied_guard: Option<u64>,
     reclamation_allowed: bool,
     reclamation_ready: bool,
@@ -39,9 +41,11 @@ impl Machine {
             vmfunc_available: true,
             barrier: true,
             clock: 1000,
+            clock_hz: 1000,
             lease_available: true,
             timing_available: true,
             syscall_cr4: 0,
+            syscall_cet: false,
             denied_guard: None,
             reclamation_allowed: true,
             reclamation_ready: true,
@@ -105,6 +109,9 @@ impl PhysicalMemory for Machine {
 }
 
 impl InterceptionMemory for Machine {
+    fn syscall_cet_available(&self) -> bool {
+        self.syscall_cet
+    }
     fn check_budget(&self) -> Result<(), Error> {
         let checks = self.budget_checks.get();
         self.budget_checks.set(checks + 1);
@@ -121,7 +128,7 @@ impl InterceptionMemory for Machine {
         self.clock
     }
     fn clock_hz(&self) -> u64 {
-        1000
+        self.clock_hz
     }
     fn timer_rate(&self) -> u32 {
         5
@@ -359,7 +366,7 @@ fn seeded_profile_packet_fuzzing_preserves_bounds_tokens_and_barrier_cleanup() {
                 }
                 if syscall.entry != 0 {
                     assert_eq!(syscall.token, configuration.token, "{context}");
-                    assert_eq!(configuration.debug_count, 1, "{context}");
+                    assert!(configuration.debug_count < 4, "{context}");
                 }
             }
         }
@@ -382,7 +389,7 @@ fn syscall_install_shares_the_owned_token_and_lease_with_cpuid_and_code_hooks() 
     assert_eq!(session.syscall.get_mut().token, token);
     assert_eq!(session.cpuid.get_mut().token, token);
     assert_eq!(word(&request, 104), 1);
-    assert_eq!(word(&request, 108), 1);
+    assert_eq!(word(&request, 108), 0);
     assert_eq!(word(&request, 128) & INTERCEPT_SYSCALL, INTERCEPT_SYSCALL);
     assert_eq!(
         session
@@ -406,7 +413,7 @@ fn syscall_install_shares_the_owned_token_and_lease_with_cpuid_and_code_hooks() 
 }
 
 #[test]
-fn syscall_install_rejects_unowned_tokens_and_generic_debug_cannot_replace_it() {
+fn syscall_and_debug_profiles_share_slots_and_reject_unowned_tokens() {
     let mut machine = Machine::new();
     let mut session = session();
     let mut request = syscall_request(&mut machine, 0);
@@ -418,10 +425,9 @@ fn syscall_install_rejects_unowned_tokens_and_generic_debug_cannot_replace_it() 
         Err(Error::Session)
     );
     let mut generic = packet(&["debug-registers", "set", "0x3000", "0x400000", "0x400100"]);
-    assert_eq!(
-        execute(&mut session, &mut machine, &mut generic),
-        Err(Error::Busy)
-    );
+    execute(&mut session, &mut machine, &mut generic).unwrap();
+    let token = quad(&generic, 80);
+    assert_eq!(session.configuration.get_mut().debug_count, 1);
     assert_eq!(session.syscall.get_mut().token, token);
     assert_eq!(session.syscall.get_mut().callback, 0x400000);
     let mut cpu = cpuid_request();
@@ -2396,4 +2402,232 @@ fn failed_guard_rollback_revokes_instead_of_publishing_partial_protection() {
     execute(&mut session, &mut machine, &mut install).unwrap();
     assert!(session.is_active());
     assert_eq!(quad(&install, 80), 2);
+}
+
+fn observed_session() -> (Box<Session>, Box<crate::memory::observation::Observation>) {
+    use crate::memory::observation::Observation;
+    let layout = std::alloc::Layout::new::<Observation>();
+    let observation =
+        unsafe { Box::from_raw(std::alloc::alloc_zeroed(layout).cast::<Observation>()) };
+    let mut session = session();
+    session.observation = &*observation as *const _ as u64;
+    (session, observation)
+}
+
+#[test]
+fn context_sampling_requires_a_timer_and_a_nonzero_clock_frequency() {
+    use neo::memory::{InterceptionRequest, interception_packet};
+    for (lease_available, clock_hz, expected_ticks) in
+        [(true, 0, 0), (false, 1_000_000, 0), (true, 1_000_000, 1000)]
+    {
+        let mut machine = Machine::new();
+        machine.lease_available = lease_available;
+        machine.clock_hz = clock_hz;
+        let (mut session, observation) = observed_session();
+        let mut request = interception_packet(&InterceptionRequest {
+            operation: CONTEXT_SET,
+            cr3: ROOT,
+            flags: INTERCEPT_NO_LEASE,
+            ..Default::default()
+        })
+        .unwrap();
+        execute(&mut session, &mut machine, &mut request).unwrap();
+        assert!(session.is_active());
+        assert!(observation.context_enabled);
+        assert_eq!(observation.sample_ticks, expected_ticks);
+    }
+}
+
+#[test]
+fn removing_hooks_clears_data_shadow_metadata_and_preserves_other_observers_until_release() {
+    use neo::memory::{InterceptionRequest, interception_packet};
+    for operation in [HOOK_REMOVE, INTERCEPT_RELEASE] {
+        for retained in [WATCH_SET, CONTEXT_SET] {
+            let mut machine = Machine::new();
+            let (mut session, observation) = observed_session();
+            let mut install = packet(&[
+                "hook",
+                "install",
+                "0x3000",
+                "0x400009",
+                "11223344",
+                "--data-shadow",
+                "--no-lease",
+            ]);
+            execute(&mut session, &mut machine, &mut install).unwrap();
+            assert_eq!(observation.data_count, 1);
+            assert_eq!(observation.hook_flags[0], HOOK_DATA_SHADOW);
+            let mut retain = interception_packet(&InterceptionRequest {
+                operation: retained,
+                cr3: ROOT,
+                token: quad(&install, 80),
+                flags: INTERCEPT_NO_LEASE,
+                watchpoints: if retained == WATCH_SET {
+                    vec![(0x400008, 3, 8)]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            })
+            .unwrap();
+            execute(&mut session, &mut machine, &mut retain).unwrap();
+            let mut remove = interception_packet(&InterceptionRequest {
+                operation,
+                token: quad(&retain, 80),
+                ..Default::default()
+            })
+            .unwrap();
+            execute(&mut session, &mut machine, &mut remove).unwrap();
+            assert_eq!(session.configuration.get_mut().hook_count, 0);
+            assert_eq!(observation.data_count, 0);
+            assert!(observation.hook_flags.iter().all(|flags| *flags == 0));
+            assert!(!observation.data_shadow(GPA));
+            assert_eq!(session.is_active(), operation == HOOK_REMOVE);
+            assert_eq!(
+                observation.watch_count,
+                usize::from(operation == HOOK_REMOVE && retained == WATCH_SET)
+            );
+            assert_eq!(
+                observation.context_enabled,
+                operation == HOOK_REMOVE && retained == CONTEXT_SET
+            );
+        }
+    }
+}
+
+#[test]
+fn data_shadows_accept_read_only_cow_pages_and_preserve_native_physical_memory() {
+    let mut machine = Machine::new();
+    let (mut session, observation) = observed_session();
+    machine
+        .store_entry(0x6000, GPA | 5 | (1 << 9) | (1 << 63))
+        .unwrap();
+    let mut request = packet(&[
+        "hook",
+        "install",
+        "0x3000",
+        "0x400009",
+        "11223344",
+        "--data-shadow",
+        "--vmfunc",
+        "--concurrent-writes",
+    ]);
+    execute(&mut session, &mut machine, &mut request).unwrap();
+    let configuration = session.configuration.get_mut();
+    let (execute_leaf, _) = machine.leaf(configuration.ept, GPA);
+    let (data_leaf, _) = machine.leaf(configuration.data_ept, GPA);
+    assert_eq!(execute_leaf & MASK, data_leaf & MASK);
+    assert_ne!(execute_leaf & MASK, GPA);
+    assert_eq!(execute_leaf & 7, 7);
+    assert_eq!(data_leaf & 7, 7);
+    assert_eq!(machine.pages[&GPA][9..13], [0x90; 4]);
+    assert_eq!(configuration.base_leaves[0], 0);
+    assert!(observation.data_shadow(GPA));
+    let mut listing = packet(&["hook", "list", &quad(&request, 80).to_string()]);
+    execute(&mut session, &mut machine, &mut listing).unwrap();
+    assert_eq!(word(&listing, HEADER_BYTES + 20), HOOK_DATA_SHADOW);
+    let mut conflicting = packet(&[
+        "hook",
+        "add",
+        &quad(&request, 80).to_string(),
+        "0x400020",
+        "cc",
+    ]);
+    assert_eq!(
+        execute(&mut session, &mut machine, &mut conflicting),
+        Err(Error::Format)
+    );
+    assert!(session.is_active());
+}
+
+#[test]
+fn watch_and_context_packets_share_the_lease_and_preserve_fetch_cursors() {
+    use crate::memory::observation::ContextRecord;
+    use neo::memory::{InterceptionRequest, interception_packet};
+    let mut machine = Machine::new();
+    let (mut session, observation) = observed_session();
+    let mut request = interception_packet(&InterceptionRequest {
+        operation: WATCH_SET,
+        cr3: ROOT,
+        flags: INTERCEPT_NO_LEASE,
+        watchpoints: vec![(0x400008, 3, 8)],
+        ..Default::default()
+    })
+    .unwrap();
+    execute(&mut session, &mut machine, &mut request).unwrap();
+    let mut token = quad(&request, 80);
+    observation.set_overlay(0, [3, 0, 0, 0]);
+    assert_eq!(observation.overlay(0), [3, 0, 0, 0]);
+    observation.capture(
+        ContextRecord {
+            rip: 0x400100,
+            ..Default::default()
+        },
+        Some(0),
+    );
+    let mut fetch = interception_packet(&InterceptionRequest {
+        operation: WATCH_FETCH,
+        token,
+        count: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    execute(&mut session, &mut machine, &mut fetch).unwrap();
+    assert_eq!(word(&fetch, 32), 1);
+    assert_eq!(quad(&fetch, 88), 1);
+    assert_eq!(quad(&fetch, HEADER_BYTES + 24), 0x400100);
+    let mut context = interception_packet(&InterceptionRequest {
+        operation: CONTEXT_SET,
+        cr3: ROOT,
+        token,
+        flags: INTERCEPT_NO_LEASE,
+        ..Default::default()
+    })
+    .unwrap();
+    execute(&mut session, &mut machine, &mut context).unwrap();
+    token = quad(&context, 80);
+    let mut clear = interception_packet(&InterceptionRequest {
+        operation: WATCH_CLEAR,
+        token,
+        ..Default::default()
+    })
+    .unwrap();
+    execute(&mut session, &mut machine, &mut clear).unwrap();
+    assert!(session.is_active());
+    assert_eq!(observation.watch_count, 0);
+    assert!(observation.context_enabled);
+    clear[12..16].copy_from_slice(&CONTEXT_CLEAR.to_le_bytes());
+    execute(&mut session, &mut machine, &mut clear).unwrap();
+    assert!(!session.is_active());
+}
+
+#[test]
+fn cet_syscall_install_uses_a_distinct_slot_and_capacity_failures_preserve_the_profile() {
+    let mut machine = Machine::new();
+    let (mut session, _observation) = observed_session();
+    machine.syscall_cr4 = 1 << 23;
+    machine.syscall_cet = true;
+    let mut request = syscall_request(&mut machine, 0);
+    execute(&mut session, &mut machine, &mut request).unwrap();
+    let token = quad(&request, 80);
+    let mut debug = packet(&[
+        "debug-registers",
+        "set",
+        "0x3000",
+        "0x400000",
+        "0x400100",
+        "0x400010",
+        "0x400110",
+        "0x400020",
+        "0x400120",
+        "0x400030",
+        "0x400130",
+    ]);
+    assert_eq!(
+        execute(&mut session, &mut machine, &mut debug),
+        Err(Error::Capacity)
+    );
+    assert_eq!(session.syscall.get_mut().token, token);
+    assert_eq!(session.configuration.get_mut().debug_count, 0);
+    assert!(session.is_active());
 }

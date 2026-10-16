@@ -4,24 +4,24 @@ use super::{
     ResidentCode, ResidentProbeError, matrixhv_resident_boot_run_asm,
     matrixhv_resident_startup_halt_asm,
 };
+use crate::arch;
+use crate::memory::host::{AddressConstraint, HostAddressSpace, ResidentPages};
 use crate::vmx::controls;
 use crate::vmx::ept::{self, EptError};
 use crate::vmx::exits::VMCALL_EXIT_REASON;
 use crate::vmx::exits::{ResidentBootReport, validate_resident_run_path};
+use crate::vmx::hyperv;
 use crate::vmx::msr::configure_resident_msr_switch;
 use crate::vmx::nested::{
     NestedVmcs02Configuration, configure_nested_vmcs02, configure_resident_vmcs_shadowing,
 };
+use crate::vmx::nested::{VMX_SECONDARY_ENABLE_EPT, VMX_SECONDARY_ENABLE_VPID};
 use crate::vmx::state::{self, configure_resident_host};
 use crate::vmx::vcpu::{ResidentApLaunch, ResidentCpuResources};
 use crate::vmx::vmcs::VM_INSTRUCTION_ERROR;
 use crate::vmx::vmcs::{self, VmcsError};
+use crate::vmx::vmcs12::VMCS12_LAUNCH_STATE_LAUNCHED;
 use crate::vmx::vmxon::{self, VmxInstructionResult};
-use crate::memory::host::{AddressConstraint, HostAddressSpace, ResidentPages};
-use crate::vmx::nested::{VMX_SECONDARY_ENABLE_EPT, VMX_SECONDARY_ENABLE_VPID};
-use crate::vmx::vmcs12::{VMCS12_LAUNCH_STATE_LAUNCHED};
-use crate::arch;
-use crate::vmx::hyperv;
 use core::sync::atomic::Ordering;
 pub fn run_boot_loader(
     options: crate::boot::config::MatrixConfig,
@@ -34,8 +34,7 @@ pub fn run_boot_loader(
     let initial_rflags = arch::read_rflags();
     let code = ResidentCode::allocate(event_context)?;
     let root_segments = arch::capture();
-    let msr_bitmap =
-        crate::vmx::msr::allocate_bitmap().map_err(ResidentProbeError::Allocation)?;
+    let msr_bitmap = crate::vmx::msr::allocate_bitmap().map_err(ResidentProbeError::Allocation)?;
     let ept_test_page = ResidentPages::allocate_initialized(1, AddressConstraint::Any, |bytes| {
         bytes[..8].copy_from_slice(&0x4550_5454_4553_5431_u64.to_ne_bytes());
     })
@@ -454,8 +453,7 @@ pub fn run_boot_loader(
             || nested.ept_composition_count < 2
             || nested.ept_probe_count != 3
             || nested.ept_observed_value != crate::vmx::vcpu::NESTED_EPT_TARGET_MARKER
-            || nested.ept_observed_value_before_invept
-                != crate::vmx::vcpu::NESTED_EPT_TARGET_MARKER
+            || nested.ept_observed_value_before_invept != crate::vmx::vcpu::NESTED_EPT_TARGET_MARKER
             || nested.ept_observed_value_after_invept
                 != crate::vmx::vcpu::NESTED_EPT_SECOND_TARGET_MARKER
             || nested.invept_count != 2
@@ -739,6 +737,10 @@ fn protect_update_memory(
             interception_configuration.pool_base,
             crate::protocol::memory::intercept_storage_pages(interception_configuration.cpu_mask),
         ),
+        (
+            interception.observation,
+            core::mem::size_of::<crate::memory::observation::Observation>().div_ceil(PAGE_SIZE),
+        ),
         (update.staging, MAX_PACKAGE_BYTES.div_ceil(PAGE_SIZE)),
         (
             event.update_context_physical,
@@ -750,7 +752,11 @@ fn protect_update_memory(
             core::mem::size_of::<crate::memory::tracking::Session>().div_ceil(PAGE_SIZE),
         ),
         (
-            unsafe { (*(event.tracking_context_physical as *const crate::memory::tracking::Session)).pool.base },
+            unsafe {
+                (*(event.tracking_context_physical as *const crate::memory::tracking::Session))
+                    .pool
+                    .base
+            },
             crate::protocol::memory::TRACK_TABLE_PAGES,
         ),
     ] {

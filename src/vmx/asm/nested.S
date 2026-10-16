@@ -270,8 +270,8 @@ call .Lresident_hyperv_evmcs_store
 // VMCS12 now owns any interrupted event reported to L1.
 mov qword ptr [r12 + {b_nmi_injected}], 0
 mov qword ptr [r12 + {b_nested_l2_active}], 0
-vmptrld [r12 + {b_nested_vmcs01_region}]
-jna .Lresident_dispatch_halt
+lea rdi, [r12 + {b_nested_vmcs01_region}]
+call .Lresident_nested_select_vmcs_inherit_cet
 call .Lresident_nested_activate_vmcs01_msr_entry
 call .Lresident_nested_restore_l1_host_state
 mov rax, {guest_rip}
@@ -1637,6 +1637,11 @@ mov eax, ecx
 shr eax, 8
 cmp eax, 8
 je .Lresident_nested_read_saved_msr_invalid
+cmp ecx, 0x6a2
+je .Lresident_nested_read_saved_cet_msr
+cmp ecx, 0x6a8
+je .Lresident_nested_read_saved_cet_msr
+.Lresident_nested_read_saved_msr_native:
 mov eax, {guest_pat}
 cmp ecx, 0x277
 je .Lresident_nested_read_saved_msr_vmcs
@@ -1671,6 +1676,16 @@ ret
 .Lresident_nested_read_saved_msr_invalid:
 stc
 ret
+.Lresident_nested_read_saved_cet_msr:
+mov eax, {vm_entry_controls}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+test r11d, 0x100000
+jz .Lresident_nested_read_saved_msr_native
+mov eax, {guest_s_cet}
+cmp ecx, 0x6a2
+je .Lresident_nested_read_saved_msr_vmcs
+mov eax, {guest_interrupt_ssp_table}
 .Lresident_nested_read_saved_msr_vmcs:
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
@@ -1847,8 +1862,8 @@ resident_telemetry_counter dec, {b_nested_entry_rejection_count}, {b_telemetry_a
 mov qword ptr [r12 + {b_nested_l2_entry_was_resume}], 0
 mov qword ptr [r12 + {b_nested_l2_active}], 1
 resident_telemetry_counter inc, {b_nested_l2_entry_count}, {b_telemetry_active}
-vmptrld [r12 + {b_nested_vmcs02_region}]
-jna .Lresident_dispatch_halt
+lea rdi, [r12 + {b_nested_vmcs02_region}]
+call .Lresident_nested_select_vmcs_inherit_cet
 call .Lresident_nested_prepare_ept02
 call .Lresident_nested_merge_vmcs02_controls
 call .Lresident_nested_sync_vmcs02_guest_state
@@ -3254,6 +3269,39 @@ jna .Lresident_dispatch_vmread_failed
 mov qword ptr [r12 + {b_nested_ept01_pointer}], r11
 .Lresident_nested_snapshot_vmcs01_ready:
 ret
+.Lresident_nested_select_vmcs_inherit_cet:
+// Virtual CET load controls are unadvertised, so entries and exits preserve
+// the live CET triple. Root's disabled CET state is never inherited.
+mov eax, {vm_entry_controls}
+vmread r11, rax
+jna .Lresident_dispatch_vmread_failed
+test r11d, 0x100000
+jz .Lresident_nested_select_vmcs_without_cet
+mov eax, {guest_s_cet}
+vmread r8, rax
+jna .Lresident_dispatch_vmread_failed
+mov eax, {guest_ssp}
+vmread r9, rax
+jna .Lresident_dispatch_vmread_failed
+mov eax, {guest_interrupt_ssp_table}
+vmread r10, rax
+jna .Lresident_dispatch_vmread_failed
+vmptrld [rdi]
+jna .Lresident_dispatch_halt
+mov eax, {guest_s_cet}
+vmwrite rax, r8
+jna .Lresident_dispatch_vmwrite_failed
+mov eax, {guest_ssp}
+vmwrite rax, r9
+jna .Lresident_dispatch_vmwrite_failed
+mov eax, {guest_interrupt_ssp_table}
+vmwrite rax, r10
+jna .Lresident_dispatch_vmwrite_failed
+ret
+.Lresident_nested_select_vmcs_without_cet:
+vmptrld [rdi]
+jna .Lresident_dispatch_halt
+ret
 .Lresident_nested_sync_vmcs02_guest_state:
 mov rax, {vmcs_link_pointer}
 mov r11, -1
@@ -4092,8 +4140,8 @@ mov qword ptr [r12 + {b_nested_l2_entry_was_resume}], 1
 mov qword ptr [r12 + {b_nested_l2_active}], 1
 resident_telemetry_counter inc, {b_nested_l2_entry_count}, {b_telemetry_active}
 resident_telemetry_counter inc, {b_nested_l2_resume_count}, {b_telemetry_active}
-vmptrld [r12 + {b_nested_vmcs02_region}]
-jna .Lresident_dispatch_halt
+lea rdi, [r12 + {b_nested_vmcs02_region}]
+call .Lresident_nested_select_vmcs_inherit_cet
 call .Lresident_nested_prepare_ept02
 call .Lresident_nested_merge_vmcs02_controls
 call .Lresident_nested_sync_vmcs02_guest_state

@@ -28,12 +28,16 @@ for declaration, replacement in [
     ('fn shared_entry(', 'fn shared_entry(pointer: u64, target: u64, permissions: u64) { crate::hardware::shared_entry(pointer, target, permissions); }'),
     ('fn page_byte(', 'fn page_byte(address: u64, value: Option<u8>) -> u8 { crate::hardware::page_byte(address, value) }'),
     ('fn clock()', 'fn clock() -> u64 { crate::hardware::clock() }'),
+    ('fn user_cet()', 'fn user_cet() -> [u64; 2] { crate::hardware::STATE.with(|state| state.borrow().user_cet) }'),
+    ('fn kernel_gs()', 'fn kernel_gs() -> u64 { crate::hardware::STATE.with(|state| state.borrow().kernel_gs) }'),
     ('fn syscall_msrs()', 'fn syscall_msrs() -> [u64; 2] { crate::hardware::syscall_msrs() }'),
     ('fn original_value(', 'fn original_value(address: u64, width: usize, value: Option<u64>) -> u64 { crate::hardware::original_value(address, width, value) }'),
 ]:
     runtime = runtime.replace(item(runtime, declaration), replacement)
 runtime = runtime.replace('crate::memory::access::resident::instruction_bytes(',
                           'crate::hardware::fetch_instruction(')
+runtime = runtime.replace('core::arch::x86_64::__cpuid_count(',
+                          'crate::hardware::cpuid_count(')
 start = runtime.index('        if !no_flush &&')
 end = runtime.index('        Ok(2)', start)
 runtime = runtime[:start] + '''        if !no_flush && read(SECONDARY_VM_EXEC_CONTROL)? & (1 << 5) != 0 {
@@ -43,6 +47,9 @@ runtime = runtime[:start] + '''        if !no_flush && read(SECONDARY_VM_EXEC_CO
 assert 'core::arch::asm!' not in runtime
 engine = source[:source.index('pub(crate) trait InterceptionMemory')]
 engine = engine.replace('use crate::memory::access::{PhysicalMemory, page_mapping};', '')
+engine = engine.replace('#[cfg(target_os = \"uefi\")]\nuse crate::memory::observation::ContextRecord;', 'use crate::memory::observation::ContextRecord;')
+for declaration in ['unsafe fn observer_mut(', 'fn has_features(']:
+    engine = engine.replace(item(engine, declaration), '')
 engine = re.sub(r'const OPTIONS: u32 = .*?;', '', engine, flags=re.S)
 # Split ownership is tested by the frontend harness. Keep its storage opaque
 # here while preserving the complete session layout and resident ABI assertions.
@@ -54,6 +61,8 @@ abi = (project / 'src/vmx/resident/abi.rs').read_text()
 cpu = 'use core::sync::atomic::AtomicU64;\n#[repr(C)]\n#[derive(Default)]\n' + item(abi, 'pub struct InterceptionCpuState')
 vmcs = (project / 'src/vmx/vmcs.rs').read_text()
 constants = '\n'.join(re.findall(r'pub const \w+: u64 = (?:0x[0-9a-fA-F_]+|\d+);', vmcs))
+access = (project / 'src/memory/access.rs').read_text().split('#[cfg(any(target_os = \"uefi\", test))]')[0]
+(output / 'access.rs').write_text(access)
 definitions = '''pub mod protocol { include!("../../src/protocol.rs"); }
 pub mod arch {
     pub struct Leaf { pub eax: u32 }
@@ -63,7 +72,10 @@ pub mod arch {
         Leaf { eax: crate::hardware::STATE.with(|state| u32::from(state.borrow().lam_supported) << 26) }
     }
 }
-pub mod memory { pub mod interception {
+pub mod memory {
+    pub mod access { include!("access.rs"); }
+    pub mod observation { include!("../../src/memory/observation.rs"); }
+    pub mod interception {
 ''' + engine + '''
 } }
 pub mod vmx {
