@@ -309,32 +309,35 @@ jz .Lresident_dispatch_vmwrite_failed
 mov eax, {guest_interruptibility_info}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
+test r11d, 3
+jz .Lresident_advance_guest_rip_flags
 and r11d, -4
 vmwrite rax, r11
 jna .Lresident_dispatch_vmwrite_failed
+.Lresident_advance_guest_rip_flags:
 mov eax, {guest_rflags}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
 // Successful emulation retires RF just as execution of the instruction does.
 btr r11, 16
+jnc .Lresident_advance_guest_rip_flags_ready
 vmwrite rax, r11
 jna .Lresident_dispatch_vmwrite_failed
-mov r10d, r11d
-and r10d, 0x100
+.Lresident_advance_guest_rip_flags_ready:
+// With TF clear, instruction retirement cannot add a single-step cause.
+test r11d, 0x100
+jz .Lresident_advance_guest_rip_done
 mov eax, {guest_ia32_debugctl}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
 test r11d, 2
-jz .Lresident_advance_guest_rip_debug_check
-xor r10d, r10d
+jnz .Lresident_advance_guest_rip_done
 .Lresident_advance_guest_rip_debug_check:
 mov eax, {guest_pending_dbg_exceptions}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
-test r10d, r10d
-jz .Lresident_advance_guest_rip_debug_ready
 bts r11, 14
-.Lresident_advance_guest_rip_debug_ready:
+jc .Lresident_advance_guest_rip_done
 mov eax, {guest_pending_dbg_exceptions}
 vmwrite rax, r11
 jna .Lresident_dispatch_vmwrite_failed

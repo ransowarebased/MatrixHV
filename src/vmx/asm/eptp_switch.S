@@ -983,29 +983,40 @@ jmp .Lresident_nested_eptp_sync_recover
 // entry-gate retries until the next VM exit. NMIs cannot renew that budget.
 .Lresident_nested_eptp_sync_budget_start:
 mov r8, qword ptr [r12 + {b_processor_number}]
-shl r8, 4
+shl r8, 6
 lea r9, [rip + .Lresident_eptp_sync_budgets]
 add r9, r8
 call .Lresident_nested_eptp_sync_clock
+mov r11, rax
 mov r10, qword ptr [r12 + {b_watchdog_tsc_hz}]
+cmp r10, qword ptr [r9 + 24]
+jne .Lresident_nested_eptp_sync_budget_duration
+mov rax, qword ptr [r9 + 16]
+test rax, rax
+jnz .Lresident_nested_eptp_sync_budget_deadline
+.Lresident_nested_eptp_sync_budget_duration:
 test r10, r10
 jz .Lresident_nested_eptp_sync_budget_fallback
-mov r11, rax
 mov rax, r10
 xor edx, edx
 mov ecx, 50
 div rcx
-add rax, r11
-jmp .Lresident_nested_eptp_sync_budget_store
+jmp .Lresident_nested_eptp_sync_budget_cache
 .Lresident_nested_eptp_sync_budget_fallback:
-add rax, 80000000
+mov eax, 80000000
+.Lresident_nested_eptp_sync_budget_cache:
+// Frequency is stable across exits; recompute only when its source changes.
+mov qword ptr [r9 + 16], rax
+mov qword ptr [r9 + 24], r10
+.Lresident_nested_eptp_sync_budget_deadline:
+add rax, r11
 .Lresident_nested_eptp_sync_budget_store:
 mov qword ptr [r9], rax
 mov qword ptr [r9 + 8], 1000000
 ret
 .Lresident_nested_eptp_sync_budget_expired:
 mov r8, qword ptr [r12 + {b_processor_number}]
-shl r8, 4
+shl r8, 6
 lea r9, [rip + .Lresident_eptp_sync_budgets]
 add r9, r8
 // Standalone control requests have no dispatch entry; initialize once there.
@@ -1475,8 +1486,10 @@ ret
 .zero 512
 .Lresident_interception_stall_records:
 .zero 4096
+.balign 64
 .Lresident_eptp_sync_budgets:
-.zero 1024
+// Every exit writes its CPU's deadline. Separate slots avoid false sharing.
+.zero 4096
 .Lresident_eptp_lists_live:
 .quad 0
 .endm

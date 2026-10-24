@@ -60,12 +60,12 @@ event = (
 event = re.sub(r"\{(\w+)\}", lambda match: str(fields[match[1]]), event)
 event = re.sub(
     r"vmread (r\w+), rax",
-    r"mov \1, [r12 + 64 + rax * 8]\ncmp r12, 0",
+    r"inc qword ptr [r12 + 280 + rax * 8]\nmov \1, [r12 + 64 + rax * 8]\ncmp r12, 0",
     event,
 )
 event = re.sub(
     r"vmwrite rax, (r\w+)",
-    r"mov [r12 + 64 + rax * 8], \1\ncmp r12, 0",
+    r"inc qword ptr [r12 + 432 + rax * 8]\nmov [r12 + 64 + rax * 8], \1\ncmp r12, 0",
     event,
 )
 assert not re.search(r"(?m)^vm(?:read|write) ", event)

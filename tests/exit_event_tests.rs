@@ -19,6 +19,8 @@ struct EventContext {
     injected: u64,
     pending: u64,
     entry_retries: u64,
+    reads: [u64; 19],
+    writes: [u64; 19],
 }
 
 #[repr(C)]
@@ -219,6 +221,40 @@ fn instruction_completion_retires_resume_flag_without_changing_other_flags() {
         unsafe { test_event_advance(&mut context) };
         assert_eq!(context.vmcs[11], flags & !(1 << 16));
         assert_eq!(context.vmcs[13] & (1 << 14), (flags & (1 << 8)) << 6);
+    }
+}
+
+#[test]
+fn instruction_completion_avoids_unchanged_vmcs_writes_and_inactive_debug_reads() {
+    for (flags, interruptibility, debugctl, pending, flag_writes, shadow_writes, debug_reads, pending_reads, pending_writes) in [
+        (0x202, 8, 0, 0x1001, 0, 0, 0, 0, 0),
+        (0x10202, 0xb, 0, 0x1001, 1, 1, 0, 0, 0),
+        (0x302, 8, 2, 0x1001, 0, 0, 1, 0, 0),
+        (0x302, 8, 0, 0x5001, 0, 0, 1, 1, 0),
+        (0x302, 8, 0, 0x1001, 0, 0, 1, 1, 1),
+    ] {
+        let mut context = EventContext {
+            rip: 0x1000,
+            instruction_len: 3,
+            ..Default::default()
+        };
+        context.vmcs[10] = 0x2000;
+        context.vmcs[15] = 0x500;
+        context.vmcs[11] = flags;
+        context.vmcs[2] = interruptibility;
+        context.vmcs[12] = debugctl;
+        context.vmcs[13] = pending;
+        unsafe { test_event_advance(&mut context) };
+        assert_eq!(context.vmcs[14], 0x1003);
+        assert_eq!(context.vmcs[11], flags & !(1 << 16));
+        assert_eq!(context.vmcs[2], interruptibility & !3);
+        assert_eq!(context.writes[14], 1);
+        assert_eq!(context.writes[11], flag_writes);
+        assert_eq!(context.writes[2], shadow_writes);
+        assert_eq!(context.reads[12], debug_reads);
+        assert_eq!(context.reads[13], pending_reads);
+        assert_eq!(context.writes[13], pending_writes);
+        assert_eq!(context.vmcs[13], pending | if pending_writes == 1 { 1 << 14 } else { 0 });
     }
 }
 

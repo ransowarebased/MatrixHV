@@ -679,6 +679,9 @@ mod sync {
         "lea rcx, [rip + .Lresident_eptp_lists_live + 8]",
         "sub rcx, rdi", "shr rcx, 3",
         "rep stosq", "pop rdi", "ret",
+        ".globl sync_budget_address",
+        "sync_budget_address:", "mov rax, rcx", "shl rax, 6",
+        "lea rdx, [rip + .Lresident_eptp_sync_budgets]", "add rax, rdx", "ret",
         ".Ltest_read_stall:", "mov rax, [r12 + {b_processor_number}]", "shl rax, 6",
         "lea r9, [rip + .Lresident_interception_stall_records]", "add r9, rax",
         "mov rax, [r9 + rdx * 8]", "ret",
@@ -831,6 +834,7 @@ mod sync {
         fn sync_poll(context: *const Context);
         fn sync_poll_retained(context: *const Context);
         fn sync_budget_check(context: *const Context) -> u64;
+        fn sync_budget_address(processor: u64) -> *const u64;
         fn sync_enter(context: *const Context);
         fn sync_host_nmi(context: *const Context) -> u64;
         fn sync_host_nmi_retained(context: *const Context) -> u64;
@@ -1437,6 +1441,40 @@ unsafe { sync_poll(&*owner); sync_poll(&*peer); }
         assert_eq!(unsafe { sync_begin(&*peer) }, 1);
         unsafe { sync_end(&*peer); }
         assert_eq!(owner.revocations.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn budget_slots_are_isolated_and_refresh_cached_durations_after_clock_changes() {
+        let _serial = isolate();
+        let profile = Profile::new();
+        let event = Event { cpus: [0; 64], interception: &profile as *const _ as u64 };
+        let mut first = Context::new(&event, false);
+        let mut second = Context::new(&event, false);
+        second.processor.store(1, Ordering::Release);
+        for cpu in [&first, &second] {
+            cpu.clock_enabled.store(1, Ordering::Release);
+            cpu.clock_step.store(0, Ordering::Release);
+        }
+        first.tsc_hz = 10_000;
+        first.clock_ticks.store(100, Ordering::Release);
+        second.tsc_hz = 20_000;
+        second.clock_ticks.store(200, Ordering::Release);
+        let first_slot = unsafe { sync_budget_address(0) };
+        let second_slot = unsafe { sync_budget_address(1) };
+        assert_eq!(first_slot as usize % 64, 0);
+        assert_eq!(second_slot as usize - first_slot as usize, 64);
+        unsafe { sync_poll(&first); sync_poll(&second); }
+        assert_eq!(unsafe { first_slot.read() }, 300);
+        assert_eq!(unsafe { second_slot.read() }, 600);
+        for (frequency, ticks, duration) in [(50_000, 1000, 1000), (0, 1000, 80_000_000), (0, 2000, 80_000_000)] {
+            first.tsc_hz = frequency;
+            first.clock_ticks.store(ticks, Ordering::Release);
+            unsafe { sync_poll(&first); }
+            assert_eq!(unsafe { first_slot.read() }, ticks + duration);
+            assert_eq!(unsafe { first_slot.add(2).read() }, duration);
+            assert_eq!(unsafe { first_slot.add(3).read() }, frequency);
+            assert_eq!(unsafe { second_slot.read() }, 600);
+        }
     }
 
     #[test]

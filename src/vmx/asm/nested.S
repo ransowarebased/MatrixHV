@@ -1004,17 +1004,22 @@ jnz .Lresident_nested_translate_ept02_misconfigured
 993:
 .endif
 .endm
-.Lresident_nested_translate_ept02:
+.macro resident_nested_ept12_initialize
 mov rbp, r9
+and ebp, 0x40
+xor ebx, ebx
 xor r14d, r14d
 xor r15d, r15d
 mov rdx, {host_page_address_mask}
 and r9, rdx
 mov r14d, 7
 cmp qword ptr [r12 + {b_nested_ept02_mbec}], 0
-je .Lresident_nested_ept12_mode_ready
+je 994f
 or r14d, 0x400
-.Lresident_nested_ept12_mode_ready:
+994:
+.endm
+.Lresident_nested_translate_ept02:
+resident_nested_ept12_initialize
 call .Lresident_nested_map_ept12_table
 test eax, eax
 jz .Lresident_nested_translate_ept02_failed
@@ -1050,6 +1055,7 @@ and r9, rdx
 call .Lresident_nested_map_ept12_table
 test eax, eax
 jz .Lresident_nested_translate_ept02_failed
+.Lresident_nested_ept12_pd_ready:
 mov rcx, r8
 shr rcx, 21
 and ecx, 0x1ff
@@ -1272,8 +1278,31 @@ mov qword ptr [r12 + {b_nested_eptp_write_retry}], 1
 jmp .Lresident_nested_translate_ept02_failed
 // EPT12 table pointers belong to L1's physical address space, including its
 // root. Return the host table in R9 and effective EPT01 permissions in R11.
-// A/D updates must honor write protection on the backing table page.
+// A/D updates must honor write protection on the backing table page. RBX/RBP
+// cache one EPT01 large-leaf range only for this composition walk; BPL bit 6
+// retains EPT12 A/D mode. Root synchronization excludes EPT01 changes here.
 .Lresident_nested_map_ept12_table:
+mov rax, r9
+and rax, -2097152
+or rax, 1
+cmp rax, rbx
+jne .Lresident_nested_map_ept12_walk
+mov r11, rbp
+mov rdx, 0x0080000000000007
+and r11, rdx
+mov rax, r9
+and eax, 0x1fffff
+mov r9, rbp
+mov rdx, {host_page_address_mask}
+and r9, rdx
+or r9, rax
+// A large EPT01 leaf does not prove every host virtual page is mapped.
+push r11
+mov r11, r9
+call .Lresident_ept01_host_page_is_mapped
+pop r11
+ret
+.Lresident_nested_map_ept12_walk:
 push r8
 mov r8, r9
 call .Lresident_nested_translate_eptp_list_address
@@ -1282,11 +1311,140 @@ mov r11, r10
 test eax, eax
 jz .Lresident_nested_map_ept12_done
 bt qword ptr [rdx], 55
-jnc .Lresident_nested_map_ept12_done
+jnc .Lresident_nested_map_ept12_cache
 bts r11, 55
+.Lresident_nested_map_ept12_cache:
+test byte ptr [rdx], 0x80
+jz .Lresident_nested_map_ept12_done
+mov rbx, r8
+and rbx, -2097152
+or rbx, 1
+and ebp, 0x40
+mov rax, r9
+and rax, -2097152
+or rbp, rax
+or rbp, r11
 .Lresident_nested_map_ept12_done:
 pop r8
 ret
+// RDI names a 160-byte cache owned by one revalidation's stack frame. EPT01
+// and root mappings remain stable under root synchronization. Every EPT12
+// parent is still read; a changed value discards all derived child state.
+// Flags at +0 publish the root (+8..40), PML4 (+48..96), and PDPT (+104..152)
+// records only after their metadata mapping succeeds. Records retain the
+// effective permissions and composition-local large-leaf mapping cache.
+.Lresident_nested_translate_ept02_revalidate:
+resident_nested_ept12_initialize
+mov rax, r9
+or rax, rbp
+test byte ptr [rdi], 1
+jz .Lresident_nested_prefix_root_miss
+cmp qword ptr [rdi + 8], rax
+jne .Lresident_nested_prefix_root_miss
+mov r9, qword ptr [rdi + 16]
+mov r11, qword ptr [rdi + 24]
+mov rbx, qword ptr [rdi + 32]
+mov rbp, qword ptr [rdi + 40]
+jmp .Lresident_nested_prefix_pml4
+.Lresident_nested_prefix_root_miss:
+mov qword ptr [rdi], 0
+mov qword ptr [rdi + 8], rax
+call .Lresident_nested_map_ept12_table
+test eax, eax
+jz .Lresident_nested_translate_ept02_failed
+mov qword ptr [rdi + 16], r9
+mov qword ptr [rdi + 24], r11
+mov qword ptr [rdi + 32], rbx
+mov qword ptr [rdi + 40], rbp
+mov qword ptr [rdi], 1
+.Lresident_nested_prefix_pml4:
+mov rcx, r8
+shr rcx, 39
+and ecx, 0x1ff
+lea rsi, [r9 + rcx * 8]
+mov r10, qword ptr [rsi]
+test byte ptr [rdi], 2
+jz .Lresident_nested_prefix_pml4_miss
+cmp qword ptr [rdi + 48], rsi
+jne .Lresident_nested_prefix_pml4_miss
+cmp qword ptr [rdi + 56], r10
+jne .Lresident_nested_prefix_pml4_miss
+mov r14, qword ptr [rdi + 64]
+mov r9, qword ptr [rdi + 72]
+mov r11, qword ptr [rdi + 80]
+mov rbx, qword ptr [rdi + 88]
+mov rbp, qword ptr [rdi + 96]
+jmp .Lresident_nested_prefix_pdpt
+.Lresident_nested_prefix_pml4_miss:
+and qword ptr [rdi], 1
+resident_nested_ept12_permissions 4
+test bpl, 0x40
+jz .Lresident_nested_prefix_pml4_accessed
+test r10d, 0x100
+jz .Lresident_nested_translate_ept02_failed
+.Lresident_nested_prefix_pml4_accessed:
+mov qword ptr [rdi + 48], rsi
+mov qword ptr [rdi + 56], r10
+mov qword ptr [rdi + 64], r14
+mov r9, r10
+mov rdx, {host_page_address_mask}
+and r9, rdx
+call .Lresident_nested_map_ept12_table
+test eax, eax
+jz .Lresident_nested_translate_ept02_failed
+mov qword ptr [rdi + 72], r9
+mov qword ptr [rdi + 80], r11
+mov qword ptr [rdi + 88], rbx
+mov qword ptr [rdi + 96], rbp
+or qword ptr [rdi], 2
+.Lresident_nested_prefix_pdpt:
+mov rcx, r8
+shr rcx, 30
+and ecx, 0x1ff
+lea rsi, [r9 + rcx * 8]
+mov r10, qword ptr [rsi]
+test byte ptr [rdi], 4
+jz .Lresident_nested_prefix_pdpt_miss
+cmp qword ptr [rdi + 104], rsi
+jne .Lresident_nested_prefix_pdpt_miss
+cmp qword ptr [rdi + 112], r10
+jne .Lresident_nested_prefix_pdpt_miss
+mov r14, qword ptr [rdi + 120]
+mov r9, qword ptr [rdi + 128]
+mov r11, qword ptr [rdi + 136]
+mov rbx, qword ptr [rdi + 144]
+mov rbp, qword ptr [rdi + 152]
+xor edi, edi
+jmp .Lresident_nested_ept12_pd_ready
+.Lresident_nested_prefix_pdpt_miss:
+and qword ptr [rdi], 3
+resident_nested_ept12_permissions 3
+test bpl, 0x40
+jz .Lresident_nested_prefix_pdpt_accessed
+test r10d, 0x100
+jz .Lresident_nested_translate_ept02_failed
+.Lresident_nested_prefix_pdpt_accessed:
+test r10b, 0x80
+jz .Lresident_nested_prefix_pdpt_table
+xor edi, edi
+jmp .Lresident_nested_ept12_1g_leaf
+.Lresident_nested_prefix_pdpt_table:
+mov qword ptr [rdi + 104], rsi
+mov qword ptr [rdi + 112], r10
+mov qword ptr [rdi + 120], r14
+mov r9, r10
+mov rdx, {host_page_address_mask}
+and r9, rdx
+call .Lresident_nested_map_ept12_table
+test eax, eax
+jz .Lresident_nested_translate_ept02_failed
+mov qword ptr [rdi + 128], r9
+mov qword ptr [rdi + 136], r11
+mov qword ptr [rdi + 144], rbx
+mov qword ptr [rdi + 152], rbp
+or qword ptr [rdi], 4
+xor edi, edi
+jmp .Lresident_nested_ept12_pd_ready
 .Lresident_nested_allocate_ept02_table:
 mov rax, qword ptr [r12 + {b_nested_ept02_table_pool_used}]
 cmp rax, qword ptr [r12 + {b_nested_ept02_table_pool_pages}]
@@ -1458,15 +1616,23 @@ ret
 .Lresident_nested_revalidate_ept02:
 cmp qword ptr [r12 + {b_nested_ept02_cache_initialized}], 0
 je .Lresident_nested_invalidate_ept02
-// Revalidate populated entries instead of discarding a dense working set;
-// a root reset would force a new EPT violation for every unchanged mapping.
-resident_telemetry_counter inc, {b_nested_ept02_invalidation_count}, {b_telemetry_active}
+// Retain small working sets, but bound translation walks so an INVEPT cannot
+// keep L2 behind a pending host interrupt indefinitely. Larger sets refill
+// on demand after disconnecting the entire root and retiring translations.
+sub rsp, 176
+mov qword ptr [rsp], 256
+mov qword ptr [rsp + 16], 0
+mov rdx, rsp
 mov rdi, qword ptr [r12 + {b_nested_ept02_pointer}]
 mov rax, {host_page_address_mask}
 and rdi, rax
 xor r8d, r8d
 mov ecx, 39
 call .Lresident_nested_revalidate_ept02_table
+test eax, eax
+lea rsp, [rsp + 176]
+jz .Lresident_nested_invalidate_ept02
+resident_telemetry_counter inc, {b_nested_ept02_invalidation_count}, {b_telemetry_active}
 jmp .Lresident_nested_flush_ept02
 .Lresident_nested_revalidate_ept02_table:
 sub rsp, 48
@@ -1474,6 +1640,7 @@ mov qword ptr [rsp], rdi
 mov qword ptr [rsp + 8], r8
 mov qword ptr [rsp + 16], rcx
 mov qword ptr [rsp + 24], 0
+mov qword ptr [rsp + 40], rdx
 .Lresident_nested_revalidate_ept02_entry:
 mov rax, qword ptr [rsp + 24]
 mov rdi, qword ptr [rsp]
@@ -1501,13 +1668,21 @@ jnz .Lresident_nested_revalidate_ept02_leaf
 mov rdi, {host_page_address_mask}
 and rdi, r10
 sub ecx, 9
+mov rdx, qword ptr [rsp + 40]
 call .Lresident_nested_revalidate_ept02_table
+test eax, eax
+jz .Lresident_nested_revalidate_ept02_return
 jmp .Lresident_nested_revalidate_ept02_next
 .Lresident_nested_revalidate_ept02_leaf:
+mov rdx, qword ptr [rsp + 40]
+xor eax, eax
+cmp qword ptr [rdx], 0
+je .Lresident_nested_revalidate_ept02_return
+dec qword ptr [rdx]
 mov qword ptr [rsp + 32], rdi
 mov r9, qword ptr [r12 + {b_nested_ept12_pointer}]
-xor edi, edi
-call .Lresident_nested_translate_ept02
+lea rdi, [rdx + 16]
+call .Lresident_nested_translate_ept02_revalidate
 cmp eax, 1
 jne .Lresident_nested_revalidate_ept02_remove
 cmp qword ptr [rsp + 16], 12
@@ -1536,6 +1711,8 @@ inc qword ptr [rsp + 24]
 cmp qword ptr [rsp + 24], 512
 jne .Lresident_nested_revalidate_ept02_entry
 .Lresident_nested_revalidate_ept02_done:
+mov eax, 1
+.Lresident_nested_revalidate_ept02_return:
 add rsp, 48
 ret
 matrixhv_ept01_host_mapping_validation

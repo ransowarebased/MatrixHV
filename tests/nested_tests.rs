@@ -2878,6 +2878,22 @@ mod ept {
         "pop r15", "pop r14", "pop r13", "pop r12",
         "pop rsi", "pop rdi", "pop rbp", "pop rbx",
         "ret",
+        ".globl translate_test_ept_prefix",
+        "translate_test_ept_prefix:",
+        "push rbx", "push rbp", "push rdi", "push rsi",
+        "push r12", "push r13", "push r14", "push r15", "push r9",
+        "mov r12, rcx", "mov rdi, rdx",
+        "mov r9, [r12 + {b_nested_ept12_pointer}]",
+        "test rdi, rdi", "jz .Ltest_translate_without_prefix",
+        "call .Lresident_nested_translate_ept02_revalidate",
+        "jmp .Ltest_translate_prefix_result",
+        ".Ltest_translate_without_prefix:",
+        "call .Lresident_nested_translate_ept02",
+        ".Ltest_translate_prefix_result:",
+        "pop rdx", "mov [rdx], rax", "mov [rdx + 8], r13",
+        "mov [rdx + 16], r14", "mov [rdx + 24], r15",
+        "pop r15", "pop r14", "pop r13", "pop r12",
+        "pop rsi", "pop rdi", "pop rbp", "pop rbx", "ret",
         ".globl check_test_host_mapping",
         "check_test_host_mapping:",
         "push r12", "mov r12, rcx", "mov r11, rdx",
@@ -3023,6 +3039,7 @@ mod ept {
     );
 
     unsafe extern "win64" {
+        fn translate_test_ept_prefix(context: *mut Context, cache: *mut u64, gpa: u64, result: *mut [u64; 4]);
         fn check_test_host_mapping(context: *mut Context, address: u64) -> u64;
         fn resolve_test_ept(context: *mut Context) -> u64;
         fn discard_test_ept(context: *mut Context);
@@ -3152,6 +3169,49 @@ mod ept {
             table = entry & ADDRESS_MASK;
         }
         addresses
+    }
+
+    #[test]
+    fn composition_local_metadata_cache_preserves_ad_permissions_and_host_mapping_checks() {
+        const TRACKED: u64 = 1 << 55;
+        let mut arena = Arena::new();
+        let allocation = arena.pages(1024);
+        let root = (allocation + 0x1fffff) & !0x1fffff;
+        let ept01 = arena.pages(1);
+        unsafe {
+            (root as *mut u64).write((root + 4096) | 0x107);
+            ((root + 4096) as *mut u64).write((root + 8192) | 0x107);
+            ((root + 8192 + 8) as *mut u64).write((root + 12288) | 0x107);
+            ((root + 12288 + 24) as *mut u64).write(0x403037);
+        }
+        arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+        let mut state = context(&mut arena, root | 0x40, ept01);
+        state.gpa = 0x203000;
+        state.qualification = 2;
+        arena.map(ept01, root, root, 21, 0xb7);
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+        assert_eq!(leaf(root, state.gpa).1 & 0x300, 0x300);
+        assert_eq!(leaf(state.ept02, state.gpa).1 & 7, 7);
+
+        for tracked in [0, TRACKED] {
+            unsafe { ((root + 12288 + 24) as *mut u64).write(0x403037) };
+            arena.map(ept01, root, root, 21, 0xb5 | tracked);
+            unsafe { discard_test_ept(&mut state) };
+            assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+            assert_eq!(leaf(root, state.gpa).1 & 0x300, 0);
+            assert_eq!(state.write_retry, u64::from(tracked != 0));
+        }
+
+        arena.map(ept01, root, root, 21, 0xb7);
+        let host_root = arena.pages(1);
+        for offset in [0, 4096, 12288] {
+            arena.map(host_root, root + offset, root + offset, 12, 3);
+        }
+        state.host_cr3 = host_root;
+        state.host_mapping_cache = [0; 4];
+        assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+        assert_eq!(state.write_retry, 0);
+        assert_eq!(leaf(root, state.gpa).1 & 0x300, 0);
     }
 
     #[test]
@@ -4309,6 +4369,128 @@ mod ept {
         assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
     }
 
+    fn assert_prefix_translation_matches(
+        state: &mut Context,
+        prefix: &mut [u64; 20],
+        address: u64,
+    ) -> [u64; 4] {
+        let mut expected = [0; 4];
+        let mut actual = [0; 4];
+        unsafe {
+            translate_test_ept_prefix(state, std::ptr::null_mut(), address, &mut expected);
+            translate_test_ept_prefix(state, prefix.as_mut_ptr(), address, &mut actual);
+        }
+        assert_eq!(actual[0], expected[0]);
+        if actual[0] == 1 {
+            assert_eq!(actual, expected);
+        }
+        actual
+    }
+
+    #[test]
+    fn revalidation_prefix_rereads_parent_remaps_revocations_and_invalid_entries() {
+        for level in [0, 1] {
+            let mut arena = Arena::new();
+            let ept12 = arena.pages(1);
+            let alternate = arena.pages(1);
+            let ept01 = arena.pages(1);
+            arena.map(ept01, 0, 0, 30, 0xb7);
+            arena.map(ept12, 0x203000, 0x403000, 12, 0x37);
+            arena.map(alternate, 0x203000, 0x803000, 12, 0x31);
+            arena.expose_ept12(alternate, ept01);
+            let mut state = context(&mut arena, ept12, ept01);
+            state.physical_address_bits = 48;
+            let entry = entry_addresses(ept12, state.gpa)[level] as *mut u64;
+            let original = unsafe { entry.read() };
+            let replacement = unsafe {
+                (entry_addresses(alternate, state.gpa)[level] as *const u64).read()
+            };
+            let mut prefix = [0; 20];
+            let address = state.gpa;
+            assert_eq!(assert_prefix_translation_matches(&mut state, &mut prefix, address)[0], 1);
+            assert_eq!(prefix[0], 7);
+            for value in [
+                replacement,
+                original & !2,
+                original & !4,
+                original & !1,
+                original | 0x80,
+                original | (1_u64 << 50),
+                0x40_0000_0000 | (original & 0xfff),
+                0,
+            ] {
+                unsafe { entry.write(value) };
+                assert_prefix_translation_matches(&mut state, &mut prefix, address);
+                unsafe { entry.write(original) };
+                assert_eq!(assert_prefix_translation_matches(&mut state, &mut prefix, address)[0], 1);
+            }
+            state.cached_ept12 = alternate;
+            assert_eq!(assert_prefix_translation_matches(&mut state, &mut prefix, address)[1], 0x803000);
+        }
+    }
+
+    #[test]
+    fn revalidation_prefix_preserves_ad_mbec_large_leaves_and_gpa_boundaries() {
+        for shift in [12, 21, 30] {
+            for ad in [false, true] {
+                for mbec in [false, true] {
+                    let mut arena = Arena::new();
+                    let ept12 = arena.pages(1);
+                    let ept01 = arena.pages(1);
+                    arena.map(ept01, 0, 0, 30, 0xb7);
+                    let attributes = 0x437 | if shift == 12 { 0 } else { 0x80 };
+                    for address in [0_u64, 1 << 30, 1 << 39] {
+                        arena.map(ept12, address, 0, shift, attributes);
+                    }
+                    let mut state = context(&mut arena, ept12 | if ad { 0x40 } else { 0 }, ept01);
+                    state.mbec = u64::from(mbec);
+                    let mut prefix = [0; 20];
+                    for address in [0_u64, 4096, 1 << 30, 1 << 39, 0] {
+                        if ad {
+                            for entry in entry_addresses(ept12, address) {
+                                unsafe { *(entry as *mut u64) |= 0x300 };
+                            }
+                        }
+                        assert_prefix_translation_matches(&mut state, &mut prefix, address);
+                    }
+                    if ad {
+                        let parent = entry_addresses(ept12, 0)[0] as *mut u64;
+                        unsafe { *parent &= !0x100 };
+                        assert_eq!(assert_prefix_translation_matches(&mut state, &mut prefix, 0)[0], 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn revalidation_prefix_state_does_not_survive_an_invept_or_ept01_change() {
+        let mut arena = Arena::new();
+        let ept12 = arena.pages(1);
+        let ept01 = arena.pages(1);
+        arena.map(ept01, 0x400000, 0x600000, 21, 0xb7);
+        for index in 0..8 {
+            arena.map(ept12, 0x200000 + index * 4096, 0x400000 + index * 4096, 12, 0x37);
+        }
+        let mut state = context(&mut arena, ept12, ept01);
+        for index in 0..8 {
+            state.gpa = 0x200000 + index * 4096;
+            assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+        }
+        unsafe { revalidate_test_ept(&mut state) };
+        arena.map(ept01, 0x400000, 0x800000, 21, 0xb1);
+        unsafe { revalidate_test_ept(&mut state) };
+        for index in 0..8 {
+            assert_eq!(leaf(state.ept02, 0x200000 + index * 4096), (12, 0x800031 + index * 4096));
+        }
+        let parent = entry_addresses(ept12, state.gpa)[1] as *mut u64;
+        unsafe { *parent = 0 };
+        unsafe { revalidate_test_ept(&mut state) };
+        for index in 0..8 {
+            assert_eq!(leaf(state.ept02, 0x200000 + index * 4096).1, 0);
+        }
+    }
+
     #[test]
     fn revalidation_updates_remaps_permissions_and_memory_type() {
         let mut arena = Arena::new();
@@ -4442,6 +4624,127 @@ mod ept {
         arena.map(ept12, address, 0, 12, 0);
         unsafe { revalidate_test_ept(&mut state) };
         assert_eq!(leaf(state.ept02, address).1, 0);
+    }
+
+    #[test]
+    fn revalidation_budget_preserves_the_boundary_and_discards_unvisited_tail_mappings() {
+        for leaf_count in [256_u64, 257, 513] {
+            let mut arena = Arena::new();
+            let ept12 = arena.pages(1);
+            let ept01 = arena.pages(1);
+            let base = 0x200000;
+            arena.map(ept01, 0, 0, 30, 0xb7);
+            for index in 0..leaf_count {
+                let address = base + index * 4096;
+                arena.map(ept12, address, address + 0x4000000, 12, 0x37);
+            }
+            let mut state = context(&mut arena, ept12, ept01);
+            for index in 0..leaf_count {
+                state.gpa = base + index * 4096;
+                assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+            }
+            let pool_used = state.pool_used;
+            let remapped = base + (leaf_count - 2) * 4096;
+            let revoked = base + (leaf_count - 1) * 4096;
+            arena.map(ept12, remapped, remapped + 0x8000000, 12, 0x31);
+            arena.map(ept12, revoked, 0, 12, 0);
+
+            unsafe { revalidate_test_ept(&mut state) };
+
+            assert_eq!(state.native_invept, 1);
+            assert_eq!(state.invalidations, 1);
+            if leaf_count == 256 {
+                assert_eq!(state.pool_used, pool_used);
+                assert_eq!(leaf(state.ept02, remapped), (12, remapped + 0x8000031));
+                assert_eq!(leaf(state.ept02, revoked).1, 0);
+            } else {
+                assert_eq!(state.pool_used, 0);
+                assert!(
+                    unsafe { std::slice::from_raw_parts(state.ept02 as *const u64, 512) }
+                        .iter()
+                        .all(|entry| *entry == 0),
+                    "Budget exhaustion must disconnect every partially revalidated subtree"
+                );
+                state.gpa = remapped;
+                assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+                assert_eq!(leaf(state.ept02, remapped), (12, remapped + 0x8000031));
+                assert_eq!(leaf(state.ept02, base).1, 0);
+                state.gpa = revoked;
+                assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+                assert_eq!(leaf(state.ept02, revoked).1, 0);
+                state.gpa = base;
+                assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+                assert_eq!(leaf(state.ept02, base), (12, base + 0x4000037));
+            }
+        }
+    }
+
+    #[test]
+    fn global_invept_budget_resets_both_execution_modes_and_refills_current_mappings() {
+        let mut arena = Arena::new();
+        let ept12 = arena.pages(1);
+        let ept01 = arena.pages(1);
+        let base = 0x200000;
+        let remapped = base + 255 * 4096;
+        let revoked = base + 256 * 4096;
+        arena.map(ept01, 0, 0, 30, 0xb7);
+        for index in 0..257 {
+            let address = base + index * 4096;
+            arena.map(ept12, address, address + 0x4000000, 12, 0x437);
+        }
+        let mut state = context(&mut arena, ept12 | 0x1e, ept01);
+        let supervisor_root = state.ept02;
+        for mode in [0, 1] {
+            state.secondary_control = 2 | (mode << 22);
+            unsafe { prepare_test_ept(&mut state) };
+            for index in 0..257 {
+                state.gpa = base + index * 4096;
+                assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+            }
+        }
+        let mbec_root = state.ept02;
+        assert_ne!(supervisor_root, mbec_root);
+        let flushes = state.native_invept;
+        let invalidations = state.invalidations;
+        arena.map(ept12, remapped, remapped + 0x8000000, 12, 0x431);
+        arena.map(ept12, revoked, 0, 12, 0);
+        let descriptor = [u64::MAX, 0];
+
+        assert_eq!(
+            unsafe { invalidate_test_all_ept_contexts(&mut state, descriptor.as_ptr()) },
+            0
+        );
+
+        assert_eq!(state.ept02, mbec_root);
+        assert_eq!(state.mbec, 1);
+        assert_eq!(state.pool_used, 0);
+        assert_eq!(state.alternate_pool_used, 0);
+        assert_eq!(state.native_invept, flushes + 2);
+        assert_eq!(state.invalidations, invalidations + 2);
+        for root in [supervisor_root, mbec_root] {
+            assert!(
+                unsafe { std::slice::from_raw_parts(root as *const u64, 512) }
+                    .iter()
+                    .all(|entry| *entry == 0)
+            );
+        }
+        for mode in [0, 1, 0, 1] {
+            state.secondary_control = 2 | (mode << 22);
+            unsafe { prepare_test_ept(&mut state) };
+            assert_eq!(state.mbec, mode);
+            state.gpa = remapped;
+            if leaf(state.ept02, remapped).1 == 0 {
+                assert_eq!(unsafe { resolve_test_ept(&mut state) }, 1);
+            }
+            assert_eq!(
+                leaf(state.ept02, remapped),
+                (12, remapped + 0x8000031 + if mode == 1 { 0x400 } else { 0 })
+            );
+            state.gpa = revoked;
+            assert_eq!(unsafe { resolve_test_ept(&mut state) }, 0);
+            assert_eq!(leaf(state.ept02, revoked).1, 0);
+        }
+        assert_eq!(state.native_invept, flushes + 2);
     }
 
     #[test]
