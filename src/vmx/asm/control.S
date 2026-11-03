@@ -82,6 +82,71 @@ shr rdx, 32
 mov ecx, \msr_index
 wrmsr
 .endm
+.macro resident_control_capture_segment index, selector_offset, required, system
+mov rax, qword ptr [rbx + \selector_offset]
+lea rsi, [r9 + {control_cpu_on_native_segments} + (\index * 32)]
+mov qword ptr [rsi], rax
+mov qword ptr [rsi + 8], 0
+mov qword ptr [rsi + 16], 0
+mov qword ptr [rsi + 24], 0x10000
+test eax, 0xfffc
+jnz .Lresident_control_segment_present\@
+.if \required
+jmp .Lresident_control_capture_segments_failed
+.endif
+jmp .Lresident_control_segment_done\@
+.Lresident_control_segment_present\@:
+test eax, 4
+jnz .Lresident_control_capture_segments_failed
+and eax, 0xfff8
+lea edx, [eax + 7 + (\system * 8)]
+cmp rdx, qword ptr [rbx + {probe_guest_gdtr_limit}]
+ja .Lresident_control_capture_segments_failed
+mov rdi, qword ptr [rbx + {probe_guest_gdtr_base}]
+add rdi, rax
+mov r11, qword ptr [rdi]
+mov rax, r11
+shr rax, 40
+and eax, 0xf0ff
+test eax, 0x80
+jz .Lresident_control_capture_segments_failed
+.if \system
+mov edx, eax
+and edx, 0x1f
+cmp edx, 0xb
+jne .Lresident_control_capture_segments_failed
+.else
+test eax, 0x10
+jz .Lresident_control_capture_segments_failed
+.endif
+mov qword ptr [rsi + 24], rax
+mov rax, r11
+shr rax, 16
+and eax, 0xffffff
+mov rdx, r11
+shr rdx, 32
+and edx, 0xff000000
+or rax, rdx
+.if \system
+mov edx, dword ptr [rdi + 8]
+shl rdx, 32
+or rax, rdx
+.endif
+mov qword ptr [rsi + 8], rax
+mov eax, r11d
+and eax, 0xffff
+mov rdx, r11
+shr rdx, 32
+and edx, 0xf0000
+or eax, edx
+bt r11, 55
+jnc .Lresident_control_segment_limit_ready\@
+shl eax, 12
+or eax, 0xfff
+.Lresident_control_segment_limit_ready\@:
+mov qword ptr [rsi + 16], rax
+.Lresident_control_segment_done\@:
+.endm
 .macro resident_control_native_checkpoint stage
 mov qword ptr [r9 + {control_cpu_stage}], \stage
 call .Lresident_control_capture_native
@@ -1425,49 +1490,8 @@ xor rax, rdx
 shr rax, 39
 test eax, 0x1ff
 jz .Lresident_control_on_preflight_failed
-mov r11, r8
-imul r11, {probe_state_size}
-lea r11, [r10 + r11 + {event_control_probe_states}]
-mov ax, es
-cmp ax, word ptr [r11 + {probe_guest_es_selector}]
-jne .Lresident_control_on_preflight_failed
-mov ax, cs
-cmp ax, word ptr [r11 + {probe_guest_cs_selector}]
-jne .Lresident_control_on_preflight_failed
-mov ax, ss
-cmp ax, word ptr [r11 + {probe_guest_ss_selector}]
-jne .Lresident_control_on_preflight_failed
-mov ax, ds
-cmp ax, word ptr [r11 + {probe_guest_ds_selector}]
-jne .Lresident_control_on_preflight_failed
-mov ax, fs
-cmp ax, word ptr [r11 + {probe_guest_fs_selector}]
-jne .Lresident_control_on_preflight_failed
-mov ax, gs
-cmp ax, word ptr [r11 + {probe_guest_gs_selector}]
-jne .Lresident_control_on_preflight_failed
-str ax
-cmp ax, word ptr [r11 + {probe_guest_tr_selector}]
-jne .Lresident_control_on_preflight_failed
-sldt ax
-cmp ax, word ptr [r11 + {probe_guest_ldtr_selector}]
-jne .Lresident_control_on_preflight_failed
-sub rsp, 32
-sgdt [rsp]
-sidt [rsp + 16]
-mov ax, word ptr [rsp]
-cmp ax, word ptr [r11 + {probe_guest_gdtr_limit}]
-jne .Lresident_control_on_table_failed
-mov rax, qword ptr [rsp + 2]
-cmp rax, qword ptr [r11 + {probe_guest_gdtr_base}]
-jne .Lresident_control_on_table_failed
-mov ax, word ptr [rsp + 16]
-cmp ax, word ptr [r11 + {probe_guest_idtr_limit}]
-jne .Lresident_control_on_table_failed
-mov rax, qword ptr [rsp + 18]
-cmp rax, qword ptr [r11 + {probe_guest_idtr_base}]
-jne .Lresident_control_on_table_failed
-add rsp, 32
+call .Lresident_control_capture_segments
+jc .Lresident_control_on_preflight_failed
 push rbx
 mov eax, 1
 cpuid
@@ -1478,6 +1502,8 @@ mov rax, cr4
 mov qword ptr [r9 + {control_cpu_on_original_cr4}], rax
 test rax, {cr4_vmxe}
 jnz .Lresident_control_on_busy
+test rax, 0x800000
+jnz .Lresident_control_on_preflight_failed
 mov ecx, 0x486
 rdmsr
 shl rdx, 32
@@ -1576,6 +1602,7 @@ mov rdx, qword ptr [r9 + {control_cpu_exit_msr_load_count}]
 vmwrite rax, rdx
 jna .Lresident_control_on_root_failed
 resident_control_on_write {vm_entry_msr_load_count}, 0
+call .Lresident_control_write_segments
 mov rdx, cr0
 mov qword ptr [r9 + {control_cpu_on_native_cr0}], rdx
 resident_control_on_write {guest_cr0}, rdx
@@ -1675,8 +1702,6 @@ ret
 add rsp, 16
 resident_control_native_checkpoint 132
 jmp .Lresident_control_on_root_cleanup
-.Lresident_control_on_table_failed:
-add rsp, 32
 .Lresident_control_on_preflight_failed:
 resident_control_native_checkpoint 128
 mov rsp, qword ptr [r9 + {control_cpu_native_caller_rsp}]
@@ -1853,6 +1878,119 @@ mov rax, qword ptr [r9 + {control_cpu_on_native_dr7}]
 mov dr7, rax
 call .Lresident_control_capture_native
 jmp .Lresident_control_on_native_failed
+.Lresident_control_capture_segments:
+// Firmware calls can load different descriptor tables between off and on.
+// Capture the current context for both VM entry and native failure recovery.
+push rbx
+push rsi
+push rdi
+sub rsp, 32
+mov rbx, r8
+imul rbx, {probe_state_size}
+lea rbx, [r10 + rbx + {event_control_probe_states}]
+sgdt [rsp]
+sidt [rsp + 16]
+movzx eax, word ptr [rsp]
+mov qword ptr [rbx + {probe_guest_gdtr_limit}], rax
+mov rax, qword ptr [rsp + 2]
+mov qword ptr [rbx + {probe_guest_gdtr_base}], rax
+movzx eax, word ptr [rsp + 16]
+mov qword ptr [rbx + {probe_guest_idtr_limit}], rax
+mov rax, qword ptr [rsp + 18]
+mov qword ptr [rbx + {probe_guest_idtr_base}], rax
+xor eax, eax
+mov ax, es
+mov qword ptr [rbx + {probe_guest_es_selector}], rax
+mov ax, cs
+mov qword ptr [rbx + {probe_guest_cs_selector}], rax
+mov ax, ss
+mov qword ptr [rbx + {probe_guest_ss_selector}], rax
+mov ax, ds
+mov qword ptr [rbx + {probe_guest_ds_selector}], rax
+mov ax, fs
+mov qword ptr [rbx + {probe_guest_fs_selector}], rax
+mov ax, gs
+mov qword ptr [rbx + {probe_guest_gs_selector}], rax
+sldt ax
+mov qword ptr [rbx + {probe_guest_ldtr_selector}], rax
+test eax, eax
+jnz .Lresident_control_capture_segments_failed
+str ax
+mov qword ptr [rbx + {probe_guest_tr_selector}], rax
+test eax, 7
+jnz .Lresident_control_capture_segments_failed
+resident_control_capture_segment 0, {probe_guest_es_selector}, 0, 0
+resident_control_capture_segment 1, {probe_guest_cs_selector}, 1, 0
+resident_control_capture_segment 2, {probe_guest_ss_selector}, 0, 0
+resident_control_capture_segment 3, {probe_guest_ds_selector}, 0, 0
+resident_control_capture_segment 4, {probe_guest_fs_selector}, 0, 0
+resident_control_capture_segment 5, {probe_guest_gs_selector}, 0, 0
+resident_control_capture_segment 6, {probe_guest_ldtr_selector}, 0, 0
+resident_control_capture_segment 7, {probe_guest_tr_selector}, 1, 1
+mov rax, qword ptr [r9 + {control_cpu_on_native_segments} + 32]
+test eax, 7
+jnz .Lresident_control_capture_segments_failed
+mov rax, qword ptr [r9 + {control_cpu_on_native_segments} + 32 + 24]
+and eax, 0x60f8
+cmp eax, 0x2098
+jne .Lresident_control_capture_segments_failed
+mov rax, qword ptr [rsi + 8]
+mov qword ptr [rbx + {probe_guest_tr_base}], rax
+mov rax, qword ptr [rsi + 16]
+cmp rax, 0x67
+jne .Lresident_control_capture_segments_failed
+mov qword ptr [rbx + {probe_guest_tr_limit}], rax
+mov rax, qword ptr [rsi + 24]
+mov qword ptr [rbx + {probe_guest_tr_access}], rax
+add rsp, 32
+pop rdi
+pop rsi
+pop rbx
+clc
+ret
+.Lresident_control_capture_segments_failed:
+add rsp, 32
+pop rdi
+pop rsi
+pop rbx
+stc
+ret
+.Lresident_control_write_segments:
+xor r11d, r11d
+lea rcx, [r9 + {control_cpu_on_native_segments}]
+.Lresident_control_write_segment:
+lea eax, [r11 * 2 + {guest_es_selector}]
+mov rdx, qword ptr [rcx]
+vmwrite rax, rdx
+jna .Lresident_control_on_root_failed
+lea eax, [r11 * 2 + {guest_es_base}]
+mov rdx, qword ptr [rcx + 8]
+vmwrite rax, rdx
+jna .Lresident_control_on_root_failed
+lea eax, [r11 * 2 + {guest_es_limit}]
+mov rdx, qword ptr [rcx + 16]
+vmwrite rax, rdx
+jna .Lresident_control_on_root_failed
+lea eax, [r11 * 2 + {guest_es_ar_bytes}]
+mov rdx, qword ptr [rcx + 24]
+vmwrite rax, rdx
+jna .Lresident_control_on_root_failed
+add rcx, 32
+inc r11d
+cmp r11d, 8
+jb .Lresident_control_write_segment
+mov r11, r8
+imul r11, {probe_state_size}
+lea r11, [r10 + r11 + {event_control_probe_states}]
+mov rdx, qword ptr [r11 + {probe_guest_gdtr_base}]
+resident_control_on_write {guest_gdtr_base}, rdx
+mov rdx, qword ptr [r11 + {probe_guest_gdtr_limit}]
+resident_control_on_write {guest_gdtr_limit}, rdx
+mov rdx, qword ptr [r11 + {probe_guest_idtr_base}]
+resident_control_on_write {guest_idtr_base}, rdx
+mov rdx, qword ptr [r11 + {probe_guest_idtr_limit}]
+resident_control_on_write {guest_idtr_limit}, rdx
+ret
 .Lresident_control_capture_native:
 // The saved return address is the native instruction following this checkpoint.
 // Only the dedicated runtime stack is copied; its complete allocation is mapped.

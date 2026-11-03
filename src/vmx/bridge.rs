@@ -37,6 +37,8 @@ pub struct ControlCpuState {
     pub on_failure_reason: u64,
     pub on_failure_qualification: u64,
     pub vmcs02_region: u64,
+    // VMCS segment order, with selector, base, limit and access rights per entry.
+    pub on_native_segments: [[u64; 4]; 8],
 }
 
 #[repr(C, align(16))]

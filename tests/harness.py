@@ -1690,6 +1690,7 @@ def prepare_resident_control(project: Path):
     entry = re.sub(r"^resident_telemetry_counter[^\n]*\n", "", entry, flags=re.M)
     reason = section(".Lresident_dispatch_reason_ready:", "and eax, 0xffff")
     assembly = "\n".join([
+        section(".macro resident_control_on_write field", ".macro resident_control_on_write_msr "),
         section(".macro resident_control_on_restore_msr ", ".macro resident_control_native_checkpoint "),
         entry,
         ".Lresident_control_rearm_done:",
@@ -1709,7 +1710,8 @@ def prepare_resident_control(project: Path):
             if name in {"control_cpu_state_size", "probe_state_size"}:
                 continue
             offsets[name] = cursor
-            size = 72 if name == "control_cpu_on_native_msrs" else 8
+            size = {"control_cpu_on_native_msrs": 72,
+                    "control_cpu_on_native_segments": 256}.get(name, 8)
             if name == "event_control_cpu_states":
                 size = sizes["control_cpu_"] * 64
             elif name == "event_control_probe_states":
@@ -1726,6 +1728,10 @@ def prepare_resident_control(project: Path):
         "host_page_address_mask": 0x000FFFFFFFFFF000,
         "exit_reason": 0, "exit_qualification": 1, "vm_entry_msr_load_count": 2, "guest_rip": 3,
         "spec_ctrl_msr": 0x48,
+        "guest_es_selector": 0x800, "guest_es_base": 0x6806,
+        "guest_es_limit": 0x4800, "guest_es_ar_bytes": 0x4814,
+        "guest_gdtr_base": 0x6816, "guest_idtr_base": 0x6818,
+        "guest_gdtr_limit": 0x4810, "guest_idtr_limit": 0x4812,
     }
     assembly = re.sub(r"\{([a-z0-9_]+)\}", lambda match: str(
         offsets[match[1]] if match[1] in offsets else constants[match[1]]
@@ -1738,6 +1744,9 @@ def prepare_resident_control(project: Path):
         "cr0": 1, "cr4": 1, "dr7": 1, "cr3_count": 1, "cr3_values": 2,
         "gdt_base": 1, "gdt_limit": 1, "idt_base": 1, "idt_limit": 1,
         "selectors": 8, "msr_mask": 1, "msrs": 9,
+        "native_selectors": 8, "native_gdt_base": 1, "native_gdt_limit": 1,
+        "native_idt_base": 1, "native_idt_limit": 1,
+        "native_write_count": 1, "native_vmcs_fields": 36, "native_vmcs_values": 36,
     }
     model_offsets = {}
     cursor = 0
@@ -1890,8 +1899,43 @@ def prepare_resident_control(project: Path):
         popfq
     .endm
     """
+    helpers += r"""
+    .macro test_read_native_selector index
+        push rsi
+        mov rsi, qword ptr [rip + test_model]
+        mov ax, word ptr [rsi + $native_selectors + (\index * 8)]
+        pop rsi
+    .endm
+    .macro test_store_native_table stack_offset, base_field, limit_field
+        push rsi
+        push rax
+        mov rsi, qword ptr [rip + test_model]
+        mov ax, word ptr [rsi + \limit_field]
+        mov word ptr [rsp + 16 + \stack_offset], ax
+        mov rax, qword ptr [rsi + \base_field]
+        mov qword ptr [rsp + 18 + \stack_offset], rax
+        pop rax
+        pop rsi
+    .endm
+    .macro test_vmwrite_native
+        push rsi
+        push rcx
+        mov rsi, qword ptr [rip + test_model]
+        mov rcx, qword ptr [rsi + $native_write_count]
+        mov qword ptr [rsi + $native_vmcs_fields + rcx * 8], rax
+        mov qword ptr [rsi + $native_vmcs_values + rcx * 8], rdx
+        inc qword ptr [rsi + $native_write_count]
+        pop rcx
+        pop rsi
+        clc
+    .endm
+    """
     helpers = re.sub(r"\$([a-z0-9_]+)", lambda match: str(model_offsets[match[1]]), helpers)
     replacements = {
+        "sgdt [rsp]": f'test_store_native_table 0, {model_offsets["native_gdt_base"]}, {model_offsets["native_gdt_limit"]}',
+        "sidt [rsp + 16]": f'test_store_native_table 16, {model_offsets["native_idt_base"]}, {model_offsets["native_idt_limit"]}',
+        "vmwrite rax, rdx": "test_vmwrite_native",
+        "sldt ax": "test_read_native_selector 6", "str ax": "test_read_native_selector 7",
         "vmread r11, rax": "test_vmread",
         "vmwrite rax, r11": "test_vmwrite", "vmxoff": "test_vmxoff",
         "mov cr0, r11": f'test_note {model_offsets["cr0"]}, r11',
@@ -1905,6 +1949,8 @@ def prepare_resident_control(project: Path):
     }
     for index, name in enumerate(("ss", "es", "ds", "fs", "gs"), start=1):
         replacements[f"mov {name}, ax"] = f"test_segment {index}"
+    for index, name in enumerate(("es", "cs", "ss", "ds", "fs", "gs")):
+        replacements[f"mov ax, {name}"] = f"test_read_native_selector {index}"
     assembly = "\n".join(
         "test_vmclear" if line.startswith("vmclear ") else replacements.get(line, line)
         for line in assembly.splitlines()
@@ -1923,6 +1969,22 @@ def prepare_resident_control(project: Path):
         imul r9, @state_size
         lea r9, [r10 + r9 + @states]
     .endm
+    .globl test_control_capture_native_segments
+    test_control_capture_native_segments:
+        test_setup
+        sub rsp, 8
+        call .Lresident_control_capture_segments
+        setc al
+        movzx eax, al
+        add rsp, 8
+        ret
+    .globl test_control_write_native_segments
+    test_control_write_native_segments:
+        test_setup
+        sub rsp, 8
+        call .Lresident_control_write_segments
+        add rsp, 8
+        ret
     .globl test_control_off
     test_control_off:
         test_setup
@@ -1978,6 +2040,7 @@ def prepare_resident_control(project: Path):
         popfq
         pop r12
         ret
+    .Lresident_control_on_root_failed:
     .Lresident_dispatch_vmread_failed:
     .Lresident_dispatch_vmwrite_failed:
     matrixhv_resident_island_fatal:
@@ -2010,12 +2073,17 @@ def prepare_resident_control(project: Path):
     for name, prefix in (("BOOT_WORDS", "b_"), ("EVENT_WORDS", "event_"),
                          ("STATE_WORDS", "control_cpu_"), ("PROBE_WORDS", "probe_")):
         mapping += f"const {name}: usize = {sizes[prefix] // 8};\n"
-    mapping += "#[repr(C)]\n#[derive(Default)]\nstruct Model {\n"
+    mapping += "#[repr(C)]\nstruct Model {\n"
     mapping += "\n".join(
         f"    {name}: " + ("u64," if count == 1 else f"[u64; {count}],")
         for name, count in model_fields.items()
     )
-    mapping += "\n}\n"
+    mapping += "\n}\nimpl Default for Model { fn default() -> Self { Self {\n"
+    mapping += "\n".join(
+        f"    {name}: " + ("0," if count == 1 else f"[0; {count}],")
+        for name, count in model_fields.items()
+    )
+    mapping += "\n} } }\n"
     (output / "offsets.rs").write_text(mapping, encoding="utf-8")
 
 

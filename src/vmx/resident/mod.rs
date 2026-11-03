@@ -1717,6 +1717,7 @@ global_asm!(
     control_cpu_on_native_msrs = const core::mem::offset_of!(ControlCpuState, on_native_msrs),
     control_cpu_on_failure_reason = const core::mem::offset_of!(ControlCpuState, on_failure_reason),
     control_cpu_on_failure_qualification = const core::mem::offset_of!(ControlCpuState, on_failure_qualification),
+    control_cpu_on_native_segments = const core::mem::offset_of!(ControlCpuState, on_native_segments),
     native_stack_bytes = const CONTROL_NATIVE_STACK_BYTES,
     native_recovery_pml4 = const core::mem::offset_of!(ControlNativeStorage, recovery_pml4),
     native_snapshots_offset = const core::mem::offset_of!(ControlNativeStorage, snapshots),

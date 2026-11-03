@@ -22,6 +22,16 @@ mod control {
 
     unsafe extern "win64" {
         fn test_control_restore_address() -> u64;
+        fn test_control_capture_native_segments(
+            shared: *mut u64,
+            model: *mut Model,
+            processor: u64,
+        ) -> u64;
+        fn test_control_write_native_segments(
+            shared: *mut u64,
+            model: *mut Model,
+            processor: u64,
+        );
         fn test_control_off(shared: *mut u64, model: *mut Model, processor: u64) -> u64;
         fn test_control_cleanup(shared: *mut u64, model: *mut Model, processor: u64) -> u64;
         fn test_control_dispatch(
@@ -164,6 +174,179 @@ mod control {
             assert_eq!(self.model.backing_vmcs, self.model.dirty_vmcs);
             assert_eq!(self.model.vmcs_active, 0);
         }
+
+        fn native_context(&mut self) {
+            self.model.native_gdt_base = self.gdt.as_ptr() as u64;
+            self.model.native_gdt_limit = 127;
+            self.model.native_idt_base = 0xffff800056780000;
+            self.model.native_idt_limit = 4095;
+            self.model.native_selectors = [0, 16, 24, 0, 67, 0, 0, 40];
+            self.descriptor(16, 0, 0xfffff, 0x9b, 0xa);
+            self.descriptor(24, 0, 0xfffff, 0x93, 0xc);
+            self.descriptor(40, 0xffff800012340000, 0x67, 0x8b, 0);
+            self.descriptor(64, 0x12345678, 0xfffff, 0xf3, 0xc);
+        }
+
+        fn descriptor(&mut self, selector: usize, base: u64, limit: u32, access: u8, flags: u8) {
+            let descriptor = u64::from(limit & 0xffff)
+                | ((base & 0xffffff) << 16)
+                | (u64::from(access) << 40)
+                | (u64::from((limit >> 16) & 0xf) << 48)
+                | (u64::from(flags) << 52)
+                | ((base & 0xff000000) << 32);
+            self.gdt[selector..selector + 8].copy_from_slice(&descriptor.to_le_bytes());
+            if access & 0x10 == 0 {
+                self.gdt[selector + 8..selector + 12]
+                    .copy_from_slice(&((base >> 32) as u32).to_le_bytes());
+            }
+        }
+
+        fn capture_native(&mut self) -> u64 {
+            unsafe {
+                test_control_capture_native_segments(
+                    self.shared.as_mut_ptr(),
+                    &mut self.model,
+                    self.processor as u64,
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn activation_refreshes_changed_descriptor_tables_and_selectors_before_vm_entry() {
+        let _guard = ASSEMBLY_LOCK.lock().unwrap();
+        let mut scenario = Scenario::new(3);
+        scenario.native_context();
+        scenario.probe_set("probe_guest_gdtr_base", 0xdead0000);
+        scenario.probe_set("probe_guest_idtr_base", 0xbeef0000);
+        scenario.probe_set("probe_guest_cs_selector", 8);
+        scenario.probe_set("probe_guest_fs_selector", 48);
+        assert_eq!(scenario.capture_native(), 0);
+        let segments = scenario.state_index("control_cpu_on_native_segments");
+        let expected = [
+            [0, 0, 0, 0x10000],
+            [16, 0, 0xffffffff, 0xa09b],
+            [24, 0, 0xffffffff, 0xc093],
+            [0, 0, 0, 0x10000],
+            [67, 0x12345678, 0xffffffff, 0xc0f3],
+            [0, 0, 0, 0x10000],
+            [0, 0, 0, 0x10000],
+            [40, 0xffff800012340000, 0x67, 0x8b],
+        ];
+        for (index, segment) in expected.iter().enumerate() {
+            assert_eq!(
+                &scenario.shared[segments + index * 4..segments + index * 4 + 4],
+                segment,
+            );
+        }
+        unsafe {
+            test_control_write_native_segments(
+                scenario.shared.as_mut_ptr(),
+                &mut scenario.model,
+                scenario.processor as u64,
+            );
+        }
+        assert_eq!(scenario.model.native_write_count, 36);
+        for (index, segment) in expected.iter().enumerate() {
+            let encoding = index as u64 * 2;
+            assert_eq!(
+                &scenario.model.native_vmcs_fields[index * 4..index * 4 + 4],
+                &[
+                    0x800 + encoding,
+                    0x6806 + encoding,
+                    0x4800 + encoding,
+                    0x4814 + encoding,
+                ],
+            );
+            assert_eq!(
+                &scenario.model.native_vmcs_values[index * 4..index * 4 + 4],
+                segment,
+            );
+        }
+        assert_eq!(
+            &scenario.model.native_vmcs_fields[32..],
+            &[0x6816, 0x4810, 0x6818, 0x4812],
+        );
+        assert_eq!(
+            &scenario.model.native_vmcs_values[32..],
+            &[
+                scenario.gdt.as_ptr() as u64,
+                127,
+                scenario.model.native_idt_base,
+                4095,
+            ],
+        );
+        let probe = offset("event_control_probe_states") + scenario.processor * PROBE_WORDS;
+        assert_eq!(scenario.shared[probe + offset("probe_guest_cs_selector")], 16);
+        assert_eq!(scenario.shared[probe + offset("probe_guest_fs_selector")], 67);
+        assert_eq!(
+            scenario.shared[probe + offset("probe_guest_tr_base")],
+            0xffff800012340000,
+        );
+    }
+
+    #[test]
+    fn native_segment_capture_decodes_byte_and_page_granular_descriptor_limits() {
+        let _guard = ASSEMBLY_LOCK.lock().unwrap();
+        for (base, limit, flags, expected_limit) in [
+            (0, 0, 0, 0),
+            (0xabcdef12, 0xabcde, 4, 0xabcde),
+            (0xfedcba98, 0xabcde, 0xc, 0xabcdefff),
+        ] {
+            let mut scenario = Scenario::new(2);
+            scenario.native_context();
+            scenario.descriptor(64, base, limit, 0xf3, flags);
+            assert_eq!(scenario.capture_native(), 0);
+            let index = scenario.state_index("control_cpu_on_native_segments") + 4 * 4;
+            assert_eq!(
+                &scenario.shared[index..index + 4],
+                &[67, base, expected_limit, 0xf3 | (u64::from(flags) << 12)],
+            );
+        }
+    }
+
+    #[test]
+    fn native_segment_capture_rejects_invalid_contexts_before_vmxon() {
+        let _guard = ASSEMBLY_LOCK.lock().unwrap();
+        for case in 0..10 {
+            let mut scenario = Scenario::new(2);
+            scenario.native_context();
+            match case {
+                0 => scenario.model.native_selectors[6] = 8,
+                1 => scenario.model.native_selectors[7] = 0,
+                2 => scenario.model.native_selectors[7] = 44,
+                3 => scenario.model.native_gdt_limit = 46,
+                4 => scenario.descriptor(64, 0, 0xffff, 0x73, 4),
+                5 => scenario.descriptor(16, 0, 0xfffff, 0xfb, 0xa),
+                6 => scenario.descriptor(16, 0, 0xfffff, 0x9b, 0xc),
+                7 => scenario.descriptor(40, 0xffff800012340000, 0x68, 0x8b, 0),
+                8 => scenario.model.native_selectors[4] = 68,
+                9 => scenario.descriptor(40, 0xffff800012340000, 0x67, 0x89, 0),
+                _ => unreachable!(),
+            }
+            assert_eq!(scenario.capture_native(), 1, "case {case}");
+            assert_eq!(scenario.model.off_count, 0);
+            assert_eq!(scenario.model.native_write_count, 0);
+            assert_eq!(scenario.event("event_control_failed_mask"), 0);
+        }
+    }
+
+    #[test]
+    fn entry_failure_restores_the_context_captured_during_activation() {
+        let _guard = ASSEMBLY_LOCK.lock().unwrap();
+        let mut scenario = Scenario::new(5);
+        scenario.native_context();
+        assert_eq!(scenario.capture_native(), 0);
+        scenario.model.reason = 0x80000021;
+        assert_eq!(scenario.dispatch(), DEVICE_ERROR);
+        assert_eq!(scenario.model.gdt_base, scenario.model.native_gdt_base);
+        assert_eq!(scenario.model.gdt_limit, scenario.model.native_gdt_limit);
+        assert_eq!(scenario.model.idt_base, scenario.model.native_idt_base);
+        assert_eq!(scenario.model.idt_limit, scenario.model.native_idt_limit);
+        assert_eq!(scenario.model.selectors, [16, 24, 0, 0, 67, 0, 0, 40]);
+        assert_eq!(scenario.state("control_cpu_phase"), 2);
+        assert_eq!(scenario.event("event_control_active_mask"), 1);
+        assert_eq!(scenario.event("event_control_failed_mask"), 0);
     }
 
     #[test]
