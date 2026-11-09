@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 pub const DEFAULT_LISTEN_ADDRESS: &str = "0.0.0.0:4040";
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(300);
-const MAX_CAPTURED_STREAM_SIZE: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_CAPTURED_STREAM_SIZE: usize = 16 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 8;
 
 struct ConnectionSlot(Arc<AtomicUsize>);
@@ -107,7 +107,12 @@ pub fn serve(
                         .map_err(|_| "telemetry callback failed".to_string())
                         .and_then(|mut callback| callback(mode, control))
                 };
-                match handle_connection(&mut stream, &mut prepare, &mut collect) {
+                match handle_connection(
+                    &mut stream,
+                    &mut prepare,
+                    &mut collect,
+                    |stream, timeout| stream.set_write_timeout(Some(timeout)),
+                ) {
                     Ok(true) => {
                         update_completed.store(true, Ordering::Release);
                         // Wake blocking accept after the update response has been sent.
@@ -130,10 +135,11 @@ fn configure_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_write_timeout(Some(CONNECTION_TIMEOUT))
 }
 
-pub(crate) fn handle_connection(
-    stream: &mut (impl Read + Write),
+pub(crate) fn handle_connection<S: Read + Write>(
+    stream: &mut S,
     prepare_update: &mut impl FnMut(&[u8]) -> Result<(), String>,
     collect_telemetry: &mut impl FnMut(u32, u32) -> Result<String, String>,
+    set_write_timeout: impl Fn(&S, Duration) -> io::Result<()>,
 ) -> Result<bool, String> {
     let (request_id, request) = read_request(stream).map_err(|error| error.to_string())?;
     let (response, update) = match request {
@@ -143,6 +149,35 @@ pub(crate) fn handle_connection(
             arguments,
             timeout_ms,
         } => (execute(arguments, timeout_ms), None),
+        Request::ExecStream {
+            arguments,
+            timeout_ms,
+        } => {
+            let mut write_failed = false;
+            let response = execute_stream(arguments, timeout_ms, |stdout, stderr, remaining| {
+                let result = set_write_timeout(stream, remaining).and_then(|()| {
+                    write_response(
+                        stream,
+                        request_id,
+                        &Response {
+                            stdout,
+                            stderr,
+                            ..Response::success(RequestKind::ExecStream, "")
+                        },
+                    )
+                    .map_err(io::Error::other)
+                });
+                write_failed = result.is_err();
+                result
+            });
+            if write_failed {
+                // A failed write may have left a partial frame on the connection.
+                return Err(response.message);
+            }
+            set_write_timeout(stream, Duration::from_secs(10))
+                .map_err(|error| error.to_string())?;
+            (response, None)
+        }
         Request::Telemetry { mode, control } => {
             let response = match collect_telemetry(mode, control) {
                 Ok(snapshot) => Response::success(RequestKind::Telemetry, snapshot),
@@ -192,7 +227,9 @@ pub fn status_text() -> String {
     if let Ok(executable) = std::env::current_exe() {
         text.push_str(&format!("executable_path={}\n", executable.display()));
     }
-    text.push_str("road_protocol=1\nexec_timeout=true\nremote_memory_commands=true\n");
+    text.push_str(
+        "road_protocol=1\nexec_timeout=true\nexec_stream=true\nremote_memory_commands=true\n",
+    );
     text.push_str(&crate::telemetry::capability_status(
         status.matrixhv_present,
         status.matrixhv_protocol,
@@ -335,6 +372,122 @@ pub(crate) fn execute(arguments: Vec<String>, timeout_ms: u64) -> Response {
             RequestKind::Exec,
             format!("failed to start or supervise {program}: {error}"),
         ),
+    }
+}
+
+type StreamChunk = (Vec<u8>, Vec<u8>);
+
+fn stream_pipe(
+    mut pipe: impl Read,
+    stderr: bool,
+    sender: std::sync::mpsc::SyncSender<io::Result<StreamChunk>>,
+) {
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let chunk = match pipe.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(length) if stderr => Ok((Vec::new(), buffer[..length].to_vec())),
+            Ok(length) => Ok((buffer[..length].to_vec(), Vec::new())),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                let _ = sender.send(Err(error));
+                return;
+            }
+        };
+        if sender.send(chunk).is_err() {
+            return;
+        }
+    }
+}
+
+fn execute_stream(
+    arguments: Vec<String>,
+    timeout_ms: u64,
+    mut emit: impl FnMut(Vec<u8>, Vec<u8>, Duration) -> io::Result<()>,
+) -> Response {
+    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+
+    let kind = RequestKind::ExecStream;
+    let output = (|| -> io::Result<Option<std::process::ExitStatus>> {
+        let (program, arguments) = arguments.split_first().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "no executable was provided")
+        })?;
+        let mut command = Command::new(program);
+        command
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut child, tree) = ProcessTree::spawn(&mut command)?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        // A slow receiver applies backpressure to the pipes without growing the server heap.
+        let (sender, receiver) = sync_channel(8);
+        std::thread::scope(|scope| {
+            let stdout_sender = sender.clone();
+            scope.spawn(move || stream_pipe(stdout, false, stdout_sender));
+            scope.spawn(move || stream_pipe(stderr, true, sender));
+            let mut status = None;
+            let mut pipes_open = true;
+            let result = (|| {
+                loop {
+                    if status.is_none() {
+                        status = child.try_wait()?;
+                    }
+                    if status.is_some() && !pipes_open {
+                        return Ok(status);
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(None);
+                    }
+                    let interval = remaining.min(Duration::from_millis(10));
+                    if pipes_open {
+                        match receiver.recv_timeout(interval) {
+                            Ok(chunk) => {
+                                let (stdout, stderr) = chunk?;
+                                let remaining = deadline.saturating_duration_since(Instant::now());
+                                if remaining.is_zero() {
+                                    return Ok(None);
+                                }
+                                if let Err(error) = emit(stdout, stderr, remaining) {
+                                    if Instant::now() >= deadline {
+                                        return Ok(None);
+                                    }
+                                    return Err(error);
+                                }
+                            }
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) => pipes_open = false,
+                        }
+                    } else {
+                        std::thread::sleep(interval);
+                    }
+                }
+            })();
+            drop(receiver);
+            let terminated = tree.terminate();
+            drop(tree);
+            if status.is_none() {
+                let _ = child.kill();
+                child.wait()?;
+            }
+            terminated?;
+            result
+        })
+    })();
+    let (exit_code, message) = match output {
+        Ok(Some(status)) if status.success() => (0, String::new()),
+        Ok(Some(status)) => (status.code().unwrap_or(1), "process failed".into()),
+        Ok(None) => (124, format!("process timed out after {timeout_ms} ms")),
+        Err(error) => (1, format!("failed to start or supervise process: {error}")),
+    };
+    Response {
+        exit_code: Some(exit_code),
+        success: exit_code == 0,
+        message,
+        ..Response::success(kind, "")
     }
 }
 
@@ -502,6 +655,7 @@ pub mod protocol {
         Exec = 3,
         Update = 4,
         Telemetry = 5,
+        ExecStream = 6,
     }
 
     impl TryFrom<u16> for RequestKind {
@@ -514,6 +668,7 @@ pub mod protocol {
                 3 => Ok(Self::Exec),
                 4 => Ok(Self::Update),
                 5 => Ok(Self::Telemetry),
+                6 => Ok(Self::ExecStream),
                 _ => Err(ProtocolError::InvalidKind(value)),
             }
         }
@@ -524,6 +679,10 @@ pub mod protocol {
         Ping,
         Status,
         Exec {
+            arguments: Vec<String>,
+            timeout_ms: u64,
+        },
+        ExecStream {
             arguments: Vec<String>,
             timeout_ms: u64,
         },
@@ -542,6 +701,7 @@ pub mod protocol {
                 Self::Ping => RequestKind::Ping,
                 Self::Status => RequestKind::Status,
                 Self::Exec { .. } => RequestKind::Exec,
+                Self::ExecStream { .. } => RequestKind::ExecStream,
                 Self::Update { .. } => RequestKind::Update,
                 Self::Telemetry { .. } => RequestKind::Telemetry,
             }
@@ -636,6 +796,10 @@ pub mod protocol {
             Request::Exec {
                 arguments,
                 timeout_ms,
+            }
+            | Request::ExecStream {
+                arguments,
+                timeout_ms,
             } => {
                 if !(1..=MAX_COMMAND_ARGUMENTS).contains(&arguments.len()) {
                     return Err(ProtocolError::InvalidPayload(
@@ -664,6 +828,10 @@ pub mod protocol {
             Request::Exec {
                 arguments,
                 timeout_ms,
+            }
+            | Request::ExecStream {
+                arguments,
+                timeout_ms,
             } => {
                 let count = u32::try_from(arguments.len())
                     .map_err(|_| ProtocolError::InvalidPayload("too many command arguments"))?;
@@ -687,7 +855,7 @@ pub mod protocol {
         let request = match kind {
             RequestKind::Ping => Request::Ping,
             RequestKind::Status => Request::Status,
-            RequestKind::Exec => {
+            RequestKind::Exec | RequestKind::ExecStream => {
                 let count = cursor.read_u32()? as usize;
                 if !(1..=MAX_COMMAND_ARGUMENTS).contains(&count) {
                     return Err(ProtocolError::InvalidPayload(
@@ -710,9 +878,16 @@ pub mod protocol {
                 if !(1..=3_600_000).contains(&timeout_ms) {
                     return Err(ProtocolError::InvalidPayload("invalid execution timeout"));
                 }
-                Request::Exec {
-                    arguments,
-                    timeout_ms,
+                if kind == RequestKind::ExecStream {
+                    Request::ExecStream {
+                        arguments,
+                        timeout_ms,
+                    }
+                } else {
+                    Request::Exec {
+                        arguments,
+                        timeout_ms,
+                    }
                 }
             }
             RequestKind::Update => Request::Update {
@@ -846,7 +1021,7 @@ pub mod protocol {
         } else {
             let valid_size = match RequestKind::try_from(kind)? {
                 RequestKind::Ping | RequestKind::Status => payload_size == 0,
-                RequestKind::Exec => payload_size >= 8,
+                RequestKind::Exec | RequestKind::ExecStream => payload_size >= 8,
                 RequestKind::Update => payload_size >= 4,
                 RequestKind::Telemetry => matches!(payload_size, 0 | 8),
             };

@@ -146,13 +146,20 @@ mod transport {
 
     #[test]
     fn invalid_request_headers_are_rejected_without_reading_the_payload() {
-        for (kind, size) in [(1, 1), (2, MAX_FRAME_SIZE as u32), (3, 7), (4, 3), (5, 9)] {
+        for (kind, size) in [
+            (1, 1),
+            (2, MAX_FRAME_SIZE as u32),
+            (3, 7),
+            (4, 3),
+            (5, 9),
+            (6, 7),
+        ] {
             assert!(matches!(
                 read_request(&mut header(kind, size).as_slice()),
                 Err(ProtocolError::InvalidPayload(_))
             ));
         }
-        for kind in [0, 6, 0x8001, u16::MAX] {
+        for kind in [0, 0x7fff, 0x8001, u16::MAX] {
             assert!(matches!(
                 read_request(&mut header(kind, MAX_FRAME_SIZE as u32).as_slice()),
                 Err(ProtocolError::InvalidKind(value)) if value == kind
@@ -167,8 +174,8 @@ mod transport {
             Err(ProtocolError::InvalidResponseKind(1))
         ));
         assert!(matches!(
-            read_response(&mut header(0x8006, MAX_FRAME_SIZE as u32).as_slice()),
-            Err(ProtocolError::InvalidKind(6))
+            read_response(&mut header(0xffff, MAX_FRAME_SIZE as u32).as_slice()),
+            Err(ProtocolError::InvalidKind(0x7fff))
         ));
         assert!(matches!(
             read_response(&mut header(0x8001, 19).as_slice()),
@@ -280,6 +287,7 @@ mod transport {
                 Ok(())
             },
             &mut |_, _| unreachable!(),
+            |_, _| Ok(()),
         )
         .unwrap();
         assert!(result);

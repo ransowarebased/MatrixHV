@@ -475,3 +475,110 @@ fn investigation_reopens_offline_and_unwinds_jit_frames_from_captured_regions() 
     assert_eq!(rows[1]["data"]["type"], "query_summary");
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn remote_investigation_query_streams_all_1500_events_past_the_capture_limit() {
+    use serde_json::{Value, json};
+    use std::io::{BufWriter, Write};
+
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../builds/tests/neo");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("large-investigation-{}.jsonl", std::process::id()));
+    let mut journal = BufWriter::new(std::fs::File::create(&path).unwrap());
+    writeln!(
+        journal,
+        "{}",
+        json!({
+            "type": "session", "format": "neo-investigation-v1",
+            "catalog": {"modules": [], "dynamic": [], "dynamic_list": null},
+        })
+    )
+    .unwrap();
+    let payload = "\u{e1}0123456789".repeat(1100);
+    for sequence in 1..=1500 {
+        writeln!(
+            journal,
+            "{}",
+            json!({
+                "type": "event", "kind": "watch",
+                "context": {"sequence": format!("0x{sequence:016x}"), "cpu": "0x0"},
+                "payload": payload,
+            })
+        )
+        .unwrap();
+    }
+    writeln!(journal, "{}", json!({"type": "end", "complete": true})).unwrap();
+    journal.flush().unwrap();
+    drop(journal);
+
+    let executable = env!("CARGO_BIN_EXE_neo");
+    let arguments = ["session", "query", path.to_str().unwrap(), "--json"];
+    let local = Command::new(executable).args(arguments).output().unwrap();
+    assert!(local.status.success());
+    assert!(local.stdout.len() > 16 * 1024 * 1024);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let address_text = address.to_string();
+    let _server = ServerProcess(
+        Command::new(executable)
+            .args(["serve", "--listen", &address_text])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err() {
+        assert!(Instant::now() < deadline, "server did not bind");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let remote = |extra: &[&str]| {
+        Command::new(executable)
+            .args(["--remote", &address_text])
+            .args(extra)
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let result = remote(&[]);
+    assert!(
+        result.status.success(),
+        "remote exit {:?}, output bytes {}, stderr {}",
+        result.status.code(),
+        result.stdout.len(),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        result.stdout == local.stdout,
+        "remote and local JSONL differ"
+    );
+    let mut rows = result
+        .stdout
+        .strip_suffix(b"\n")
+        .unwrap()
+        .split(|&byte| byte == b'\n');
+    assert_eq!(
+        rows.next_back()
+            .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+            .unwrap()["data"]["events"],
+        "0x00000000000005dc"
+    );
+    assert_eq!(rows.count(), 1500);
+
+    let result = remote(&["--exec-timeout-ms", "1"]);
+    assert_eq!(result.status.code(), Some(124));
+    let terminal: Value = serde_json::from_slice(
+        result
+            .stdout
+            .strip_suffix(b"\n")
+            .unwrap()
+            .rsplit(|&byte| byte == b'\n')
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(terminal["error"]["code"], "EXEC_TIMEOUT");
+    std::fs::remove_file(path).unwrap();
+}

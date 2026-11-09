@@ -1,6 +1,6 @@
 use crate::server::protocol::{
-    DEFAULT_EXEC_TIMEOUT_MS, ProtocolError, Request, RequestKind, Response, read_response,
-    write_request,
+    DEFAULT_EXEC_TIMEOUT_MS, MAX_FRAME_SIZE, ProtocolError, Request, RequestKind, Response,
+    read_response, write_request,
 };
 use crate::server::{self, DEFAULT_LISTEN_ADDRESS, ServerExit};
 use crate::{matrix, output, startup, telemetry};
@@ -68,20 +68,33 @@ pub fn run(mut arguments: Vec<String>) -> Result<i32, String> {
                 return Err(status.message);
             }
             let executable = status_field(&status.message, "executable_path")?;
+            let session_query = matches!(arguments.as_slice(), [command, action, ..]
+                if command == "session" && action == "query");
             let mut command = vec![executable.to_string()];
             if output::is_json() {
                 command.push("--json".into());
             }
             command.extend(arguments);
+            let timeout = timeout.max(Duration::from_millis(timeout_ms) + Duration::from_secs(10));
+            if session_query && status_field(&status.message, "exec_stream") == Ok("true") {
+                return stream_execution(&remote, timeout, command, timeout_ms);
+            }
             let response = transact(
                 &remote,
-                timeout.max(Duration::from_millis(timeout_ms) + Duration::from_secs(10)),
+                timeout,
                 Request::Exec {
                     arguments: command,
                     timeout_ms,
                 },
             )?;
             ensure_kind(&response, RequestKind::Exec)?;
+            if session_query
+                && response.stdout.len() >= server::MAX_CAPTURED_STREAM_SIZE
+                && !response.message.starts_with("process timed out")
+            {
+                output::set_error("REMOTE_OUTPUT_LIMIT", false);
+                return Err("remote server reached its output limit; update Neo on the server to stream session queries".into());
+            }
             return print_execution(response, true);
         }
         return run_memory(&arguments);
@@ -559,7 +572,111 @@ fn print_execution(response: Response, self_command: bool) -> Result<i32, String
     Ok(exit_code)
 }
 
+fn stream_execution(
+    remote: &str,
+    timeout: Duration,
+    arguments: Vec<String>,
+    timeout_ms: u64,
+) -> Result<i32, String> {
+    let (mut stream, id) = send_request(
+        remote,
+        timeout,
+        Request::ExecStream {
+            arguments,
+            timeout_ms,
+        },
+    )?;
+    let mut pending = Vec::new();
+    let mut last_ok = None;
+    let json = output::is_json();
+    let response = loop {
+        let response = receive_response(&mut stream, id)?;
+        ensure_kind(&response, RequestKind::ExecStream)?;
+        if response.exit_code.is_some() {
+            break response;
+        }
+        if !response.success
+            || !response.message.is_empty()
+            || response.stdout.is_empty() && response.stderr.is_empty()
+        {
+            output::set_error("PROTOCOL_ERROR", false);
+            return Err("invalid remote execution stream frame".into());
+        }
+        io::stderr()
+            .write_all(&response.stderr)
+            .map_err(|error| error.to_string())?;
+        if !json {
+            io::stdout()
+                .write_all(&response.stdout)
+                .and_then(|()| io::stdout().flush())
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
+        let complete = response
+            .stdout
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |last| pending.len() + last + 1);
+        pending.extend_from_slice(&response.stdout);
+        for line in pending[..complete].split_inclusive(|&byte| byte == b'\n') {
+            if line.len() > MAX_FRAME_SIZE {
+                output::set_error("REMOTE_OUTPUT_LIMIT", false);
+                return Err("remote JSON row exceeds the maximum size".into());
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let row: serde_json::Value = serde_json::from_slice(line).map_err(|error| {
+                output::set_error("REMOTE_OUTPUT_INVALID", false);
+                format!("invalid JSON row from remote command: {error}")
+            })?;
+            last_ok = row.get("ok").and_then(serde_json::Value::as_bool);
+            if last_ok.is_none() {
+                output::set_error("REMOTE_OUTPUT_INVALID", false);
+                return Err("remote JSON row has no result status".into());
+            }
+            output::write(&row)?;
+        }
+        pending.drain(..complete);
+        if pending.len() > MAX_FRAME_SIZE {
+            output::set_error("REMOTE_OUTPUT_LIMIT", false);
+            return Err("remote JSON row exceeds the maximum size".into());
+        }
+    };
+
+    let exit_code = response.exit_code.unwrap();
+    if response.success != (exit_code == 0)
+        || !response.stdout.is_empty()
+        || !response.stderr.is_empty()
+    {
+        output::set_error("PROTOCOL_ERROR", false);
+        return Err("invalid terminal frame from remote command".into());
+    }
+    if json && response.success && (!pending.is_empty() || last_ok != Some(true)) {
+        output::set_error("REMOTE_OUTPUT_INVALID", false);
+        return Err("remote command did not finish with a complete JSON result".into());
+    }
+    if !response.success {
+        if json && (last_ok != Some(false) || !pending.is_empty() || exit_code == 124) {
+            let (code, _) = output::classify(&response.message);
+            output::partial(json!({"exit_code": exit_code}), code, &response.message)?;
+        } else if !json {
+            eprintln!("{} exit_code={exit_code}", response.message);
+        }
+    }
+    Ok(exit_code)
+}
+
 fn transact(remote: &str, timeout: Duration, request: Request) -> Result<Response, String> {
+    let (mut stream, id) = send_request(remote, timeout, request)?;
+    receive_response(&mut stream, id)
+}
+
+fn send_request(
+    remote: &str,
+    timeout: Duration,
+    request: Request,
+) -> Result<(TcpStream, u64), String> {
     output::clear_error();
     let addresses: Vec<_> = remote
         .to_socket_addrs()
@@ -598,7 +715,11 @@ fn transact(remote: &str, timeout: Duration, request: Request) -> Result<Respons
         .map_err(|error| format!("failed to configure write timeout: {error}"))?;
     let request_id = request_id();
     write_request(&mut stream, request_id, &request).map_err(transport_error)?;
-    let (response_id, response) = read_response(&mut stream).map_err(transport_error)?;
+    Ok((stream, request_id))
+}
+
+fn receive_response(stream: &mut TcpStream, request_id: u64) -> Result<Response, String> {
+    let (response_id, response) = read_response(stream).map_err(transport_error)?;
     if response_id != request_id {
         output::set_error("PROTOCOL_ERROR", false);
         return Err(format!(
