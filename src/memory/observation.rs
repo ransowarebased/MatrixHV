@@ -78,6 +78,43 @@ struct RecordBuffer {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RipRange {
+    start: u64,
+    end: u64,
+    exclude: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CaptureFilter {
+    thread_teb: u64,
+    count: usize,
+    ranges: [RipRange; OBSERVATION_FILTER_RANGES],
+}
+
+impl CaptureFilter {
+    fn accepts(&self, context: &ContextRecord) -> bool {
+        if self.thread_teb != 0 && self.thread_teb != context.thread_teb {
+            return false;
+        }
+        let mut included = false;
+        let mut has_includes = false;
+        for range in &self.ranges[..self.count] {
+            let matches = (range.start..range.end).contains(&context.rip);
+            if range.exclude != 0 && matches {
+                return false;
+            }
+            if range.exclude == 0 {
+                has_includes = true;
+                included |= matches;
+            }
+        }
+        !has_includes || included
+    }
+}
+
+#[repr(C)]
 pub(crate) struct Observation {
     pub watch: [WatchTarget; 4],
     pub watch_count: usize,
@@ -89,12 +126,61 @@ pub(crate) struct Observation {
     overlays: UnsafeCell<[[u8; 4]; 64]>,
     hits: AtomicU64,
     cpus: [CpuRecords; 64],
+    // Append only: old hot-update allocations have a zeroed final-page tail.
+    filters: [CaptureFilter; 2],
+    pub events: Events,
 }
 
 const _: () = assert!(core::mem::size_of::<ContextRecord>() == CONTEXT_RECORD_BYTES);
 const _: () = assert!(core::mem::size_of::<WatchRecord>() == WATCH_RECORD_BYTES);
+const _: () = assert!(core::mem::offset_of!(Observation, filters) == 1_198_824);
 
 impl Observation {
+    pub fn reset_filters(&mut self) {
+        self.filters.fill(CaptureFilter::default());
+    }
+
+    pub fn set_filter(&mut self, packet: &[u8], la57: bool) -> Result<(), Error> {
+        let count = word(packet, 32) as usize;
+        if count > OBSERVATION_FILTER_RANGES
+            || packet.len() != HEADER_BYTES + count * OBSERVATION_FILTER_BYTES
+        {
+            return Err(Error::Bounds);
+        }
+        let shift = if la57 { 7 } else { 16 };
+        let canonical = |address: u64| ((address << shift) as i64 >> shift) as u64 == address;
+        let mut filter = CaptureFilter {
+            thread_teb: quad(packet, 24),
+            count,
+            ..CaptureFilter::default()
+        };
+        if !canonical(filter.thread_teb) {
+            return Err(Error::Bounds);
+        }
+        for (index, range) in filter.ranges[..count].iter_mut().enumerate() {
+            let offset = HEADER_BYTES + index * OBSERVATION_FILTER_BYTES;
+            *range = RipRange {
+                start: quad(packet, offset),
+                end: quad(packet, offset + 8),
+                exclude: quad(packet, offset + 16),
+            };
+            if range.start >= range.end
+                || range.exclude > 1
+                || !canonical(range.start)
+                || !canonical(range.end - 1)
+                || range.start >> 63 != (range.end - 1) >> 63
+            {
+                return Err(Error::Bounds);
+            }
+        }
+        let index = match word(packet, 12) {
+            WATCH_FILTER_SET => 0,
+            CONTEXT_FILTER_SET => 1,
+            _ => return Err(Error::Format),
+        };
+        self.filters[index] = filter;
+        Ok(())
+    }
     pub fn overlay(&self, cpu: usize) -> [u8; 4] {
         unsafe { (*self.overlays.get())[cpu] }
     }
@@ -164,17 +250,22 @@ impl Observation {
         }
     }
 
-    pub fn capture(&self, mut context: ContextRecord, watch_slot: Option<usize>) {
-        let Some(cpu) = self.cpus.get(context.cpu as usize) else {
-            return;
-        };
+    pub fn capture(
+        &self,
+        mut context: ContextRecord,
+        watch_slot: Option<usize>,
+    ) -> Option<ContextRecord> {
+        if !self.filters[usize::from(watch_slot.is_none())].accepts(&context) {
+            return None;
+        }
+        let cpu = self.cpus.get(context.cpu as usize)?;
         if cpu
             .lock
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             cpu.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
+            return None;
         }
         let records = unsafe { &mut *cpu.records.get() };
         if let Some(slot) = watch_slot.filter(|slot| *slot < self.watch_count) {
@@ -211,6 +302,7 @@ impl Observation {
             records.contexts[index] = context;
         }
         cpu.lock.store(0, Ordering::Release);
+        Some(context)
     }
 
     pub fn fetch(&self, packet: &mut [u8]) -> Result<(), Error> {
@@ -304,22 +396,8 @@ impl Observation {
         Ok(())
     }
 
-    pub fn stack_walk(
-        &self,
-        memory: &mut impl PhysicalMemory,
-        packet: &mut [u8],
-        la57: bool,
-        physical_bits: u32,
-    ) -> Result<(), Error> {
-        let cpu = self
-            .cpus
-            .get(quad(packet, 24) as usize)
-            .ok_or(Error::Bounds)?;
-        let sequence = quad(packet, 64);
-        let count = word(packet, 32) as usize;
-        if count == 0 || count > STACK_MAX_FRAMES || packet.len() != HEADER_BYTES + count * 16 {
-            return Err(Error::Bounds);
-        }
+    fn cached_context(&self, cpu_index: u64, sequence: u64) -> Result<ContextRecord, Error> {
+        let cpu = self.cpus.get(cpu_index as usize).ok_or(Error::Bounds)?;
         if cpu
             .lock
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
@@ -335,7 +413,31 @@ impl Observation {
             .find(|record| record.sequence == sequence && sequence != 0)
             .copied();
         cpu.lock.store(0, Ordering::Release);
-        let context = context.ok_or(Error::Session)?;
+        context.ok_or(Error::Session)
+    }
+
+    pub fn get_context(&self, packet: &mut [u8]) -> Result<(), Error> {
+        if packet.len() != HEADER_BYTES + CONTEXT_RECORD_BYTES || word(packet, 32) != 1 {
+            return Err(Error::Bounds);
+        }
+        let context = self.cached_context(quad(packet, 24), quad(packet, 64))?;
+        context.encode(&mut packet[HEADER_BYTES..]);
+        Ok(())
+    }
+
+    pub fn stack_walk(
+        &self,
+        memory: &mut impl PhysicalMemory,
+        packet: &mut [u8],
+        la57: bool,
+        physical_bits: u32,
+    ) -> Result<(), Error> {
+        let sequence = quad(packet, 64);
+        let count = word(packet, 32) as usize;
+        if count == 0 || count > STACK_MAX_FRAMES || packet.len() != HEADER_BYTES + count * 16 {
+            return Err(Error::Bounds);
+        }
+        let context = self.cached_context(quad(packet, 24), sequence)?;
         packet[HEADER_BYTES..].fill(0);
         let mut rip = context.rip;
         let mut rsp = context.rsp;
@@ -391,5 +493,355 @@ impl Observation {
         packet[32..36].copy_from_slice(&(returned as u32).to_le_bytes());
         packet[72..76].copy_from_slice(&status.to_le_bytes());
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct EventRegion {
+    pub address: u64,
+    pub length: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Probe {
+    pub address: u64,
+    pub kind: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct EventConfig {
+    pub enabled: bool,
+    pub sample: bool,
+    pub exceptions: u64,
+    pub regions: [EventRegion; EVENT_REGIONS],
+    pub probes: [Probe; 4],
+    pub probe_count: usize,
+}
+
+impl EventConfig {
+    pub fn parse(packet: &[u8], la57: bool) -> Result<Self, Error> {
+        let regions = word(packet, 32) as usize;
+        let probe_count = word(packet, 44) as usize;
+        let exceptions = quad(packet, 48);
+        let flags = quad(packet, 56);
+        if regions > EVENT_REGIONS
+            || probe_count > 4
+            || exceptions & !EVENT_EXCEPTION_MASK != 0
+            || flags & !u64::from(EVENT_SAMPLE) != 0
+            || packet.len() != HEADER_BYTES + (regions + probe_count) * 16
+        {
+            return Err(Error::Bounds);
+        }
+        let user_max = if la57 { 1 << 56 } else { 1 << 47 };
+        let mut config = Self {
+            enabled: true,
+            sample: flags & u64::from(EVENT_SAMPLE) != 0,
+            exceptions,
+            probe_count,
+            ..Self::default()
+        };
+        for (index, region) in config.regions[..regions].iter_mut().enumerate() {
+            let offset = HEADER_BYTES + index * 16;
+            let address = quad(packet, offset);
+            let length = quad(packet, offset + 8);
+            if address == 0
+                || length == 0
+                || length > EVENT_REGION_BYTES as u64
+                || address.checked_add(length).is_none_or(|end| end > user_max)
+            {
+                return Err(Error::Bounds);
+            }
+            *region = EventRegion {
+                address,
+                length: length as usize,
+            };
+        }
+        let mut has_entry = false;
+        let mut has_return = false;
+        for index in 0..probe_count {
+            let offset = HEADER_BYTES + (regions + index) * 16;
+            let address = quad(packet, offset);
+            let kind = quad(packet, offset + 8);
+            if address == 0
+                || address >= user_max
+                || !matches!(kind, EVENT_ENTRY | EVENT_RETURN | EVENT_SOFTWARE_EXCEPTION)
+                || config.probes[..index]
+                    .iter()
+                    .any(|probe| probe.address == address)
+            {
+                return Err(Error::Bounds);
+            }
+            config.probes[index] = Probe { address, kind };
+            has_entry |= kind == EVENT_ENTRY;
+            has_return |= kind == EVENT_RETURN;
+        }
+        if has_entry != has_return {
+            return Err(Error::Format);
+        }
+        Ok(config)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Event {
+    pub kind: u64,
+    pub invocation: u64,
+    pub parent: u64,
+    pub detail: u64,
+    pub auxiliary: u64,
+    pub address: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Invocation {
+    id: u64,
+    parent: u64,
+    teb: u64,
+    stack_base: u64,
+    return_rip: u64,
+    return_rsp: u64,
+    entry: u64,
+}
+
+struct Calls {
+    next: u64,
+    active: [Invocation; 256],
+}
+
+struct EventCpu {
+    lock: AtomicU64,
+    dropped: AtomicU64,
+    buffer: UnsafeCell<EventBuffer>,
+}
+
+struct EventBuffer {
+    next: u64,
+    records: [[u8; EVENT_RECORD_BYTES]; EVENT_RING_RECORDS],
+}
+
+pub(crate) struct Events {
+    pub config: EventConfig,
+    call_lock: AtomicU64,
+    calls: UnsafeCell<Calls>,
+    cpus: [EventCpu; 64],
+}
+
+impl Events {
+    pub fn reset(&mut self) {
+        self.calls.get_mut().active.fill(Invocation::default());
+        for cpu in &mut self.cpus {
+            cpu.buffer.get_mut().next = 0;
+            cpu.dropped.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn fetch(&self, packet: &mut [u8]) -> Result<(), Error> {
+        let cpu = self
+            .cpus
+            .get(quad(packet, 24) as usize)
+            .ok_or(Error::Bounds)?;
+        let count = word(packet, 32) as usize;
+        if count > EVENT_FETCH_MAX || packet.len() != HEADER_BYTES + count * EVENT_RECORD_BYTES {
+            return Err(Error::Bounds);
+        }
+        if cpu
+            .lock
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(Error::Busy);
+        }
+        let buffer = unsafe { &*cpu.buffer.get() };
+        let cursor = quad(packet, 64);
+        let oldest = if buffer.next == 0 {
+            0
+        } else {
+            buffer
+                .next
+                .saturating_sub(EVENT_RING_RECORDS as u64 - 1)
+                .max(1)
+        };
+        let first = cursor.saturating_add(1).max(oldest);
+        let returned = if first <= buffer.next {
+            (buffer.next - first + 1).min(count as u64) as usize
+        } else {
+            0
+        };
+        packet[HEADER_BYTES..].fill(0);
+        for (index, record) in packet[HEADER_BYTES..]
+            .chunks_exact_mut(EVENT_RECORD_BYTES)
+            .take(returned)
+            .enumerate()
+        {
+            let sequence = first + index as u64;
+            record.copy_from_slice(&buffer.records[(sequence - 1) as usize % EVENT_RING_RECORDS]);
+        }
+        let next = if returned == 0 {
+            cursor
+        } else {
+            first + returned as u64 - 1
+        };
+        let dropped = cpu.dropped.load(Ordering::Relaxed);
+        let buffer_next = buffer.next;
+        cpu.lock.store(0, Ordering::Release);
+        packet[32..36].copy_from_slice(&(returned as u32).to_le_bytes());
+        packet[88..96].copy_from_slice(&next.to_le_bytes());
+        packet[96..104].copy_from_slice(&oldest.to_le_bytes());
+        packet[104..112].copy_from_slice(&buffer_next.to_le_bytes());
+        packet[120..128].copy_from_slice(&dropped.to_le_bytes());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "uefi", test))]
+    pub fn emit(&self, mut context: ContextRecord, event: Event, capture: impl FnOnce(&mut [u8])) {
+        let cpu = &self.cpus[context.cpu as usize];
+        if cpu
+            .lock
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            cpu.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let buffer = unsafe { &mut *cpu.buffer.get() };
+        buffer.next = buffer.next.saturating_add(1);
+        let source = context.sequence;
+        context.sequence = buffer.next;
+        let record = &mut buffer.records[(buffer.next - 1) as usize % EVENT_RING_RECORDS];
+        record.fill(0);
+        context.encode(&mut record[..CONTEXT_RECORD_BYTES]);
+        for (value, bytes) in [
+            event.kind,
+            event.invocation,
+            event.parent,
+            event.detail,
+            event.auxiliary,
+            source,
+            event.address,
+        ]
+        .into_iter()
+        .zip(record[CONTEXT_RECORD_BYTES..EVENT_RECORD_HEADER].chunks_exact_mut(8))
+        {
+            bytes.copy_from_slice(&value.to_le_bytes());
+        }
+        capture(&mut record[EVENT_RECORD_HEADER..]);
+        cpu.lock.store(0, Ordering::Release);
+    }
+
+    #[cfg(any(target_os = "uefi", test))]
+    pub fn correlate(
+        &self,
+        context: ContextRecord,
+        mut event: Event,
+        return_rip: u64,
+        stack_base: u64,
+        mut emit: impl FnMut(Event),
+    ) {
+        if self.config.probe_count == 0
+            || context.cpl != 3
+            || context.thread_teb == 0
+            || stack_base <= context.rsp
+        {
+            if matches!(event.kind, EVENT_ENTRY | EVENT_RETURN) {
+                event.auxiliary = event.kind;
+                event.kind = EVENT_UNMATCHED;
+            }
+            emit(event);
+            return;
+        }
+        if self
+            .call_lock
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            self.cpus[context.cpu as usize]
+                .dropped
+                .fetch_add(1, Ordering::Relaxed);
+            if matches!(event.kind, EVENT_ENTRY | EVENT_RETURN) {
+                event.auxiliary = event.kind;
+                event.kind = EVENT_UNMATCHED;
+            }
+            emit(event);
+            return;
+        }
+        let calls = unsafe { &mut *self.calls.get() };
+        let teb = context.thread_teb;
+        // Match the innermost invocation first. The caller's post-RET RSP
+        // disambiguates recursion and shared continuation addresses.
+        let top = |calls: &Calls| {
+            calls
+                .active
+                .iter()
+                .enumerate()
+                .filter(|(_, call)| {
+                    call.id != 0 && call.teb == teb && call.stack_base == stack_base
+                })
+                .max_by_key(|(_, call)| call.id)
+                .map(|(index, _)| index)
+        };
+        let mut matched = false;
+        while let Some(index) = top(calls) {
+            let call = calls.active[index];
+            if event.kind == EVENT_RETURN
+                && context.rip == call.return_rip
+                && context.rsp == call.return_rsp
+            {
+                event.invocation = call.id;
+                event.parent = call.parent;
+                event.address = call.entry;
+                calls.active[index].id = 0;
+                matched = true;
+                break;
+            }
+            if context.rsp < call.return_rsp
+                || context.rsp == call.return_rsp && context.rip == call.return_rip
+            {
+                break;
+            }
+            calls.active[index].id = 0;
+            emit(Event {
+                kind: EVENT_ABANDON,
+                invocation: call.id,
+                parent: call.parent,
+                address: call.entry,
+                detail: call.return_rip,
+                auxiliary: call.return_rsp,
+            });
+        }
+        if event.kind == EVENT_ENTRY {
+            let parent = top(calls).map_or(0, |index| calls.active[index].id);
+            event.parent = parent;
+            if let Some(slot) = calls
+                .active
+                .iter_mut()
+                .find(|call| call.id == 0)
+                .filter(|_| return_rip != 0 && calls.next != u64::MAX)
+            {
+                calls.next += 1;
+                *slot = Invocation {
+                    id: calls.next,
+                    parent,
+                    teb,
+                    stack_base,
+                    return_rip,
+                    return_rsp: context.rsp + 8,
+                    entry: context.rip,
+                };
+                event.invocation = slot.id;
+                event.auxiliary = slot.return_rsp;
+            } else {
+                event.auxiliary = EVENT_ENTRY;
+                event.kind = EVENT_UNMATCHED;
+            }
+            event.detail = return_rip;
+        } else if event.kind == EVENT_RETURN && !matched {
+            event.auxiliary = EVENT_RETURN;
+            event.kind = EVENT_UNMATCHED;
+        } else if !matched && let Some(index) = top(calls) {
+            event.invocation = calls.active[index].id;
+            event.parent = calls.active[index].parent;
+        }
+        self.call_lock.store(0, Ordering::Release);
+        emit(event);
     }
 }

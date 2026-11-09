@@ -1,7 +1,11 @@
+mod analysis_cli;
 mod commands;
+mod investigation;
 mod matrix;
 #[path = "memory_cli.rs"]
 mod memory;
+mod output;
+mod process;
 use neo::protocol;
 mod server;
 mod startup;
@@ -20,14 +24,29 @@ fn main() {
     #[cfg(not(target_os = "windows"))]
     let result = commands::run(arguments);
     match result {
-        Ok(exit_code) => std::process::exit(exit_code),
+        Ok(exit_code) => {
+            if let Err(error) = output::finish(exit_code) {
+                eprintln!("neo: {error}");
+                std::process::exit(1);
+            }
+            std::process::exit(exit_code);
+        }
         Err(error) => {
-            eprintln!("neo: {error}");
+            if output::is_json() {
+                if let Err(error) = output::failure(&error) {
+                    eprintln!("neo: {error}");
+                }
+            } else {
+                eprintln!("neo: {error}");
+            }
             std::process::exit(1);
         }
     }
 }
 
+#[cfg(test)]
+#[path = "../../../tests/neo_json_tests.rs"]
+mod json_tests;
 #[cfg(test)]
 #[path = "../../../tests/neo_tests.rs"]
 mod tests;

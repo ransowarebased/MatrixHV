@@ -715,6 +715,38 @@ fn cpuid_identity_is_scoped_gated_and_preserves_the_native_apic_id() {
 }
 
 #[test]
+fn ungated_cpuid_profiles_still_require_the_owned_cr3_and_nonzero_cpl() {
+    let mut machine = Machine::new();
+    let mut session = session();
+    let mut request = cpuid_request();
+    request[24..32].fill(0);
+    request[144..160].fill(0);
+    execute(&mut session, &mut machine, &mut request).unwrap();
+    let configuration = unsafe { &*session.configuration.get() };
+    let profile = unsafe { &*session.cpuid.get() };
+    assert!(
+        interception::cpuid_values(configuration, profile, ROOT, 3, [0, 0], [1, 0], [0; 4])
+            .is_some()
+    );
+    assert!(
+        interception::cpuid_values(configuration, profile, ROOT, 0, [0, 0], [1, 0], [0; 4])
+            .is_none()
+    );
+    assert!(
+        interception::cpuid_values(
+            configuration,
+            profile,
+            ROOT + 4096,
+            3,
+            [0, 0],
+            [1, 0],
+            [0; 4]
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn invalid_cpuid_records_cannot_replace_an_active_profile_or_hide_the_transport() {
     let mut machine = Machine::new();
     let mut session = session();
@@ -2602,6 +2634,132 @@ fn watch_and_context_packets_share_the_lease_and_preserve_fetch_cursors() {
 }
 
 #[test]
+fn observation_filter_commands_require_the_active_token_and_leave_session_abi_unchanged() {
+    use crate::memory::observation::ContextRecord;
+    use neo::memory::{InterceptionRequest, ObservationFilter, interception_packet};
+    assert_eq!(core::mem::size_of::<Session>(), 348_152);
+    let mut machine = Machine::new();
+    let (mut session, observation) = observed_session();
+    let mut request = interception_packet(&InterceptionRequest {
+        operation: WATCH_SET,
+        cr3: ROOT,
+        flags: INTERCEPT_NO_LEASE,
+        watchpoints: vec![(0x400008, 3, 8)],
+        ..Default::default()
+    })
+    .unwrap();
+    execute(&mut session, &mut machine, &mut request).unwrap();
+    let token = quad(&request, 80);
+    let mut filter_request = InterceptionRequest {
+        operation: WATCH_FILTER_SET,
+        token: token + 1,
+        filter: ObservationFilter {
+            thread_teb: 0x3000,
+            ranges: vec![],
+        },
+        ..Default::default()
+    };
+    let mut filter = interception_packet(&filter_request).unwrap();
+    assert_eq!(
+        execute(&mut session, &mut machine, &mut filter),
+        Err(Error::Session)
+    );
+    filter_request.token = token;
+    let mut filter = interception_packet(&filter_request).unwrap();
+    execute(&mut session, &mut machine, &mut filter).unwrap();
+    observation.capture(
+        ContextRecord {
+            thread_teb: 0x4000,
+            ..Default::default()
+        },
+        Some(0),
+    );
+    observation.capture(
+        ContextRecord {
+            thread_teb: 0x3000,
+            ..Default::default()
+        },
+        Some(0),
+    );
+    let mut fetch = interception_packet(&InterceptionRequest {
+        operation: WATCH_FETCH,
+        token,
+        count: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    execute(&mut session, &mut machine, &mut fetch).unwrap();
+    assert_eq!(word(&fetch, 32), 1);
+    assert_eq!(quad(&fetch, HEADER_BYTES + 64), 0x3000);
+    assert_eq!(quad(&filter, 80), token);
+    assert_eq!(machine.events.last(), Some(&"resume"));
+}
+
+#[test]
+fn cached_context_retrieval_preserves_exported_sequences_during_resampling() {
+    use crate::memory::observation::ContextRecord;
+    use neo::memory::{InterceptionRequest, interception_packet};
+    let mut machine = Machine::new();
+    let (mut session, observation) = observed_session();
+    let mut setup = interception_packet(&InterceptionRequest {
+        operation: CONTEXT_SET,
+        cr3: ROOT,
+        flags: INTERCEPT_NO_LEASE,
+        ..Default::default()
+    })
+    .unwrap();
+    execute(&mut session, &mut machine, &mut setup).unwrap();
+    let token = quad(&setup, 80);
+    let first = ContextRecord {
+        rip: 0x400100,
+        rsp: 0x400080,
+        cr3: ROOT,
+        thread_teb: 0x3000,
+        cpl: 3,
+        ..Default::default()
+    };
+    observation.capture(first, None);
+    let mut snapshot = interception_packet(&InterceptionRequest {
+        operation: CONTEXT_SNAPSHOT,
+        token,
+        count: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    execute(&mut session, &mut machine, &mut snapshot).unwrap();
+    observation.capture(
+        ContextRecord {
+            rip: 0x400200,
+            ..first
+        },
+        None,
+    );
+    for _ in 0..2 {
+        let mut cached = interception_packet(&InterceptionRequest {
+            operation: CONTEXT_RECORD_GET,
+            token,
+            cursor: 1,
+            count: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        execute(&mut session, &mut machine, &mut cached).unwrap();
+        assert_eq!(quad(&cached, HEADER_BYTES + 24), first.rip);
+        assert_eq!(quad(&cached, HEADER_BYTES), 1);
+    }
+    let mut walk = interception_packet(&InterceptionRequest {
+        operation: STACK_WALK,
+        token,
+        cursor: 1,
+        count: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    execute(&mut session, &mut machine, &mut walk).unwrap();
+    assert_eq!(quad(&walk, HEADER_BYTES), first.rip);
+}
+
+#[test]
 fn cet_syscall_install_uses_a_distinct_slot_and_capacity_failures_preserve_the_profile() {
     let mut machine = Machine::new();
     let (mut session, _observation) = observed_session();
@@ -2630,4 +2788,96 @@ fn cet_syscall_install_uses_a_distinct_slot_and_capacity_failures_preserve_the_p
     assert_eq!(session.syscall.get_mut().token, token);
     assert_eq!(session.configuration.get_mut().debug_count, 0);
     assert!(session.is_active());
+}
+
+#[test]
+fn event_setup_with_probes_and_a_lease_crosses_the_memory_transport() {
+    use crate::memory::{
+        access,
+        observation::{ContextRecord, Event},
+    };
+    use neo::memory::{InterceptionRequest, interception_packet};
+
+    struct Transport<'a> {
+        session: &'a mut Session,
+        machine: Machine,
+    }
+    impl PhysicalMemory for Transport<'_> {
+        fn read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), Error> {
+            self.machine.read(address, bytes)
+        }
+        fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), Error> {
+            self.machine.write(address, bytes)
+        }
+        fn intercept(&mut self, packet: &mut [u8], la57: bool, bits: u32) -> Result<(), Error> {
+            unsafe { interception::execute(self.session, &mut self.machine, packet, la57, bits) }
+        }
+    }
+
+    let (mut session, observation) = observed_session();
+    let mut transport = Transport {
+        session: &mut session,
+        machine: Machine::new(),
+    };
+    let mut request = InterceptionRequest {
+        operation: EVENT_SET,
+        cr3: ROOT,
+        lease_ms: 1500,
+        event_probes: vec![(0x401000, EVENT_ENTRY), (0x402000, EVENT_RETURN)],
+        event_regions: vec![(0x601000, 8)],
+        event_sample: true,
+        event_exceptions: 1 << 14,
+        ..Default::default()
+    };
+    let mut packet = interception_packet(&request).unwrap();
+    assert_eq!(word(&packet, 44), 2);
+    access::execute(&mut transport, &mut packet, false, 48).unwrap();
+    assert_eq!(word(&packet, 132), 1500);
+    assert_eq!(observation.events.config.regions[0].address, 0x601000);
+    assert_eq!(observation.events.config.regions[0].length, 8);
+    assert_eq!(observation.events.config.probes[1].kind, EVENT_RETURN);
+    assert!(observation.events.config.sample);
+    assert_eq!(observation.events.config.exceptions, 1 << 14);
+    let context = ContextRecord {
+        cpl: 3,
+        rip: 0x401000,
+        rsp: 0x700000,
+        thread_teb: 0x600000,
+        ..Default::default()
+    };
+    observation.events.correlate(
+        context,
+        Event {
+            kind: EVENT_ENTRY,
+            ..Default::default()
+        },
+        0x402000,
+        0x701000,
+        |event| observation.events.emit(context, event, |_| {}),
+    );
+    let token = quad(&packet, 80);
+    let mut fetch = interception_packet(&InterceptionRequest {
+        operation: EVENT_FETCH,
+        token,
+        count: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    access::execute(&mut transport, &mut fetch, false, 48).unwrap();
+    assert_eq!(word(&fetch, 32), 1);
+    assert_eq!(quad(&fetch, HEADER_BYTES + CONTEXT_RECORD_BYTES + 8), 1);
+    request.token = token;
+    request.lease_ms = 0;
+    request.flags = INTERCEPT_NO_LEASE;
+    let mut packet = interception_packet(&request).unwrap();
+    access::execute(&mut transport, &mut packet, false, 48).unwrap();
+    assert_eq!(word(&packet, 132), 0);
+    let mut fetch = interception_packet(&InterceptionRequest {
+        operation: EVENT_FETCH,
+        token: quad(&packet, 80),
+        ..Default::default()
+    })
+    .unwrap();
+    access::execute(&mut transport, &mut fetch, false, 48).unwrap();
+    assert_eq!(quad(&fetch, 104), 0);
 }

@@ -13,6 +13,28 @@ pub struct Item {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpuidRecord {
+    pub leaf: u32,
+    pub subleaf: u32,
+    pub subleaf_mask: u32,
+    pub values: [u32; 4],
+    pub keep_masks: [u32; 4],
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CpuidGate {
+    pub dr3: u64,
+    pub dr7_mask: u64,
+    pub dr7_value: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ObservationFilter {
+    pub thread_teb: u64,
+    pub ranges: Vec<(u64, u64, bool)>,
+}
+
 #[derive(Default)]
 pub struct InterceptionRequest {
     pub operation: u32,
@@ -32,6 +54,13 @@ pub struct InterceptionRequest {
     pub cpu: u32,
     pub cursor: u64,
     pub count: usize,
+    pub cpuid_records: Vec<CpuidRecord>,
+    pub cpuid_gate: Option<CpuidGate>,
+    pub filter: ObservationFilter,
+    pub event_regions: Vec<(u64, u64)>,
+    pub event_probes: Vec<(u64, u64)>,
+    pub event_exceptions: u64,
+    pub event_sample: bool,
 }
 
 pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, String> {
@@ -43,31 +72,134 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
         INTERCEPT_RENEW, INTERCEPT_STATUS, STACK_MAX_FRAMES, STACK_WALK, SYSCALL_CLEAR,
         SYSCALL_SET, WATCH_CLEAR, WATCH_FETCH, WATCH_RECORD_BYTES, WATCH_RING_RECORDS, WATCH_SET,
     };
+    use crate::protocol::memory::{
+        CONTEXT_FILTER_SET, CONTEXT_RECORD_GET, CPUID_CLEAR, CPUID_MAX_RECORDS, CPUID_RECORD_BYTES,
+        CPUID_SET, INTERCEPT_CONCURRENT_WRITES, INTERCEPT_PERSISTENT_DATA,
+        INTERCEPT_PRIVATE_SHARED_DATA, INTERCEPT_VMFUNC, OBSERVATION_FILTER_BYTES,
+        OBSERVATION_FILTER_RANGES, WATCH_FILTER_SET,
+    };
+    use crate::protocol::memory::{
+        EVENT_CLEAR, EVENT_FETCH, EVENT_FETCH_MAX, EVENT_RECORD_BYTES, EVENT_REGIONS, EVENT_SAMPLE,
+        EVENT_SET,
+    };
     let operation = request.operation;
+    let setup = matches!(
+        operation,
+        HOOK_INSTALL | DEBUG_SET | CPUID_SET | WATCH_SET | CONTEXT_SET | SYSCALL_SET | EVENT_SET
+    );
     if request.lease_ms > INTERCEPT_MAX_LEASE_MS
-        || request.lease_ms != 0
-            && !matches!(
-                operation,
-                HOOK_INSTALL | DEBUG_SET | WATCH_SET | CONTEXT_SET | SYSCALL_SET | INTERCEPT_RENEW
-            )
-        || request.flags & INTERCEPT_NO_LEASE != 0
-            && (request.lease_ms != 0
-                || !matches!(
-                    operation,
-                    HOOK_INSTALL | DEBUG_SET | WATCH_SET | CONTEXT_SET | SYSCALL_SET
-                ))
+        || request.lease_ms != 0 && !(setup || operation == INTERCEPT_RENEW)
+        || request.flags & INTERCEPT_NO_LEASE != 0 && (request.lease_ms != 0 || !setup)
     {
         return Err("invalid interception lease configuration".into());
     }
-    if matches!(
-        operation,
-        HOOK_INSTALL | DEBUG_SET | WATCH_SET | CONTEXT_SET | SYSCALL_SET
-    ) && request.cr3 & !4095 == 0
+    if setup && request.cr3 & !4095 == 0
         || request.alternate_cr3 != 0 && request.alternate_cr3 & !4095 == 0
     {
         return Err("CR3 must contain a nonzero page-table root".into());
     }
+    if request.flags & INTERCEPT_PRIVATE_SHARED_DATA != 0
+        && (operation != HOOK_INSTALL
+            || request.flags
+                & (INTERCEPT_VMFUNC
+                    | INTERCEPT_CONCURRENT_WRITES
+                    | INTERCEPT_PERSISTENT_DATA
+                    | INTERCEPT_NO_LEASE)
+                != 0
+            || request
+                .items
+                .iter()
+                .filter(|item| item.address == 0x7ffe0000 && item.bytes.len() == 4096)
+                .count()
+                != 1
+            || request.items.iter().any(|item| {
+                item.address & !4095 == 0x7ffe0000
+                    && (item.address != 0x7ffe0000 || item.bytes.len() != 4096)
+            })
+            || request.items.iter().enumerate().any(|(index, item)| {
+                item.address == 0x7ffe0000
+                    && request.hook_flags.get(index).copied().unwrap_or(0) != 0
+            }))
+    {
+        return Err("private shared data requires a full 4 KiB patch at 0x7ffe0000, a lease, and compatible hook modes".into());
+    }
     let mut bytes = match operation {
+        CPUID_SET => {
+            if request.cpuid_records.is_empty() || request.cpuid_records.len() > CPUID_MAX_RECORDS {
+                return Err("invalid CPUID profile: expected 1..16 records".into());
+            }
+            if let Some(gate) = &request.cpuid_gate {
+                if gate.dr3 == 0 || gate.dr7_mask == 0 || gate.dr7_value & !gate.dr7_mask != 0 {
+                    return Err("invalid CPUID debug-register gate".into());
+                }
+            }
+            let mut bytes =
+                vec![0; HEADER_BYTES + request.cpuid_records.len() * CPUID_RECORD_BYTES];
+            bytes[16..24].copy_from_slice(&request.cr3.to_le_bytes());
+            bytes[32..36].copy_from_slice(&(request.cpuid_records.len() as u32).to_le_bytes());
+            for (index, record) in request.cpuid_records.iter().enumerate() {
+                if record.leaf == 0
+                    || record.leaf == 0x8000_0000
+                    || (0x4000_0000..0x5000_0000).contains(&record.leaf)
+                    || record.subleaf & !record.subleaf_mask != 0
+                    || record
+                        .values
+                        .iter()
+                        .zip(record.keep_masks)
+                        .any(|(value, keep)| value & keep != 0)
+                    || request.cpuid_records[..index].iter().any(|previous| {
+                        previous.leaf == record.leaf
+                            && (previous.subleaf ^ record.subleaf)
+                                & previous.subleaf_mask
+                                & record.subleaf_mask
+                                == 0
+                    })
+                {
+                    return Err("invalid, reserved, or overlapping CPUID record".into());
+                }
+                let offset = HEADER_BYTES + index * CPUID_RECORD_BYTES;
+                for (slot, value) in [record.leaf, record.subleaf, record.subleaf_mask, 0]
+                    .into_iter()
+                    .chain(record.values)
+                    .chain(record.keep_masks)
+                    .enumerate()
+                {
+                    bytes[offset + slot * 4..offset + slot * 4 + 4]
+                        .copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            if let Some(gate) = &request.cpuid_gate {
+                bytes[24..32].copy_from_slice(&gate.dr3.to_le_bytes());
+                bytes[144..152].copy_from_slice(&gate.dr7_mask.to_le_bytes());
+                bytes[152..160].copy_from_slice(&gate.dr7_value.to_le_bytes());
+            }
+            bytes
+        }
+        WATCH_FILTER_SET | CONTEXT_FILTER_SET => {
+            if request.filter.ranges.len() > OBSERVATION_FILTER_RANGES
+                || request
+                    .filter
+                    .ranges
+                    .iter()
+                    .any(|(start, end, _)| start >= end)
+            {
+                return Err(
+                    "invalid observation filter: expected at most 16 nonempty RIP ranges".into(),
+                );
+            }
+            let mut bytes =
+                vec![0; HEADER_BYTES + request.filter.ranges.len() * OBSERVATION_FILTER_BYTES];
+            bytes[24..32].copy_from_slice(&request.filter.thread_teb.to_le_bytes());
+            bytes[32..36].copy_from_slice(&(request.filter.ranges.len() as u32).to_le_bytes());
+            for (index, (start, end, exclude)) in request.filter.ranges.iter().enumerate() {
+                let offset = HEADER_BYTES + index * OBSERVATION_FILTER_BYTES;
+                for (slot, value) in [*start, *end, u64::from(*exclude)].into_iter().enumerate() {
+                    bytes[offset + slot * 8..offset + slot * 8 + 8]
+                        .copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            bytes
+        }
         HOOK_INSTALL | HOOK_ADD => {
             if !request.hook_flags.is_empty() && request.hook_flags.len() != request.items.len()
                 || request
@@ -135,13 +267,46 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
             }
             bytes
         }
-        WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK => {
+        EVENT_SET => {
+            let regions = &request.event_regions;
+            let probes = &request.event_probes;
+            if regions.len() > EVENT_REGIONS || probes.len() > 4 {
+                return Err("event capture accepts up to four regions and four probes".into());
+            }
+            let mut bytes = vec![0; HEADER_BYTES + (regions.len() + probes.len()) * 16];
+            bytes[32..36].copy_from_slice(&(regions.len() as u32).to_le_bytes());
+            bytes[44..48].copy_from_slice(&(probes.len() as u32).to_le_bytes());
+            bytes[48..56].copy_from_slice(&request.event_exceptions.to_le_bytes());
+            bytes[56..60].copy_from_slice(
+                &(if request.event_sample {
+                    EVENT_SAMPLE
+                } else {
+                    0
+                })
+                .to_le_bytes(),
+            );
+            for (pair, descriptor) in regions
+                .iter()
+                .chain(probes)
+                .zip(bytes[HEADER_BYTES..].chunks_exact_mut(16))
+            {
+                descriptor[..8].copy_from_slice(&pair.0.to_le_bytes());
+                descriptor[8..].copy_from_slice(&pair.1.to_le_bytes());
+            }
+            bytes
+        }
+        WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK | CONTEXT_RECORD_GET | EVENT_FETCH => {
             let (maximum, record_bytes) = match operation {
                 WATCH_FETCH => (WATCH_RING_RECORDS, WATCH_RECORD_BYTES),
+                EVENT_FETCH => (EVENT_FETCH_MAX, EVENT_RECORD_BYTES),
                 CONTEXT_SNAPSHOT => (CONTEXT_CPU_RECORDS, CONTEXT_RECORD_BYTES),
+                CONTEXT_RECORD_GET => (1, CONTEXT_RECORD_BYTES),
                 _ => (STACK_MAX_FRAMES, 16),
             };
-            if request.count == 0 || request.count > maximum || request.cpu >= 64 {
+            if request.count == 0 && operation != EVENT_FETCH
+                || request.count > maximum
+                || request.cpu >= 64
+            {
                 return Err("invalid observation CPU or record count".into());
             }
             let mut bytes = vec![0; HEADER_BYTES + request.count * record_bytes];
@@ -166,8 +331,8 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
         }
         HOOK_LIST => vec![0; HEADER_BYTES + HOOK_MAX_PATCHES * ITEM_BYTES],
         INTERCEPT_CONTEXT_LIST => vec![0; HEADER_BYTES + ROOT_HISTORY_COUNT * 8],
-        HOOK_REMOVE | HOOK_DROP | DEBUG_CLEAR | INTERCEPT_RENEW | INTERCEPT_RELEASE
-        | INTERCEPT_STATUS => vec![0; HEADER_BYTES],
+        HOOK_REMOVE | HOOK_DROP | DEBUG_CLEAR | CPUID_CLEAR | INTERCEPT_RENEW
+        | INTERCEPT_RELEASE | INTERCEPT_STATUS | EVENT_CLEAR => vec![0; HEADER_BYTES],
         _ => return Err("invalid interception operation".into()),
     };
     bytes[0..8].copy_from_slice(&MEMORY_MAGIC.to_le_bytes());
@@ -176,14 +341,17 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
     let length = bytes.len() as u32;
     bytes[36..40].copy_from_slice(&length.to_le_bytes());
     bytes[64..72].copy_from_slice(&request.alternate_cr3.to_le_bytes());
-    if matches!(operation, WATCH_SET | CONTEXT_SET | SYSCALL_SET) {
+    if matches!(operation, WATCH_SET | CONTEXT_SET | SYSCALL_SET | EVENT_SET) {
         bytes[16..24].copy_from_slice(&request.cr3.to_le_bytes());
     }
     if operation == SYSCALL_SET {
         bytes[24..32].copy_from_slice(&request.callback.to_le_bytes());
         bytes[48..56].copy_from_slice(&request.syscall_entry.to_le_bytes());
     }
-    if matches!(operation, WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK) {
+    if matches!(
+        operation,
+        WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK | CONTEXT_RECORD_GET | EVENT_FETCH
+    ) {
         bytes[64..72].copy_from_slice(&request.cursor.to_le_bytes());
     }
     bytes[80..88].copy_from_slice(&request.token.to_le_bytes());
@@ -291,36 +459,77 @@ pub fn tracking_packet(operation: u32, session: u64, count: usize) -> Result<Vec
     Ok(bytes)
 }
 
+pub struct PageBatch {
+    pub pages: Vec<(u64, u64)>,
+    pub next: u64,
+    pub limit: u64,
+}
+
+pub fn enumerate_page_batch(root: u64, cursor: u64) -> Result<PageBatch, String> {
+    if root & !4095 == 0 || cursor & 4095 != 0 {
+        return Err("enumeration requires a valid CR3 and a page-aligned cursor".into());
+    }
+    let mut bytes = tracking_packet(AD_ENUMERATE, 0, TRACK_MAX_PAGES)?;
+    bytes[16..24].copy_from_slice(&cursor.to_le_bytes());
+    bytes[64..72].copy_from_slice(&root.to_le_bytes());
+    invoke(&mut bytes)?;
+    decode_page_batch(&bytes, root, cursor)
+}
+
+pub fn decode_page_batch(bytes: &[u8], root: u64, cursor: u64) -> Result<PageBatch, String> {
+    if bytes.len() < HEADER_BYTES
+        || bytes.len() > BUFFER_BYTES
+        || quad(bytes, 0) != MEMORY_MAGIC
+        || word(bytes, 8) != MEMORY_VERSION
+        || word(bytes, 12) != AD_ENUMERATE
+        || word(bytes, 36) as usize != bytes.len()
+    {
+        return Err("invalid or truncated enumeration response".into());
+    }
+    let count = word(bytes, 32) as usize;
+    let next = quad(bytes, 16);
+    let limit = quad(bytes, 72);
+    if count > TRACK_MAX_PAGES
+        || bytes.len() < HEADER_BYTES + count * TRACK_TARGET_BYTES
+        || !matches!(limit, 0x8000_0000_0000 | 0x100_0000_0000_0000)
+        || next <= cursor
+        || next > limit
+        || next & 4095 != 0
+    {
+        return Err("invalid resident enumeration response or cursor".into());
+    }
+    let mut pages = Vec::with_capacity(count);
+    let mut previous = None;
+    for index in 0..count {
+        let offset = HEADER_BYTES + index * TRACK_TARGET_BYTES;
+        let address = quad(bytes, offset + 8);
+        if quad(bytes, offset) != root
+            || address < cursor
+            || address >= next
+            || address & 4095 != 0
+            || previous.is_some_and(|value| address <= value)
+        {
+            return Err("invalid resident enumeration entry".into());
+        }
+        pages.push((root, address));
+        previous = Some(address);
+    }
+    Ok(PageBatch { pages, next, limit })
+}
+
 pub fn enumerate_targets(root: u64) -> Result<Vec<(u64, u64)>, String> {
     let mut targets = Vec::new();
     let mut cursor = 0u64;
     loop {
-        let mut bytes = tracking_packet(AD_ENUMERATE, 0, TRACK_MAX_PAGES)?;
-        bytes[16..24].copy_from_slice(&cursor.to_le_bytes());
-        bytes[64..72].copy_from_slice(&root.to_le_bytes());
-        invoke(&mut bytes)?;
-        let count = word(&bytes, 32) as usize;
-        if count > TRACK_MAX_PAGES {
-            return Err("invalid resident enumeration response".into());
-        }
-        for index in 0..count {
-            let offset = HEADER_BYTES + index * TRACK_TARGET_BYTES;
-            targets.push((quad(&bytes, offset), quad(&bytes, offset + 8)));
-        }
+        let batch = enumerate_page_batch(root, cursor)?;
+        targets.extend(batch.pages);
         if targets.len() > TRACK_MAX_PAGES {
             return Err(format!(
                 "process exceeds {TRACK_MAX_PAGES} resident pages; select a smaller virtual address range"
             ));
         }
-        let next = quad(&bytes, 16);
-        if next == cursor {
-            return Err("resident enumeration made no progress".into());
-        }
-        cursor = next;
-        if !matches!(quad(&bytes, 72), 0x8000_0000_0000 | 0x100_0000_0000_0000) {
-            return Err("invalid resident user address limit".into());
-        }
-        if cursor >= quad(&bytes, 72) {
+        cursor = batch.next;
+        if cursor >= batch.limit {
             break;
         }
     }
@@ -588,6 +797,14 @@ pub fn transfer(
     items: &[Item],
 ) -> Result<Vec<Transfer>, String> {
     let mut bytes = process_packet(symbols, process, operation, target_cr3, items)?;
+    invoke(&mut bytes)?;
+    decode_transfers(&bytes)
+}
+
+pub fn transfer_present(cr3: u64, items: &[Item]) -> Result<Vec<Transfer>, String> {
+    // Resident scans revalidate mappings without synthesizing demand-zero pages
+    // or walking the VAD tree for every page in a batch.
+    let mut bytes = packet(READ, 0, cr3, items)?;
     invoke(&mut bytes)?;
     decode_transfers(&bytes)
 }

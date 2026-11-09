@@ -14,6 +14,7 @@ pub(crate) mod interception;
 #[path = "../../memory/observation.rs"]
 pub(crate) mod observation;
 
+use crate::output;
 use crate::protocol::memory::{
     AD_CANCEL, AD_ENABLED, AD_LARGE_PAGE, AD_RELEASE, AD_STATUS, AD_STOP, BUFFER_BYTES,
     HEADER_BYTES, ITEM_BYTES, MAX_ITEMS, READ, ROOT_HISTORY_COUNT, TRACK_ACCESSED, TRACK_DIRTY,
@@ -22,10 +23,130 @@ use crate::protocol::memory::{
 };
 use neo::memory::{
     InterceptionRequest, Item, bitmap_packet, enumerate_targets, fetch_tracking_packet,
-    info_packet, invoke, resolve_process, start_tracking_packet, status_text, tracking_packet,
-    transfer,
+    info_packet, resolve_process, start_tracking_packet, status_text, tracking_packet, transfer,
 };
 use neo::symbols;
+use serde_json::{Value, json};
+
+pub(crate) fn invoke(bytes: &mut [u8]) -> Result<(), String> {
+    output::clear_error();
+    neo::memory::invoke(bytes).inspect_err(|_| {
+        if bytes.len() >= HEADER_BYTES && word(bytes, 40) != 0 {
+            let (code, retryable) = output::memory_status(word(bytes, 40));
+            output::set_error(code, retryable);
+        }
+    })
+}
+
+fn tracking_json(bytes: &[u8]) -> Value {
+    json!({"session": output::hex(quad(bytes, 80)), "state": word(bytes, 104), "pages": word(bytes, 108), "t0": output::hex(quad(bytes, 88)), "t1": output::hex(quad(bytes, 96)), "split_tables": word(bytes, 112)})
+}
+
+pub(crate) fn interception_json(bytes: &[u8]) -> Result<Value, String> {
+    use crate::protocol::memory::*;
+    if bytes.len() < HEADER_BYTES {
+        return Err("truncated interception response".into());
+    }
+    let operation = word(bytes, 12);
+    let mut data = json!({
+        "token": output::hex(quad(bytes, 80)), "cr3": output::hex(quad(bytes, 16)),
+        "alternate_cr3": output::hex(quad(bytes, 64)), "state": word(bytes, 112),
+        "revocation_cause": word(bytes, 116), "hooks": word(bytes, 104), "debug_targets": word(bytes, 108),
+        "hits": output::hex(quad(bytes, 88)), "data_exits": output::hex(quad(bytes, 96)),
+        "write_windows": output::hex(quad(bytes, 120)), "lease_ms": word(bytes, 132),
+        "remaining_ms": output::hex(quad(bytes, 136)), "generation": output::hex(quad(bytes, 144)),
+        "patches": output::hex(quad(bytes, 152)), "contexts": word(bytes, 44), "flags": word(bytes, 128),
+        "lease_enabled": word(bytes, 128) & INTERCEPT_NO_LEASE == 0,
+        "concurrent_writes": word(bytes, 128) & INTERCEPT_CONCURRENT_WRITES != 0,
+        "persistent_data": word(bytes, 128) & INTERCEPT_PERSISTENT_DATA != 0,
+        "private_shared_data": word(bytes, 128) & INTERCEPT_PRIVATE_SHARED_DATA != 0,
+        "cpuid_records": word(bytes, 24),
+        "tsc_offset": word(bytes, 128) & INTERCEPT_TSC_OFFSET != 0,
+        "compensated_ticks": output::hex(quad(bytes, 72)),
+        "vmfunc": word(bytes, 128) & INTERCEPT_VMFUNC != 0,
+        "execute_slot": INTERCEPT_EXECUTE_SLOT, "data_slot": INTERCEPT_DATA_SLOT
+    });
+    if matches!(operation, HOOK_INSTALL | HOOK_ADD | HOOK_LIST) {
+        let count = word(bytes, 32) as usize;
+        if count > HOOK_MAX_PATCHES || HEADER_BYTES + count * ITEM_BYTES > bytes.len() {
+            return Err("invalid hook response count".into());
+        }
+        data["items"] = json!((0..count).map(|index| {
+            let offset = HEADER_BYTES + index * ITEM_BYTES;
+            if operation == HOOK_LIST {
+                json!({"id": output::hex(quad(bytes, offset)), "address": output::hex(quad(bytes, offset + 8)), "length": word(bytes, offset + 16), "flags": word(bytes, offset + 20)})
+            } else {
+                json!({"id": output::hex(quad(bytes, offset + 16)), "address": output::hex(quad(bytes, offset)), "length": word(bytes, offset + 12)})
+            }
+        }).collect::<Vec<_>>());
+    } else if operation == INTERCEPT_CONTEXT_LIST {
+        let count = word(bytes, 32) as usize;
+        if count > ROOT_HISTORY_COUNT || HEADER_BYTES + count * 8 > bytes.len() {
+            return Err("invalid context response count".into());
+        }
+        data["context_roots"] = json!(
+            (0..count)
+                .map(|index| output::hex(quad(bytes, HEADER_BYTES + index * 8)))
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(data)
+}
+
+pub(crate) fn observation_json(bytes: &[u8], operation: u32) -> Result<Value, String> {
+    use crate::protocol::memory::*;
+    if bytes.len() < HEADER_BYTES {
+        return Err("truncated observation response".into());
+    }
+    if !matches!(operation, WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK) {
+        return Ok(json!({"token": output::hex(quad(bytes, 80)), "state": word(bytes, 112)}));
+    }
+    let size = match operation {
+        WATCH_FETCH => WATCH_RECORD_BYTES,
+        CONTEXT_SNAPSHOT => CONTEXT_RECORD_BYTES,
+        _ => 16,
+    };
+    let count = word(bytes, 32) as usize;
+    let records = bytes
+        .get(HEADER_BYTES..)
+        .and_then(|body| body.get(..count.checked_mul(size)?))
+        .ok_or("invalid observation response count")?;
+    let records: Vec<_> = records
+        .chunks_exact(size)
+        .map(|record| {
+            if operation == STACK_WALK {
+                json!({"rip": output::hex(quad(record, 0)), "rsp": output::hex(quad(record, 8))})
+            } else {
+                let mut data = context_json(record);
+                if operation == WATCH_FETCH {
+                    data["address"] = json!(output::hex(quad(record, 208)));
+                    data["hit_count"] = json!(output::hex(quad(record, 216)));
+                    data["slot"] = json!(output::hex(quad(record, 224)));
+                    data["post_instruction"] =
+                        json!(quad(record, 232) & WATCH_POST_INSTRUCTION != 0);
+                }
+                data
+            }
+        })
+        .collect();
+    Ok(
+        json!({"token": output::hex(quad(bytes, 80)), "next": output::hex(quad(bytes, 88)), "oldest": output::hex(quad(bytes, 96)), "dropped": output::hex(quad(bytes, 120)), "walk_status": word(bytes, 72), "records": records}),
+    )
+}
+
+pub(crate) fn context_json(record: &[u8]) -> Value {
+    let mut data = json!({"sequence": output::hex(quad(record, 0)), "tsc": output::hex(quad(record, 8)), "cr3": output::hex(quad(record, 16)), "rip": output::hex(quad(record, 24)), "rsp": output::hex(quad(record, 32)), "rbp": output::hex(quad(record, 40)), "rflags": output::hex(quad(record, 48)), "gs_base": output::hex(quad(record, 56)), "thread_teb": output::hex(quad(record, 64)), "cpu": output::hex(quad(record, 192)), "cpl": output::hex(quad(record, 200))});
+    for (index, name) in [
+        "rax", "rcx", "rdx", "rbx", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+        "r14", "r15",
+    ]
+    .iter()
+    .enumerate()
+    {
+        data[*name] = json!(output::hex(quad(record, 72 + index * 8)));
+    }
+    data
+}
 
 pub(crate) fn number(text: &str) -> Result<u64, String> {
     let value = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
@@ -37,6 +158,9 @@ pub(crate) fn number(text: &str) -> Result<u64, String> {
 }
 
 pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, String> {
+    if arguments.first().is_some_and(|command| command == "cpuid") {
+        return cpuid_packet(arguments);
+    }
     use crate::protocol::memory::{
         DEBUG_CLEAR, DEBUG_SET, HOOK_ADD, HOOK_DROP, HOOK_INSTALL, HOOK_LIST, HOOK_REMOVE,
         INTERCEPT_CONTEXT_ADD, INTERCEPT_CONTEXT_LIST, INTERCEPT_CONTEXT_REMOVE,
@@ -58,6 +182,10 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
         };
     let mut modes = 0;
     for (option, flag) in [
+        (
+            "--private-shared-data",
+            crate::protocol::memory::INTERCEPT_PRIVATE_SHARED_DATA,
+        ),
         (
             "--concurrent-writes",
             crate::protocol::memory::INTERCEPT_CONCURRENT_WRITES,
@@ -215,9 +343,160 @@ pub(crate) fn interception_packet(arguments: &[String]) -> Result<Vec<u8>, Strin
     neo::memory::interception_packet(&request)
 }
 
+pub(crate) fn cpuid_packet(arguments: &[String]) -> Result<Vec<u8>, String> {
+    use crate::protocol::memory::*;
+    use neo::memory::{CpuidGate, CpuidRecord};
+    let mut request = InterceptionRequest::default();
+    match arguments.get(1).map(String::as_str) {
+        Some("status") if arguments.len() == 2 => request.operation = INTERCEPT_STATUS,
+        Some("clear") if arguments.len() == 3 => {
+            request.operation = CPUID_CLEAR;
+            request.token = number(&arguments[2])?;
+        }
+        Some("set") if arguments.len() >= 3 => {
+            request.operation = CPUID_SET;
+            request.cr3 = number(&arguments[2])?;
+            let mut dr3 = None;
+            let mut dr7_mask = None;
+            let mut dr7_value = None;
+            let mut index = 3;
+            while index < arguments.len() {
+                let option = arguments[index].as_str();
+                if option == "--record" {
+                    let fields = arguments.get(index + 1..index + 12).ok_or("--record requires LEAF SUBLEAF MASK EAX EBX ECX EDX KEEP_EAX KEEP_EBX KEEP_ECX KEEP_EDX")?;
+                    let values = fields.iter().map(|value| u32::try_from(number(value)?).map_err(|_| "CPUID fields must fit in u32".to_string())).collect::<Result<Vec<_>, _>>()?;
+                    request.cpuid_records.push(CpuidRecord { leaf: values[0], subleaf: values[1], subleaf_mask: values[2],
+                        values: values[3..7].try_into().map_err(|_| "invalid register values")?,
+                        keep_masks: values[7..11].try_into().map_err(|_| "invalid keep masks")? });
+                    index += 12;
+                } else if matches!(option, "--no-lease" | "--tsc-offset") {
+                    request.flags |= if option == "--no-lease" { INTERCEPT_NO_LEASE } else { INTERCEPT_TSC_OFFSET };
+                    index += 1;
+                } else {
+                    let value = number(arguments.get(index + 1).ok_or_else(|| format!("{option} requires a value"))?)?;
+                    match option {
+                        "--token" => request.token = value,
+                        "--alternate-cr3" => request.alternate_cr3 = value,
+                        "--lease-ms" => {
+                            request.lease_ms = u32::try_from(value).map_err(|_| "invalid lease duration")?;
+                            if request.lease_ms == 0 { return Err("lease duration must be nonzero".into()); }
+                        }
+                        "--dr3" => dr3 = Some(value),
+                        "--dr7-mask" => dr7_mask = Some(value),
+                        "--dr7-value" => dr7_value = Some(value),
+                        _ => return Err(format!("unknown CPUID option: {option}")),
+                    }
+                    index += 2;
+                }
+            }
+            request.cpuid_gate = match (dr3, dr7_mask, dr7_value) {
+                (None, None, None) => None,
+                (Some(dr3), Some(dr7_mask), Some(dr7_value)) => Some(CpuidGate { dr3, dr7_mask, dr7_value }),
+                _ => return Err("CPUID gating requires --dr3, --dr7-mask and --dr7-value together".into()),
+            };
+        }
+        _ => return Err("usage: neo cpuid set CR3 [--token TOKEN] --record LEAF SUBLEAF MASK EAX EBX ECX EDX KEEP_EAX KEEP_EBX KEEP_ECX KEEP_EDX [...] [--dr3 ADDRESS --dr7-mask MASK --dr7-value VALUE] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset]; cpuid clear TOKEN; cpuid status".into()),
+    }
+    neo::memory::interception_packet(&request)
+}
+
+pub(crate) fn filter_packet(arguments: &[String]) -> Result<Vec<u8>, String> {
+    use crate::protocol::memory::*;
+    if arguments.len() < 3 || arguments.get(1).map(String::as_str) != Some("filter") {
+        return Err("usage: neo watch|context filter TOKEN [--thread-teb TEB] [--rip-include START END] [--rip-exclude START END]; empty filters clear restrictions".into());
+    }
+    let operation = match arguments[0].as_str() {
+        "watch" => WATCH_FILTER_SET,
+        "context" => CONTEXT_FILTER_SET,
+        _ => return Err("filters require watch or context".into()),
+    };
+    let mut request = InterceptionRequest {
+        operation,
+        token: number(&arguments[2])?,
+        ..Default::default()
+    };
+    let mut index = 3;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--thread-teb" => {
+                request.filter.thread_teb = number(
+                    arguments
+                        .get(index + 1)
+                        .ok_or("--thread-teb requires a TEB address")?,
+                )?;
+                index += 2;
+            }
+            "--rip-include" | "--rip-exclude" => {
+                let start = number(
+                    arguments
+                        .get(index + 1)
+                        .ok_or("RIP filters require START END")?,
+                )?;
+                let end = number(
+                    arguments
+                        .get(index + 2)
+                        .ok_or("RIP filters require START END")?,
+                )?;
+                request
+                    .filter
+                    .ranges
+                    .push((start, end, arguments[index] == "--rip-exclude"));
+                index += 3;
+            }
+            option => return Err(format!("unknown filter option: {option}")),
+        }
+    }
+    neo::memory::interception_packet(&request)
+}
+
+fn run_filter(arguments: &[String]) -> Result<i32, String> {
+    let mut bytes = filter_packet(arguments)?;
+    let mut info = info_packet()?;
+    invoke(&mut info)?;
+    if word(&info, 72) & crate::protocol::memory::OBSERVATION_FILTER_CAPABILITY == 0 {
+        return Err(
+            "observation filters are unsupported by this hypervisor; update the EFI".into(),
+        );
+    }
+    invoke(&mut bytes)?;
+    let data = json!({"token": output::hex(quad(&bytes, 80)), "filter_applied": true});
+    if output::is_json() {
+        output::success(data)?;
+    } else {
+        println!("token={} filter_applied=true", quad(&bytes, 80));
+    }
+    Ok(0)
+}
+
 pub(crate) fn run_observation(arguments: &[String]) -> Result<i32, String> {
     use crate::protocol::memory::*;
-    let mut operands = arguments.to_vec();
+    let unwind = arguments.iter().any(|argument| argument == "--unwind");
+    if unwind && arguments.get(1).is_some_and(|action| action == "stack") {
+        return crate::analysis_cli::run_unwind(arguments);
+    }
+    let decode = arguments.iter().any(|argument| argument == "--disasm");
+    let mut option_arguments = arguments.to_vec();
+    let options = crate::analysis_cli::TargetOptions::extract(&mut option_arguments)?;
+    let analysis = crate::investigation::analysis(&mut option_arguments)?;
+    // Only observation setup accepts symbolic operands. The analysis
+    // switches have already been removed from read-only observation requests.
+    let operands_for_fetch = matches!(
+        arguments.get(1).map(String::as_str),
+        Some("fetch" | "snapshot")
+    );
+    let mut operands = if operands_for_fetch {
+        option_arguments
+    } else if decode || unwind {
+        return Err("--disasm and --unwind require watch fetch or context snapshot".into());
+    } else {
+        crate::analysis_cli::resolve_operands(arguments)?
+    };
+    if operands.get(1).is_some_and(|action| action == "filter") {
+        if decode {
+            return Err("--disasm requires watch fetch or context snapshot".into());
+        }
+        return run_filter(&operands);
+    }
     let no_lease = if let Some(index) = operands.iter().position(|value| value == "--no-lease") {
         operands.remove(index);
         true
@@ -285,7 +564,34 @@ pub(crate) fn run_observation(arguments: &[String]) -> Result<i32, String> {
         }
     }
     let mut bytes = neo::memory::interception_packet(&request)?;
+    let snapshots = operands_for_fetch && (decode || unwind) && crate::investigation::available()?;
+    if unwind && !snapshots {
+        return Err("inline unwind requires event snapshots from the updated MatrixHV EFI".into());
+    }
+    if decode && !snapshots && options.selector.is_none() {
+        return Err("legacy disassembly requires --process PID|NAME".into());
+    }
     invoke(&mut bytes)?;
+    if operands_for_fetch && (options.selector.is_some() || snapshots) {
+        let data = if snapshots {
+            crate::investigation::attach(&bytes, &request, &options, analysis)?
+        } else {
+            crate::analysis_cli::decorate_observation(&bytes, request.operation, &options, decode)?
+        };
+        if output::is_json() {
+            output::success(data)?;
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&data).map_err(|error| error.to_string())?
+            );
+        }
+        return Ok(0);
+    }
+    if output::is_json() {
+        output::success(observation_json(&bytes, request.operation)?)?;
+        return Ok(0);
+    }
     if matches!(
         request.operation,
         WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK
@@ -350,14 +656,18 @@ pub(crate) fn run_observation(arguments: &[String]) -> Result<i32, String> {
 }
 
 pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
+    let resolved = crate::analysis_cli::resolve_operands(arguments)?;
+    let arguments = resolved.as_slice();
     if arguments.get(1).is_some_and(|action| action == "watch") {
         let mut renewal = arguments.to_vec();
         renewal[1] = "renew".into();
         let template = interception_packet(&renewal)?;
-        println!(
-            "Renewing session {} until this process exits; the watchdog remains armed.",
-            quad(&template, 80)
-        );
+        if !output::is_json() {
+            println!(
+                "Renewing session {} until this process exits; the watchdog remains armed.",
+                quad(&template, 80)
+            );
+        }
         loop {
             let mut bytes = template.clone();
             if let Err(error) = invoke(&mut bytes) {
@@ -368,7 +678,13 @@ pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
                 return Err(error);
             }
             if word(&bytes, 112) != crate::protocol::memory::INTERCEPT_ACTIVE {
+                if word(&bytes, 116) == crate::protocol::memory::INTERCEPT_CAUSE_LEASE {
+                    output::set_error("LEASE_EXPIRED", false);
+                }
                 return Err("session is no longer active".into());
+            }
+            if output::is_json() {
+                output::success(interception_json(&bytes)?)?;
             }
             std::thread::sleep(std::time::Duration::from_millis(
                 (u64::from(word(&bytes, 132)) / 3).max(1),
@@ -377,7 +693,18 @@ pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
     }
     let mut bytes = interception_packet(arguments)?;
     let operation = word(&bytes, 12);
+    if operation == crate::protocol::memory::CPUID_SET && quad(&bytes, 144) == 0 {
+        let mut info = info_packet()?;
+        invoke(&mut info)?;
+        if word(&info, 72) & crate::protocol::memory::CPUID_UNGATED_CAPABILITY == 0 {
+            return Err("ungated CPUID profiles are unsupported by this hypervisor; specify --dr3, --dr7-mask and --dr7-value or update the EFI".into());
+        }
+    }
     invoke(&mut bytes)?;
+    if output::is_json() {
+        output::success(interception_json(&bytes)?)?;
+        return Ok(0);
+    }
     let state = match word(&bytes, 112) {
         crate::protocol::memory::INTERCEPT_DISABLED => "disabled",
         crate::protocol::memory::INTERCEPT_ACTIVE => "active",
@@ -432,6 +759,11 @@ pub(crate) fn run_interception(arguments: &[String]) -> Result<i32, String> {
         word(&bytes, 44),
         word(&bytes, 128) & crate::protocol::memory::INTERCEPT_CONCURRENT_WRITES != 0,
         word(&bytes, 128) & crate::protocol::memory::INTERCEPT_PERSISTENT_DATA != 0
+    );
+    println!(
+        "cpuid_records={} private_shared_data={}",
+        word(&bytes, 24),
+        word(&bytes, 128) & crate::protocol::memory::INTERCEPT_PRIVATE_SHARED_DATA != 0
     );
     if matches!(
         operation,
@@ -495,6 +827,17 @@ pub(crate) fn run_bitmap(arguments: &[String]) -> Result<i32, String> {
     let bitmap_bytes = page_count.div_ceil(8);
     let accessed = &bytes[HEADER_BYTES..HEADER_BYTES + bitmap_bytes];
     let dirty = &bytes[HEADER_BYTES + bitmap_bytes..];
+    if output::is_json() {
+        let path = arguments.get(4);
+        if let Some(path) = path {
+            std::fs::write(path, &bytes)
+                .map_err(|error| format!("cannot save A/D bitmap: {error}"))?;
+        }
+        output::success(
+            json!({"gpa": output::hex(start), "pages": page_count, "accessed_count": accessed.iter().map(|byte| byte.count_ones()).sum::<u32>(), "dirty_count": dirty.iter().map(|byte| byte.count_ones()).sum::<u32>(), "large_page_coverage": flags & AD_LARGE_PAGE != 0, "scope": "L1", "snapshot": "observational", "accessed": hex_bytes(accessed), "dirty": hex_bytes(dirty), "output": path}),
+        )?;
+        return Ok(0);
+    }
     println!(
         "gpa={start:#x} pages={page_count} accessed={} dirty={} large_page_coverage={} scope=L1 snapshot=observational",
         accessed.iter().map(|byte| byte.count_ones()).sum::<u32>(),
@@ -605,6 +948,10 @@ fn start_tracking(arguments: &[String]) -> Result<i32, String> {
     };
     let mut bytes = start_tracking_packet(pid.unwrap_or(0), &targets)?;
     invoke(&mut bytes)?;
+    if output::is_json() {
+        output::success(tracking_json(&bytes))?;
+        return Ok(0);
+    }
     println!(
         "session={} state=ACTIVE pages={} t0={} scope=L1 precision=4096",
         quad(&bytes, 80),
@@ -719,11 +1066,24 @@ pub(crate) fn dump_tracking(
         quad(&status, 24), quad(&status, 88), quad(&status, 96))).map_err(|error| error.to_string())?;
     let mut release = tracking_packet(AD_RELEASE, session, 0)?;
     submit(&mut release)?;
-    println!(
-        "session={session} state=IDLE captured_state=STOPPED pages={total} dirty={dirty} remapped={remapped} output={}",
-        directory.display()
-    );
-    if remapped != 0 {
+    if output::is_json() {
+        let data = json!({"session": output::hex(session), "state": "IDLE", "captured_state": "STOPPED", "pages": total, "dirty": dirty, "remapped": remapped, "output": directory});
+        if failed {
+            output::partial(
+                data,
+                "PARTIAL_TRANSFER",
+                "some frozen pages could not be exported",
+            )?;
+        } else {
+            output::success(data)?;
+        }
+    } else {
+        println!(
+            "session={session} state=IDLE captured_state=STOPPED pages={total} dirty={dirty} remapped={remapped} output={}",
+            directory.display()
+        );
+    }
+    if remapped != 0 && !output::is_json() {
         eprintln!(
             "tracking warning: {remapped} page mappings changed; their frames were excluded from the dump"
         );
@@ -737,6 +1097,7 @@ fn run_tracking(arguments: &[String]) -> Result<i32, String> {
         "status" if arguments.len() == 1 => {
             let mut bytes = tracking_packet(AD_STATUS, 0, 0)?;
             invoke(&mut bytes)?;
+            if output::is_json() { output::success(tracking_json(&bytes))?; return Ok(0); }
             println!("session={} state={} pages={} t0={} t1={} split_tables={}",
                 quad(&bytes, 80), word(&bytes, 104), word(&bytes, 108), quad(&bytes, 88), quad(&bytes, 96), word(&bytes, 112));
             Ok(0)
@@ -745,6 +1106,7 @@ fn run_tracking(arguments: &[String]) -> Result<i32, String> {
             let operation = if arguments[0] == "cancel" { AD_CANCEL } else { AD_RELEASE };
             let mut bytes = tracking_packet(operation, number(&arguments[1])?, 0)?;
             invoke(&mut bytes)?;
+            if output::is_json() { output::success(tracking_json(&bytes))?; }
             Ok(0)
         }
         "stop" | "dump" if arguments.len() == 4 && arguments[2] == "--output" => {
@@ -753,6 +1115,7 @@ fn run_tracking(arguments: &[String]) -> Result<i32, String> {
         "stop" if arguments.len() == 2 => {
             let mut bytes = tracking_packet(AD_STOP, number(&arguments[1])?, 0)?;
             invoke(&mut bytes)?;
+            if output::is_json() { output::success(tracking_json(&bytes))?; return Ok(0); }
             println!("session={} state=STOPPED pages={} t0={} t1={}; use dump SESSION --output DIRECTORY to export",
                 quad(&bytes, 80), word(&bytes, 108), quad(&bytes, 88), quad(&bytes, 96));
             Ok(0)
@@ -832,9 +1195,11 @@ pub fn run(arguments: &[String]) -> Result<i32, String> {
     let mut image = symbols::default_kernel_image()?;
     let mut cache = symbols::default_cache()?;
     let mut operands = Vec::new();
+    let mut decode = false;
     let mut index = 3;
     while index < arguments.len() {
         match arguments[index].as_str() {
+            "--disasm" if operation == READ => decode = true,
             "--kernel-cr3" | "--kernel-image" | "--symbols" => {
                 let option = &arguments[index];
                 index += 1;
@@ -854,7 +1219,19 @@ pub fn run(arguments: &[String]) -> Result<i32, String> {
         }
         index += 1;
     }
-    let items = parse_items(operation, &operands)?;
+    let symbolic = operands
+        .iter()
+        .step_by(2)
+        .any(|value| value.contains('!') || value.contains('+'));
+    let mut numeric_operands = operands.clone();
+    if symbolic {
+        for value in numeric_operands.iter_mut().step_by(2) {
+            if value.contains('!') || value.contains('+') {
+                *value = "0".into();
+            }
+        }
+    }
+    let mut items = parse_items(operation, &numeric_operands)?;
     if operation == WRITE && items.is_empty() {
         return Err("write requires at least one ADDRESS HEX pair".into());
     }
@@ -867,12 +1244,30 @@ pub fn run(arguments: &[String]) -> Result<i32, String> {
         cr3,
         (kernel_cr3 != 0).then_some(kernel_cr3),
     )?;
+    let modules = if symbolic || decode {
+        crate::analysis_cli::load_modules(&process)?
+    } else {
+        Vec::new()
+    };
+    if symbolic {
+        for (index, value) in operands.iter().enumerate().step_by(2) {
+            numeric_operands[index] =
+                format!("{:#x}", neo::user::resolve_address(&modules, value)?);
+        }
+        items = parse_items(operation, &numeric_operands)?;
+    }
     let target_cr3 = if cr3 == 0 { process.kernel_cr3 } else { cr3 };
-    println!(
-        "pid={} name={} cr3={target_cr3:#x} kernel_cr3={:#x} user_cr3={:#x}",
-        process.pid, process.name, process.kernel_cr3, process.user_cr3
-    );
+    let mut data = json!({"pid": output::hex(process.pid), "name": process.name, "cr3": output::hex(target_cr3), "kernel_cr3": output::hex(process.kernel_cr3), "user_cr3": output::hex(process.user_cr3)});
+    if !output::is_json() {
+        println!(
+            "pid={} name={} cr3={target_cr3:#x} kernel_cr3={:#x} user_cr3={:#x}",
+            process.pid, process.name, process.kernel_cr3, process.user_cr3
+        );
+    }
     if items.is_empty() {
+        if output::is_json() {
+            output::success(data)?;
+        }
         return Ok(0);
     }
     let transfers = transfer(
@@ -882,6 +1277,42 @@ pub fn run(arguments: &[String]) -> Result<i32, String> {
         (cr3 != 0).then_some(cr3),
         &items,
     )?;
+    if output::is_json() {
+        let failed = transfers.iter().any(|transfer| !transfer.is_complete());
+        data["transfers"] = transfers_json(&transfers);
+        if decode {
+            for (index, transfer) in transfers.iter().enumerate() {
+                let instructions = neo::user::disassemble(
+                    &modules,
+                    transfer.address,
+                    &transfer.bytes,
+                    transfer.bytes.len(),
+                );
+                let decoded = instructions
+                    .iter()
+                    .map(|instruction| instruction.bytes.len())
+                    .sum::<usize>();
+                data["transfers"][index]["instructions"] =
+                    crate::analysis_cli::instructions_json(&instructions);
+                data["transfers"][index]["decoded_bytes"] = json!(decoded);
+                data["transfers"][index]["disassembly_complete"] =
+                    json!(decoded == transfer.bytes.len());
+                data["transfers"][index]["symbol"] =
+                    json!(neo::user::symbolize(&modules, transfer.address));
+            }
+            data["memory_consistency"] = json!("live_observational");
+        }
+        if failed {
+            output::partial(
+                data,
+                "PARTIAL_TRANSFER",
+                "one or more memory ranges were not fully transferred; inspect per-range results before retrying",
+            )?;
+        } else {
+            output::success(data)?;
+        }
+        return Ok(i32::from(failed));
+    }
     let mut failed = false;
     for result in transfers {
         failed |= !result.is_complete();
@@ -898,7 +1329,25 @@ pub fn run(arguments: &[String]) -> Result<i32, String> {
                 print!("{byte:02x}");
             }
         }
+        if decode {
+            let instructions =
+                neo::user::disassemble(&modules, result.address, &result.bytes, result.bytes.len());
+            println!(
+                "\n{}",
+                serde_json::to_string_pretty(&crate::analysis_cli::instructions_json(
+                    &instructions
+                ))
+                .map_err(|error| error.to_string())?
+            );
+        }
         println!();
     }
     Ok(i32::from(failed))
+}
+
+pub(crate) fn transfers_json(transfers: &[neo::memory::Transfer]) -> Value {
+    json!(transfers.iter().map(|transfer| {
+        let (code, retryable) = if transfer.is_complete() { ("SUCCESS", false) } else if transfer.status == 0 { ("PARTIAL_TRANSFER", false) } else { output::memory_status(transfer.status) };
+        json!({"address": output::hex(transfer.address), "status": transfer.status, "code": code, "retryable": retryable, "complete": transfer.is_complete(), "transferred": transfer.transferred, "requested": transfer.requested, "data": hex_bytes(&transfer.bytes)})
+    }).collect::<Vec<_>>())
 }

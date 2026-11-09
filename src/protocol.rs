@@ -182,10 +182,12 @@ pub mod memory {
     // CPUID profiles share the interception token, CR3 scope and lease.
     // Install carries DR3 at 24, DR7 mask/value at 144/152, and 48-byte
     // records (leaf, subleaf, subleaf mask, reserved, values[4], keep masks[4]).
-    // Only nonzero-CPL callers matching the debug-register gate participate.
+    // Only nonzero-CPL callers participate. An all-zero gate disables DR gating
+    // when CPUID_UNGATED_CAPABILITY is advertised.
     // Status returns the configured CPUID record count at 24.
     pub const CPUID_SET: u32 = 24;
     pub const CPUID_CLEAR: u32 = 25;
+    pub const CPUID_UNGATED_CAPABILITY: u32 = 1 << 6;
     // A single native LSTAR breakpoint returns to a scoped user callback with
     // SYSRET64 state. Install carries callback at 24, LSTAR at 48 and token at 80.
     pub const SYSCALL_SET: u32 = 26;
@@ -202,6 +204,57 @@ pub mod memory {
     pub const CONTEXT_CLEAR: u32 = 32;
     pub const CONTEXT_SNAPSHOT: u32 = 33;
     pub const STACK_WALK: u32 = 34;
+    // Filters use TEB at 24 and count at 32; records are (start, end, exclude),
+    // with exclusive ends. Empty filters accept everything. Exclusions win.
+    pub const WATCH_FILTER_SET: u32 = 35;
+    pub const CONTEXT_FILTER_SET: u32 = 36;
+    // Retrieve one cached snapshot by sequence without replacing snapshots.
+    pub const CONTEXT_RECORD_GET: u32 = 37;
+    pub const EVENT_SET: u32 = 38;
+    pub const EVENT_CLEAR: u32 = 39;
+    pub const EVENT_FETCH: u32 = 40;
+    pub const EVENT_CAPABILITY: u32 = 1 << 7;
+    pub const EVENT_SAMPLE: u32 = 1;
+    pub const EVENT_EXCEPTION_MASK: u64 = (1 << 0)
+        | (1 << 1)
+        | (1 << 3)
+        | (1 << 4)
+        | (1 << 5)
+        | (1 << 6)
+        | (1 << 7)
+        | (1 << 10)
+        | (1 << 11)
+        | (1 << 12)
+        | (1 << 13)
+        | (1 << 14)
+        | (1 << 16)
+        | (1 << 17)
+        | (1 << 19)
+        | (1 << 21);
+    pub const EVENT_REGIONS: usize = 4;
+    pub const EVENT_REGION_BYTES: usize = 1024;
+    pub const EVENT_STACK_BYTES: usize = 2048;
+    pub const EVENT_CODE_BYTES: usize = 32;
+    pub const EVENT_RING_RECORDS: usize = 16;
+    pub const EVENT_SEGMENT_HEADER: usize = 16;
+    pub const EVENT_RECORD_HEADER: usize = CONTEXT_RECORD_BYTES + 56;
+    pub const EVENT_RECORD_BYTES: usize = EVENT_RECORD_HEADER
+        + (2 + EVENT_REGIONS) * EVENT_SEGMENT_HEADER
+        + EVENT_CODE_BYTES
+        + EVENT_STACK_BYTES
+        + EVENT_REGIONS * EVENT_REGION_BYTES;
+    pub const EVENT_FETCH_MAX: usize = (BUFFER_BYTES - HEADER_BYTES) / EVENT_RECORD_BYTES;
+    pub const EVENT_CONTEXT: u64 = 1;
+    pub const EVENT_WATCH: u64 = 2;
+    pub const EVENT_EXCEPTION: u64 = 3;
+    pub const EVENT_ENTRY: u64 = 4;
+    pub const EVENT_RETURN: u64 = 5;
+    pub const EVENT_ABANDON: u64 = 6;
+    pub const EVENT_UNMATCHED: u64 = 7;
+    pub const EVENT_SOFTWARE_EXCEPTION: u64 = 8;
+    pub const OBSERVATION_FILTER_RANGES: usize = 16;
+    pub const OBSERVATION_FILTER_BYTES: usize = 24;
+    pub const OBSERVATION_FILTER_CAPABILITY: u32 = 1 << 5;
     pub const WATCH_RECORD_BYTES: usize = 240;
     pub const CONTEXT_RECORD_BYTES: usize = 208;
     pub const WATCH_RING_RECORDS: usize = 64;

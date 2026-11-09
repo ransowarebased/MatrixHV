@@ -560,12 +560,19 @@ pub fn capture(
         }
         capture_samples(&options, &mut request)
     })();
-    if options.mode == Mode::Watchdog {
+    let result = if options.mode == Mode::Watchdog {
         let stopped = request(options.mode, Control::Stop);
         result.and(stopped.map(|_| ()))
     } else {
         result
+    };
+    result?;
+    if crate::output::is_json()
+        && let Some(path) = options.output.as_ref()
+    {
+        crate::output::success(serde_json::json!({"output": path, "format": "jsonl"}))?;
     }
+    Ok(())
 }
 
 fn capture_samples(
@@ -586,6 +593,13 @@ fn capture_samples(
             .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
             .as_millis();
         let sample = request(options.mode, Control::Query)?;
+        let rendered = if crate::output::is_json() {
+            let mut data = crate::output::fields(&sample);
+            data["sample_unix_ms"] = serde_json::json!(crate::output::hex(sample_time as u64));
+            format!("{}\n", serde_json::json!({"ok": true, "data": data}))
+        } else {
+            format!("sample_unix_ms={sample_time}\n{sample}\n")
+        };
         if let Some(path) = options.output.as_ref() {
             if output_file.is_none() {
                 output_file = Some(
@@ -597,13 +611,17 @@ fn capture_samples(
                 );
             }
             let file = output_file.as_mut().unwrap();
-            write!(file, "sample_unix_ms={sample_time}\n{sample}\n")
+            file.write_all(rendered.as_bytes())
                 .and_then(|()| file.sync_data())
                 .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
         } else {
-            write!(stdout, "sample_unix_ms={sample_time}\n{sample}\n")
+            stdout
+                .write_all(rendered.as_bytes())
                 .and_then(|()| stdout.flush())
                 .map_err(|error| format!("failed to write telemetry: {error}"))?;
+            if crate::output::is_json() {
+                crate::output::mark_emitted();
+            }
         }
         let Some(deadline) = deadline else {
             return Ok(());
@@ -1714,6 +1732,23 @@ pub fn capability_status(matrixhv_present: bool, protocol: u32) -> String {
             "capabilities=0x{:x}\n[TELEMETRY v{format_version}]\nlogical_processor_count={count}\n",
             caps.eax,
         );
+        for (name, flag) in [
+            ("intel_pt", crate::protocol::MATRIXHV_INTEL_PT_CAPABILITY),
+            (
+                "intel_pt_ring",
+                crate::protocol::MATRIXHV_INTEL_PT_RING_CAPABILITY,
+            ),
+            ("exit_timing", MATRIXHV_EXIT_TIMING_CAPABILITY),
+            ("ept_diagnostics", EPT_DIAGNOSTIC_CAPABILITY),
+            ("ept_recycling", EPT_RECYCLING_CAPABILITY),
+            ("control_trace", CONTROL_STAGE_CAPABILITY),
+            (
+                "control_native_snapshot",
+                CONTROL_NATIVE_SNAPSHOT_CAPABILITY,
+            ),
+        ] {
+            writeln!(text, "{name}={}", caps.eax & flag != 0).unwrap();
+        }
         if caps.eax & TELEMETRY_CONTROL_CAPABILITY != 0 {
             writeln!(
                 text,

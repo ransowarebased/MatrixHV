@@ -393,14 +393,14 @@ pub fn execute(
     if !(HEADER_BYTES..=BUFFER_BYTES).contains(&packet.len()) {
         return Err(Error::Bounds);
     }
+    let operation = word(packet, 12);
     if quad(packet, 0) != MEMORY_MAGIC
         || word(packet, 8) != MEMORY_VERSION
         || word(packet, 36) as usize != packet.len()
-        || word(packet, 44) != 0
+        || operation != EVENT_SET && word(packet, 44) != 0
     {
         return Err(Error::Format);
     }
-    let operation = word(packet, 12);
     let count = word(packet, 32) as usize;
     if matches!(
         operation,
@@ -428,6 +428,12 @@ pub fn execute(
             | CONTEXT_CLEAR
             | CONTEXT_SNAPSHOT
             | STACK_WALK
+            | WATCH_FILTER_SET
+            | CONTEXT_FILTER_SET
+            | CONTEXT_RECORD_GET
+            | EVENT_SET
+            | EVENT_CLEAR
+            | EVENT_FETCH
     ) {
         return memory.intercept(packet, la57, physical_bits);
     }
@@ -608,8 +614,8 @@ pub(crate) mod resident {
     const _: () = assert!(core::mem::offset_of!(Environment, tracking_session) == 64);
     const _: () = assert!(core::mem::offset_of!(Environment, synchronize) == 80);
 
-    struct Memory<'a> {
-        environment: &'a Environment,
+    pub(crate) struct Memory<'a> {
+        pub(crate) environment: &'a Environment,
     }
 
     #[cfg(target_os = "uefi")]
@@ -617,11 +623,24 @@ pub(crate) mod resident {
         boot: &crate::vmx::resident::abi::ResidentBootContext,
         configuration: &crate::memory::interception::RoadEptProfile,
         rip: u64,
-        execution: &mut [u8; 15],
-        original: &mut [u8; 15],
+        execution: &mut [u8],
+        original: &mut [u8],
     ) -> usize {
+        instruction_bytes_in(
+            &event_environment(boot),
+            configuration,
+            rip,
+            execution,
+            original,
+        )
+    }
+
+    #[cfg(target_os = "uefi")]
+    pub(crate) fn event_environment(
+        boot: &crate::vmx::resident::abi::ResidentBootContext,
+    ) -> Environment {
         use crate::vmx::vmcs::{GUEST_CR3, GUEST_CR4, vmread};
-        let environment = Environment {
+        Environment {
             caller_cr3: vmread(GUEST_CR3).unwrap_or(0),
             guest_cr4: vmread(GUEST_CR4).unwrap_or(0),
             ept: boot.cache_ept_pointer,
@@ -634,16 +653,15 @@ pub(crate) mod resident {
             boot_context: 0,
             synchronize: 0,
             interception_session: 0,
-        };
-        instruction_bytes_in(&environment, configuration, rip, execution, original)
+        }
     }
 
     pub(crate) fn instruction_bytes_in(
         environment: &Environment,
         configuration: &crate::memory::interception::RoadEptProfile,
         rip: u64,
-        execution: &mut [u8; 15],
-        original: &mut [u8; 15],
+        execution: &mut [u8],
+        original: &mut [u8],
     ) -> usize {
         let mut memory = Memory { environment };
         let mut index = 0;
@@ -689,7 +707,7 @@ pub(crate) mod resident {
             }
             index += count;
         }
-        15
+        index
     }
 
     impl Memory<'_> {
@@ -1324,6 +1342,7 @@ pub(crate) mod resident {
                     0
                 } | if environment.interception_session != 0 {
                     CPUID_PROFILE_CAPABILITY
+                        | CPUID_UNGATED_CAPABILITY
                         | PRIVATE_SHARED_DATA_CAPABILITY
                         | SYSCALL_PROFILE_CAPABILITY
                         | if unsafe {
@@ -1334,6 +1353,8 @@ pub(crate) mod resident {
                             != 0
                         {
                             OBSERVATION_CAPABILITY
+                                | OBSERVATION_FILTER_CAPABILITY
+                                | EVENT_CAPABILITY
                         } else {
                             0
                         }

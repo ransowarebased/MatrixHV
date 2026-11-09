@@ -1,5 +1,141 @@
 use super::*;
-use memory::observation::{ContextRecord, Observation, WatchTarget};
+use memory::observation::{ContextRecord, EventConfig, Observation, WatchTarget};
+
+#[test]
+fn observation_filters_reject_hot_loop_hits_before_ring_sequences_advance() {
+    let mut scenario = Scenario::new();
+    let mut observation = observer(&mut scenario);
+    observation.watch_count = 1;
+    observation.watch[0] = WatchTarget {
+        address: 0x2000,
+        control: 1,
+    };
+    observation.context_enabled = true;
+    let mut filter = vec![0; HEADER_BYTES + 2 * OBSERVATION_FILTER_BYTES];
+    filter[12..16].copy_from_slice(&WATCH_FILTER_SET.to_le_bytes());
+    filter[24..32].copy_from_slice(&0x3000_u64.to_le_bytes());
+    filter[32..36].copy_from_slice(&2_u32.to_le_bytes());
+    for (index, values) in [[0x1000_u64, 0x2000, 0], [0x1100, 0x1200, 1]]
+        .iter()
+        .enumerate()
+    {
+        for (slot, value) in values.iter().enumerate() {
+            let offset = HEADER_BYTES + index * OBSERVATION_FILTER_BYTES + slot * 8;
+            filter[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    observation.set_filter(&filter, false).unwrap();
+    let accepted = ContextRecord {
+        rip: 0x1000,
+        thread_teb: 0x3000,
+        ..Default::default()
+    };
+    observation.capture(accepted, Some(0));
+    for _ in 0..256 {
+        observation.capture(
+            ContextRecord {
+                rip: 0x1150,
+                ..accepted
+            },
+            Some(0),
+        );
+        observation.capture(
+            ContextRecord {
+                thread_teb: 0x4000,
+                ..accepted
+            },
+            Some(0),
+        );
+        observation.capture(
+            ContextRecord {
+                rip: 0x2000,
+                ..accepted
+            },
+            Some(0),
+        );
+    }
+    let mut fetch = vec![0; HEADER_BYTES + WATCH_RECORD_BYTES * WATCH_RING_RECORDS];
+    fetch[12..16].copy_from_slice(&WATCH_FETCH.to_le_bytes());
+    fetch[32..36].copy_from_slice(&(WATCH_RING_RECORDS as u32).to_le_bytes());
+    observation.fetch(&mut fetch).unwrap();
+    assert_eq!(word(&fetch, 32), 1);
+    assert_eq!(quad(&fetch, HEADER_BYTES), 1);
+    assert_eq!(quad(&fetch, HEADER_BYTES + 24), 0x1000);
+    observation.capture(
+        ContextRecord {
+            rip: 0x1150,
+            ..accepted
+        },
+        None,
+    );
+    let mut snapshot = vec![0; HEADER_BYTES + CONTEXT_RECORD_BYTES];
+    snapshot[12..16].copy_from_slice(&CONTEXT_SNAPSHOT.to_le_bytes());
+    snapshot[32..36].copy_from_slice(&1_u32.to_le_bytes());
+    observation.fetch(&mut snapshot).unwrap();
+    assert_eq!(word(&snapshot, 32), 1);
+    assert_eq!(quad(&snapshot, HEADER_BYTES + 24), 0x1150);
+    filter[12..16].copy_from_slice(&CONTEXT_FILTER_SET.to_le_bytes());
+    observation.set_filter(&filter, false).unwrap();
+    observation.capture(
+        ContextRecord {
+            rip: 0x1150,
+            ..accepted
+        },
+        None,
+    );
+    let mut cached = vec![0; HEADER_BYTES + CONTEXT_RECORD_BYTES];
+    cached[32..36].copy_from_slice(&1_u32.to_le_bytes());
+    cached[64..72].copy_from_slice(&1_u64.to_le_bytes());
+    observation.get_context(&mut cached).unwrap();
+    assert_eq!(quad(&cached, HEADER_BYTES + 24), 0x1150);
+    observation.reset_filters();
+    observation.capture(
+        ContextRecord {
+            rip: 0x1150,
+            ..accepted
+        },
+        Some(0),
+    );
+    fetch[32..36].copy_from_slice(&(WATCH_RING_RECORDS as u32).to_le_bytes());
+    observation.fetch(&mut fetch).unwrap();
+    assert_eq!(word(&fetch, 32), 2);
+}
+
+#[test]
+fn invalid_filter_updates_preserve_the_previous_filter_and_cached_context() {
+    let mut scenario = Scenario::new();
+    let mut observation = observer(&mut scenario);
+    observation.context_enabled = true;
+    let mut filter = vec![0; HEADER_BYTES];
+    filter[12..16].copy_from_slice(&CONTEXT_FILTER_SET.to_le_bytes());
+    filter[24..32].copy_from_slice(&0x3000_u64.to_le_bytes());
+    observation.set_filter(&filter, false).unwrap();
+    filter[24..32].copy_from_slice(&0x8000_0000_0000_u64.to_le_bytes());
+    assert_eq!(observation.set_filter(&filter, false), Err(Error::Bounds));
+    observation.capture(
+        ContextRecord {
+            rip: 0x1000,
+            thread_teb: 0x3000,
+            ..Default::default()
+        },
+        None,
+    );
+    observation.capture(
+        ContextRecord {
+            rip: 0x2000,
+            thread_teb: 0x4000,
+            ..Default::default()
+        },
+        None,
+    );
+    let mut cached = vec![0; HEADER_BYTES + CONTEXT_RECORD_BYTES];
+    cached[32..36].copy_from_slice(&1_u32.to_le_bytes());
+    cached[64..72].copy_from_slice(&1_u64.to_le_bytes());
+    observation.get_context(&mut cached).unwrap();
+    assert_eq!(quad(&cached, HEADER_BYTES + 64), 0x3000);
+    cached[64..72].copy_from_slice(&2_u64.to_le_bytes());
+    assert_eq!(observation.get_context(&mut cached), Err(Error::Session));
+}
 use protocol::memory::*;
 
 fn observer(scenario: &mut Scenario) -> Box<Observation> {
@@ -13,6 +149,7 @@ fn observer(scenario: &mut Scenario) -> Box<Observation> {
 fn query(operation: u32, count: usize, cursor: u64) -> Vec<u8> {
     let size = match operation {
         WATCH_FETCH => WATCH_RECORD_BYTES,
+        EVENT_FETCH => EVENT_RECORD_BYTES,
         STACK_WALK => 16,
         _ => CONTEXT_RECORD_BYTES,
     };
@@ -407,4 +544,218 @@ fn legacy_sessions_route_debug_and_syscall_slots_independently() {
     hardware::write(GUEST_RIP, 0xffff800000400000).unwrap();
     assert_eq!(scenario.exit(0, 2), 1);
     assert_eq!(hardware::read(GUEST_RIP), Ok(0x402000));
+}
+
+#[test]
+fn event_snapshots_freeze_stack_code_and_selected_bytes_and_report_overwrites() {
+    let mut scenario = Scenario::new();
+    let mut observer = observer(&mut scenario);
+    observer.events.reset();
+    let mut setup = vec![0; HEADER_BYTES + 16];
+    setup[32..36].copy_from_slice(&1u32.to_le_bytes());
+    setup[48..56].copy_from_slice(&(1u64 << 14).to_le_bytes());
+    setup[HEADER_BYTES..HEADER_BYTES + 8].copy_from_slice(&0x500000u64.to_le_bytes());
+    setup[HEADER_BYTES + 8..].copy_from_slice(&8u64.to_le_bytes());
+    observer.events.config = EventConfig::parse(&setup, false).unwrap();
+    for (address, value) in [
+        (0x3000, 0x10007),
+        (0x10000, 0x87),
+        (0x700010, 0x12345678),
+        (0x500000, 0xfedcba98),
+        (0x401000, 0xc3),
+    ] {
+        hardware::original_value(address, 8, Some(value));
+    }
+    for (field, value) in [
+        (GUEST_RIP, 0x401000),
+        (GUEST_RSP, 0x700010),
+        (GUEST_CS_SELECTOR, 3),
+        (VM_EXIT_INTR_INFO, 0x80000b0e),
+        (VM_EXIT_INTR_ERROR_CODE, 5),
+        (EXCEPTION_BITMAP, 1 << 6),
+    ] {
+        hardware::write(field, value).unwrap();
+    }
+    assert_eq!(scenario.call(1), 0);
+    assert_eq!(
+        hardware::read(EXCEPTION_BITMAP).unwrap() & (1 << 14 | 1 << 6),
+        1 << 14 | 1 << 6
+    );
+    assert_eq!(scenario.exit(0, 0x800123), 0);
+    hardware::original_value(0x700010, 8, Some(0));
+    hardware::original_value(0x500000, 8, Some(0));
+    hardware::original_value(0x401000, 8, Some(0));
+    let mut packet = query(EVENT_FETCH, 1, 0);
+    observer.events.fetch(&mut packet).unwrap();
+    let event = &packet[HEADER_BYTES..];
+    assert_eq!(quad(event, CONTEXT_RECORD_BYTES), EVENT_EXCEPTION);
+    assert_eq!(quad(event, CONTEXT_RECORD_BYTES + 32), 5);
+    assert_eq!(quad(event, CONTEXT_RECORD_BYTES + 48), 0x800123);
+    let code = EVENT_RECORD_HEADER + EVENT_SEGMENT_HEADER;
+    let stack = code + EVENT_CODE_BYTES + EVENT_SEGMENT_HEADER;
+    let region = stack + EVENT_STACK_BYTES + EVENT_SEGMENT_HEADER;
+    assert_eq!(quad(event, code), 0xc3);
+    assert_eq!(quad(event, stack), 0x12345678);
+    assert_eq!(quad(event, region), 0xfedcba98);
+    for _ in 0..EVENT_RING_RECORDS {
+        assert_eq!(scenario.exit(0, 0x800123), 0);
+    }
+    let mut peek = query(EVENT_FETCH, 0, 0);
+    observer.events.fetch(&mut peek).unwrap();
+    assert_eq!(quad(&peek, 96), 2);
+    assert_eq!(quad(&peek, 104), EVENT_RING_RECORDS as u64 + 1);
+    scenario.session.active.store(0, Ordering::Release);
+    assert_eq!(scenario.call(1), 0);
+    assert_eq!(hardware::read(EXCEPTION_BITMAP), Ok(1 << 6));
+}
+
+#[test]
+fn probes_pair_recursion_migration_and_shared_returns_and_keep_handled_exceptions_open() {
+    use memory::observation::Event;
+    let mut scenario = Scenario::new();
+    let mut observer = observer(&mut scenario);
+    let mut setup = vec![0; HEADER_BYTES + 32];
+    setup[44..48].copy_from_slice(&2u32.to_le_bytes());
+    for (descriptor, (address, kind)) in setup[HEADER_BYTES..]
+        .chunks_exact_mut(16)
+        .zip([(0x401000u64, EVENT_ENTRY), (0x402000u64, EVENT_RETURN)])
+    {
+        descriptor[..8].copy_from_slice(&address.to_le_bytes());
+        descriptor[8..].copy_from_slice(&kind.to_le_bytes());
+    }
+    observer.events.config = EventConfig::parse(&setup, false).unwrap();
+    let context = ContextRecord {
+        cpu: 0,
+        cpl: 3,
+        thread_teb: 0x500000,
+        ..Default::default()
+    };
+    let mut events = Vec::new();
+    let mut hit = |kind, rip, rsp, cpu, return_rip| {
+        observer.events.correlate(
+            ContextRecord {
+                rip,
+                rsp,
+                cpu,
+                ..context
+            },
+            Event {
+                kind,
+                address: rip,
+                ..Event::default()
+            },
+            return_rip,
+            0x800000,
+            |event| events.push(event),
+        );
+    };
+    hit(EVENT_ENTRY, 0x401000, 0x701000, 0, 0x402000);
+    hit(EVENT_ENTRY, 0x401000, 0x700f00, 0, 0x402000);
+    hit(EVENT_EXCEPTION, 0x401005, 0x700e00, 1, 0);
+    hit(EVENT_CONTEXT, 0x402000, 0x700f08, 1, 0);
+    hit(EVENT_RETURN, 0x402000, 0x700f08, 1, 0);
+    hit(EVENT_ENTRY, 0x401000, 0x700f00, 1, 0x402000);
+    hit(EVENT_RETURN, 0x402000, 0x701008, 0, 0);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| (event.kind, event.invocation, event.parent))
+            .collect::<Vec<_>>(),
+        [
+            (EVENT_ENTRY, 1, 0),
+            (EVENT_ENTRY, 2, 1),
+            (EVENT_EXCEPTION, 2, 1),
+            (EVENT_CONTEXT, 2, 1),
+            (EVENT_RETURN, 2, 1),
+            (EVENT_ENTRY, 3, 1),
+            (EVENT_ABANDON, 3, 1),
+            (EVENT_RETURN, 1, 0)
+        ]
+    );
+}
+
+#[test]
+fn coincident_watch_and_redirect_capture_the_original_guest_frame() {
+    let mut scenario = Scenario::new();
+    let mut observation = observer(&mut scenario);
+    observation.watch_count = 1;
+    observation.watch[0] = WatchTarget {
+        address: 0x600008,
+        control: 9,
+    };
+    for (field, value) in [
+        (GUEST_RIP, 0x400000),
+        (GUEST_RFLAGS, 0x202),
+        (VM_EXIT_INTR_INFO, 0x80000301),
+    ] {
+        hardware::write(field, value).unwrap();
+    }
+    assert_eq!(scenario.call(1), 0);
+    assert_eq!(scenario.exit(0, 3), 1);
+    assert_eq!(hardware::read(GUEST_RIP), Ok(0x400100));
+    let mut packet = query(EVENT_FETCH, 1, 0);
+    observation.events.fetch(&mut packet).unwrap();
+    let event = &packet[HEADER_BYTES..];
+    assert_eq!(quad(event, CONTEXT_RECORD_BYTES), EVENT_WATCH);
+    assert_eq!(quad(event, 24), 0x400000);
+    assert_eq!(quad(event, 48), 0x202);
+}
+
+#[test]
+fn execution_probe_debug_exits_publish_a_paired_invocation() {
+    let mut scenario = Scenario::new();
+    scenario.session.configuration.get_mut().debug_count = 0;
+    let mut observation = observer(&mut scenario);
+    let entry = 0x401000u64;
+    let continuation = 0x402000u64;
+    let stack = 0x701000u64;
+    let teb = 0x500000u64;
+    let mut setup = vec![0; HEADER_BYTES + 32];
+    setup[44..48].copy_from_slice(&2u32.to_le_bytes());
+    for (descriptor, (address, kind)) in setup[HEADER_BYTES..]
+        .chunks_exact_mut(16)
+        .zip([(entry, EVENT_ENTRY), (continuation, EVENT_RETURN)])
+    {
+        descriptor[..8].copy_from_slice(&address.to_le_bytes());
+        descriptor[8..].copy_from_slice(&kind.to_le_bytes());
+    }
+    observation.events.config = EventConfig::parse(&setup, false).unwrap();
+    for (address, value) in [
+        (0x3000, 0x10007),
+        (0x10000, 0x87),
+        (stack, continuation),
+        (teb + 8, 0x702000),
+    ] {
+        hardware::original_value(address, 8, Some(value));
+    }
+    for (field, value) in [
+        (GUEST_RIP, entry),
+        (GUEST_RSP, stack),
+        (GUEST_GS_BASE, teb),
+        (GUEST_CS_SELECTOR, 3),
+        (VM_EXIT_INTR_INFO, 0x80000301),
+    ] {
+        hardware::write(field, value).unwrap();
+    }
+    assert_eq!(scenario.call(1), 0);
+    assert_eq!(hardware::debug_registers()[..2], [entry, continuation]);
+    assert_eq!(scenario.exit(0, 1), 1);
+    assert_eq!(hardware::read(GUEST_RIP), Ok(entry));
+
+    hardware::write(GUEST_RIP, continuation).unwrap();
+    hardware::write(GUEST_RSP, stack + 8).unwrap();
+    assert_eq!(scenario.call(1), 0);
+    assert_eq!(scenario.exit(0, 2), 1);
+    assert_eq!(hardware::read(GUEST_RIP), Ok(continuation));
+    let mut packet = query(EVENT_FETCH, 2, 0);
+    observation.events.fetch(&mut packet).unwrap();
+    assert_eq!(word(&packet, 32), 2);
+    let first = HEADER_BYTES + CONTEXT_RECORD_BYTES;
+    let second = first + EVENT_RECORD_BYTES;
+    assert_eq!(
+        (quad(&packet, first), quad(&packet, second)),
+        (EVENT_ENTRY, EVENT_RETURN)
+    );
+    assert_eq!(quad(&packet, first + 8), 1);
+    assert_eq!(quad(&packet, second + 8), 1);
 }

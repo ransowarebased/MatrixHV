@@ -1,6 +1,10 @@
-use crate::server::protocol::{Request, RequestKind, Response, read_response, write_request};
+use crate::server::protocol::{
+    DEFAULT_EXEC_TIMEOUT_MS, ProtocolError, Request, RequestKind, Response, read_response,
+    write_request,
+};
 use crate::server::{self, DEFAULT_LISTEN_ADDRESS, ServerExit};
-use crate::{matrix, startup, telemetry};
+use crate::{matrix, output, startup, telemetry};
+use serde_json::json;
 use std::io::{self, BufRead, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -15,7 +19,10 @@ enum Action {
     Serve,
     Ping,
     Status,
-    Exec(Vec<String>),
+    Exec {
+        arguments: Vec<String>,
+        timeout_ms: u64,
+    },
     Update(Option<PathBuf>),
     Telemetry(telemetry::CaptureOptions),
     TelemetryControl(telemetry::Control),
@@ -43,31 +50,53 @@ struct RemoteStatus {
     binary_fingerprint: String,
 }
 
-pub fn run(arguments: Vec<String>) -> Result<i32, String> {
-    if matches!(
-        arguments.first().map(String::as_str),
-        Some("watch" | "context" | "syscall")
-    ) {
-        return crate::memory::run_observation(&arguments);
+pub fn run(mut arguments: Vec<String>) -> Result<i32, String> {
+    output::begin(&mut arguments);
+    if output::is_json()
+        && arguments
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+        && !arguments.iter().any(|argument| argument == "exec")
+    {
+        return Err("--json requires a command result; use --help without --json".into());
     }
-    if matches!(
-        arguments.first().map(String::as_str),
-        Some("hook" | "debug-registers")
-    ) {
-        return crate::memory::run_interception(&arguments);
-    }
-    if arguments.first().map(String::as_str) == Some("ad-bitmap") {
-        return crate::memory::run_bitmap(&arguments);
-    }
-    if matches!(
-        arguments.first().map(String::as_str),
-        Some("read" | "write")
-    ) {
-        return crate::memory::run(&arguments);
+    if let Some((arguments, remote, timeout, timeout_ms)) = memory_options(&arguments)? {
+        if let Some(remote) = remote {
+            let status = transact(&remote, timeout, Request::Status)?;
+            ensure_kind(&status, RequestKind::Status)?;
+            if !status.success {
+                return Err(status.message);
+            }
+            let executable = status_field(&status.message, "executable_path")?;
+            let mut command = vec![executable.to_string()];
+            if output::is_json() {
+                command.push("--json".into());
+            }
+            command.extend(arguments);
+            let response = transact(
+                &remote,
+                timeout.max(Duration::from_millis(timeout_ms) + Duration::from_secs(10)),
+                Request::Exec {
+                    arguments: command,
+                    timeout_ms,
+                },
+            )?;
+            ensure_kind(&response, RequestKind::Exec)?;
+            return print_execution(response, true);
+        }
+        return run_memory(&arguments);
     }
     let Some(options) = parse_options(arguments)? else {
         return Ok(0);
     };
+    if output::is_json()
+        && matches!(
+            &options.action,
+            Action::Shell | Action::Serve | Action::ApplyUpdate(_) | Action::Matrix(_)
+        )
+    {
+        return Err("--json requires a noninteractive status, ping, telemetry, PT, memory, startup, update, or exec command".into());
+    }
     if let Some(path) = options.cleanup_path.as_deref() {
         startup::remove_stale_updater(path);
     }
@@ -76,6 +105,150 @@ pub fn run(arguments: Vec<String>) -> Result<i32, String> {
     } else {
         run_local(options.action, &options.listen_address)
     }
+}
+
+type MemoryOptions = (Vec<String>, Option<String>, Duration, u64);
+
+fn memory_options(arguments: &[String]) -> Result<Option<MemoryOptions>, String> {
+    let mut operands = Vec::new();
+    let mut remote = None;
+    let mut timeout = DEFAULT_TIMEOUT;
+    let mut timeout_ms = DEFAULT_EXEC_TIMEOUT_MS;
+    let mut timeout_given = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = &arguments[index];
+        if option == "exec" && operands.is_empty() {
+            return Ok(None);
+        }
+        if matches!(
+            option.as_str(),
+            "--remote" | "--timeout" | "--exec-timeout-ms"
+        ) {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| format!("{option} requires a value"))?;
+            match option.as_str() {
+                "--remote" => remote = Some(value.clone()),
+                "--timeout" => {
+                    timeout = Duration::from_secs(parse_duration(value, "--timeout", 3600)?);
+                    timeout_given = true;
+                }
+                _ => {
+                    timeout_ms = parse_duration(value, "--exec-timeout-ms", 3_600_000)?;
+                    timeout_given = true;
+                }
+            }
+            index += 2;
+        } else {
+            operands.push(option.clone());
+            index += 1;
+            if matches!(
+                option.as_str(),
+                "--output"
+                    | "--kernel-cr3"
+                    | "--kernel-image"
+                    | "--symbols"
+                    | "--pid"
+                    | "--cr3"
+                    | "--gva"
+                    | "--pages"
+                    | "--alternate-cr3"
+                    | "--lease-ms"
+                    | "--process"
+                    | "--pattern"
+                    | "--start"
+                    | "--end"
+                    | "--max-hits"
+                    | "--token"
+                    | "--dr3"
+                    | "--dr7-mask"
+                    | "--dr7-value"
+                    | "--thread-teb"
+            ) && index < arguments.len()
+            {
+                operands.push(arguments[index].clone());
+                index += 1;
+            }
+        }
+    }
+    if !matches!(
+        operands.first().map(String::as_str),
+        Some(
+            "read"
+                | "write"
+                | "watch"
+                | "context"
+                | "session"
+                | "syscall"
+                | "hook"
+                | "debug-registers"
+                | "ad-bitmap"
+                | "cpuid"
+                | "memmap"
+                | "modules"
+                | "scan"
+                | "disasm"
+        )
+    ) {
+        return Ok(None);
+    }
+    if remote.is_none() && timeout_given {
+        return Err("--timeout and --exec-timeout-ms require --remote".into());
+    }
+    Ok(Some((operands, remote, timeout, timeout_ms)))
+}
+
+fn parse_duration(value: &str, option: &str, maximum: u64) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| (1..=maximum).contains(value))
+        .ok_or_else(|| format!("{option} must be an integer in 1..={maximum}"))
+}
+
+fn run_memory(arguments: &[String]) -> Result<i32, String> {
+    if arguments
+        .first()
+        .is_some_and(|command| command == "session")
+        || matches!(
+            (
+                arguments.first().map(String::as_str),
+                arguments.get(1).map(String::as_str)
+            ),
+            (Some("watch"), Some("record"))
+        )
+    {
+        return crate::investigation::run(arguments);
+    }
+    if arguments
+        .first()
+        .is_some_and(|command| matches!(command.as_str(), "memmap" | "modules" | "scan" | "disasm"))
+    {
+        return crate::analysis_cli::run(arguments);
+    }
+    if matches!(
+        arguments.first().map(String::as_str),
+        Some("watch" | "context" | "syscall")
+    ) {
+        return crate::memory::run_observation(arguments);
+    }
+    if matches!(
+        arguments.first().map(String::as_str),
+        Some("hook" | "debug-registers" | "cpuid")
+    ) {
+        return crate::memory::run_interception(arguments);
+    }
+    if arguments.first().map(String::as_str) == Some("ad-bitmap") {
+        return crate::memory::run_bitmap(arguments);
+    }
+    if matches!(
+        arguments.first().map(String::as_str),
+        Some("read" | "write")
+    ) {
+        return crate::memory::run(arguments);
+    }
+    Err("unknown memory command".into())
 }
 
 #[cfg(target_os = "windows")]
@@ -130,11 +303,11 @@ fn run_local(action: Action, listen_address: &str) -> Result<i32, String> {
             Ok(0)
         }
         Action::Ping => {
-            println!("{}", server::ping_text());
+            output::text(&format!("{}\n", server::ping_text()))?;
             Ok(0)
         }
         Action::Status => {
-            print!("{}", server::status_text());
+            output::text(&server::status_text())?;
             Ok(0)
         }
         Action::Telemetry(options) => {
@@ -144,14 +317,14 @@ fn run_local(action: Action, listen_address: &str) -> Result<i32, String> {
             Ok(0)
         }
         Action::TelemetryControl(control) => {
-            print!(
-                "{}",
-                telemetry::request_text(telemetry::Mode::General as u32, control as u32)?
-            );
+            output::text(&telemetry::request_text(
+                telemetry::Mode::General as u32,
+                control as u32,
+            )?)?;
             Ok(0)
         }
         Action::IntelPt { operation, output } => {
-            print!("{}", telemetry::intel_pt(&operation, output.as_deref())?);
+            output::text(&telemetry::intel_pt(&operation, output.as_deref())?)?;
             Ok(0)
         }
         Action::TelemetryControlTrace(options) => {
@@ -170,7 +343,7 @@ fn run_local(action: Action, listen_address: &str) -> Result<i32, String> {
             startup::apply_windows_update(&target, listen_address)?;
             Ok(0)
         }
-        Action::Exec(_) | Action::Update(_) => {
+        Action::Exec { .. } | Action::Update(_) => {
             Err("the command requires --remote ADDRESS:PORT".to_string())
         }
     }
@@ -208,11 +381,17 @@ fn run_remote(remote: &str, timeout: Duration, action: Action) -> Result<i32, St
             if !response.success {
                 return Err(response.message);
             }
-            println!(
-                "{} time_ms={}",
-                response.message,
-                started.elapsed().as_millis()
-            );
+            if output::is_json() {
+                output::success(
+                    json!({"message": response.message, "time_ms": output::hex(started.elapsed().as_millis() as u64)}),
+                )?;
+            } else {
+                println!(
+                    "{} time_ms={}",
+                    response.message,
+                    started.elapsed().as_millis()
+                );
+            }
             Ok(0)
         }
         Action::Status => {
@@ -221,28 +400,23 @@ fn run_remote(remote: &str, timeout: Duration, action: Action) -> Result<i32, St
             if !response.success {
                 return Err(response.message);
             }
-            print!("{}", response.message);
+            output::text(&response.message)?;
             Ok(0)
         }
-        Action::Exec(arguments) => {
-            let response = transact(remote, timeout, Request::Exec { arguments })?;
+        Action::Exec {
+            arguments,
+            timeout_ms,
+        } => {
+            let response = transact(
+                remote,
+                timeout.max(Duration::from_millis(timeout_ms) + Duration::from_secs(10)),
+                Request::Exec {
+                    arguments,
+                    timeout_ms,
+                },
+            )?;
             ensure_kind(&response, RequestKind::Exec)?;
-            io::stdout()
-                .write_all(&response.stdout)
-                .map_err(|error| format!("failed to write process stdout: {error}"))?;
-            io::stderr()
-                .write_all(&response.stderr)
-                .map_err(|error| format!("failed to write process stderr: {error}"))?;
-            if !response.message.is_empty() && !response.success {
-                if let Some(exit_code) = response.exit_code {
-                    eprintln!("{} exit_code={exit_code}", response.message);
-                } else {
-                    eprintln!("{}", response.message);
-                }
-            }
-            Ok(response
-                .exit_code
-                .unwrap_or(if response.success { 0 } else { 1 }))
+            print_execution(response, false)
         }
         Action::Update(binary_path) => {
             let status_before = remote_status(remote, timeout)?;
@@ -264,13 +438,19 @@ fn run_remote(remote: &str, timeout: Duration, action: Action) -> Result<i32, St
                 status_before.process_id,
                 &expected_fingerprint,
             )?;
-            println!(
-                "{} source={} process_id={} fingerprint={}",
-                response.message,
-                path.display(),
-                status_after.process_id,
-                status_after.binary_fingerprint
-            );
+            if output::is_json() {
+                output::success(
+                    json!({"message": response.message, "source": path, "process_id": status_after.process_id, "binary_fingerprint": status_after.binary_fingerprint}),
+                )?;
+            } else {
+                println!(
+                    "{} source={} process_id={} fingerprint={}",
+                    response.message,
+                    path.display(),
+                    status_after.process_id,
+                    status_after.binary_fingerprint
+                );
+            }
             Ok(0)
         }
         Action::Telemetry(options) => {
@@ -305,7 +485,7 @@ fn run_remote(remote: &str, timeout: Duration, action: Action) -> Result<i32, St
             if !response.success {
                 return Err(response.message);
             }
-            print!("{}", response.message);
+            output::text(&response.message)?;
             Ok(0)
         }
         Action::Shell
@@ -319,12 +499,77 @@ fn run_remote(remote: &str, timeout: Duration, action: Action) -> Result<i32, St
     }
 }
 
+fn print_execution(response: Response, self_command: bool) -> Result<i32, String> {
+    let exit_code = response
+        .exit_code
+        .unwrap_or(if response.success { 0 } else { 1 });
+    if output::is_json() {
+        if self_command
+            && !response.stdout.is_empty()
+            && !response.message.starts_with("process timed out")
+        {
+            let invalid_output = |message| {
+                output::set_error("REMOTE_OUTPUT_INVALID", false);
+                message
+            };
+            let mut rows = Vec::new();
+            for line in response.stdout.split(|&byte| byte == b'\n') {
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                let row: serde_json::Value = serde_json::from_slice(line).map_err(|error| {
+                    invalid_output(format!(
+                        "remote command did not return complete JSON rows: {error}"
+                    ))
+                })?;
+                let ok = row
+                    .get("ok")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| invalid_output("remote JSON row has no result status".into()))?;
+                rows.push((row, ok));
+            }
+            if rows.last().map(|(_, ok)| *ok) != Some(response.success) {
+                return Err(invalid_output(
+                    "remote JSON result does not match the process exit status".into(),
+                ));
+            }
+            for (row, _) in rows {
+                output::write(&row)?;
+            }
+        } else {
+            let data = json!({"exit_code": response.exit_code, "stdout": String::from_utf8_lossy(&response.stdout), "stderr": String::from_utf8_lossy(&response.stderr), "stdout_may_be_truncated": response.stdout.len() >= 16 * 1024 * 1024, "stderr_may_be_truncated": response.stderr.len() >= 16 * 1024 * 1024});
+            if response.success {
+                output::success(data)?;
+            } else {
+                let (code, _) = output::classify(&response.message);
+                output::partial(data, code, &response.message)?;
+            }
+        }
+    } else {
+        io::stdout()
+            .write_all(&response.stdout)
+            .map_err(|error| format!("failed to write process stdout: {error}"))?;
+        io::stderr()
+            .write_all(&response.stderr)
+            .map_err(|error| format!("failed to write process stderr: {error}"))?;
+        if !response.success {
+            eprintln!("{} exit_code={exit_code}", response.message);
+        }
+    }
+    Ok(exit_code)
+}
+
 fn transact(remote: &str, timeout: Duration, request: Request) -> Result<Response, String> {
+    output::clear_error();
     let addresses: Vec<_> = remote
         .to_socket_addrs()
-        .map_err(|error| format!("invalid remote address {remote}: {error}"))?
+        .map_err(|error| {
+            output::set_error("INVALID_REMOTE_ADDRESS", false);
+            format!("invalid remote address {remote}: {error}")
+        })?
         .collect();
     if addresses.is_empty() {
+        output::set_error("INVALID_REMOTE_ADDRESS", false);
         return Err(format!("remote address {remote} did not resolve"));
     }
     let mut last_error = None;
@@ -338,8 +583,10 @@ fn transact(remote: &str, timeout: Duration, request: Request) -> Result<Respons
             Err(error) => last_error = Some(error),
         }
     }
-    let mut stream = connected
-        .ok_or_else(|| format!("failed to connect to {remote}: {}", last_error.unwrap()))?;
+    let mut stream = connected.ok_or_else(|| {
+        output::set_error("CONNECTION_FAILED", true);
+        format!("failed to connect to {remote}: {}", last_error.unwrap())
+    })?;
     stream
         .set_nodelay(true)
         .map_err(|error| format!("failed to configure TCP_NODELAY: {error}"))?;
@@ -350,9 +597,10 @@ fn transact(remote: &str, timeout: Duration, request: Request) -> Result<Respons
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("failed to configure write timeout: {error}"))?;
     let request_id = request_id();
-    write_request(&mut stream, request_id, &request).map_err(|error| error.to_string())?;
-    let (response_id, response) = read_response(&mut stream).map_err(|error| error.to_string())?;
+    write_request(&mut stream, request_id, &request).map_err(transport_error)?;
+    let (response_id, response) = read_response(&mut stream).map_err(transport_error)?;
     if response_id != request_id {
+        output::set_error("PROTOCOL_ERROR", false);
         return Err(format!(
             "response request id mismatch: expected {request_id}, received {response_id}"
         ));
@@ -360,10 +608,28 @@ fn transact(remote: &str, timeout: Duration, request: Request) -> Result<Respons
     Ok(response)
 }
 
+fn transport_error(error: ProtocolError) -> String {
+    let code = match &error {
+        ProtocolError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            "CONNECTION_TIMEOUT"
+        }
+        ProtocolError::Io(_) => "CONNECTION_LOST",
+        _ => "PROTOCOL_ERROR",
+    };
+    output::set_error(code, false);
+    error.to_string()
+}
+
 fn ensure_kind(response: &Response, expected: RequestKind) -> Result<(), String> {
     if response.request_kind == expected {
         Ok(())
     } else {
+        output::set_error("PROTOCOL_ERROR", false);
         Err(format!(
             "response kind mismatch: expected {expected:?}, received {:?}",
             response.request_kind
@@ -463,6 +729,8 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
     let mut remote = None;
     let mut timeout = DEFAULT_TIMEOUT;
     let mut timeout_given = false;
+    let mut exec_timeout_ms = DEFAULT_EXEC_TIMEOUT_MS;
+    let mut exec_timeout_given = false;
     let mut listen_address = DEFAULT_LISTEN_ADDRESS.to_string();
     let mut listen_given = false;
     let mut cleanup_path = None;
@@ -499,6 +767,17 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
                 }
                 timeout = Duration::from_secs(timeout_seconds);
                 timeout_given = true;
+            }
+            "--exec-timeout-ms" => {
+                index += 1;
+                exec_timeout_ms = parse_duration(
+                    arguments
+                        .get(index)
+                        .ok_or("--exec-timeout-ms requires milliseconds")?,
+                    "--exec-timeout-ms",
+                    3_600_000,
+                )?;
+                exec_timeout_given = true;
             }
             "--listen" => {
                 index += 1;
@@ -708,7 +987,10 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
                     output,
                 })
             }
-            Some("exec") if positional.len() >= 2 => Action::Exec(positional[1..].to_vec()),
+            Some("exec") if positional.len() >= 2 => Action::Exec {
+                arguments: positional[1..].to_vec(),
+                timeout_ms: exec_timeout_ms,
+            },
             Some("exec") => return Err("exec requires an executable".to_string()),
             Some(command) => return Err(format!("unknown command or extra argument: {command}")),
             None if remote.is_some() => Action::Status,
@@ -754,6 +1036,9 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
     if remote.is_none() && timeout_given {
         return Err("--timeout requires --remote".to_string());
     }
+    if exec_timeout_given && !matches!(&action, Action::Exec { .. }) {
+        return Err("--exec-timeout-ms requires exec or a remote memory command".into());
+    }
     if listen_given
         && !matches!(
             &action,
@@ -772,6 +1057,12 @@ fn parse_options(arguments: Vec<String>) -> Result<Option<Options>, String> {
 }
 
 fn print_usage() {
+    println!(
+        "neo cpuid set CR3 [--token TOKEN] --record LEAF SUBLEAF MASK EAX EBX ECX EDX KEEP_EAX KEEP_EBX KEEP_ECX KEEP_EDX [--record ...] [--dr3 ADDRESS --dr7-mask MASK --dr7-value VALUE] [--alternate-cr3 CR3] [--lease-ms MS | --no-lease] [--tsc-offset]\nneo cpuid clear TOKEN | cpuid status\nneo memmap PID|NAME CR3|auto [--resident] [--output PATH]\nneo modules PID|NAME CR3|auto [--sections] [--exports] [--output PATH]\nneo scan PID|NAME CR3|auto --pattern \"48 8B ??\" [--start ADDRESS --end ADDRESS] [--max-hits COUNT] [--disasm] [--output PATH]\nneo disasm PID|NAME CR3|auto ADDRESS SIZE [--output PATH]\nneo read PID|NAME CR3|auto ADDRESS SIZE [--disasm]\nneo watch|context filter TOKEN [--thread-teb TEB] [--rip-include START END] [--rip-exclude START END]\nneo watch fetch TOKEN CPU CURSOR COUNT [--process PID|NAME] [--disasm] [--unwind]\nneo context snapshot TOKEN CPU CURSOR COUNT [--process PID|NAME] [--disasm] [--unwind]\nneo context stack TOKEN CPU SEQUENCE COUNT --unwind [--process PID|NAME]\nneo session set CR3 TOKEN [--sample] [--exceptions MASK] [--region ADDRESS SIZE ...] [--entry ADDRESS --return ADDRESS ...] [--exception-dispatch ADDRESS] [--no-lease | --lease-ms MS]\nneo session clear TOKEN\nneo session record TOKEN --output FILE.jsonl [--seconds N] [--interval-ms N] [--cpu CPU] [--process PID|NAME] [--disasm] [--unwind]\nneo watch record TOKEN --output FILE.jsonl [--seconds N] [--interval-ms N] [--cpu CPU] [--process PID|NAME] [--disasm] [--unwind]\nneo session query FILE.jsonl [--kind KIND] [--cpu CPU] [--sequence N] [--thread-teb TEB] [--invocation ID] [--limit N] [--disasm] [--unwind]\nneo session tree FILE.jsonl [--thread-teb TEB]\nUnwind options include --frames N, --dynamic-list HEAD, and repeatable --table BASE START END ADDRESS COUNT (sorted AMD64 runtime functions). Capture code, function tables and unwind metadata with --region for offline analysis.\nAnalysis accepts --kernel-cr3 CR3 --kernel-image PATH --symbols DIRECTORY, --json and --remote HOST:PORT. Paths refer to the target host.\nADDRESS accepts integers, module!export (including forwarded exports and #ordinals), and module+offset. Symbolic interception addresses require --process PID|NAME.\n--private-shared-data requires a full 4096-byte hook patch at 0x7ffe0000 and a lease; VMFUNC, concurrent writes, persistent data and data-shadow on that page are incompatible.\nCPUID gates are optional on updated hypervisors; specify all three DR options to enable gating. Keep masks preserve native bits before replacement values are ORed.\nFilters use exclusive range ends, exclusions win, and an empty filter clears restrictions. Filters persist within the session and affect future captures. Watch RIP is post-instruction.\nEvent snapshots retain 32 instruction bytes, up to 2048 stack bytes and four selected regions of up to 1024 bytes each. Peer CPUs can still modify shared memory during the VM exit. Probes require an entry address and the caller continuation address after CALL. They share the four debug slots with watchpoints and redirects. Hardware exceptions use a bit mask by x86 vector. --exception-dispatch accepts the address of native AMD64 RtlDispatchException and records the dispatched Windows exception. AMD64 unwind supports version 1 PE and dynamic tables. A missing snapshot range stops unwind with a partial stack. Legacy context stack on older EFI uses live reads and labels them accordingly.\n"
+    );
+    println!(
+        "Use --json with status, ping, telemetry, PT, memory, startup, update, or remote exec. JSON results use {{\"ok\":true,\"data\":...}} or {{\"ok\":false,\"error\":{{\"code\":...,\"message\":...,\"retryable\":...}}}}. All u64 values use fixed-width hexadecimal strings. Telemetry emits one JSON object per sample (JSONL), including --output files. Memory commands accept --remote ADDRESS:PORT; paths refer to the remote host. Use --exec-timeout-ms 1..3600000 before exec, or anywhere with remote memory commands (default 290000 ms). The server terminates the process tree on timeout. Socket waits allow the execution deadline plus cleanup time.\n"
+    );
     println!(
         "neo telemetry --benchmark [--seconds 1..3600] [--interval-ms 50..60000] [--output FILE]\nBenchmark measures CPUID leaf 0 from guest to guest, including VM exit, handling and reentry.\nIt pins each available registered CPU and reports raw/calibrated TSC ticks, nanoseconds and min/mean/p50/p95/p99/max.\nCollection settings stay unchanged; compare telemetry disabled/enabled in separate runs.\nAn invariant TSC and clock diagnostics are required; release profiles using TSC compensation first.\nWith --remote, the benchmark runs on the remote server.\n"
     );

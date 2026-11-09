@@ -179,13 +179,15 @@ pub fn install(listen_address: &str) -> Result<(), String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("failed to resolve the neo executable: {error}"))?;
     install_platform(&executable, listen_address)?;
-    println!("neo user-mode startup installed for {listen_address}");
+    crate::output::text(&format!(
+        "neo user-mode startup installed for {listen_address}\n"
+    ))?;
     Ok(())
 }
 
 pub fn uninstall() -> Result<(), String> {
     uninstall_platform()?;
-    println!("neo user-mode startup removed");
+    crate::output::text("neo user-mode startup removed\n")?;
     Ok(())
 }
 

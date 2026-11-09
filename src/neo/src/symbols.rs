@@ -462,6 +462,27 @@ pub struct Process {
     pub name: String,
     pub kernel_cr3: u64,
     pub user_cr3: u64,
+    pub peb: u64,
+    pub wow64: bool,
+}
+
+impl Process {
+    pub fn user_root(&self) -> u64 {
+        if self.user_cr3 != 0 {
+            self.user_cr3
+        } else {
+            self.kernel_cr3
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryRegion {
+    pub start: u64,
+    pub end: u64,
+    pub protection: u32,
+    pub private: bool,
+    pub committed: Option<bool>,
 }
 
 pub struct KernelSymbols {
@@ -476,6 +497,8 @@ pub struct KernelSymbols {
     name_bytes: usize,
     directory_offset: usize,
     user_directory_offset: Option<usize>,
+    peb_offset: usize,
+    wow64_offset: Option<usize>,
     pub soft_layout: SoftPteLayout,
 }
 
@@ -548,12 +571,15 @@ impl KernelSymbols {
                 .fields
                 .get("UserDirectoryTableBase")
                 .map(|field| pcb + field.0),
+            peb_offset: field(&process, "Peb")?,
+            wow64_offset: process.fields.get("WoW64Process").map(|field| field.0),
         };
         for (offset, length) in [
             (result.pid_offset, 8),
             (result.links_offset, 16),
             (result.name_offset, name_bytes),
             (result.directory_offset, 8),
+            (result.peb_offset, 8),
         ] {
             if offset
                 .checked_add(length)
@@ -638,44 +664,29 @@ impl KernelSymbols {
                 .ok_or("VAD pointer underflow")?;
             let rows = read_ranges(process.kernel_cr3, &[(object, self.vad.bytes)])?;
             let row = &rows[0];
-            let start = (u64::from(word(row, self.vad.start_offset)?)
-                | (u64::from(row[self.vad.start_high_offset]) << 32))
-                << 12;
-            let end = (((u64::from(word(row, self.vad.end_offset)?)
-                | (u64::from(row[self.vad.end_high_offset]) << 32))
-                + 1)
-                << 12)
-                - 1;
-            if start > end || end >> 63 != 0 {
-                return Err("invalid VAD address range".into());
-            }
-            if address < start {
+            let region = self.vad.region(row)?;
+            if address < region.start {
                 node = quad(row, self.vad.node_offset + self.vad.left_offset)?;
-            } else if address > end {
+            } else if address >= region.end {
                 node = quad(row, self.vad.node_offset + self.vad.right_offset)?;
             } else {
-                let flags = u64::from(word(row, self.vad.flags_offset)?);
-                let committed = match self.vad.commit {
-                    VadCommit::Flag { offset, mask } => u64::from(word(row, offset)?) & mask != 0,
-                    VadCommit::Charge {
-                        offset,
-                        high_offset,
-                    } => {
-                        let charge =
-                            u64::from(word(row, offset)?) | (u64::from(row[high_offset]) << 32);
-                        charge == ((end - start) >> 12) + 1
-                    }
-                };
-                if end_address > end || flags & self.vad.private_mask == 0 || !committed {
-                    return Ok(None);
-                }
-                let protection = ((flags & self.vad.protection_mask)
-                    >> self.vad.protection_mask.trailing_zeros())
-                    as u32;
-                return Ok(Some(protection));
+                return Ok((end_address < region.end
+                    && region.private
+                    && region.committed == Some(true))
+                .then_some(region.protection));
             }
         }
         Err("VAD traversal exceeded its depth limit".into())
+    }
+
+    pub fn memory_map(&self, process: &Process) -> Result<Vec<MemoryRegion>, String> {
+        let root_address = process
+            .object
+            .checked_add(self.vad.root_offset as u64)
+            .ok_or("VAD root overflow")?;
+        self.vad.regions(root_address, &mut |address, length| {
+            Ok(read_ranges(process.kernel_cr3, &[(address, length)])?.remove(0))
+        })
     }
 
     pub fn resolve(
@@ -756,6 +767,13 @@ impl KernelSymbols {
                     name,
                     kernel_cr3: directory,
                     user_cr3: user_directory,
+                    peb: quad(row, self.peb_offset)?,
+                    wow64: self
+                        .wow64_offset
+                        .map(|offset| quad(row, offset))
+                        .transpose()?
+                        .unwrap_or(0)
+                        != 0,
                 });
                 if numeric.is_some() {
                     return matched.ok_or_else(|| "matched process is unavailable".into());
@@ -778,3 +796,99 @@ impl KernelSymbols {
         Err("process list traversal exceeded its bounded query limit".into())
     }
 }
+
+impl VadLayout {
+    fn region(&self, row: &[u8]) -> Result<MemoryRegion, String> {
+        let start = (u64::from(word(row, self.start_offset)?)
+            | u64::from(
+                *bytes_at(row, self.start_high_offset, 1)?
+                    .first()
+                    .ok_or("truncated VAD")?,
+            ) << 32)
+            << 12;
+        let end = ((u64::from(word(row, self.end_offset)?)
+            | u64::from(
+                *bytes_at(row, self.end_high_offset, 1)?
+                    .first()
+                    .ok_or("truncated VAD")?,
+            ) << 32)
+            + 1)
+            << 12;
+        if start >= end || (end - 1) >> 63 != 0 {
+            return Err("invalid VAD address range".into());
+        }
+        let flags = u64::from(word(row, self.flags_offset)?);
+        let private = flags & self.private_mask != 0;
+        let committed = if !private {
+            None
+        } else {
+            match self.commit {
+                VadCommit::Flag { offset, mask } => Some(u64::from(word(row, offset)?) & mask != 0),
+                VadCommit::Charge {
+                    offset,
+                    high_offset,
+                } => {
+                    let charge = u64::from(word(row, offset)?)
+                        | u64::from(
+                            *bytes_at(row, high_offset, 1)?
+                                .first()
+                                .ok_or("truncated VAD")?,
+                        ) << 32;
+                    if charge == 0 {
+                        Some(false)
+                    } else if charge == (end - start) >> 12 {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        Ok(MemoryRegion {
+            start,
+            end,
+            private,
+            committed,
+            protection: ((flags & self.protection_mask) >> self.protection_mask.trailing_zeros())
+                as u32,
+        })
+    }
+
+    fn regions(
+        &self,
+        root_address: u64,
+        reader: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, String>,
+    ) -> Result<Vec<MemoryRegion>, String> {
+        let root = reader(root_address, 8)?;
+        let mut pending = vec![quad(&root, 0)?];
+        let mut visited = HashSet::new();
+        let mut regions = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node == 0 {
+                continue;
+            }
+            if node >> 63 == 0 || node & 7 != 0 || !visited.insert(node) || visited.len() > 262_144
+            {
+                return Err("invalid, changing, or oversized VAD tree; retry the query".into());
+            }
+            let object = node
+                .checked_sub(self.node_offset as u64)
+                .ok_or("VAD pointer underflow")?;
+            let row = reader(object, self.bytes)?;
+            regions.push(self.region(&row)?);
+            pending.push(quad(&row, self.node_offset + self.right_offset)?);
+            pending.push(quad(&row, self.node_offset + self.left_offset)?);
+        }
+        regions.sort_by_key(|region| region.start);
+        if regions.windows(2).any(|pair| pair[0].end > pair[1].start)
+            || quad(&reader(root_address, 8)?, 0)? != quad(&root, 0)?
+        {
+            return Err("VAD tree changed during enumeration; retry the query".into());
+        }
+        Ok(regions)
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/neo_symbols_tests.rs"]
+mod tests;

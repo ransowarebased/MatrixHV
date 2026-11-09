@@ -47,8 +47,10 @@ runtime = runtime[:start] + '''        if !no_flush && read(SECONDARY_VM_EXEC_CO
 assert 'core::arch::asm!' not in runtime
 engine = source[:source.index('pub(crate) trait InterceptionMemory')]
 engine = engine.replace('use crate::memory::access::{PhysicalMemory, page_mapping};', '')
+engine = engine.replace('use crate::memory::observation::{EventConfig, Observation};',
+                        'use crate::memory::observation::Observation;')
 engine = engine.replace('#[cfg(target_os = \"uefi\")]\nuse crate::memory::observation::ContextRecord;', 'use crate::memory::observation::ContextRecord;')
-for declaration in ['unsafe fn observer_mut(', 'fn has_features(']:
+for declaration in ['fn observer_ptr(', 'fn has_features(']:
     engine = engine.replace(item(engine, declaration), '')
 engine = re.sub(r'const OPTIONS: u32 = .*?;', '', engine, flags=re.S)
 # Split ownership is tested by the frontend harness. Keep its storage opaque
@@ -73,7 +75,36 @@ pub mod arch {
     }
 }
 pub mod memory {
-    pub mod access { include!("access.rs"); }
+    pub mod access {
+        include!("access.rs");
+        pub mod resident {
+            use super::{Error, PhysicalMemory};
+            use crate::vmx::resident::abi::ResidentBootContext;
+            use crate::memory::interception::RoadEptProfile;
+            pub struct Environment { pub guest_cr4: u64, pub physical_bits: u64 }
+            pub struct Memory<'a> { pub environment: &'a Environment }
+            pub fn event_environment(_: &ResidentBootContext) -> Environment {
+                Environment { guest_cr4: 0, physical_bits: 48 }
+            }
+            impl PhysicalMemory for Memory<'_> {
+                fn read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), Error> {
+                    assert_eq!(self.environment.physical_bits, 48);
+                    for (offset, byte) in bytes.iter_mut().enumerate() {
+                        *byte = crate::hardware::page_byte(address + offset as u64, None);
+                    }
+                    Ok(())
+                }
+                fn write(&mut self, _: u64, _: &[u8]) -> Result<(), Error> {
+                    Err(Error::Permission)
+                }
+            }
+            pub(crate) fn instruction_bytes_in(_: &Environment, _: &RoadEptProfile, _: u64,
+                execution: &mut [u8], original: &mut [u8]) -> usize {
+                original.copy_from_slice(execution);
+                execution.len()
+            }
+        }
+    }
     pub mod observation { include!("../../src/memory/observation.rs"); }
     pub mod interception {
 ''' + engine + '''

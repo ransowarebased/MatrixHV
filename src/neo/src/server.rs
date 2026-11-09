@@ -1,10 +1,11 @@
 use self::protocol::{Request, RequestKind, Response, read_request, write_response};
+use crate::process::ProcessTree;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_LISTEN_ADDRESS: &str = "0.0.0.0:4040";
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -138,7 +139,10 @@ pub(crate) fn handle_connection(
     let (response, update) = match request {
         Request::Ping => (Response::success(RequestKind::Ping, "pong"), None),
         Request::Status => (Response::success(RequestKind::Status, status_text()), None),
-        Request::Exec { arguments } => (execute(arguments), None),
+        Request::Exec {
+            arguments,
+            timeout_ms,
+        } => (execute(arguments, timeout_ms), None),
         Request::Telemetry { mode, control } => {
             let response = match collect_telemetry(mode, control) {
                 Ok(snapshot) => Response::success(RequestKind::Telemetry, snapshot),
@@ -185,10 +189,46 @@ pub fn status_text() -> String {
         status.matrixhv_present,
         status.matrixhv_protocol,
     );
+    if let Ok(executable) = std::env::current_exe() {
+        text.push_str(&format!("executable_path={}\n", executable.display()));
+    }
+    text.push_str("road_protocol=1\nexec_timeout=true\nremote_memory_commands=true\n");
     text.push_str(&crate::telemetry::capability_status(
         status.matrixhv_present,
         status.matrixhv_protocol,
     ));
+    if status.matrixhv_present {
+        use neo::memory::{info_packet, invoke};
+        use neo::protocol::memory::{
+            AD_ENABLED, CPUID_PROFILE_CAPABILITY, CPUID_UNGATED_CAPABILITY, EVENT_CAPABILITY,
+            OBSERVATION_CAPABILITY, OBSERVATION_FILTER_CAPABILITY, PRIVATE_SHARED_DATA_CAPABILITY,
+            SYSCALL_PROFILE_CAPABILITY, word,
+        };
+        if let Ok(mut packet) = info_packet() {
+            if invoke(&mut packet).is_ok() {
+                let flags = word(&packet, 72);
+                text.push_str(&format!(
+                    "memory_transport=true\nmemory_capabilities=0x{flags:x}\n"
+                ));
+                for (name, flag) in [
+                    ("memory_ad_tracking", AD_ENABLED),
+                    ("memory_cpuid_profile", CPUID_PROFILE_CAPABILITY),
+                    ("memory_private_shared_data", PRIVATE_SHARED_DATA_CAPABILITY),
+                    ("memory_syscall_profile", SYSCALL_PROFILE_CAPABILITY),
+                    ("memory_observation", OBSERVATION_CAPABILITY),
+                    ("memory_observation_filters", OBSERVATION_FILTER_CAPABILITY),
+                    ("memory_event_snapshots", EVENT_CAPABILITY),
+                    ("memory_cpuid_ungated", CPUID_UNGATED_CAPABILITY),
+                ] {
+                    text.push_str(&format!("{name}={}\n", flags & flag != 0));
+                }
+            } else {
+                text.push_str("memory_transport=false\n");
+            }
+        }
+    } else {
+        text.push_str("memory_transport=false\n");
+    }
     text
 }
 
@@ -217,44 +257,75 @@ pub fn ping_text() -> String {
     "pong".to_string()
 }
 
-pub(crate) fn execute(arguments: Vec<String>) -> Response {
+pub(crate) fn execute(arguments: Vec<String>, timeout_ms: u64) -> Response {
+    if !(1..=3_600_000).contains(&timeout_ms) {
+        return Response::failure(
+            RequestKind::Exec,
+            "invalid execution timeout; expected 1..=3600000 ms",
+        );
+    }
     let Some((program, program_arguments)) = arguments.split_first() else {
         return Response::failure(RequestKind::Exec, "no executable was provided");
     };
     let output = (|| -> io::Result<_> {
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(program_arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        let (mut child, tree) = ProcessTree::spawn(&mut command)?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
         std::thread::scope(|scope| {
             let stdout = scope.spawn(move || capture_stream(&mut stdout));
             let stderr = scope.spawn(move || capture_stream(&mut stderr));
-            let status = child.wait();
+            let mut status = None;
+            let wait = (|| -> io::Result<bool> {
+                loop {
+                    if status.is_none() {
+                        status = child.try_wait()?;
+                    }
+                    if status.is_some() && stdout.is_finished() && stderr.is_finished() {
+                        return Ok(false);
+                    }
+                    // Descendants may retain inherited pipes after the direct child exits.
+                    if Instant::now() >= deadline {
+                        return Ok(true);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })();
+            let terminated = tree.terminate();
+            drop(tree);
+            if status.is_none() {
+                let _ = child.kill();
+                status = Some(child.wait()?);
+            }
             let stdout = stdout
                 .join()
                 .map_err(|_| io::Error::other("stdout capture thread panicked"))?;
             let stderr = stderr
                 .join()
                 .map_err(|_| io::Error::other("stderr capture thread panicked"))?;
-            Ok((status?, stdout?, stderr?))
+            terminated?;
+            Ok((status.unwrap(), stdout?, stderr?, wait?))
         })
     })();
     match output {
-        Ok((status, stdout, stderr)) => {
-            let exit_code = status.code();
-            let success = status.success();
+        Ok((status, stdout, stderr, timed_out)) => {
+            let success = !timed_out && status.success();
             Response {
                 request_kind: RequestKind::Exec,
                 success,
-                exit_code,
-                message: if success {
-                    "process completed".to_string()
+                exit_code: if timed_out { Some(124) } else { status.code() },
+                message: if timed_out {
+                    format!("process timed out after {timeout_ms} ms")
+                } else if success {
+                    "process completed".into()
                 } else {
-                    "process failed".to_string()
+                    "process failed".into()
                 },
                 stdout,
                 stderr,
@@ -262,7 +333,7 @@ pub(crate) fn execute(arguments: Vec<String>) -> Response {
         }
         Err(error) => Response::failure(
             RequestKind::Exec,
-            format!("failed to start {program}: {error}"),
+            format!("failed to start or supervise {program}: {error}"),
         ),
     }
 }
@@ -418,6 +489,7 @@ pub mod protocol {
 
     const MAGIC: [u8; 4] = *b"ROAD";
     pub const PROTOCOL_VERSION: u16 = 1;
+    pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 290_000;
     pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
     const MAX_COMMAND_ARGUMENTS: usize = 4096;
     const HEADER_SIZE: usize = 20;
@@ -451,9 +523,17 @@ pub mod protocol {
     pub enum Request {
         Ping,
         Status,
-        Exec { arguments: Vec<String> },
-        Update { binary: Vec<u8> },
-        Telemetry { mode: u32, control: u32 },
+        Exec {
+            arguments: Vec<String>,
+            timeout_ms: u64,
+        },
+        Update {
+            binary: Vec<u8>,
+        },
+        Telemetry {
+            mode: u32,
+            control: u32,
+        },
     }
 
     impl Request {
@@ -553,13 +633,24 @@ pub mod protocol {
         let payload_size = match request {
             Request::Ping | Request::Status => 0,
             Request::Telemetry { .. } => 8,
-            Request::Exec { arguments } => {
+            Request::Exec {
+                arguments,
+                timeout_ms,
+            } => {
                 if !(1..=MAX_COMMAND_ARGUMENTS).contains(&arguments.len()) {
                     return Err(ProtocolError::InvalidPayload(
                         "invalid command argument count",
                     ));
                 }
-                encoded_size(4, arguments.iter().map(String::len))?
+                if !(1..=3_600_000).contains(timeout_ms) {
+                    return Err(ProtocolError::InvalidPayload("invalid execution timeout"));
+                }
+                let fixed = if *timeout_ms == DEFAULT_EXEC_TIMEOUT_MS {
+                    4
+                } else {
+                    12
+                };
+                encoded_size(fixed, arguments.iter().map(String::len))?
             }
             Request::Update { binary } => encoded_size(0, [binary.len()])?,
         };
@@ -570,12 +661,18 @@ pub mod protocol {
                 put_u32(&mut payload, *mode);
                 put_u32(&mut payload, *control);
             }
-            Request::Exec { arguments } => {
+            Request::Exec {
+                arguments,
+                timeout_ms,
+            } => {
                 let count = u32::try_from(arguments.len())
                     .map_err(|_| ProtocolError::InvalidPayload("too many command arguments"))?;
                 put_u32(&mut payload, count);
                 for argument in arguments {
                     put_bytes(&mut payload, argument.as_bytes())?;
+                }
+                if *timeout_ms != DEFAULT_EXEC_TIMEOUT_MS {
+                    payload.extend_from_slice(&timeout_ms.to_le_bytes());
                 }
             }
             Request::Update { binary } => put_bytes(&mut payload, binary)?,
@@ -604,7 +701,19 @@ pub mod protocol {
                         .map_err(|_| ProtocolError::InvalidUtf8)?;
                     arguments.push(argument);
                 }
-                Request::Exec { arguments }
+                // Version 1 clients without a deadline retain a bounded default.
+                let timeout_ms = if cursor.offset == payload.len() {
+                    DEFAULT_EXEC_TIMEOUT_MS
+                } else {
+                    u64::from_le_bytes(cursor.take(8)?.try_into().unwrap())
+                };
+                if !(1..=3_600_000).contains(&timeout_ms) {
+                    return Err(ProtocolError::InvalidPayload("invalid execution timeout"));
+                }
+                Request::Exec {
+                    arguments,
+                    timeout_ms,
+                }
             }
             RequestKind::Update => Request::Update {
                 binary: cursor.read_bytes()?.to_vec(),

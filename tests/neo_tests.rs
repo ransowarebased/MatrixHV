@@ -81,7 +81,8 @@ mod transport {
                     &mut frame,
                     42,
                     &Request::Exec {
-                        arguments: vec![String::new(); count]
+                        arguments: vec![String::new(); count],
+                        timeout_ms: 1000
                     }
                 ),
                 Err(ProtocolError::InvalidPayload(_))
@@ -90,6 +91,7 @@ mod transport {
         }
         let request = Request::Exec {
             arguments: vec!["argument".into(); 4096],
+            timeout_ms: 1000,
         };
         let mut frame = Vec::new();
         write_request(&mut frame, 42, &request).unwrap();
@@ -338,7 +340,7 @@ mod transport {
         ];
         #[cfg(not(target_os = "windows"))]
         let arguments = ["sh", "-c", "printf output; printf error >&2; exit 7"];
-        let response = execute(arguments.into_iter().map(str::to_string).collect());
+        let response = execute(arguments.into_iter().map(str::to_string).collect(), 5000);
         assert!(!response.success);
         assert_eq!(response.exit_code, Some(7));
         assert_eq!(String::from_utf8(response.stdout).unwrap().trim(), "output");
