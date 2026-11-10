@@ -82,7 +82,7 @@ fn print_banner() {
         " | \\ | | ____/ _ \\    \"The Matrix is everywhere. It is all around us.\"",
         " |  \\| |  _|| | | |   Bare-Metal Ring -1 CPUID Hypercall (Rust CLI)",
         " | |\\  | |__| |_| |",
-        " |_| \\_|_____\\___/    v0.1.0 (UEFI MatrixHV Core)",
+        " |_| \\_|_____\\___/    v1.0.0 (UEFI MatrixHV Core)",
         "==================================================================",
     ] {
         println!("{}", line.bright_green().bold());

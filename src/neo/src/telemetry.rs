@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MATRIXHV_DIAGNOSTIC_MIN_PROTOCOL: u32 = 4;
-const MATRIXHV_DIAGNOSTIC_PROTOCOL: u32 = 7;
+const MATRIXHV_DIAGNOSTIC_PROTOCOL: u32 = 8;
 const TELEMETRY_CONTROL_CAPABILITY: u32 = 1 << 8;
 const EXIT_PROFILE_CAPABILITY: u32 = 1 << 10;
 const EXIT_REASON_COUNTS_CAPABILITY: u32 = 1 << 11;

@@ -228,7 +228,7 @@ pub fn status_text() -> String {
         text.push_str(&format!("executable_path={}\n", executable.display()));
     }
     text.push_str(
-        "road_protocol=1\nexec_timeout=true\nexec_stream=true\nremote_memory_commands=true\n",
+        "road_protocol=2\nexec_timeout=true\nexec_stream=true\nremote_memory_commands=true\n",
     );
     text.push_str(&crate::telemetry::capability_status(
         status.matrixhv_present,
@@ -641,7 +641,7 @@ pub mod protocol {
     use std::io::{self, Read, Write};
 
     const MAGIC: [u8; 4] = *b"ROAD";
-    pub const PROTOCOL_VERSION: u16 = 1;
+    pub const PROTOCOL_VERSION: u16 = 2;
     pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 290_000;
     pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
     const MAX_COMMAND_ARGUMENTS: usize = 4096;
@@ -869,7 +869,7 @@ pub mod protocol {
                         .map_err(|_| ProtocolError::InvalidUtf8)?;
                     arguments.push(argument);
                 }
-                // Version 1 clients without a deadline retain a bounded default.
+                // Requests without an explicit deadline retain a bounded default.
                 let timeout_ms = if cursor.offset == payload.len() {
                     DEFAULT_EXEC_TIMEOUT_MS
                 } else {

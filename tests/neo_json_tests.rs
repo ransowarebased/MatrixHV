@@ -83,9 +83,9 @@ fn u64_fields_and_memory_results_preserve_every_bit() {
     let mut arguments = vec!["--json".into()];
     output::begin(&mut arguments);
     let fields = output::fields(
-        "matrixhv_protocol=7\nlogical_processor_count=64\ntelemetry_enabled=1\ncpu0.rip=18446744073709551615\ncpu0.cr3=0xffff800000001000\ncapabilities=0x12\nbinary_fingerprint=ffffffffffffffff\n",
+        "matrixhv_protocol=8\nlogical_processor_count=64\ntelemetry_enabled=1\ncpu0.rip=18446744073709551615\ncpu0.cr3=0xffff800000001000\ncapabilities=0x12\nbinary_fingerprint=ffffffffffffffff\n",
     );
-    assert_eq!(fields["matrixhv_protocol"], 7);
+    assert_eq!(fields["matrixhv_protocol"], 8);
     assert_eq!(fields["logical_processor_count"], 64);
     assert_eq!(fields["telemetry_enabled"], true);
     assert_eq!(fields["cpu0.rip"], "0xffffffffffffffff");
