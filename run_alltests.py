@@ -8,7 +8,7 @@ from time import perf_counter
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tests"))
-from harness import COMPONENTS, prepare_boot_state
+from harness import COMPONENTS, prepare_boot_state, protocol_extern
 
 
 def execute(command, project, env=None):
@@ -25,10 +25,12 @@ def run_component(project, component, release=False):
         output = project / "builds" / "tests" / component
         output.mkdir(parents=True, exist_ok=True)
         binary = output / (name + (".exe" if sys.platform == "win32" else ""))
+        externs = protocol_extern(project, output) if component == "nested" and name == "policy" else []
         execute(
             [
                 "rustc", "--edition=2024", "--test",
                 "--cfg", f'test_harness="{name}"',
+                *externs,
                 *(["-C", "opt-level=3"] if release else []),
                 str(project / "tests" / f"{component}_tests.rs"),
                 "-o", str(binary),

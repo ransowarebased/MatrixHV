@@ -44,8 +44,10 @@ def build_package(object_path, key_path, output_path, version=None, efi_path=Non
         raise ValueError("The packaged resident image does not match the embedded EFI core")
     code_end = symbols["matrixhv_resident_code_end"]
     metadata = symbols["matrixhv_resident_package_abi"]
-    abi = struct.unpack_from("<5I4xQ", image, metadata)
-    release = version if version is not None else abi[5]
+    bridge, boot_bytes, event_bytes, nested_bytes, cpu_bytes, state_abi, core_version = (
+        struct.unpack_from("<6IQ", image, metadata)
+    )
+    release = version if version is not None else core_version
     if not 0 < release < 1 << 64 or len(image) > 256 * 1024 or code_end % 4096:
         raise ValueError("Invalid resident package capacity, version, or code alignment")
     header = bytearray(256)
@@ -69,8 +71,9 @@ def build_package(object_path, key_path, output_path, version=None, efi_path=Non
     body = regions + relocations + image
     image_offset = 256 + len(regions) + len(relocations)
     for offset, value in [(8, 1), (12, 256), (16, 256 + len(body)), (20, image_offset),
-                          (24, len(image)), (28, 1), (40, abi[0]), (44, 2), (48, 7), (52, 5),
-                          (80, abi[1]), (84, abi[2]), (88, abi[3]), (92, abi[4]), (96, 256), (100, 288)]:
+                          (24, len(image)), (28, state_abi or 1), (40, bridge), (44, 2), (48, 7), (52, 5),
+                          (80, boot_bytes), (84, event_bytes), (88, nested_bytes), (92, cpu_bytes),
+                          (96, 256), (100, 288)]:
         struct.pack_into("<I", header, offset, value)
     struct.pack_into("<Q", header, 32, release)
     for offset, name in [(56, "matrixhv_resident_dispatch_entry"), (60, "matrixhv_resident_island_fatal"),

@@ -2521,4 +2521,3 @@ fn cet_syscall_install_uses_a_distinct_slot_and_capacity_failures_preserve_the_p
     assert_eq!(session.configuration.get_mut().debug_count, 0);
     assert!(session.is_active());
 }
-

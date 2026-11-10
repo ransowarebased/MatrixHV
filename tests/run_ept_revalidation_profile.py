@@ -13,7 +13,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'builds/validation/ept-revalidation-profile'
 PATHS = ['src/vmx/asm/nested.S', 'src/asm/diagnostics.S',
-         'clients/neo/src/telemetry.rs', 'tests/nested_tests.rs', 'src/vmx/asm/island.S']
+         None, 'tests/nested_tests.rs', 'src/vmx/asm/island.S']
 
 
 def replace_once(text, old, new):
@@ -303,7 +303,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=['prepare', 'test', 'layout', 'restore'])
     parser.add_argument('--output', type=Path, default=OUT)
+    parser.add_argument('--neo-source', type=Path,
+                        help='Path to src/telemetry.rs in a separate Neo checkout (modified by prepare and restore)')
     arguments = parser.parse_args()
+    if arguments.mode in ('prepare', 'restore'):
+        if arguments.neo_source is None or not arguments.neo_source.is_file():
+            parser.error('prepare and restore require --neo-source from a separate Neo checkout')
+        PATHS[2] = str(arguments.neo_source.resolve())
     OUT = arguments.output.resolve()
     OUT.relative_to((ROOT / 'builds').resolve())
     {'prepare': prepare, 'test': test, 'layout': layout, 'restore': restore}[arguments.mode]()

@@ -35,6 +35,7 @@ resident = "\n".join((project / "src/vmx" / name).read_text()
                      for name in ("resident/abi.rs", "pt.rs"))
 nested = (project / "src/vmx/nested.rs").read_text() + "\n" + (
     project / "src/vmx/vmcs12.rs").read_text()
+protocol = (project / "crates/matrixhv-protocol/src/lib.rs").read_text(encoding="utf-8")
 fields = {}
 formats = {}
 offset = 0
@@ -65,7 +66,7 @@ def append_u64_fields(source, prefix):
             length = array[1].split("::")[-1]
             offset += int(length) if length.isdecimal() else int(
                 re.search(r"const " + re.escape(length) + r": usize = (\d+)",
-                          (project / "src/protocol.rs").read_text())[1])
+                          protocol)[1])
         elif (array := re.fullmatch(r"\[\[u64; (\d+)\]; (\d+)\]", kind)):
             offset = (offset + 7) // 8 * 8 + 8 * int(array[1]) * int(array[2])
         elif (array := re.fullmatch(r"\[(u64|u32); ([\w:]+)\]", kind)):
@@ -75,7 +76,7 @@ def append_u64_fields(source, prefix):
             offset = (offset + size - 1) // size * size
             count = int(length) if length.isdecimal() else int(
                 re.search(r"const " + re.escape(length) + r": usize = (\d+)",
-                          resident + nested + (project / "src/protocol.rs").read_text())[1]
+                          resident + nested + protocol)[1]
             )
             for index in range(count):
                 if name == "flight_recorder_records" and index not in (0, count - 1):
@@ -294,10 +295,8 @@ try:
         values["event.visual_base"] = event[5]
         values["event.visual_stride_bytes"] = event[6]
         if "interception" not in result:
-            interception_source = (project / "src/memory/interception.rs").read_text() + (
-                project / "src/protocol.rs").read_text()
-            event_source = resident + (project / "src/vmx/bridge.rs").read_text() + (
-                project / "src/protocol.rs").read_text()
+            interception_source = (project / "src/memory/interception.rs").read_text() + protocol
+            event_source = resident + (project / "src/vmx/bridge.rs").read_text() + protocol
             event_fields, _, _ = plain_layout(event_source, "ResidentEventContext")
             session_fields, _, _ = plain_layout(interception_source, "Session", "splits")
             profile_fields, profile_size, _ = plain_layout(interception_source, "RoadEptProfile")
@@ -314,7 +313,7 @@ try:
                    for name in ("pool_base", "cpu_mask", "pool_used", "base_pool_used", "hook_count", "generation")},
             }
         if "update" not in result:
-            layout_source = resident + (project / "src/vmx/bridge.rs").read_text() + (project / "src/protocol.rs").read_text()
+            layout_source = resident + (project / "src/vmx/bridge.rs").read_text() + protocol
             event_fields, event_size, _ = plain_layout(layout_source, "ResidentEventContext")
             cpu_fields, cpu_size, _ = plain_layout(layout_source, "ControlCpuState")
             update_source = (project / "src/update.rs").read_text()

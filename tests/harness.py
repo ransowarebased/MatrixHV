@@ -8,8 +8,20 @@ import subprocess
 import textwrap
 
 
+PROTOCOL_SOURCE = Path("crates/matrixhv-protocol/src/lib.rs")
+
+
+def protocol_extern(project: Path, output: Path) -> list[str]:
+    output.mkdir(parents=True, exist_ok=True)
+    library = output / "libmatrixhv_protocol.rlib"
+    subprocess.run(["rustc", "--edition=2024", "-Dwarnings", "--crate-name", "matrixhv_protocol",
+                    "--crate-type", "rlib", str(project / PROTOCOL_SOURCE), "-o", str(library)],
+                   check=True, cwd=project)
+    return ["--extern", f"matrixhv_protocol={library}"]
+
+
 def read_resident_rust(project: Path) -> str:
-    return (project / "src/protocol.rs").read_text(encoding="utf-8") + "\n" + "\n".join((project / "src/vmx" / name).read_text(encoding="utf-8")
+    return (project / PROTOCOL_SOURCE).read_text(encoding="utf-8") + "\n" + "\n".join((project / "src/vmx" / name).read_text(encoding="utf-8")
                      for name in ("resident/mod.rs", "resident/abi.rs", "resident/boot.rs", "state.rs", "msr.rs", "nested.rs", "vmcs12.rs", "bridge.rs", "entry.rs", "exits.rs", "pt.rs"))
 
 
@@ -3252,7 +3264,8 @@ def prepare_boot_state(project: Path):
     collector = ast.parse((project / "tests/collect_boot_state.py").read_text())
     functions = [node for node in collector.body if isinstance(node, ast.FunctionDef)
                  and node.name in ("structure", "append_u64_fields")]
-    namespace = {"resident": resident, "nested": nested, "re": re, "project": project,
+    namespace = {"resident": resident, "nested": nested, "re": re,
+                 "protocol": (project / PROTOCOL_SOURCE).read_text(encoding="utf-8"),
                  "fields": {}, "formats": {}, "offset": 0}
     exec(compile(ast.Module(body=functions, type_ignores=[]), "collect_boot_state.py", "exec"), namespace)
     namespace["append_u64_fields"](namespace["structure"](resident, "ResidentBootContext"), "")
@@ -3276,7 +3289,7 @@ def prepare_boot_state(project: Path):
         legacy_abi = legacy_abi.replace(declaration, "").replace(initializer, "")
     (output / "legacy-abi.rs").write_text(legacy_abi, encoding="utf-8")
     harness = "use std::mem::{offset_of, size_of};\n"
-    harness += 'pub mod protocol { include!("../../src/protocol.rs"); }\n'
+    harness += 'pub use matrixhv_protocol as protocol;\n'
     harness += 'pub mod memory { pub mod host { pub const PAGE_SIZE: usize = 4096; } }\n'
     trace_source = (project / "src/vmx/pt.rs").read_text()
     (output / "trace_state.rs").write_text(trace_source[trace_source.index("#[repr(C)]"):trace_source.index("pub(crate) fn supported")])
@@ -3303,7 +3316,7 @@ def prepare_boot_state(project: Path):
     source_path = output / "layout.rs"
     executable = output / "layout.exe"
     source_path.write_text(harness)
-    subprocess.run(["rustc", "--edition=2024", "-Dwarnings", str(source_path),
+    subprocess.run(["rustc", "--edition=2024", "-Dwarnings", *protocol_extern(project, output), str(source_path),
                     "-o", str(executable)], check=True, cwd=project)
     result = subprocess.run([str(executable)], check=True, capture_output=True, text=True)
     actual = dict(line.split("=", 1) for line in result.stdout.splitlines())

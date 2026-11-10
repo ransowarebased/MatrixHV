@@ -3,13 +3,15 @@
 [CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release')]
-    [string]$Configuration = 'Release'
+    [string]$Configuration = 'Release',
+
+    [switch]$SkipImage
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$BuildRoot = [System.IO.Path]::GetFullPath('D:\Projetos\MatrixHV\builds')
+$BuildRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\builds'))
 $ConfigurationName = $Configuration.ToLowerInvariant()
 $OutputRoot = Join-Path $BuildRoot $ConfigurationName
 $BinaryPath = Join-Path $OutputRoot 'MatrixHV.efi'
@@ -52,7 +54,7 @@ try {
     Copy-Item -LiteralPath $BootPath -Destination (Join-Path $StagingRoot 'EFI\BOOT\BOOTX64.EFI') -Force
     Copy-Item -LiteralPath $UpdatePath -Destination (Join-Path $StagingRoot 'MatrixHV.mxcore') -Force
 
-    if (Test-Path -LiteralPath $ImagePath -PathType Leaf) {
+    if (-not $SkipImage -and (Test-Path -LiteralPath $ImagePath -PathType Leaf)) {
         Copy-Item -LiteralPath $ImagePath -Destination (Join-Path $StagingRoot (Split-Path -Leaf $ImagePath)) -Force
     }
 

@@ -7,7 +7,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$buildRoot = [System.IO.Path]::GetFullPath('D:\Projetos\MatrixHV\builds')
+$buildRoot = Join-Path $projectRoot 'builds'
 $testRoot = Join-Path $buildRoot ('tests\build-scripts-' + [Guid]::NewGuid().ToString('N'))
 $makeConfig = Join-Path $projectRoot 'scripts\make_config.ps1'
 $makeImage = Join-Path $projectRoot 'scripts\make_image.ps1'

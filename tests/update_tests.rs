@@ -124,6 +124,11 @@ fn tampering_and_another_signer_are_rejected() {
 #[test]
 fn incompatible_abi_and_malformed_regions_or_relocations_are_rejected() {
     let (mut bytes, mut abi, key) = package(2);
+    bytes[28..32].copy_from_slice(&1_u32.to_le_bytes());
+    resign(&mut bytes);
+    assert_eq!(Package::parse(&bytes, abi, &key).unwrap_err(), Error::Abi);
+    bytes[28..32].copy_from_slice(&STATE_ABI.to_le_bytes());
+    resign(&mut bytes);
     abi.boot_bytes += 1;
     assert_eq!(Package::parse(&bytes, abi, &key).unwrap_err(), Error::Abi);
     abi.boot_bytes -= 1;

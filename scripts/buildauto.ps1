@@ -120,7 +120,7 @@ if (-not $SkipImage) {
 
 if (-not $SkipPackage) {
     $PackageScript = Join-Path $PSScriptRoot 'package.ps1'
-    & $PackageScript -Configuration $Configuration
+    & $PackageScript -Configuration $Configuration -SkipImage:$SkipImage
 }
 
 Write-Output $StagedBinary
