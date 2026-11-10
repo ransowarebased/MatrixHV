@@ -789,6 +789,7 @@ global_asm!(
     event_context_size = const size_of::<ResidentEventContext>(),
     nested_context_size = const size_of::<NestedVmxState>(),
     core_version = const core_version(),
+    state_abi = const crate::update::STATE_ABI,
     update_vmcall = const crate::update::UPDATE_VMCALL,
     update_result = const crate::update::UPDATE_RESULT,
     update_request_size = const crate::update::REQUEST_BYTES,

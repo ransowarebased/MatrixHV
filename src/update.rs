@@ -4,7 +4,8 @@ use sha2::{Digest, Sha256};
 
 pub const PACKAGE_MAGIC: &[u8; 8] = b"MATRIXUP";
 pub const PACKAGE_VERSION: u32 = 1;
-pub const STATE_ABI: u32 = 1;
+// The retained hook data-shadow metadata has a different layout from ABI 1.
+pub const STATE_ABI: u32 = 2;
 pub const HEADER_BYTES: usize = 256;
 pub const BANK_BYTES: usize = 256 * 1024;
 pub const BANK_PAGES: usize = BANK_BYTES / 4096;

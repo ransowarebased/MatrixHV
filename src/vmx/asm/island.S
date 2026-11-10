@@ -205,7 +205,7 @@ matrixhv_island_slots
 .globl matrixhv_resident_package_abi
 matrixhv_resident_package_abi:
 .long {bridge_version}, {boot_context_size}, {event_context_size}, {nested_context_size}, {control_cpu_state_size}
-.long 0
+.long {state_abi}
 .quad {core_version}
 .globl matrixhv_resident_update_loader
 matrixhv_resident_update_loader:

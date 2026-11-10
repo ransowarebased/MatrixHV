@@ -232,8 +232,7 @@ def main():
         command('protect-data', readOnly=False)
         mark('Arbitrary read-only data shadow changes scoped reads and preserves original RAM and protections')
 
-        # Code hooks, debug redirects and CPUID remain installed while syscall and
-        # watchpoint state are independently added and cleared.
+        # Code hooks, debug redirects and CPUID remain installed while syscall routing is cleared.
         hook = packet(11, 190)
         struct.pack_into('<Q', hook, 16, root)
         struct.pack_into('<I', hook, 32, 1)
@@ -272,73 +271,14 @@ def main():
         if syscall_status == 0:
             token = struct.unpack_from('<Q', response, 80)[0]
             assert all(row[:2] == [0x12345678, 64] for row in command('syscall', gated=True, iterations=64))
-        watch = packet(28, 176)
-        struct.pack_into('<Q', watch, 16, root)
-        struct.pack_into('<I', watch, 32, 1)
-        struct.pack_into('<Q', watch, 80, token)
-        struct.pack_into('<I', watch, 128, 16)
-        struct.pack_into('<QII', watch, 160, data_address, 3, 8)
-        response = invoke(watch)
-        token = struct.unpack_from('<Q', response, 80)[0]
-        context = packet(31)
-        struct.pack_into('<Q', context, 16, root)
-        struct.pack_into('<Q', context, 80, token)
-        struct.pack_into('<I', context, 128, 16)
-        response = invoke(context)
-        token = struct.unpack_from('<Q', response, 80)[0]
-        if syscall_status == 0:
-            configured = remote(args.guest_neo, 'syscall', 'set', root, token,
-                                fixtures[0]['callback'], lstar, '--no-lease')
-            token = int(re.search(r'\btoken=(\d+)', configured)[1])
-        command('memory', gated=True, iterations=128)
         results['combined_before_debug'] = remote(args.guest_neo, 'hook', 'status')
         save()
         assert all(row[0] == 51 for row in command('debug', gated=True, iterations=32))
         assert command('cpuid', gated=True, iterations=32) == [values] * fixtures[0]['processors']
         if syscall_status == 0:
             assert all(row[:2] == [0x12345678, 32] for row in command('syscall', gated=True, iterations=32))
-        results['cli_watch'] = remote(args.guest_neo, 'watch', 'fetch', token, 0, 0, 64)
-        assert int(re.search(r'\brecords=(\d+)', results['cli_watch'])[1]) > 0
-        results['cli_context'] = remote(args.guest_neo, 'context', 'snapshot', token, 0, 0, 8)
-        context_sequence = int(re.search(r'(?m)^sequence=(\d+)', results['cli_context'])[1])
-        results['cli_stack'] = remote(args.guest_neo, 'context', 'stack', token, 0, context_sequence, 8)
-        assert int(re.search(r'\brecords=(\d+)', results['cli_stack'])[1]) > 0
-        mark('Neo watch, context snapshot and stack commands read the live combined profile')
-        all_hits = []
-        snapshots = []
-        for cpu in range(fixtures[0]['processors']):
-            fetch = packet(30, 160 + 64 * 240)
-            struct.pack_into('<Q', fetch, 24, cpu)
-            struct.pack_into('<I', fetch, 32, 64)
-            struct.pack_into('<Q', fetch, 80, token)
-            fetched = invoke(fetch)
-            count = struct.unpack_from('<I', fetched, 32)[0]
-            assert count > 0, (cpu, fetched[:160].hex())
-            hits = [struct.unpack_from('<30Q', fetched, 160 + index * 240) for index in range(count)]
-            assert all(hit[26] == data_address and hit[29] == 1 and hit[24] == cpu and hit[8] != 0 for hit in hits)
-            assert all(int(fixtures[0]['memoryWorker'], 0) + 19 <= hit[3] <= int(fixtures[0]['memoryWorker'], 0) + 25 for hit in hits)
-            all_hits.extend(hits)
-            snapshot = packet(33, 160 + 8 * 208)
-            struct.pack_into('<Q', snapshot, 24, cpu)
-            struct.pack_into('<I', snapshot, 32, 8)
-            struct.pack_into('<Q', snapshot, 80, token)
-            snapshot = invoke(snapshot)
-            captured = struct.unpack_from('<I', snapshot, 32)[0]
-            assert captured > 0, cpu
-            rows = [struct.unpack_from('<26Q', snapshot, 160 + index * 208) for index in range(captured)]
-            assert all(row[2] == root & ~4095 and row[24] == cpu for row in rows)
-            snapshots.extend(rows)
-            walk = packet(34, 160 + 8 * 16)
-            struct.pack_into('<Q', walk, 24, cpu)
-            struct.pack_into('<I', walk, 32, 8)
-            struct.pack_into('<Q', walk, 64, rows[-1][0])
-            struct.pack_into('<Q', walk, 80, token)
-            walk = invoke(walk)
-            assert struct.unpack_from('<I', walk, 32)[0] >= 1
-        results['watch_hits'] = all_hits
-        results['context_snapshots'] = snapshots
         results['simultaneous_syscall_status'] = syscall_status
-        mark('VMFUNC EPT hooks, debug redirects, CPUID, watch logs and cached contexts coexist across every CPU')
+        mark('VMFUNC EPT hooks, debug redirects and CPUID coexist across every CPU')
         if syscall_status == 0:
             remote(args.guest_neo, 'syscall', 'clear', token)
             assert all(row[0] == 51 for row in command('debug', gated=True, iterations=16))

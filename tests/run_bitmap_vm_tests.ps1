@@ -2,6 +2,7 @@
 [CmdletBinding(DefaultParameterSetName = 'Remote')]
 param(
     [Parameter(Mandatory = $true, ParameterSetName = 'Remote')][string]$Remote,
+    [Parameter(Mandatory = $true, ParameterSetName = 'Remote')][string]$GuestNeoPath,
     [Parameter(Mandatory = $true, ParameterSetName = 'Local')][switch]$Local,
     [Parameter(Mandatory = $true)][string]$NeoPath,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
@@ -12,7 +13,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $guestDirectory = 'C:\MatrixHVBitmapTests'
-$guestNeo = "$guestDirectory\neo.exe"
+$guestNeo = $GuestNeoPath
 if ($Local) {
     $guestDirectory = Join-Path ([IO.Path]::GetFullPath($OutputDirectory)) 'fixture'
     $guestNeo = [IO.Path]::GetFullPath($NeoPath)
@@ -111,11 +112,9 @@ function Require([bool]$condition, [string]$message) {
 
 if (-not $ResumeFixture) {
     $fixtureBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot 'bitmap_vm_fixture.ps1')))
-    $deployNeo = if ($Local) { '' } else { "Copy-Item -LiteralPath 'E:\neo.exe' -Destination '$guestNeo' -Force" }
     Invoke-GuestScript @"
 New-Item -ItemType Directory -Path '$guestDirectory' -Force | Out-Null
 [IO.File]::WriteAllBytes('$guestDirectory\fixture.ps1', [Convert]::FromBase64String('$fixtureBytes'))
-$deployNeo
 Remove-Item -LiteralPath '$guestDirectory\fixture.json' -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath '$guestDirectory\command.txt' -ErrorAction SilentlyContinue
 Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "& ''$guestDirectory\fixture.ps1'' -OutputDirectory ''$guestDirectory'' *> ''$guestDirectory\fixture-out.log''"'

@@ -2,6 +2,10 @@
 from pathlib import Path
 import re
 import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+from harness import protocol_extern
 
 project = Path(__file__).resolve().parents[1]
 output = project / "builds" / "interception-runtime-tests"
@@ -29,7 +33,6 @@ for declaration, replacement in [
     ('fn page_byte(', 'fn page_byte(address: u64, value: Option<u8>) -> u8 { crate::hardware::page_byte(address, value) }'),
     ('fn clock()', 'fn clock() -> u64 { crate::hardware::clock() }'),
     ('fn user_cet()', 'fn user_cet() -> [u64; 2] { crate::hardware::STATE.with(|state| state.borrow().user_cet) }'),
-    ('fn kernel_gs()', 'fn kernel_gs() -> u64 { crate::hardware::STATE.with(|state| state.borrow().kernel_gs) }'),
     ('fn syscall_msrs()', 'fn syscall_msrs() -> [u64; 2] { crate::hardware::syscall_msrs() }'),
     ('fn original_value(', 'fn original_value(address: u64, width: usize, value: Option<u64>) -> u64 { crate::hardware::original_value(address, width, value) }'),
 ]:
@@ -47,9 +50,6 @@ runtime = runtime[:start] + '''        if !no_flush && read(SECONDARY_VM_EXEC_CO
 assert 'core::arch::asm!' not in runtime
 engine = source[:source.index('pub(crate) trait InterceptionMemory')]
 engine = engine.replace('use crate::memory::access::{PhysicalMemory, page_mapping};', '')
-engine = engine.replace('use crate::memory::observation::{EventConfig, Observation};',
-                        'use crate::memory::observation::Observation;')
-engine = engine.replace('#[cfg(target_os = \"uefi\")]\nuse crate::memory::observation::ContextRecord;', 'use crate::memory::observation::ContextRecord;')
 for declaration in ['fn observer_ptr(', 'fn has_features(']:
     engine = engine.replace(item(engine, declaration), '')
 engine = re.sub(r'const OPTIONS: u32 = .*?;', '', engine, flags=re.S)
@@ -63,9 +63,8 @@ abi = (project / 'src/vmx/resident/abi.rs').read_text()
 cpu = 'use core::sync::atomic::AtomicU64;\n#[repr(C)]\n#[derive(Default)]\n' + item(abi, 'pub struct InterceptionCpuState')
 vmcs = (project / 'src/vmx/vmcs.rs').read_text()
 constants = '\n'.join(re.findall(r'pub const \w+: u64 = (?:0x[0-9a-fA-F_]+|\d+);', vmcs))
-access = (project / 'src/memory/access.rs').read_text().split('#[cfg(any(target_os = \"uefi\", test))]')[0]
-(output / 'access.rs').write_text(access)
-definitions = '''pub mod protocol { include!("../../src/protocol.rs"); }
+access = (project / "src/memory/access.rs").read_text()
+definitions = '''pub use matrixhv_protocol as protocol;
 pub mod arch {
     pub struct Leaf { pub eax: u32 }
     pub fn leaf(_: u32) -> Leaf { Leaf { eax: 48 } }
@@ -76,11 +75,11 @@ pub mod arch {
 }
 pub mod memory {
     pub mod access {
-        include!("access.rs");
+        use crate::protocol::memory::Error;
+''' + item(access, 'pub trait PhysicalMemory') + '''
         pub mod resident {
             use super::{Error, PhysicalMemory};
             use crate::vmx::resident::abi::ResidentBootContext;
-            use crate::memory::interception::RoadEptProfile;
             pub struct Environment { pub guest_cr4: u64, pub physical_bits: u64 }
             pub struct Memory<'a> { pub environment: &'a Environment }
             pub fn event_environment(_: &ResidentBootContext) -> Environment {
@@ -97,11 +96,6 @@ pub mod memory {
                 fn write(&mut self, _: u64, _: &[u8]) -> Result<(), Error> {
                     Err(Error::Permission)
                 }
-            }
-            pub(crate) fn instruction_bytes_in(_: &Environment, _: &RoadEptProfile, _: u64,
-                execution: &mut [u8], original: &mut [u8]) -> usize {
-                original.copy_from_slice(execution);
-                execution.len()
             }
         }
     }
@@ -253,6 +247,7 @@ host = next(line.removeprefix('host: ') for line in subprocess.check_output(['ru
 name = "interception-runtime-dependencies"
 version = "0.1.0"
 edition = "2024"
+[workspace]
 [lib]
 path = "dependencies.rs"
 [dependencies]
@@ -263,7 +258,7 @@ yaxpeax-arch = { version = "0.3.2", default-features = false }
 subprocess.run(['cargo', 'build', '--manifest-path', str(output / 'Cargo.toml'), '--target', host,
                 '--target-dir', str(output / 'target')], cwd=project, check=True)
 deps = output / 'target' / host / 'debug' / 'deps'
-externs = []
+externs = protocol_extern(project, output)
 for name in ['yaxpeax_x86', 'yaxpeax_arch']:
     externs += ['--extern', f'{name}={next(deps.glob("lib" + name + "-*.rlib"))}']
 subprocess.run(['rustc', '--edition=2024', '-Dwarnings', '--test', str(project / 'tests/interception_runtime_tests.rs'),

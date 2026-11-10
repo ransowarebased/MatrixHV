@@ -2,7 +2,7 @@
 
 MatrixHV is an experimental Intel VT-x (VMX) pre-boot hypervisor written in Rust (`#![no_std]`) and assembly for the `x86_64-unknown-uefi` target. It executes as a UEFI application, establishes a resident virtualization environment across all logical processors (bootstrap processor and application processors), initializes Extended Page Tables (EPT), and chainloads an EFI boot target (such as the Windows Boot Manager) under hardware virtualization.
 
-The repository also includes **ROAD / neo**, a user-space host companion and telemetry agent, as well as test suites for offline validation of hypervisor memory mechanisms and instruction handling.
+MatrixHV exposes a versioned instrumentation ABI through `matrixhv-protocol` and a reusable Rust client through `matrixhv-client`. Independent projects can call the operations exposed by a running MatrixHV core. Client programs run in the guest OS. The hypervisor performs the operations it exposes in VMX root. [Neo](https://github.com/ransowarebased/Neo) is a separate client for control and telemetry.
 
 ---
 
@@ -13,12 +13,7 @@ MatrixHV operates as a Type-1 (bare-metal) thin hypervisor initializing during t
 - **Pre-Boot UEFI Lifecycle**: Loads configuration from `\MatrixConfig.bin`, detects serial/COM1 logging targets, discovers boot targets (Windows Boot Manager, GRUB/shim, VeraCrypt), and configures per-CPU state.
 - **Multi-Processor Resident Runtime**: Starts and virtualizes all Application Processors (APs) via INIT-SIPI-SIPI sequences, configuring individual VMCS structures, host page tables, and dedicated exit stacks.
 - **Identity & Split EPT**: Implements an identity-mapped Extended Page Table baseline with split-view execute/read permissions, dynamic Copy-on-Write (CoW) page table splitting, and per-core alternate EPT banks.
-- **Process-Scoped Interception**:
-  - Gated by CR3 matching and hardware debug register filters (DR3 / DR7) to restrict VM-exits exclusively to targeted processes, preventing global performance degradation.
-  - Time-leased session management with automatic reclamation upon expiry.
-  - **CPUID Profiles**: Masked and spoofed CPUID emulation on VM-exit reason 10, combining native output with configurable profile masks.
-  - **Private `KUSER_SHARED_DATA` (`0x7ffe0000`)**: Virtualized shadow view for the Windows user-shared data page, with atomic `KSYSTEM_TIME` clock synchronization (`High2Time` / `LowPart` / `High1Time`) updated via the VMX Preemption Timer (VM-exit reason 52).
-  - **Syscall Routing**: Hardware execution breakpoint at the `LSTAR` entry (`KiSystemCall64`) that simulates an Intel `SYSRET64` privilege transition directly into a ring-3 user callback, bypassing kernel-mode transition, with an `FXSAVE` SIMD token bypass (`RFLAGS.RF`) for executing native syscalls.
+- **Process-Scoped Instrumentation**: Interception sessions can be scoped to selected guest address spaces and use leases for automatic reclamation.
 - **Nested VMX (Research / Partial)**: Emulates a restricted contract of Intel VMX instructions (VMXON/VMXOFF, VMCLEAR, VMPTRLD/VMPTRST, VMREAD/VMWRITE, VMLAUNCH/VMRESUME), shadow VMCS12 state management, and exit reflection to L1.
 - **Intel PT Diagnostics**: Support for Intel Processor Trace logging and performance counters.
 - **Authenticated Hot Update**: Cryptographically signed in-memory resident core replacement mechanism (`update.rs`).
@@ -31,7 +26,6 @@ To ensure clarity and avoid unrealistic expectations:
 
 - **Hardware Architecture**: MatrixHV requires an **Intel x86-64 processor** with VMX and EPT support. **AMD processors (SVM / AMD-V) are not supported.**
 - **Nested Virtualization is Experimental**: The nested VMX implementation covers a restricted architectural subset for hypervisor research. It does **not** provide full, bug-free compatibility with nested Hyper-V, Windows Virtualization-Based Security (VBS/HVCI), VMware, or KVM.
-- **No Unconditional Stealth Guarantees**: While process-scoped CPUID masking, EPT split views, and debug register gates avoid global system hooks and SSDT modifications, this software does not guarantee undetectability against sophisticated heuristic or timing-based anti-cheat / anti-rootkit scanners.
 - **Firmware Signing**: Loading development UEFI binaries requires a firmware configuration that permits unsigned or custom test-signed EFI applications (e.g., Secure Boot disabled or custom platform keys enrolled).
 
 ---
@@ -40,6 +34,9 @@ To ensure clarity and avoid unrealistic expectations:
 
 ```
 MatrixHV/
+├── crates/
+│   ├── matrixhv-protocol/      # Shared #[repr(C)] host/guest ABI (no_std)
+│   └── matrixhv-client/        # Host-side packet builders + CPUID memory transport API
 ├── src/
 │   ├── main.rs                 # UEFI entry point and boot coordination
 │   ├── arch.rs                 # Low-level x86-64 MSR, CPUID, and register access
@@ -52,12 +49,11 @@ MatrixHV/
 │   ├── memory/                 # Memory access, tracking, and interception engines
 │   │   ├── access.rs           # Physical and virtual memory translation
 │   │   ├── interception.rs     # EPT split views, CPUID profiles, and syscall interception
+│   │   ├── observation.rs      # Hook data-shadow metadata (watch/context/event capture removed)
 │   │   └── tracking.rs         # Accessed and dirty bit tracking
-│   ├── protocol.rs             # Hypervisor-to-host resident memory communication protocol
 │   ├── update.rs               # Authenticated resident runtime hot-swap engine
 │   ├── diagnostics.rs          # Diagnostic utilities and hardware checks
-│   ├── logging.rs              # Serial (COM1) and resident memory logging
-│   └── neo/                    # User-space companion CLI (telemetry, control, memory access)
+│   └── logging.rs              # Serial (COM1) and resident memory logging
 ├── scripts/                    # Automation scripts for build, image generation, and packaging
 └── tests/                      # Unit tests, integration harnesses, and runtime verification
 ```
@@ -67,13 +63,11 @@ MatrixHV/
 ## Prerequisites
 
 - **Toolchain**: Rust stable with the `x86_64-unknown-uefi` target.
-- **Host Targets**: `x86_64-pc-windows-msvc` (for Windows host builds and tests) and optionally `x86_64-unknown-linux-musl` for `neo`.
 - **System Tools**: PowerShell 5.1+, Python 3, and the MSVC C++ build tools / linker.
 
-Install required Rust targets:
+Install the required Rust target:
 ```powershell
 rustup target add x86_64-unknown-uefi
-rustup target add x86_64-pc-windows-msvc
 ```
 
 ---
@@ -89,19 +83,22 @@ cargo build --release --target x86_64-unknown-uefi
 The resulting UEFI binary will be produced at:
 `builds/.cargo-target/x86_64-unknown-uefi/release/MatrixHV.efi`
 
-### 2. Build ROAD / neo (Host Companion)
+### 2. Integrate a host program
 
-```powershell
-cargo build --release --manifest-path src/neo/Cargo.toml --target x86_64-pc-windows-msvc
+Pin the client crate to a compatible MatrixHV revision in your project's Cargo manifest:
+```toml
+matrixhv-client = { git = "https://github.com/ransowarebased/MatrixHV", rev = "50292addaf4347a6eae58e1f594e4bbeeb978798" }
 ```
-The executable will be located at:
-`builds/.cargo-target/x86_64-pc-windows-msvc/release/neo.exe`
+
+The client provides packet builders and the transport for the public memory and instrumentation ABI. The shared protocol crate defines the wire layouts and constants. See [Neo](https://github.com/ransowarebased/Neo) for a separate project that consumes both crates.
+
+MatrixHV retains VM-exit diagnostics, Intel PT, and resident status. Protocol 9 retires application watchpoints, context sampling, stack walking, and event capture. For user-mode Windows debugging, use [x64dbg](https://x64dbg.com/). Boot the new EFI when migrating from protocol 8 because the resident state layout changed.
 
 ### 3. Automated Packaging Pipeline
 
-To generate the complete release package (including bootable disk images when configured):
+To generate the release ZIP and bootable disk image:
 ```powershell
-.\scripts\build_release.ps1 -SkipImage -SkipPackage
+.\scripts\build_release.ps1
 ```
 
 ---
@@ -134,30 +131,14 @@ Use `scripts/make_config.ps1` to regenerate or customize this configuration file
 MatrixHV includes mock hardware test runners to validate instruction handlers, EPT permissions, and interception mechanisms on the development host:
 
 ```powershell
-# Run the resident interception runtime test suite (62 mocked tests)
-python tests/run_interception_runtime_tests.py
+# Run the local hypervisor suites
+python run_alltests.py
 
-# Run the neo protocol and EPT split-view unit tests (54 tests)
-cargo test --manifest-path src/neo/Cargo.toml --target x86_64-pc-windows-msvc interception_tests
+# Run host API tests without a resident hypervisor
+cargo test --locked -p matrixhv-client
 ```
 
----
-
-## ROAD / neo CLI
-
-`neo` provides an administrative interface for interacting with the resident hypervisor from user space:
-
-```powershell
-# Query hypervisor resident status
-neo.exe matrix status
-
-# Enable/disable telemetry collection
-neo.exe telemetry enable
-neo.exe telemetry disable
-
-# Display help and available commands
-neo.exe --help
-```
+CLI, telemetry, and host-agent tests live in the Neo repository: https://github.com/ransowarebased/Neo.
 
 ---
 

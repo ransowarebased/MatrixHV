@@ -1079,7 +1079,6 @@ mod hardware {
         pub clock: u64,
         pub syscall_msrs: [u64; 2],
         pub user_cet: [u64; 2],
-        pub kernel_gs: u64,
         pub instruction: Option<([u8; 15], [u8; 15])>,
         pub fail_reads: BTreeMap<u64, u32>,
         pub fail_writes: BTreeMap<u64, u32>,
@@ -3638,6 +3637,3 @@ fn fatal_mixed_instruction_retires_owned_windows_before_terminal_return() {
         });
     }
 }
-
-#[path = "observation_runtime_tests.rs"]
-mod observation_runtime_tests;

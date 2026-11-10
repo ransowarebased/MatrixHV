@@ -1,10 +1,6 @@
-use neo::memory::{
-    InterceptionRequest, Item, decode_transfers, info_packet, interception_packet, invoke, packet,
-    start_tracking_packet,
-};
-use neo::protocol::memory::{
-    AD_START, HEADER_BYTES, HOOK_INSTALL, INFO_BYTES, INTERCEPT_NO_LEASE, ITEM_BYTES, READ,
-    ROAD_STATUS_DEMAND_ZERO, WRITE, quad, word,
+use matrixhv_client::memory::{Item, decode_transfers, info_packet, invoke, packet};
+use matrixhv_client::protocol::memory::{
+    HEADER_BYTES, ITEM_BYTES, READ, ROAD_STATUS_DEMAND_ZERO, WRITE,
 };
 
 #[test]
@@ -80,35 +76,4 @@ fn write_responses_return_transfer_metadata_without_echoing_the_payload() {
     let results = decode_transfers(&bytes).unwrap();
     assert!(results[0].is_complete());
     assert!(results[0].bytes.is_empty());
-}
-
-#[test]
-fn typed_requests_encode_protocol_fields_without_cli_arguments() {
-    let info = info_packet().unwrap();
-    assert_eq!(info.len(), INFO_BYTES);
-    assert_eq!(word(&info, 36) as usize, INFO_BYTES);
-    let tracking = start_tracking_packet(10, &[(0x2000, 0x1000)]).unwrap();
-    assert_eq!(word(&tracking, 12), AD_START);
-    assert_eq!(quad(&tracking, 24), 10);
-    assert_eq!(quad(&tracking, HEADER_BYTES), 0x2000);
-    assert_eq!(quad(&tracking, HEADER_BYTES + 8), 0x1000);
-    let mut request = InterceptionRequest {
-        operation: HOOK_INSTALL,
-        cr3: 0x2000,
-        flags: INTERCEPT_NO_LEASE,
-        items: vec![Item {
-            address: 0x1000,
-            bytes: vec![0x90],
-        }],
-        ..Default::default()
-    };
-    let hook = interception_packet(&request).unwrap();
-    assert_eq!(word(&hook, 12), HOOK_INSTALL);
-    assert_eq!(word(&hook, 128), INTERCEPT_NO_LEASE);
-    request.items[0].address = 0x1fff;
-    request.items[0].bytes = vec![0x90; 2];
-    assert!(interception_packet(&request).is_err());
-    request.items[0].bytes.truncate(1);
-    request.lease_ms = 10;
-    assert!(interception_packet(&request).is_err());
 }

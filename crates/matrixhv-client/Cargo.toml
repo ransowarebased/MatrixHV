@@ -1,0 +1,16 @@
+[package]
+name = "matrixhv-client"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "Host-side MatrixHV memory and interception transport API"
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "client"
+path = "../../tests/client_tests.rs"
+
+[dependencies]
+matrixhv-protocol = { path = "../matrixhv-protocol" }

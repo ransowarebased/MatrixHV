@@ -1,7 +1,6 @@
 """Build and run the local test suites grouped by component."""
 
 import argparse
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -9,7 +8,7 @@ from time import perf_counter
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / "tests"))
-from harness import COMPONENTS, prepare_boot_state
+from harness import COMPONENTS, prepare_boot_state, protocol_extern
 
 
 def execute(command, project, env=None):
@@ -26,10 +25,12 @@ def run_component(project, component, release=False):
         output = project / "builds" / "tests" / component
         output.mkdir(parents=True, exist_ok=True)
         binary = output / (name + (".exe" if sys.platform == "win32" else ""))
+        externs = protocol_extern(project, output) if component == "nested" and name == "policy" else []
         execute(
             [
                 "rustc", "--edition=2024", "--test",
                 "--cfg", f'test_harness="{name}"',
+                *externs,
                 *(["-C", "opt-level=3"] if release else []),
                 str(project / "tests" / f"{component}_tests.rs"),
                 "-o", str(binary),
@@ -58,40 +59,16 @@ def run_component(project, component, release=False):
         execute([sys.executable, str(project / "tests/run_nested_probe_tests.py")], project)
 
 
-def run_neo(project, release=False):
-    version = subprocess.run(
-        ["rustc", "-vV"], cwd=project, check=True, capture_output=True, text=True
-    )
-    host_target = next(
-        line.removeprefix("host: ")
-        for line in version.stdout.splitlines()
-        if line.startswith("host: ")
-    )
-    output = project / "builds" / ".cargo-target-host"
-    options = [
-        "--manifest-path", str(project / "src/neo/Cargo.toml"),
-        "--target", host_target, "--target-dir", str(output),
-    ]
-    if release:
-        options.append("--release")
-    execute(["cargo", "build", *options], project)
-    env = os.environ.copy()
-    env["NEO_TEST_BINARY"] = str(
-        output / host_target / ("release" if release else "debug") / ("neo.exe" if sys.platform == "win32" else "neo")
-    )
-    execute(["cargo", "test", *options], project, env)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--release", action="store_true", help="Build optimized host tests and the ROAD agent in Release mode")
+    parser.add_argument("--release", action="store_true", help="Build optimized host tests in Release mode")
     parser.add_argument(
         "components", nargs="*", metavar="COMPONENT",
-        help=f"Optional component filter: {', '.join([*COMPONENTS, 'neo'])}",
+        help=f"Optional component filter: {', '.join(COMPONENTS)}",
     )
     arguments = parser.parse_args()
-    components = arguments.components or [*COMPONENTS, "neo"]
-    unknown = set(components) - {*COMPONENTS, "neo"}
+    components = arguments.components or list(COMPONENTS)
+    unknown = set(components) - set(COMPONENTS)
     if unknown:
         parser.error(f"Unknown components: {', '.join(sorted(unknown))}")
     project = Path(__file__).resolve().parent
@@ -103,10 +80,7 @@ def main():
         suite_started = perf_counter()
         passed = True
         try:
-            if component == "neo":
-                run_neo(project, arguments.release)
-            else:
-                run_component(project, component, arguments.release)
+            run_component(project, component, arguments.release)
             if component == "boot" and sys.platform == "win32":
                 print("\n  boot::build_scripts", flush=True)
                 execute(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",

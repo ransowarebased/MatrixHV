@@ -3,21 +3,21 @@
 [CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release')]
-    [string]$Configuration = 'Release'
+    [string]$Configuration = 'Release',
+
+    [switch]$SkipImage
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$BuildRoot = [System.IO.Path]::GetFullPath('D:\Projetos\MatrixHV\builds')
+$BuildRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\builds'))
 $ConfigurationName = $Configuration.ToLowerInvariant()
 $OutputRoot = Join-Path $BuildRoot $ConfigurationName
 $BinaryPath = Join-Path $OutputRoot 'MatrixHV.efi'
 $ConfigPath = Join-Path $OutputRoot 'MatrixConfig.bin'
 $BootPath = Join-Path $OutputRoot 'EFI\BOOT\BOOTX64.EFI'
 $ImagePath = Join-Path $OutputRoot 'MatrixHV.img'
-$WindowsNeoPath = Join-Path $OutputRoot 'neo.exe'
-$LinuxNeoPath = Join-Path $OutputRoot 'neo'
 $UpdatePath = Join-Path $OutputRoot 'MatrixHV.mxcore'
 $PackageRoot = Join-Path $BuildRoot 'packages'
 $StagingRoot = [System.IO.Path]::GetFullPath((Join-Path $BuildRoot ".package\$ConfigurationName"))
@@ -37,10 +37,8 @@ if (-not (Test-Path -LiteralPath $BootPath -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "Staged MatrixHV configuration not found: $ConfigPath"
 }
-foreach ($RoadPath in @($WindowsNeoPath, $LinuxNeoPath, $UpdatePath)) {
-    if (-not (Test-Path -LiteralPath $RoadPath -PathType Leaf)) {
-        throw "Staged ROAD binary not found: $RoadPath"
-    }
+if (-not (Test-Path -LiteralPath $UpdatePath -PathType Leaf)) {
+    throw "Staged resident update package not found: $UpdatePath"
 }
 
 if (Test-Path -LiteralPath $StagingRoot) {
@@ -54,11 +52,9 @@ try {
     Copy-Item -LiteralPath $BinaryPath -Destination (Join-Path $StagingRoot 'MatrixHV.efi') -Force
     Copy-Item -LiteralPath $ConfigPath -Destination (Join-Path $StagingRoot 'MatrixConfig.bin') -Force
     Copy-Item -LiteralPath $BootPath -Destination (Join-Path $StagingRoot 'EFI\BOOT\BOOTX64.EFI') -Force
-    Copy-Item -LiteralPath $WindowsNeoPath -Destination (Join-Path $StagingRoot 'neo.exe') -Force
-    Copy-Item -LiteralPath $LinuxNeoPath -Destination (Join-Path $StagingRoot 'neo') -Force
     Copy-Item -LiteralPath $UpdatePath -Destination (Join-Path $StagingRoot 'MatrixHV.mxcore') -Force
 
-    if (Test-Path -LiteralPath $ImagePath -PathType Leaf) {
+    if (-not $SkipImage -and (Test-Path -LiteralPath $ImagePath -PathType Leaf)) {
         Copy-Item -LiteralPath $ImagePath -Destination (Join-Path $StagingRoot (Split-Path -Leaf $ImagePath)) -Force
     }
 

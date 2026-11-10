@@ -1,6 +1,5 @@
 #[cfg(test_harness = "policy")]
-#[path = "../src/protocol.rs"]
-pub mod protocol;
+pub use matrixhv_protocol as protocol;
 #[cfg(test_harness = "policy")]
 use vmx::hyperv;
 #[cfg(test_harness = "policy")]
@@ -1025,7 +1024,7 @@ mod policy {
         assert_eq!(MATRIXHV_STATUS_SIGNATURE_EAX, 0x4d48_5631);
         assert_eq!(MATRIXHV_STATUS_SIGNATURE_EBX.to_le_bytes(), *b"MATR");
         assert_eq!(MATRIXHV_STATUS_SIGNATURE_ECX.to_le_bytes(), *b"IXHV");
-        assert_eq!(MATRIXHV_STATUS_PROTOCOL, 8);
+        assert_eq!(MATRIXHV_STATUS_PROTOCOL, 9);
         assert_eq!(HYPERVISOR_LEAF_START, 0x4000_0000);
         assert_eq!(HYPERV_FEATURES_LEAF, 0x4000_0003);
         assert_eq!(HYPERVISOR_LEAF_END, 0x4fff_ffff);

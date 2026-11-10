@@ -1,3 +1,5 @@
+#![no_std]
+
 pub const CONTROL_PROBE_OPERATION: u32 = 3;
 pub const CONTROL_VERSION: u32 = 4;
 pub const CONTROL_MAGIC: u64 = 0x4d41_5452_4958_4354;
@@ -101,7 +103,7 @@ pub const MATRIXHV_STATUS_LEAF: u32 = 0x4d48_5652;
 pub const MATRIXHV_STATUS_SIGNATURE_EAX: u32 = 0x4d48_5631;
 pub const MATRIXHV_STATUS_SIGNATURE_EBX: u32 = u32::from_le_bytes(*b"MATR");
 pub const MATRIXHV_STATUS_SIGNATURE_ECX: u32 = u32::from_le_bytes(*b"IXHV");
-pub const MATRIXHV_STATUS_PROTOCOL: u32 = 8;
+pub const MATRIXHV_STATUS_PROTOCOL: u32 = 9;
 pub const MATRIXHV_INTEL_PT_CAPABILITY: u32 = 1 << 18;
 pub const MATRIXHV_INTEL_PT_SUBLEAF: u32 = 0x600;
 pub const MATRIXHV_INTEL_PT_DATA_SUBLEAF: u32 = 0x1000;
@@ -192,76 +194,8 @@ pub mod memory {
     // SYSRET64 state. Install carries callback at 24, LSTAR at 48 and token at 80.
     pub const SYSCALL_SET: u32 = 26;
     pub const SYSCALL_CLEAR: u32 = 27;
-    // Watch descriptors: address:u64, access:u32 (1=write, 3=read/write),
-    // length:u32 (1/2/4/8). Fetch selects CPU at 24 and exclusive sequence at 64.
-    pub const WATCH_SET: u32 = 28;
-    pub const WATCH_CLEAR: u32 = 29;
-    pub const WATCH_FETCH: u32 = 30;
-    // SET arms exit sampling; SNAPSHOT returns cached contexts for CPU at 24.
-    // STACK_WALK selects a cached sequence at 64 and returns bounded RBP frames.
-    // Exported contexts remain available until the next SNAPSHOT on that CPU.
-    pub const CONTEXT_SET: u32 = 31;
-    pub const CONTEXT_CLEAR: u32 = 32;
-    pub const CONTEXT_SNAPSHOT: u32 = 33;
-    pub const STACK_WALK: u32 = 34;
-    // Filters use TEB at 24 and count at 32; records are (start, end, exclude),
-    // with exclusive ends. Empty filters accept everything. Exclusions win.
-    pub const WATCH_FILTER_SET: u32 = 35;
-    pub const CONTEXT_FILTER_SET: u32 = 36;
-    // Retrieve one cached snapshot by sequence without replacing snapshots.
-    pub const CONTEXT_RECORD_GET: u32 = 37;
-    pub const EVENT_SET: u32 = 38;
-    pub const EVENT_CLEAR: u32 = 39;
-    pub const EVENT_FETCH: u32 = 40;
-    pub const EVENT_CAPABILITY: u32 = 1 << 7;
-    pub const EVENT_SAMPLE: u32 = 1;
-    pub const EVENT_EXCEPTION_MASK: u64 = (1 << 0)
-        | (1 << 1)
-        | (1 << 3)
-        | (1 << 4)
-        | (1 << 5)
-        | (1 << 6)
-        | (1 << 7)
-        | (1 << 10)
-        | (1 << 11)
-        | (1 << 12)
-        | (1 << 13)
-        | (1 << 14)
-        | (1 << 16)
-        | (1 << 17)
-        | (1 << 19)
-        | (1 << 21);
-    pub const EVENT_REGIONS: usize = 4;
-    pub const EVENT_REGION_BYTES: usize = 1024;
-    pub const EVENT_STACK_BYTES: usize = 2048;
-    pub const EVENT_CODE_BYTES: usize = 32;
-    pub const EVENT_RING_RECORDS: usize = 16;
-    pub const EVENT_SEGMENT_HEADER: usize = 16;
-    pub const EVENT_RECORD_HEADER: usize = CONTEXT_RECORD_BYTES + 56;
-    pub const EVENT_RECORD_BYTES: usize = EVENT_RECORD_HEADER
-        + (2 + EVENT_REGIONS) * EVENT_SEGMENT_HEADER
-        + EVENT_CODE_BYTES
-        + EVENT_STACK_BYTES
-        + EVENT_REGIONS * EVENT_REGION_BYTES;
-    pub const EVENT_FETCH_MAX: usize = (BUFFER_BYTES - HEADER_BYTES) / EVENT_RECORD_BYTES;
-    pub const EVENT_CONTEXT: u64 = 1;
-    pub const EVENT_WATCH: u64 = 2;
-    pub const EVENT_EXCEPTION: u64 = 3;
-    pub const EVENT_ENTRY: u64 = 4;
-    pub const EVENT_RETURN: u64 = 5;
-    pub const EVENT_ABANDON: u64 = 6;
-    pub const EVENT_UNMATCHED: u64 = 7;
-    pub const EVENT_SOFTWARE_EXCEPTION: u64 = 8;
-    pub const OBSERVATION_FILTER_RANGES: usize = 16;
-    pub const OBSERVATION_FILTER_BYTES: usize = 24;
-    pub const OBSERVATION_FILTER_CAPABILITY: u32 = 1 << 5;
-    pub const WATCH_RECORD_BYTES: usize = 240;
-    pub const CONTEXT_RECORD_BYTES: usize = 208;
-    pub const WATCH_RING_RECORDS: usize = 64;
-    pub const CONTEXT_CPU_RECORDS: usize = 8;
-    pub const STACK_MAX_FRAMES: usize = 64;
-    pub const WATCH_POST_INSTRUCTION: u64 = 1;
-    pub const OBSERVATION_CAPABILITY: u32 = 1 << 4;
+    // Ops 28..=40 (watch, context sampling, stack walk, app-event capture)
+    // were removed from the ABI. Packet numbers are not reused.
     // Input descriptor +20 contains flags; installation replaces +16..24 with ID.
     // Listing returns flags at +20. Data shadows map private read/execute bytes;
     // guest writes retain native page-table permissions and never modify RAM.
