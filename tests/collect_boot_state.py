@@ -35,7 +35,7 @@ resident = "\n".join((project / "src/vmx" / name).read_text()
                      for name in ("resident/abi.rs", "pt.rs"))
 nested = (project / "src/vmx/nested.rs").read_text() + "\n" + (
     project / "src/vmx/vmcs12.rs").read_text()
-protocol = (project / "crates/matrixhv-protocol/src/lib.rs").read_text(encoding="utf-8")
+protocol = (project / "sdk/src/protocol.rs").read_text(encoding="utf-8")
 fields = {}
 formats = {}
 offset = 0

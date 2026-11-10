@@ -8,16 +8,16 @@ import subprocess
 import textwrap
 
 
-PROTOCOL_SOURCE = Path("crates/matrixhv-protocol/src/lib.rs")
+PROTOCOL_SOURCE = Path("sdk/src/protocol.rs")
 
 
 def protocol_extern(project: Path, output: Path) -> list[str]:
     output.mkdir(parents=True, exist_ok=True)
-    library = output / "libmatrixhv_protocol.rlib"
-    subprocess.run(["rustc", "--edition=2024", "-Dwarnings", "--crate-name", "matrixhv_protocol",
-                    "--crate-type", "rlib", str(project / PROTOCOL_SOURCE), "-o", str(library)],
+    library = output / "libmatrixhv_sdk.rlib"
+    subprocess.run(["rustc", "--edition=2024", "-Dwarnings", "--crate-name", "matrixhv_sdk",
+                    "--crate-type", "rlib", str(project / "sdk/src/lib.rs"), "-o", str(library)],
                    check=True, cwd=project)
-    return ["--extern", f"matrixhv_protocol={library}"]
+    return ["--extern", f"matrixhv_sdk={library}"]
 
 
 def read_resident_rust(project: Path) -> str:
@@ -3289,7 +3289,7 @@ def prepare_boot_state(project: Path):
         legacy_abi = legacy_abi.replace(declaration, "").replace(initializer, "")
     (output / "legacy-abi.rs").write_text(legacy_abi, encoding="utf-8")
     harness = "use std::mem::{offset_of, size_of};\n"
-    harness += 'pub use matrixhv_protocol as protocol;\n'
+    harness += 'pub use matrixhv_sdk::protocol;\n'
     harness += 'pub mod memory { pub mod host { pub const PAGE_SIZE: usize = 4096; } }\n'
     trace_source = (project / "src/vmx/pt.rs").read_text()
     (output / "trace_state.rs").write_text(trace_source[trace_source.index("#[repr(C)]"):trace_source.index("pub(crate) fn supported")])

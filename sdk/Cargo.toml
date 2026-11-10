@@ -1,0 +1,18 @@
+[package]
+name = "matrixhv-sdk"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "MatrixHV instrumentation ABI and Rust client API"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["client"]
+client = []
+
+[[test]]
+name = "client"
+path = "../tests/client_tests.rs"
+required-features = ["client"]

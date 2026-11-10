@@ -1,5 +1,5 @@
 #[cfg(test_harness = "policy")]
-pub use matrixhv_protocol as protocol;
+pub use matrixhv_sdk::protocol;
 #[cfg(test_harness = "policy")]
 use vmx::hyperv;
 #[cfg(test_harness = "policy")]

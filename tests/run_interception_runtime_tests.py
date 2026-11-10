@@ -64,7 +64,7 @@ cpu = 'use core::sync::atomic::AtomicU64;\n#[repr(C)]\n#[derive(Default)]\n' + i
 vmcs = (project / 'src/vmx/vmcs.rs').read_text()
 constants = '\n'.join(re.findall(r'pub const \w+: u64 = (?:0x[0-9a-fA-F_]+|\d+);', vmcs))
 access = (project / "src/memory/access.rs").read_text()
-definitions = '''pub use matrixhv_protocol as protocol;
+definitions = '''pub use matrixhv_sdk::protocol;
 pub mod arch {
     pub struct Leaf { pub eax: u32 }
     pub fn leaf(_: u32) -> Leaf { Leaf { eax: 48 } }

@@ -1,5 +1,3 @@
-#![no_std]
-
 pub const CONTROL_PROBE_OPERATION: u32 = 3;
 pub const CONTROL_VERSION: u32 = 4;
 pub const CONTROL_MAGIC: u64 = 0x4d41_5452_4958_4354;

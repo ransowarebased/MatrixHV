@@ -30,7 +30,7 @@ layout_nodes = [node for node in layout_tree.body if isinstance(node, ast.Functi
 layout_scope = {'re': re}
 exec(compile(ast.Module(body=layout_nodes, type_ignores=[]), str(layout_path), 'exec'), layout_scope)
 source = (project / 'src/memory/interception.rs').read_text() + (
-    project / 'crates/matrixhv-protocol/src/lib.rs').read_text(encoding='utf-8')
+    project / 'sdk/src/protocol.rs').read_text(encoding='utf-8')
 fields, _, _ = layout_scope['plain_layout'](source, 'Session', stop='refresh_lock')
 profile, _, _ = layout_scope['plain_layout'](source, 'RoadEptProfile')
 lock_address = session + fields['refresh_lock']

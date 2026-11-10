@@ -1,4 +1,4 @@
-use matrixhv_protocol::memory::{
+use crate::protocol::memory::{
     AD_BITMAP, AD_CANCEL, AD_ENUMERATE, AD_FETCH, AD_RELEASE, AD_START, AD_STATUS, AD_STOP,
     BUFFER_BYTES, HEADER_BYTES, INFO, INFO_BYTES, ITEM_BYTES, MAX_ITEMS, MEMORY_LEAF, MEMORY_MAGIC,
     MEMORY_SIGNATURE, MEMORY_VERSION, READ, ROAD_STATUS_DEMAND_ZERO, ROOT_HISTORY_COUNT,
@@ -47,7 +47,7 @@ pub struct InterceptionRequest {
 }
 
 pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, String> {
-    use matrixhv_protocol::memory::{
+    use crate::protocol::memory::{
         CPUID_CLEAR, CPUID_MAX_RECORDS, CPUID_RECORD_BYTES, CPUID_SET, DEBUG_CLEAR, DEBUG_SET,
         HOOK_ADD, HOOK_DATA_SHADOW, HOOK_DROP, HOOK_INSTALL, HOOK_LIST, HOOK_MAX_PATCHES,
         HOOK_REMOVE, INTERCEPT_CONCURRENT_WRITES, INTERCEPT_CONTEXT_ADD, INTERCEPT_CONTEXT_LIST,

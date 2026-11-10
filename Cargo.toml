@@ -1,9 +1,5 @@
 [workspace]
-members = [
-    ".",
-    "crates/matrixhv-protocol",
-    "crates/matrixhv-client",
-]
+members = [".", "sdk"]
 resolver = "2"
 default-members = ["."]
 
@@ -18,7 +14,7 @@ name = "MatrixHV"
 path = "src/main.rs"
 
 [dependencies]
-matrixhv-protocol = { path = "crates/matrixhv-protocol" }
+matrixhv-sdk = { path = "sdk", default-features = false }
 log = { version = "0.4.28", default-features = false }
 uefi = { version = "0.40.0", features = ["alloc", "global_allocator", "panic_handler"] }
 uefi-raw = "0.16.0"
