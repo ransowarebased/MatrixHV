@@ -8,7 +8,7 @@ mod boot;
 mod diagnostics;
 mod logging;
 mod memory;
-mod protocol;
+use matrixhv_protocol as protocol;
 pub mod update;
 mod vmx;
 

@@ -145,12 +145,24 @@ version = "1.0.0"
 dependencies = [
  "ed25519-dalek",
  "log",
+ "matrixhv-protocol",
  "sha2",
  "uefi",
  "uefi-raw",
  "yaxpeax-arch",
  "yaxpeax-x86",
 ]
+
+[[package]]
+name = "matrixhv-client"
+version = "1.0.0"
+dependencies = [
+ "matrixhv-protocol",
+]
+
+[[package]]
+name = "matrixhv-protocol"
+version = "1.0.0"
 
 [[package]]
 name = "num-traits"

@@ -2,7 +2,7 @@
 
 MatrixHV is an experimental Intel VT-x (VMX) pre-boot hypervisor written in Rust (`#![no_std]`) and assembly for the `x86_64-unknown-uefi` target. It executes as a UEFI application, establishes a resident virtualization environment across all logical processors (bootstrap processor and application processors), initializes Extended Page Tables (EPT), and chainloads an EFI boot target (such as the Windows Boot Manager) under hardware virtualization.
 
-The repository also includes **ROAD / neo**, a user-space host companion and telemetry agent, as well as test suites for offline validation of hypervisor memory mechanisms and instruction handling.
+The repository exposes a shared host ABI (`matrixhv-protocol`) and a reusable host client library (`matrixhv-client`). Third-party programs integrate with a running MatrixHV core through `crates/matrixhv-client`. The optional host-side CLI and telemetry client, Neo, lives in a separate repository: https://github.com/ransowarebased/Neo.
 
 ---
 
@@ -40,6 +40,9 @@ To ensure clarity and avoid unrealistic expectations:
 
 ```
 MatrixHV/
+├── crates/
+│   ├── matrixhv-protocol/      # Shared #[repr(C)] host/guest ABI (no_std)
+│   └── matrixhv-client/        # Host-side packet builders + CPUID memory transport API
 ├── src/
 │   ├── main.rs                 # UEFI entry point and boot coordination
 │   ├── arch.rs                 # Low-level x86-64 MSR, CPUID, and register access
@@ -52,12 +55,11 @@ MatrixHV/
 │   ├── memory/                 # Memory access, tracking, and interception engines
 │   │   ├── access.rs           # Physical and virtual memory translation
 │   │   ├── interception.rs     # EPT split views, CPUID profiles, and syscall interception
+│   │   ├── observation.rs      # Hook data-shadow metadata (watch/context/event capture removed)
 │   │   └── tracking.rs         # Accessed and dirty bit tracking
-│   ├── protocol.rs             # Hypervisor-to-host resident memory communication protocol
 │   ├── update.rs               # Authenticated resident runtime hot-swap engine
 │   ├── diagnostics.rs          # Diagnostic utilities and hardware checks
-│   ├── logging.rs              # Serial (COM1) and resident memory logging
-│   └── neo/                    # User-space companion CLI (telemetry, control, memory access)
+│   └── logging.rs              # Serial (COM1) and resident memory logging
 ├── scripts/                    # Automation scripts for build, image generation, and packaging
 └── tests/                      # Unit tests, integration harnesses, and runtime verification
 ```
@@ -67,13 +69,11 @@ MatrixHV/
 ## Prerequisites
 
 - **Toolchain**: Rust stable with the `x86_64-unknown-uefi` target.
-- **Host Targets**: `x86_64-pc-windows-msvc` (for Windows host builds and tests) and optionally `x86_64-unknown-linux-musl` for `neo`.
 - **System Tools**: PowerShell 5.1+, Python 3, and the MSVC C++ build tools / linker.
 
-Install required Rust targets:
+Install the required Rust target:
 ```powershell
 rustup target add x86_64-unknown-uefi
-rustup target add x86_64-pc-windows-msvc
 ```
 
 ---
@@ -89,13 +89,14 @@ cargo build --release --target x86_64-unknown-uefi
 The resulting UEFI binary will be produced at:
 `builds/.cargo-target/x86_64-unknown-uefi/release/MatrixHV.efi`
 
-### 2. Build ROAD / neo (Host Companion)
+### 2. Integrate a host program
 
-```powershell
-cargo build --release --manifest-path src/neo/Cargo.toml --target x86_64-pc-windows-msvc
+Depend on the client crate (path while developing against this tree, or a git/tag dependency from your own project):
+```toml
+matrixhv-client = { path = "crates/matrixhv-client" }
 ```
-The executable will be located at:
-`builds/.cargo-target/x86_64-pc-windows-msvc/release/neo.exe`
+
+The companion CLI is maintained at https://github.com/ransowarebased/Neo.
 
 ### 3. Automated Packaging Pipeline
 
@@ -136,28 +137,9 @@ MatrixHV includes mock hardware test runners to validate instruction handlers, E
 ```powershell
 # Run the resident interception runtime test suite (62 mocked tests)
 python tests/run_interception_runtime_tests.py
-
-# Run the neo protocol and EPT split-view unit tests (54 tests)
-cargo test --manifest-path src/neo/Cargo.toml --target x86_64-pc-windows-msvc interception_tests
 ```
 
----
-
-## ROAD / neo CLI
-
-`neo` provides an administrative interface for interacting with the resident hypervisor from user space:
-
-```powershell
-# Query hypervisor resident status
-neo.exe matrix status
-
-# Enable/disable telemetry collection
-neo.exe telemetry enable
-neo.exe telemetry disable
-
-# Display help and available commands
-neo.exe --help
-```
+CLI, telemetry, and host-agent tests live in the Neo repository: https://github.com/ransowarebased/Neo.
 
 ---
 

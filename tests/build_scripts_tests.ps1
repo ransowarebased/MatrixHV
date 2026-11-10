@@ -36,16 +36,12 @@ try {
     }
 
     $boot = Join-Path $testRoot 'BOOTX64.EFI'
-    $linux = Join-Path $testRoot 'neo'
-    $windows = Join-Path $testRoot 'neo.exe'
     [System.IO.File]::WriteAllBytes($boot, [byte[]](0..255))
-    [System.IO.File]::WriteAllBytes($linux, [byte[]](0..255))
-    [System.IO.File]::WriteAllBytes($windows, [byte[]](0..255))
-    foreach ($source in @($boot, $config, $linux, $windows)) {
+    foreach ($source in @($boot, $config)) {
         $sourceBytes = [System.IO.File]::ReadAllBytes($source)
         $rejected = $false
         try {
-            & $makeImage -BootBinary $boot -ConfigPath $config -NeoSource $linux -WindowsNeoSource $windows -ImagePath $source | Out-Null
+            & $makeImage -BootBinary $boot -ConfigPath $config -ImagePath $source | Out-Null
         }
         catch {
             $rejected = $_.Exception.Message -like 'Image output cannot replace an input file:*'
@@ -57,7 +53,7 @@ try {
     foreach ($size in @(64, 65, 130)) {
         $image = Join-Path $testRoot "image-$size.img"
         [System.IO.File]::WriteAllText($image, 'previous image')
-        & $makeImage -BootBinary $boot -ConfigPath $config -NeoSource $linux -WindowsNeoSource $windows -ImagePath $image -ImageSizeMiB $size | Out-Null
+        & $makeImage -BootBinary $boot -ConfigPath $config -ImagePath $image -ImageSizeMiB $size | Out-Null
         $stream = [System.IO.File]::OpenRead($image)
         try {
             if ($stream.Length -ne [long]$size * 1MB) {

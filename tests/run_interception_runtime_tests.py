@@ -47,9 +47,6 @@ runtime = runtime[:start] + '''        if !no_flush && read(SECONDARY_VM_EXEC_CO
 assert 'core::arch::asm!' not in runtime
 engine = source[:source.index('pub(crate) trait InterceptionMemory')]
 engine = engine.replace('use crate::memory::access::{PhysicalMemory, page_mapping};', '')
-engine = engine.replace('use crate::memory::observation::{EventConfig, Observation};',
-                        'use crate::memory::observation::Observation;')
-engine = engine.replace('#[cfg(target_os = \"uefi\")]\nuse crate::memory::observation::ContextRecord;', 'use crate::memory::observation::ContextRecord;')
 for declaration in ['fn observer_ptr(', 'fn has_features(']:
     engine = engine.replace(item(engine, declaration), '')
 engine = re.sub(r'const OPTIONS: u32 = .*?;', '', engine, flags=re.S)

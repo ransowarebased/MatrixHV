@@ -397,7 +397,7 @@ pub fn execute(
     if quad(packet, 0) != MEMORY_MAGIC
         || word(packet, 8) != MEMORY_VERSION
         || word(packet, 36) as usize != packet.len()
-        || operation != EVENT_SET && word(packet, 44) != 0
+        || word(packet, 44) != 0
     {
         return Err(Error::Format);
     }
@@ -421,19 +421,6 @@ pub fn execute(
             | CPUID_CLEAR
             | SYSCALL_SET
             | SYSCALL_CLEAR
-            | WATCH_SET
-            | WATCH_CLEAR
-            | WATCH_FETCH
-            | CONTEXT_SET
-            | CONTEXT_CLEAR
-            | CONTEXT_SNAPSHOT
-            | STACK_WALK
-            | WATCH_FILTER_SET
-            | CONTEXT_FILTER_SET
-            | CONTEXT_RECORD_GET
-            | EVENT_SET
-            | EVENT_CLEAR
-            | EVENT_FETCH
     ) {
         return memory.intercept(packet, la57, physical_bits);
     }
@@ -1345,19 +1332,6 @@ pub(crate) mod resident {
                         | CPUID_UNGATED_CAPABILITY
                         | PRIVATE_SHARED_DATA_CAPABILITY
                         | SYSCALL_PROFILE_CAPABILITY
-                        | if unsafe {
-                            &*(environment.interception_session
-                                as *const crate::memory::interception::Session)
-                        }
-                        .observation
-                            != 0
-                        {
-                            OBSERVATION_CAPABILITY
-                                | OBSERVATION_FILTER_CAPABILITY
-                                | EVENT_CAPABILITY
-                        } else {
-                            0
-                        }
                 } else {
                     0
                 },

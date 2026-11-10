@@ -13,7 +13,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'builds/validation/ept-revalidation-profile'
 PATHS = ['src/vmx/asm/nested.S', 'src/asm/diagnostics.S',
-         'src/neo/src/telemetry.rs', 'tests/nested_tests.rs', 'src/vmx/asm/island.S']
+         'clients/neo/src/telemetry.rs', 'tests/nested_tests.rs', 'src/vmx/asm/island.S']
 
 
 def replace_once(text, old, new):

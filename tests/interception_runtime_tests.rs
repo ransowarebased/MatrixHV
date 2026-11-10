@@ -3639,5 +3639,3 @@ fn fatal_mixed_instruction_retires_owned_windows_before_terminal_return() {
     }
 }
 
-#[path = "observation_runtime_tests.rs"]
-mod observation_runtime_tests;

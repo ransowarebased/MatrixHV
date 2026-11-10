@@ -11,10 +11,6 @@ param(
 
     [string]$ImagePath,
 
-    [string]$NeoSource,
-
-    [string]$WindowsNeoSource,
-
     [ValidateRange(64, 2048)]
     [int]$ImageSizeMiB = 64,
 
@@ -278,18 +274,10 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 if ([string]::IsNullOrWhiteSpace($ImagePath)) {
     $ImagePath = Join-Path $BuildRoot "$ConfigurationName\MatrixHV.img"
 }
-if ([string]::IsNullOrWhiteSpace($NeoSource)) {
-    $NeoSource = Join-Path $BuildRoot "$ConfigurationName\neo"
-}
-if ([string]::IsNullOrWhiteSpace($WindowsNeoSource)) {
-    $WindowsNeoSource = Join-Path $BuildRoot "$ConfigurationName\neo.exe"
-}
 
 $BootBinary = [System.IO.Path]::GetFullPath($BootBinary)
 $ConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
 $ImagePath = [System.IO.Path]::GetFullPath($ImagePath)
-$NeoSource = [System.IO.Path]::GetFullPath($NeoSource)
-$WindowsNeoSource = [System.IO.Path]::GetFullPath($WindowsNeoSource)
 $BuildRootPrefix = $BuildRoot.TrimEnd('\') + '\'
 if (-not $ImagePath.StartsWith($BuildRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "Image output must be under $BuildRoot"
@@ -300,17 +288,9 @@ if (-not (Test-Path -LiteralPath $BootBinary -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "MatrixHV configuration not found: $ConfigPath"
 }
-if (-not (Test-Path -LiteralPath $NeoSource -PathType Leaf)) {
-    throw "Linux neo binary not found: $NeoSource"
-}
-if (-not (Test-Path -LiteralPath $WindowsNeoSource -PathType Leaf)) {
-    throw "Windows neo binary not found: $WindowsNeoSource"
-}
 
 $ImageFiles = New-Object 'System.Collections.Generic.List[object]'
 $ImageFiles.Add((New-ImageFileDescriptor -Directory 'ROOT' -Name 'MatrixConfig.bin' -ShortName 'MATRIX~1BIN' -LongName 'MatrixConfig.bin' -SourcePath $ConfigPath))
-$ImageFiles.Add((New-ImageFileDescriptor -Directory 'ROOT' -Name 'neo' -ShortName 'NEO        ' -LongName $null -SourcePath $NeoSource))
-$ImageFiles.Add((New-ImageFileDescriptor -Directory 'ROOT' -Name 'neo.exe' -ShortName 'NEO     EXE' -LongName $null -SourcePath $WindowsNeoSource))
 $ImageFiles.Add((New-ImageFileDescriptor -Directory 'BOOT' -Name 'BOOTX64.EFI' -ShortName 'BOOTX64 EFI' -LongName $null -SourcePath $BootBinary))
 if (-not [string]::IsNullOrWhiteSpace($VmxFlatEfiSource)) {
     $VmxFlatEfiSource = [System.IO.Path]::GetFullPath($VmxFlatEfiSource)
