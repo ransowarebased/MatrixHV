@@ -80,12 +80,12 @@ fn syscall_scenario() -> Scenario {
         (GUEST_RSP, 0x700000),
         (GUEST_GS_BASE, 0x7fff1000),
         (GUEST_FS_BASE, 0x7fff2000),
-        (GUEST_DR7, 0xf0440),
+        (GUEST_DR7, 0x400),
         (VM_EXIT_INTR_INFO, 0x80000301),
     ] {
         hardware::write(field, value).unwrap();
     }
-    hardware::load_debug(&[11, 22, 33, 0x7ffe0ff0, 0xffff0ff0]);
+    hardware::load_debug(&[11, 22, 33, 44, 0xffff0ff0]);
     scenario.frame = core::array::from_fn(|index| 0x12340000 + index as u64);
     scenario.frame[0] = 0xffffffff00000026;
     scenario.frame[1] = 0x400122;
@@ -101,9 +101,9 @@ fn syscall_return_restores_full_sysret64_state_and_preserves_user_stack_and_gs()
     assert_eq!(scenario.call(1), 0);
     assert_eq!(
         hardware::debug_registers(),
-        [0xffff800000400000, 22, 33, 0x7ffe0ff0, 0xffff0ff0]
+        [0xffff800000400000, 22, 33, 44, 0xffff0ff0]
     );
-    assert_eq!(hardware::read(GUEST_DR7), Ok(0x442));
+    assert_eq!(hardware::read(GUEST_DR7), Ok(0x402));
     assert_eq!(scenario.exit(0, 1), 1);
     for (field, expected) in [
         (GUEST_RIP, 0x402000),
@@ -133,8 +133,8 @@ fn syscall_return_restores_full_sysret64_state_and_preserves_user_stack_and_gs()
             .chain(&scenario.fx_state[240..])
             .all(|byte| *byte == 0xaa)
     );
-    assert_eq!(hardware::read(GUEST_DR7), Ok(0xf0440));
-    assert_eq!(hardware::debug_registers()[3], 0x7ffe0ff0);
+    assert_eq!(hardware::read(GUEST_DR7), Ok(0x400));
+    assert_eq!(hardware::debug_registers()[3], 44);
 }
 
 #[test]
@@ -160,9 +160,9 @@ fn syscall_bypass_records_the_native_selector_consumes_xmm5_and_retries_with_rf(
 #[test]
 fn syscall_overlay_preserves_foreign_breakpoints_and_forwards_their_debug_causes() {
     let mut scenario = syscall_scenario();
-    hardware::write(GUEST_DR7, 0xf0444).unwrap();
+    hardware::write(GUEST_DR7, 0x404).unwrap();
     scenario.call(1);
-    assert_eq!(hardware::read(GUEST_DR7), Ok(0x446));
+    assert_eq!(hardware::read(GUEST_DR7), Ok(0x406));
     assert_eq!(scenario.exit(0, 3), 0);
     assert_eq!(hardware::read(GUEST_RIP), Ok(0xffff800000400000));
     assert_eq!(hardware::debug_registers()[4] & 15, 2);
@@ -550,16 +550,15 @@ fn failed_debug_redirect_rollback_requests_reset_instead_of_a_partial_return() {
 }
 
 #[test]
-fn syscall_overlay_requires_the_exact_gate_free_dr0_root_and_supported_entry() {
-    for rejected in 0..7 {
+fn syscall_overlay_requires_a_free_slot_matching_root_and_supported_entry() {
+    for rejected in 0..6 {
         let mut scenario = syscall_scenario();
         match rejected {
             0 => hardware::write(GUEST_CR3, 0x5000).unwrap(),
-            1 => hardware::load_debug(&[11, 22, 33, 0x7ffe0ff1, 0xffff0ff0]),
-            2 => hardware::write(GUEST_DR7, 0xf04ff).unwrap(),
-            3 => hardware::write(GUEST_DR7, 0xf2440).unwrap(),
-            4 => hardware::write(GUEST_CR4, 1 << 23).unwrap(),
-            5 => hardware::write(GUEST_CR4, 1 << 12).unwrap(),
+            1 => hardware::write(GUEST_DR7, 0x4ff).unwrap(),
+            2 => hardware::write(GUEST_DR7, 0x2400).unwrap(),
+            3 => hardware::write(GUEST_CR4, 1 << 23).unwrap(),
+            4 => hardware::write(GUEST_CR4, 1 << 12).unwrap(),
             _ => hardware::STATE.with(|state| state.borrow_mut().syscall_msrs[1] += 16),
         }
         let debug = hardware::debug_registers();
@@ -570,33 +569,100 @@ fn syscall_overlay_requires_the_exact_gate_free_dr0_root_and_supported_entry() {
 }
 
 #[test]
+fn syscall_uses_any_free_debug_slot_without_requiring_guest_gate_values() {
+    for slot in 0..4 {
+        for dr3 in [44, 0x7ffe0ff0, 0x7ffe0ff1] {
+            let mut scenario = syscall_scenario();
+            let registers = [11, 22, 33, dr3, 0xffff0ff0];
+            let dr7 = (0..slot).fold(0x400, |value, index| value | (2 << (index * 2)));
+            hardware::load_debug(&registers);
+            hardware::write(GUEST_DR7, dr7).unwrap();
+            assert_eq!(scenario.call(1), 0);
+            assert_eq!(
+                scenario.boot.interception.debug_armed, 1,
+                "slot={slot}, dr3={dr3:x}"
+            );
+            assert_eq!(hardware::debug_registers()[slot], 0xffff800000400000);
+            assert_eq!(hardware::read(GUEST_DR7), Ok(dr7 | (2 << (slot * 2))));
+            assert_eq!(scenario.exit(0, 1 << slot), 1);
+            assert_eq!(hardware::read(GUEST_RIP), Ok(0x402000));
+            assert_eq!(hardware::debug_registers(), registers);
+            assert_eq!(hardware::read(GUEST_DR7), Ok(dr7));
+        }
+    }
+}
+
+#[test]
+fn three_debug_redirects_and_syscall_can_use_all_four_slots() {
+    for hit in 0..4 {
+        let mut scenario = syscall_scenario();
+        let configuration = scenario.session.configuration.get_mut();
+        configuration.debug_count = 3;
+        for (index, target) in configuration.debug[..3].iter_mut().enumerate() {
+            *target = DebugTarget {
+                address: 0x400000 + index as u64 * 16,
+                redirect: 0x500000 + index as u64 * 16,
+            };
+        }
+        if hit != 3 {
+            hardware::write(GUEST_RIP, 0x400000 + hit as u64 * 16).unwrap();
+        }
+        assert_eq!(scenario.call(1), 0);
+        assert_eq!(scenario.boot.interception.debug_kinds, [1, 1, 1, 2]);
+        assert_eq!(scenario.exit(0, 1 << hit), 1);
+        let expected = if hit == 3 {
+            0x402000
+        } else {
+            0x500000 + hit as u64 * 16
+        };
+        assert_eq!(hardware::read(GUEST_RIP), Ok(expected), "slot={hit}");
+    }
+}
+
+#[test]
 fn in_flight_syscall_fault_after_clear_rotation_or_lease_retries_native_privilege_state() {
     for retired in 0..5 {
-        let mut scenario = syscall_scenario();
-        scenario.call(1);
-        match retired {
-            0 => *scenario.session.syscall.get_mut() = SyscallProfile::default(),
-            1 => scenario.session.configuration.get_mut().token += 1,
-            2 => scenario.session.configuration.get_mut().generation += 1,
-            3 => scenario
-                .session
-                .active
-                .store(u64::from(INTERCEPT_REVOKED), Ordering::Release),
-            _ => {
-                scenario.session.tsc_hz.store(1000, Ordering::Release);
-                scenario
-                    .session
-                    .lease_deadline
-                    .store(1000, Ordering::Release);
-                hardware::STATE.with(|state| state.borrow_mut().clock = 1001);
+        for slot in [0, 3] {
+            let mut scenario = syscall_scenario();
+            if slot == 3 {
+                let configuration = scenario.session.configuration.get_mut();
+                configuration.debug_count = 3;
+                for (index, target) in configuration.debug[..3].iter_mut().enumerate() {
+                    *target = DebugTarget {
+                        address: 0x400000 + index as u64 * 16,
+                        redirect: 0x500000 + index as u64 * 16,
+                    };
+                }
             }
+            scenario.call(1);
+            match retired {
+                0 => *scenario.session.syscall.get_mut() = SyscallProfile::default(),
+                1 => scenario.session.configuration.get_mut().token += 1,
+                2 => scenario.session.configuration.get_mut().generation += 1,
+                3 => scenario
+                    .session
+                    .active
+                    .store(u64::from(INTERCEPT_REVOKED), Ordering::Release),
+                _ => {
+                    scenario.session.tsc_hz.store(1000, Ordering::Release);
+                    scenario
+                        .session
+                        .lease_deadline
+                        .store(1000, Ordering::Release);
+                    hardware::STATE.with(|state| state.borrow_mut().clock = 1001);
+                }
+            }
+            assert_eq!(
+                scenario.exit(0, 1 << slot),
+                1,
+                "case={retired}, slot={slot}"
+            );
+            assert_eq!(hardware::read(GUEST_RIP), Ok(0xffff800000400000));
+            assert_eq!(hardware::read(GUEST_CS_SELECTOR), Ok(0x10));
+            assert_eq!(hardware::read(GUEST_SS_SELECTOR), Ok(0x18));
+            assert_eq!(hardware::read(GUEST_RFLAGS), Ok(0x10046));
+            assert_eq!(scenario.fx_state, [0xaa; 512]);
         }
-        assert_eq!(scenario.exit(0, 1), 1, "case={retired}");
-        assert_eq!(hardware::read(GUEST_RIP), Ok(0xffff800000400000));
-        assert_eq!(hardware::read(GUEST_CS_SELECTOR), Ok(0x10));
-        assert_eq!(hardware::read(GUEST_SS_SELECTOR), Ok(0x18));
-        assert_eq!(hardware::read(GUEST_RFLAGS), Ok(0x10046));
-        assert_eq!(scenario.fx_state, [0xaa; 512]);
     }
 }
 
@@ -1683,7 +1749,7 @@ fn guest_owned_debug_exceptions_update_dr6_from_qualification_without_redirectin
     let mut scenario = Scenario::new();
     hardware::write(GUEST_DR7, 0x401).unwrap();
     scenario.call(1);
-    assert_eq!(scenario.boot.interception.debug_armed, 0);
+    assert_eq!(scenario.boot.interception.debug_armed, 1);
     hardware::write(VM_EXIT_INTR_INFO, 0x80000301).unwrap();
     hardware::write(GUEST_RIP, 0x400000).unwrap();
     assert_eq!(scenario.exit(0, 1 | (1 << 14) | (1 << 11) | (1 << 16)), 0);
@@ -1801,7 +1867,7 @@ fn conflicting_guest_writes_revoke_the_profile_and_preserve_original_data() {
 }
 
 #[test]
-fn guest_mov_dr_is_virtualized_and_debugger_ownership_suspends_the_overlay() {
+fn guest_mov_dr_is_virtualized_and_the_overlay_uses_a_free_slot() {
     let mut scenario = Scenario::new();
     scenario.call(1);
     scenario.frame[0] = 0x123000;
@@ -1813,8 +1879,8 @@ fn guest_mov_dr_is_virtualized_and_debugger_ownership_suspends_the_overlay() {
     scenario.frame[0] = 0x401;
     assert_eq!(scenario.exit(29, 7), 2);
     scenario.call(1);
-    assert_eq!(scenario.boot.interception.debug_armed, 0);
-    assert_eq!(hardware::read(GUEST_DR7), Ok(0x401));
+    assert_eq!(scenario.boot.interception.debug_armed, 1);
+    assert_eq!(hardware::read(GUEST_DR7), Ok(0x409));
     assert_eq!(hardware::debug_registers()[0], 0x123000);
     hardware::write(GUEST_CR4, 8).unwrap();
     assert_eq!(scenario.exit(29, 4), 4);
@@ -2034,7 +2100,7 @@ fn assembly_callback_services_control_exits_after_early_observer_recovery() {
     for (reason, qualification) in [(28, 3), (29, 16)] {
         let mut scenario = Scenario::new();
         scenario.session.configuration.get_mut().hook_count = 0;
-        hardware::write(GUEST_DR7, 0x401).unwrap();
+        hardware::write(GUEST_DR7, 0x4ff).unwrap();
         scenario.call(1);
         scenario.boot.last_reason = reason;
         scenario.boot.last_qualification = qualification;

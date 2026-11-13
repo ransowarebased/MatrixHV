@@ -1986,10 +1986,6 @@ pub(crate) mod runtime {
         unsafe { [crate::arch::read_msr(0x6a0), crate::arch::read_msr(0x6a7)] }
     }
 
-    fn syscall_gate(registers: &[u64; 6]) -> bool {
-        registers[3] == 0x7ffe_0ff0 && registers[5] & 0xffff_ffff_f000_0040 == 0x40
-    }
-
     fn route_syscall(
         profile: &SyscallProfile,
         frame: &mut [u64],
@@ -2651,10 +2647,7 @@ pub(crate) mod runtime {
                 }
             }
             write(CPU_BASED_VM_EXEC_CONTROL, (primary & !PRIMARY_BITS) | bits)?;
-            write(
-                EXCEPTION_BITMAP,
-                (exceptions & !(1 << 1)) | exception_bit,
-            )?;
+            write(EXCEPTION_BITMAP, (exceptions & !(1 << 1)) | exception_bit)?;
             if !active {
                 let cache =
                     unsafe { &(*session.cr3_targets.get())[boot.processor_number as usize] };
@@ -2700,7 +2693,7 @@ pub(crate) mod runtime {
                 cpu.hook_generation = configuration.generation;
             }
             let syscall = unsafe { &*session.syscall.get() };
-            let mut desired = [(0u64, 0u64, 0u64, 0u8); 4];
+            let mut desired = [(0u64, 0u64, 0u64, 0u32); 4];
             let mut needed = 0;
             if target {
                 for debug in &configuration.debug[..configuration.debug_count] {
@@ -2709,7 +2702,6 @@ pub(crate) mod runtime {
                 }
                 if syscall.entry != 0
                     && syscall.token == configuration.token
-                    && syscall_gate(&cpu.guest_debug)
                     && syscall_msrs()[1] == syscall.entry
                     && read(GUEST_CR4)? & (1 << 12) == 0
                     && (read(GUEST_CR4)? & (1 << 23) == 0
@@ -2725,11 +2717,7 @@ pub(crate) mod runtime {
             let free = (0..4)
                 .filter(|slot| cpu.guest_debug[5] & (3 << (slot * 2)) == 0)
                 .count();
-            if needed != 0
-                && free >= needed
-                && cpu.guest_debug[5] & (1 << 13) == 0
-                && (cpu.guest_debug[5] & 0xff == 0 || syscall_gate(&cpu.guest_debug))
-            {
+            if needed != 0 && free >= needed && cpu.guest_debug[5] & (1 << 13) == 0 {
                 let mut registers: [u64; 5] = cpu.guest_debug[..5].try_into().map_err(|_| ())?;
                 let mut dr7 = cpu.guest_debug[5];
                 let mut kinds = [0; 4];
@@ -2752,11 +2740,7 @@ pub(crate) mod runtime {
                         | (2 << (slot * 2));
                     next += 1;
                 }
-                if let Some(slot) = kinds.iter().position(|kind| *kind == 2) {
-                    // The syscall gate reserves guest DR3, leaving this target
-                    // entry available to retain the owned slot across revocation.
-                    cpu.debug_targets[3] = [slot as u64, u64::MAX];
-                }
+                cpu.debug_kinds = kinds;
                 cpu.debug_armed = 1;
                 cpu.debug_count = kinds
                     .iter()
@@ -3744,13 +3728,7 @@ pub(crate) mod runtime {
             core::array::from_fn(|index| {
                 let target = boot.interception.debug_targets[index];
                 if index < boot.interception.debug_count && target != [0; 2] {
-                    if boot.interception.debug_targets[3][1] == u64::MAX
-                        && boot.interception.debug_targets[3][0] == index as u64
-                    {
-                        2
-                    } else {
-                        1
-                    }
+                    boot.interception.debug_kinds[index]
                 } else {
                     0
                 }
@@ -4025,7 +4003,6 @@ pub(crate) mod runtime {
                         if syscall.token == configuration.token
                             && syscall.entry == target[0]
                             && syscall.callback == target[1]
-                            && syscall_gate(&boot.interception.guest_debug)
                         {
                             let outcome = route_syscall(syscall, frame, fx_state)?;
                             if outcome == u64::MAX {

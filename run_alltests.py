@@ -39,6 +39,7 @@ def run_component(project, component, release=False):
         )
         execute([str(binary)], project)
     if component == "resident":
+        execute([sys.executable, str(project / "tests/run_root_history_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_interception_runtime_tests.py")], project)
         print("\n  resident::boot_state_layout", flush=True)
         prepare_boot_state(project)

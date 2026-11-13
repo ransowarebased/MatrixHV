@@ -3272,6 +3272,10 @@ def prepare_boot_state(project: Path):
     output = project / "builds/boot-state-tests"
     output.mkdir(parents=True, exist_ok=True)
     legacy_abi = (project / "src/vmx/resident/abi.rs").read_text()
+    debug_kinds = "    pub debug_kinds: [u32; 4],\n"
+    assert legacy_abi.count(debug_kinds) == 1
+    (output / "previous-interception-abi.rs").write_text(
+        legacy_abi.replace(debug_kinds, ""), encoding="utf-8")
     legacy_nested = (project / "src/vmx/nested.rs").read_text()
     for field in ("inherited_l1_dr7", "inherited_l1_debugctl"):
         declaration = f"    pub {field}: u64,\n"
@@ -3295,12 +3299,15 @@ def prepare_boot_state(project: Path):
     (output / "trace_state.rs").write_text(trace_source[trace_source.index("#[repr(C)]"):trace_source.index("pub(crate) fn supported")])
     harness += 'pub mod vmx { pub mod pt { include!("trace_state.rs"); } pub mod bridge { include!("../../src/vmx/bridge.rs"); } pub mod nested { include!("../../src/vmx/nested.rs"); } pub mod vmcs12 { include!("../../src/vmx/vmcs12.rs"); } }\n'
     harness += 'pub mod abi { include!("../../src/vmx/resident/abi.rs"); }\n'
+    harness += 'pub mod previous_interception_abi { include!("previous-interception-abi.rs"); }\n'
     harness += 'pub mod legacy_nested { include!("legacy-nested.rs"); }\n'
     harness += 'pub mod legacy_abi { include!("legacy-abi.rs"); }\n'
     harness += "use abi::ResidentBootContext;\n"
     harness += "fn main() {\n"
     harness += 'let nested_delta = size_of::<vmx::nested::NestedVmxState>() - size_of::<legacy_nested::NestedVmxState>();\n'
     harness += 'assert_eq!(nested_delta, 2 * size_of::<u64>());\n'
+    harness += 'assert_eq!(size_of::<ResidentBootContext>() - size_of::<previous_interception_abi::ResidentBootContext>(), 16, "debug ownership state must reject older live-update packages by boot_bytes");\n'
+    harness += 'assert_eq!(offset_of!(ResidentBootContext, intel_pt), offset_of!(previous_interception_abi::ResidentBootContext, intel_pt) + 16);\n'
     harness += 'assert_eq!(size_of::<ResidentBootContext>() - size_of::<legacy_abi::ResidentBootContext>(), nested_delta + 2 * size_of::<u64>(), "new nested debug and NMI state must reject legacy live-update packages by boot_bytes");\n'
     for name, format_code in namespace["formats"].items():
         path = name

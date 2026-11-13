@@ -101,10 +101,10 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
             if request.cpuid_records.is_empty() || request.cpuid_records.len() > CPUID_MAX_RECORDS {
                 return Err("invalid CPUID profile: expected 1..16 records".into());
             }
-            if let Some(gate) = &request.cpuid_gate {
-                if gate.dr3 == 0 || gate.dr7_mask == 0 || gate.dr7_value & !gate.dr7_mask != 0 {
-                    return Err("invalid CPUID debug-register gate".into());
-                }
+            if let Some(gate) = &request.cpuid_gate
+                && (gate.dr3 == 0 || gate.dr7_mask == 0 || gate.dr7_value & !gate.dr7_mask != 0)
+            {
+                return Err("invalid CPUID debug-register gate".into());
             }
             let mut bytes =
                 vec![0; HEADER_BYTES + request.cpuid_records.len() * CPUID_RECORD_BYTES];
@@ -539,6 +539,171 @@ pub fn info_packet() -> Result<Vec<u8>, String> {
     bytes[36..40].copy_from_slice(&(INFO_BYTES as u32).to_le_bytes());
     Ok(bytes)
 }
+
+/// An observed page-table root whose native Windows PEB and image matched.
+///
+/// This is an observational match, not a PID binding. The caller must stop
+/// using it when the target process exits or its address space changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageRoot {
+    pub cr3: u64,
+    pub image: u64,
+}
+
+fn user_range(address: u64, length: usize) -> bool {
+    address >= 0x10000
+        && address
+            .checked_add(length as u64)
+            .is_some_and(|end| end <= 0x0000_8000_0000_0000)
+}
+
+fn image_root_candidate(
+    root: u64,
+    peb: u64,
+    image_name: &str,
+    read: &mut impl FnMut(u64, u64, usize) -> Option<Vec<u8>>,
+) -> Option<ImageRoot> {
+    let pointer = |bytes: &[u8]| -> Option<u64> {
+        Some(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?))
+    };
+    let base = pointer(&read(root, peb.checked_add(0x10)?, 8)?)?;
+    if !user_range(base, 64) {
+        return None;
+    }
+    let dos = read(root, base, 64)?;
+    if dos.get(..2)? != b"MZ" {
+        return None;
+    }
+    let pe_offset = u32::from_le_bytes(dos.get(60..64)?.try_into().ok()?) as u64;
+    if !(64..=1024 * 1024).contains(&pe_offset) {
+        return None;
+    }
+    let pe_address = base.checked_add(pe_offset)?;
+    if !user_range(pe_address, 84) {
+        return None;
+    }
+    let pe = read(root, pe_address, 84)?;
+    let machine = u16::from_le_bytes(pe.get(4..6)?.try_into().ok()?);
+    let magic = u16::from_le_bytes(pe.get(24..26)?.try_into().ok()?);
+    let image_size = u32::from_le_bytes(pe.get(80..84)?.try_into().ok()?) as usize;
+    if pe.get(..4)? != b"PE\0\0"
+        || machine != 0x8664
+        || magic != 0x20b
+        || image_size < 4096
+        || !user_range(base, image_size)
+    {
+        return None;
+    }
+
+    let parameters = pointer(&read(root, peb.checked_add(0x20)?, 8)?)?;
+    let path_address = parameters.checked_add(0x60)?;
+    if !user_range(path_address, 16) {
+        return None;
+    }
+    let descriptor = read(root, path_address, 16)?;
+    let length = u16::from_le_bytes(descriptor.get(..2)?.try_into().ok()?) as usize;
+    let capacity = u16::from_le_bytes(descriptor.get(2..4)?.try_into().ok()?) as usize;
+    let buffer = pointer(descriptor.get(8..16)?)?;
+    if length == 0
+        || length > 32766
+        || length > capacity
+        || !length.is_multiple_of(2)
+        || !user_range(buffer, length)
+    {
+        return None;
+    }
+    let encoded = read(root, buffer, length)?;
+    let units: Vec<u16> = encoded
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    let path = String::from_utf16(&units).ok()?;
+    let name = path.rsplit(['\\', '/']).next()?;
+    if !name.eq_ignore_ascii_case(image_name) {
+        return None;
+    }
+    Some(ImageRoot {
+        cr3: root,
+        image: base,
+    })
+}
+
+fn match_image_roots(
+    candidates: &[u64],
+    peb: u64,
+    image_name: &str,
+    read: &mut impl FnMut(u64, u64, usize) -> Option<Vec<u8>>,
+) -> Option<ImageRoot> {
+    for (index, candidate) in candidates.iter().enumerate() {
+        let root = candidate & !4095;
+        if root == 0
+            || candidates[..index]
+                .iter()
+                .any(|previous| previous & !4095 == root)
+        {
+            continue;
+        }
+        if let Some(found) = image_root_candidate(root, peb, image_name, read) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Find a currently observed root that maps a native 64-bit Windows PEB and
+/// an image with the requested file name. Hints are validated like observed
+/// roots, and failed candidates are retried until `timeout` expires.
+pub fn find_pe_image_root(
+    peb: u64,
+    image_name: &str,
+    hints: &[u64],
+    timeout: std::time::Duration,
+) -> Result<Option<ImageRoot>, String> {
+    if !user_range(peb, 0x28) || image_name.is_empty() || image_name.contains(['\\', '/', '\0']) {
+        return Err("expected a native user PEB and an image file name".into());
+    }
+    let start = std::time::Instant::now();
+    loop {
+        let mut info = info_packet()?;
+        if let Err(error) = invoke(&mut info) {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if word(&info, 40) != crate::protocol::memory::Error::Busy as u32 || remaining.is_zero()
+            {
+                return Err(error);
+            }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
+            continue;
+        }
+        let mut candidates = Vec::with_capacity(hints.len() + ROOT_HISTORY_COUNT + 2);
+        candidates.extend_from_slice(hints);
+        candidates
+            .extend((0..ROOT_HISTORY_COUNT).map(|index| quad(&info, HEADER_BYTES + index * 8)));
+        candidates.extend([quad(&info, 64), quad(&info, 48)]);
+        if let Some(found) =
+            match_image_roots(&candidates, peb, image_name, &mut |cr3, address, length| {
+                read_ranges(cr3, &[(address, length)])
+                    .ok()?
+                    .into_iter()
+                    .next()
+            })
+        {
+            return Ok(Some(found));
+        }
+        let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+            return Ok(None);
+        };
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/image_root_tests.rs"]
+mod image_root_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transfer {

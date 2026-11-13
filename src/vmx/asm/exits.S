@@ -5,6 +5,27 @@
 // reflection or terminal diagnostics. Internal calls balance their stack and
 // use no EFI shadow space; Rust and guarded visual callbacks use the EFI ABI.
 // SIMD state is untouched here. VMX status flags are consumed before helpers.
+.macro resident_memory_record_root
+cmp qword ptr [rax + {event_memory_kernel_cr3}], r11
+je .Lresident_memory_root_observed
+mov qword ptr [rax + {event_memory_kernel_cr3}], r11
+mov rdx, r11
+and rdx, -4096
+xor ecx, ecx
+.Lresident_memory_root_lookup:
+mov r8, qword ptr [rax + {event_memory_root_history} + rcx * 8]
+and r8, -4096
+cmp r8, rdx
+je .Lresident_memory_root_observed
+inc ecx
+cmp ecx, {memory_root_history_mask} + 1
+jb .Lresident_memory_root_lookup
+mov edx, 1
+lock xadd qword ptr [rax + {event_memory_root_sequence}], rdx
+and edx, {memory_root_history_mask}
+mov qword ptr [rax + {event_memory_root_history} + rdx * 8], r11
+.endm
+
 .macro matrixhv_island_ept_violation
 .Lresident_dispatch_ept_violation:
 mov rax, {guest_physical_address}
@@ -933,13 +954,7 @@ mov eax, {guest_cr3}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
 mov rax, qword ptr [r12 + {b_event_context}]
-cmp qword ptr [rax + {event_memory_kernel_cr3}], r11
-je .Lresident_memory_root_observed
-mov qword ptr [rax + {event_memory_kernel_cr3}], r11
-mov edx, 1
-lock xadd qword ptr [rax + {event_memory_root_sequence}], rdx
-and edx, {memory_root_history_mask}
-mov qword ptr [rax + {event_memory_root_history} + rdx * 8], r11
+resident_memory_record_root
 .Lresident_memory_root_observed:
 mov rax, {exit_instruction_len}
 vmread r11, rax

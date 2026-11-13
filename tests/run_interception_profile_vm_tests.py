@@ -184,18 +184,20 @@ def main():
         else:
             assert status == 0, (status, response.hex())
             token = struct.unpack_from('<Q', response, 80)[0]
-            assert command('syscall', gated=False, iterations=16) == syscall_native
+            ungated = command('syscall', gated=False, iterations=16)
+            assert all(row[:2] == [0x12345678, 16] for row in ungated), ungated
             routed = command('syscall', gated=True, iterations=128)
             assert all(row[:2] == [0x12345678, 128] for row in routed), routed
-            protected = command('protect-native', gated=True)
+            protected = command('protect-native', gated=False)
             assert all(row[1] == 4 and row[3] == 0 for row in protected), protected
             mark('Native syscall bypass preserves the fifth stack argument on every CPU')
             clear = packet(27)
             struct.pack_into('<Q', clear, 80, token)
             invoke(clear)
             token = None
+            assert command('syscall', gated=False, iterations=16) == syscall_native
             assert command('syscall', gated=True, iterations=16) == syscall_native
-            mark('Syscall callbacks, native bypass, DR gate and clear work on every CPU')
+            mark('Syscall callbacks, native bypass and clear work with or without DR gate values on every CPU')
         if args.syscall_only:
             results['boot_after'] = script('(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString("o")')
             assert results['boot_before'] == results['boot_after'], 'Target rebooted during syscall validation'
@@ -270,13 +272,13 @@ def main():
         assert syscall_status in (0, 5), (syscall_status, response.hex())
         if syscall_status == 0:
             token = struct.unpack_from('<Q', response, 80)[0]
-            assert all(row[:2] == [0x12345678, 64] for row in command('syscall', gated=True, iterations=64))
+            assert all(row[:2] == [0x12345678, 64] for row in command('syscall', gated=False, iterations=64))
         results['combined_before_debug'] = remote(args.guest_neo, 'hook', 'status')
         save()
         assert all(row[0] == 51 for row in command('debug', gated=True, iterations=32))
         assert command('cpuid', gated=True, iterations=32) == [values] * fixtures[0]['processors']
         if syscall_status == 0:
-            assert all(row[:2] == [0x12345678, 32] for row in command('syscall', gated=True, iterations=32))
+            assert all(row[:2] == [0x12345678, 32] for row in command('syscall', gated=False, iterations=32))
         results['simultaneous_syscall_status'] = syscall_status
         mark('VMFUNC EPT hooks, debug redirects and CPUID coexist across every CPU')
         if syscall_status == 0:

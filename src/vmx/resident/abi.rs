@@ -152,6 +152,7 @@ pub struct InterceptionCpuState {
     pub split_flush_epoch: AtomicU64,
     pub runtime_diagnostics: [u64; crate::protocol::memory::INTERCEPT_DIAGNOSTIC_WORDS],
     pub sync_diagnostics: [u64; crate::protocol::memory::EPT_SYNC_DIAGNOSTIC_WORDS],
+    pub debug_kinds: [u32; 4],
 }
 
 #[repr(C, align(16))]
