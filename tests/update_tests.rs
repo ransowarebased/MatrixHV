@@ -122,6 +122,14 @@ fn tampering_and_another_signer_are_rejected() {
 }
 
 #[test]
+fn packages_using_the_previous_host_stack_contract_require_a_reboot() {
+    let (mut bytes, abi, key) = package(2);
+    bytes[28..32].copy_from_slice(&7_u32.to_le_bytes());
+    resign(&mut bytes);
+    assert_eq!(Package::parse(&bytes, abi, &key).unwrap_err(), Error::Abi);
+}
+
+#[test]
 fn incompatible_abi_and_malformed_regions_or_relocations_are_rejected() {
     let (mut bytes, mut abi, key) = package(2);
     bytes[28..32].copy_from_slice(&1_u32.to_le_bytes());

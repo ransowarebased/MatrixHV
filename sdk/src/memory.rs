@@ -5,6 +5,7 @@ use crate::protocol::memory::{
     TRACK_FETCH_PAGES, TRACK_MAX_PAGES, TRACK_RECORD_BYTES, TRACK_TARGET_BYTES, WRITE,
     ad_bitmap_length, quad, word,
 };
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
     pub address: u64,
@@ -27,6 +28,32 @@ pub struct CpuidGate {
     pub dr7_value: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ObservationFilter {
+    pub thread_teb: u64,
+    pub ranges: Vec<(u64, u64, bool)>,
+}
+
+#[derive(Default)]
+pub struct ArgumentCapture {
+    /// Architectural GPR number (RAX=0, RCX=1, RSP=4, R8=8), or a stack byte offset.
+    pub location: u64,
+    pub on_stack: bool,
+    pub copy_bytes: usize,
+    /// Zero captures the scalar; one copies its pointee; two follows one more pointer.
+    pub pointer_depth: usize,
+    /// Signed displacement before copying (depth 1) or following the pointer (depth 2).
+    pub pointer_offset: i16,
+}
+
+#[derive(Default)]
+pub struct IdentityGuard {
+    pub cr3: u64,
+    pub address: u64,
+    pub expected: u64,
+    pub mask: u64,
+}
+
 #[derive(Default)]
 pub struct InterceptionRequest {
     pub operation: u32,
@@ -40,25 +67,114 @@ pub struct InterceptionRequest {
     pub redirects: Vec<(u64, u64)>,
     pub contexts: Vec<u64>,
     pub hook_flags: Vec<u32>,
+    pub watchpoints: Vec<(u64, u32, u32)>,
     pub callback: u64,
     pub syscall_entry: u64,
+    pub cpu: u32,
+    pub cursor: u64,
+    pub count: usize,
     pub cpuid_records: Vec<CpuidRecord>,
     pub cpuid_gate: Option<CpuidGate>,
+    pub filter: ObservationFilter,
+    pub event_regions: Vec<(u64, u64)>,
+    pub event_probes: Vec<(u64, u64)>,
+    pub event_exceptions: u64,
+    pub event_sample: bool,
+    pub event_limit: u64,
+    pub event_arguments: Vec<ArgumentCapture>,
+    pub event_stack_bytes: usize,
+    pub event_identity: [u64; 3],
+    pub event_guards: Vec<IdentityGuard>,
+    pub snapshot_arm: bool,
+    pub snapshot_after: bool,
+    pub thread_id_offset: u32,
+}
+
+#[derive(Debug)]
+pub struct EventBatch<'a> {
+    pub token: u64,
+    pub next: u64,
+    pub oldest: u64,
+    pub head: u64,
+    pub dropped: u64,
+    pub captured_hits: u64,
+    pub hit_limit: u64,
+    pub records: Vec<&'a [u8]>,
+}
+
+pub fn decode_event_batch(bytes: &[u8]) -> Result<EventBatch<'_>, String> {
+    use crate::protocol::memory::{
+        CONTEXT_RECORD_BYTES, EVENT_FETCH, EVENT_FETCH_MAX, EVENT_FORMAT_VERSION,
+        EVENT_RECORD_BYTES,
+    };
+    if bytes.len() < HEADER_BYTES
+        || bytes.len() > BUFFER_BYTES
+        || quad(bytes, 0) != MEMORY_MAGIC
+        || word(bytes, 8) != MEMORY_VERSION
+        || word(bytes, 12) != EVENT_FETCH
+        || word(bytes, 36) as usize != bytes.len()
+        || word(bytes, 40) != 0
+    {
+        return Err("invalid event response header".into());
+    }
+    let body = &bytes[HEADER_BYTES..];
+    let count = word(bytes, 32) as usize;
+    if body.len() % EVENT_RECORD_BYTES != 0
+        || count > body.len() / EVENT_RECORD_BYTES
+        || count > EVENT_FETCH_MAX
+        || quad(bytes, 56) != EVENT_FORMAT_VERSION
+    {
+        return Err("invalid event response size or version".into());
+    }
+    let mut records = Vec::with_capacity(count);
+    let mut previous = 0;
+    for record in body.chunks_exact(EVENT_RECORD_BYTES).take(count) {
+        let sequence = quad(record, 0);
+        if quad(record, CONTEXT_RECORD_BYTES + 56) != EVENT_FORMAT_VERSION
+            || sequence == 0
+            || sequence <= previous
+            || sequence > quad(bytes, 104)
+        {
+            return Err("invalid event record identity or version".into());
+        }
+        previous = sequence;
+        records.push(record);
+    }
+    Ok(EventBatch {
+        token: quad(bytes, 80),
+        next: quad(bytes, 88),
+        oldest: quad(bytes, 96),
+        head: quad(bytes, 104),
+        dropped: quad(bytes, 120),
+        captured_hits: quad(bytes, 48),
+        hit_limit: quad(bytes, 144),
+        records,
+    })
 }
 
 pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, String> {
     use crate::protocol::memory::{
-        CPUID_CLEAR, CPUID_MAX_RECORDS, CPUID_RECORD_BYTES, CPUID_SET, DEBUG_CLEAR, DEBUG_SET,
-        HOOK_ADD, HOOK_DATA_SHADOW, HOOK_DROP, HOOK_INSTALL, HOOK_LIST, HOOK_MAX_PATCHES,
-        HOOK_REMOVE, INTERCEPT_CONCURRENT_WRITES, INTERCEPT_CONTEXT_ADD, INTERCEPT_CONTEXT_LIST,
-        INTERCEPT_CONTEXT_REMOVE, INTERCEPT_MAX_LEASE_MS, INTERCEPT_NO_LEASE,
-        INTERCEPT_PERSISTENT_DATA, INTERCEPT_PRIVATE_SHARED_DATA, INTERCEPT_RELEASE,
-        INTERCEPT_RENEW, INTERCEPT_STATUS, INTERCEPT_VMFUNC, SYSCALL_CLEAR, SYSCALL_SET,
+        CONTEXT_CLEAR, CONTEXT_CPU_RECORDS, CONTEXT_RECORD_BYTES, CONTEXT_SET, CONTEXT_SNAPSHOT,
+        DEBUG_CLEAR, DEBUG_SET, HOOK_ADD, HOOK_DATA_SHADOW, HOOK_DROP, HOOK_INSTALL, HOOK_LIST,
+        HOOK_MAX_PATCHES, HOOK_REMOVE, INTERCEPT_CONTEXT_ADD, INTERCEPT_CONTEXT_LIST,
+        INTERCEPT_CONTEXT_REMOVE, INTERCEPT_MAX_LEASE_MS, INTERCEPT_NO_LEASE, INTERCEPT_RELEASE,
+        INTERCEPT_RENEW, INTERCEPT_STATUS, STACK_MAX_FRAMES, STACK_WALK, SYSCALL_CLEAR,
+        SYSCALL_SET, WATCH_CLEAR, WATCH_FETCH, WATCH_RECORD_BYTES, WATCH_RING_RECORDS, WATCH_SET,
+    };
+    use crate::protocol::memory::{
+        CONTEXT_FILTER_SET, CONTEXT_RECORD_GET, CPUID_CLEAR, CPUID_MAX_RECORDS, CPUID_RECORD_BYTES,
+        CPUID_SET, INTERCEPT_CONCURRENT_WRITES, INTERCEPT_PERSISTENT_DATA,
+        INTERCEPT_PRIVATE_SHARED_DATA, INTERCEPT_VMFUNC, OBSERVATION_FILTER_BYTES,
+        OBSERVATION_FILTER_RANGES, WATCH_FILTER_SET,
+    };
+    use crate::protocol::memory::{
+        EVENT_CLEAR, EVENT_FETCH, EVENT_FETCH_MAX, EVENT_RECORD_BYTES, EVENT_REGIONS, EVENT_SAMPLE,
+        EVENT_SET,
     };
     let operation = request.operation;
     let setup = matches!(
         operation,
-        HOOK_INSTALL | DEBUG_SET | CPUID_SET | SYSCALL_SET
+        HOOK_INSTALL | DEBUG_SET | CPUID_SET | WATCH_SET | CONTEXT_SET | SYSCALL_SET | EVENT_SET
     );
     if request.lease_ms > INTERCEPT_MAX_LEASE_MS
         || request.lease_ms != 0 && !(setup || operation == INTERCEPT_RENEW)
@@ -148,6 +264,31 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
             }
             bytes
         }
+        WATCH_FILTER_SET | CONTEXT_FILTER_SET => {
+            if request.filter.ranges.len() > OBSERVATION_FILTER_RANGES
+                || request
+                    .filter
+                    .ranges
+                    .iter()
+                    .any(|(start, end, _)| start >= end)
+            {
+                return Err(
+                    "invalid observation filter: expected at most 16 nonempty RIP ranges".into(),
+                );
+            }
+            let mut bytes =
+                vec![0; HEADER_BYTES + request.filter.ranges.len() * OBSERVATION_FILTER_BYTES];
+            bytes[24..32].copy_from_slice(&request.filter.thread_teb.to_le_bytes());
+            bytes[32..36].copy_from_slice(&(request.filter.ranges.len() as u32).to_le_bytes());
+            for (index, (start, end, exclude)) in request.filter.ranges.iter().enumerate() {
+                let offset = HEADER_BYTES + index * OBSERVATION_FILTER_BYTES;
+                for (slot, value) in [*start, *end, u64::from(*exclude)].into_iter().enumerate() {
+                    bytes[offset + slot * 8..offset + slot * 8 + 8]
+                        .copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            bytes
+        }
         HOOK_INSTALL | HOOK_ADD => {
             if !request.hook_flags.is_empty() && request.hook_flags.len() != request.items.len()
                 || request
@@ -195,7 +336,158 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
             }
             bytes
         }
-        SYSCALL_SET | SYSCALL_CLEAR => {
+        WATCH_SET => {
+            if request.watchpoints.is_empty() || request.watchpoints.len() > 4 {
+                return Err("watch requires 1..4 ADDRESS ACCESS LENGTH triples".into());
+            }
+            let mut bytes = vec![0; HEADER_BYTES + request.watchpoints.len() * 16];
+            bytes[32..36].copy_from_slice(&(request.watchpoints.len() as u32).to_le_bytes());
+            for (index, (address, access, length)) in request.watchpoints.iter().enumerate() {
+                if !matches!(access, 1 | 3)
+                    || !matches!(length, 1 | 2 | 4 | 8)
+                    || address & (u64::from(*length) - 1) != 0
+                {
+                    return Err("watch access must be write or read/write and length must be aligned 1/2/4/8".into());
+                }
+                let offset = HEADER_BYTES + index * 16;
+                bytes[offset..offset + 8].copy_from_slice(&address.to_le_bytes());
+                bytes[offset + 8..offset + 12].copy_from_slice(&access.to_le_bytes());
+                bytes[offset + 12..offset + 16].copy_from_slice(&length.to_le_bytes());
+            }
+            bytes
+        }
+        EVENT_SET => {
+            let regions = &request.event_regions;
+            let probes = &request.event_probes;
+            if regions.len() + request.event_arguments.len() > EVENT_REGIONS || probes.len() > 4 {
+                return Err(format!(
+                    "event capture accepts up to {EVENT_REGIONS} regions and four probes"
+                ));
+            }
+            let mut descriptors = regions.clone();
+            for argument in &request.event_arguments {
+                use crate::protocol::memory::{
+                    ARGUMENT_MAX_DEPTH, ARGUMENT_MAX_STACK_OFFSET, ARGUMENT_REGISTER,
+                    ARGUMENT_STACK, EVENT_REGION_BYTES,
+                };
+                if argument.pointer_depth > ARGUMENT_MAX_DEPTH
+                    || argument.copy_bytes > EVENT_REGION_BYTES
+                    || (argument.pointer_depth == 0) != (argument.copy_bytes == 0)
+                    || argument.pointer_depth == 0 && argument.pointer_offset != 0
+                    || if argument.on_stack {
+                        argument.location > ARGUMENT_MAX_STACK_OFFSET
+                    } else {
+                        argument.location >= 16
+                    }
+                {
+                    return Err("invalid argument location, copy size, or pointer depth".into());
+                }
+                descriptors.push((
+                    (if argument.on_stack {
+                        ARGUMENT_STACK
+                    } else {
+                        ARGUMENT_REGISTER
+                    }) | argument.location,
+                    argument.copy_bytes as u64
+                        | ((argument.pointer_depth as u64) << 32)
+                        | (u64::from(argument.pointer_offset as u16) << 48),
+                ));
+            }
+            if request.event_stack_bytes > crate::protocol::memory::EVENT_STACK_BYTES {
+                return Err("event stack capture exceeds its capacity".into());
+            }
+            use crate::protocol::memory::{EVENT_GUARD_BYTES, EVENT_MAX_GUARDS};
+            if request.event_guards.len() > EVENT_MAX_GUARDS {
+                return Err("event identity has too many validation guards".into());
+            }
+            let mut bytes = vec![
+                0;
+                HEADER_BYTES
+                    + (descriptors.len() + probes.len()) * 16
+                    + request.event_guards.len() * EVENT_GUARD_BYTES
+            ];
+            bytes[148..152].copy_from_slice(&(request.event_guards.len() as u32).to_le_bytes());
+            if request.thread_id_offset > 65528 || request.thread_id_offset & 7 != 0 {
+                return Err("invalid thread identity field offset".into());
+            }
+            bytes[152..156].copy_from_slice(&request.thread_id_offset.to_le_bytes());
+            for (value, slot) in request
+                .event_identity
+                .iter()
+                .zip(bytes[96..120].chunks_exact_mut(8))
+            {
+                slot.copy_from_slice(&value.to_le_bytes());
+            }
+            if request.event_limit > 1_000_000 {
+                return Err("event limit exceeds 1000000".into());
+            }
+            bytes[24..32].copy_from_slice(&request.event_limit.to_le_bytes());
+            bytes[32..36].copy_from_slice(&(descriptors.len() as u32).to_le_bytes());
+            bytes[144..148].copy_from_slice(&(request.event_stack_bytes as u32).to_le_bytes());
+            bytes[44..48].copy_from_slice(&(probes.len() as u32).to_le_bytes());
+            bytes[48..56].copy_from_slice(&request.event_exceptions.to_le_bytes());
+            bytes[56..60].copy_from_slice(
+                &((if request.event_sample {
+                    EVENT_SAMPLE
+                } else {
+                    0
+                }) | (if request.snapshot_arm {
+                    crate::protocol::memory::EVENT_SNAPSHOT_ARM
+                } else {
+                    0
+                }) | (if request.snapshot_after {
+                    crate::protocol::memory::EVENT_SNAPSHOT_AFTER
+                } else {
+                    0
+                }))
+                .to_le_bytes(),
+            );
+            for (pair, descriptor) in descriptors.iter().chain(probes).zip(
+                bytes[HEADER_BYTES..HEADER_BYTES + (descriptors.len() + probes.len()) * 16]
+                    .chunks_exact_mut(16),
+            ) {
+                descriptor[..8].copy_from_slice(&pair.0.to_le_bytes());
+                descriptor[8..].copy_from_slice(&pair.1.to_le_bytes());
+            }
+            for (guard, descriptor) in request.event_guards.iter().zip(
+                bytes[HEADER_BYTES + (descriptors.len() + probes.len()) * 16..]
+                    .chunks_exact_mut(EVENT_GUARD_BYTES),
+            ) {
+                if guard.cr3 & 0x000f_ffff_ffff_f000 == 0
+                    || guard.mask == 0
+                    || guard.address.checked_add(8).is_none()
+                {
+                    return Err("invalid event identity guard".into());
+                }
+                for (value, slot) in [guard.cr3, guard.address, guard.expected, guard.mask]
+                    .into_iter()
+                    .zip(descriptor.chunks_exact_mut(8))
+                {
+                    slot.copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            bytes
+        }
+        WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK | CONTEXT_RECORD_GET | EVENT_FETCH => {
+            let (maximum, record_bytes) = match operation {
+                WATCH_FETCH => (WATCH_RING_RECORDS, WATCH_RECORD_BYTES),
+                EVENT_FETCH => (EVENT_FETCH_MAX, EVENT_RECORD_BYTES),
+                CONTEXT_SNAPSHOT => (CONTEXT_CPU_RECORDS, CONTEXT_RECORD_BYTES),
+                CONTEXT_RECORD_GET => (1, CONTEXT_RECORD_BYTES),
+                _ => (STACK_MAX_FRAMES, 16),
+            };
+            if request.count == 0 && operation != EVENT_FETCH
+                || request.count > maximum
+                || request.cpu >= 64
+            {
+                return Err("invalid observation CPU or record count".into());
+            }
+            let mut bytes = vec![0; HEADER_BYTES + request.count * record_bytes];
+            bytes[24..32].copy_from_slice(&u64::from(request.cpu).to_le_bytes());
+            bytes[32..36].copy_from_slice(&(request.count as u32).to_le_bytes());
+            bytes
+        }
+        CONTEXT_SET | CONTEXT_CLEAR | WATCH_CLEAR | SYSCALL_SET | SYSCALL_CLEAR => {
             vec![0; HEADER_BYTES]
         }
         INTERCEPT_CONTEXT_ADD | INTERCEPT_CONTEXT_REMOVE => {
@@ -213,7 +505,7 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
         HOOK_LIST => vec![0; HEADER_BYTES + HOOK_MAX_PATCHES * ITEM_BYTES],
         INTERCEPT_CONTEXT_LIST => vec![0; HEADER_BYTES + ROOT_HISTORY_COUNT * 8],
         HOOK_REMOVE | HOOK_DROP | DEBUG_CLEAR | CPUID_CLEAR | INTERCEPT_RENEW
-        | INTERCEPT_RELEASE | INTERCEPT_STATUS => vec![0; HEADER_BYTES],
+        | INTERCEPT_RELEASE | INTERCEPT_STATUS | EVENT_CLEAR => vec![0; HEADER_BYTES],
         _ => return Err("invalid interception operation".into()),
     };
     bytes[0..8].copy_from_slice(&MEMORY_MAGIC.to_le_bytes());
@@ -222,10 +514,18 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
     let length = bytes.len() as u32;
     bytes[36..40].copy_from_slice(&length.to_le_bytes());
     bytes[64..72].copy_from_slice(&request.alternate_cr3.to_le_bytes());
-    if operation == SYSCALL_SET {
+    if matches!(operation, WATCH_SET | CONTEXT_SET | SYSCALL_SET | EVENT_SET) {
         bytes[16..24].copy_from_slice(&request.cr3.to_le_bytes());
+    }
+    if operation == SYSCALL_SET {
         bytes[24..32].copy_from_slice(&request.callback.to_le_bytes());
         bytes[48..56].copy_from_slice(&request.syscall_entry.to_le_bytes());
+    }
+    if matches!(
+        operation,
+        WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK | CONTEXT_RECORD_GET | EVENT_FETCH
+    ) {
+        bytes[64..72].copy_from_slice(&request.cursor.to_le_bytes());
     }
     bytes[80..88].copy_from_slice(&request.token.to_le_bytes());
     bytes[128..132].copy_from_slice(&request.flags.to_le_bytes());

@@ -221,6 +221,7 @@ fn remapped_and_unmapped_pages_are_flagged_without_dumping_recycled_frames() {
 fn guest_ad_updates_do_not_change_the_pte_fingerprint_but_upper_level_remaps_do() {
     let mut memory = Memory::new();
     let initial = page_mapping(&mut memory, 0x1000, 0, false, 48).unwrap();
+    assert_eq!(initial.permissions, 15);
     for (table, value) in [
         (0x1000, 0x2067),
         (0x2000, 0x3067),

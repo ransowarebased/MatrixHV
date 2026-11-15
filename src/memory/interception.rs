@@ -2,7 +2,9 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::memory::access::{PhysicalMemory, page_mapping};
-use crate::memory::observation::Observation;
+#[cfg(target_os = "uefi")]
+use crate::memory::observation::ContextRecord;
+use crate::memory::observation::{EventConfig, Observation};
 use crate::protocol::memory::*;
 
 const MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -168,15 +170,10 @@ pub(crate) struct Session {
     pub observation: u64,
 }
 const _: () = assert!(core::mem::offset_of!(Session, active) == 0);
-// Hot updates preserve every existing field and use only the zeroed tail of
-// the original page allocation. Increasing the allocation requires a new ABI.
-const _: () = assert!(
-    core::mem::size_of::<Session>().div_ceil(4096)
-        == core::mem::offset_of!(Session, cpuid).div_ceil(4096)
-);
-const _: () = assert!(core::mem::offset_of!(Session, cpuid) == 346_352);
-const _: () = assert!(core::mem::size_of::<Session>() == 348_152);
-const _: () = assert!(core::mem::offset_of!(Session, observation) == 348_144);
+// ABI 7 requires a fresh allocation for the expanded registered-root arrays.
+const _: () = assert!(core::mem::offset_of!(Session, cpuid) == 822_624);
+const _: () = assert!(core::mem::size_of::<Session>() == 824_424);
+const _: () = assert!(core::mem::offset_of!(Session, observation) == 824_416);
 
 impl Session {
     pub(crate) fn initialize(&mut self, pool_base: u64, cpu_mask: u64) {
@@ -231,13 +228,20 @@ impl Session {
     }
 
     fn debug_slots(&self, configuration: &RoadEptProfile) -> usize {
-        configuration.debug_count + usize::from(unsafe { &*self.syscall.get() }.entry != 0)
+        configuration.debug_count
+            + usize::from(unsafe { &*self.syscall.get() }.entry != 0)
+            + self.observer().map_or(0, |observer| {
+                observer.watch_count + observer.events.config.probe_count
+            })
     }
 
     fn has_features(&self, configuration: &RoadEptProfile) -> bool {
         configuration.hook_count != 0
             || self.debug_slots(configuration) != 0
             || unsafe { &*self.cpuid.get() }.count != 0
+            || self
+                .observer()
+                .is_some_and(|observer| observer.context_enabled || observer.events.config.enabled)
     }
 }
 
@@ -339,7 +343,13 @@ fn lease_duration(
         return if word(packet, 132) == 0
             && matches!(
                 word(packet, 12),
-                HOOK_INSTALL | DEBUG_SET | CPUID_SET | SYSCALL_SET
+                HOOK_INSTALL
+                    | DEBUG_SET
+                    | CPUID_SET
+                    | SYSCALL_SET
+                    | WATCH_SET
+                    | CONTEXT_SET
+                    | EVENT_SET
             ) {
             Ok((0, 0))
         } else {
@@ -645,6 +655,30 @@ fn copy_table(
     Ok(())
 }
 
+fn store_eptp_list(
+    memory: &mut impl InterceptionMemory,
+    address: u64,
+    execute: u64,
+    data: u64,
+) -> Result<(), Error> {
+    // Build unpublished lists in place instead of nesting another page-sized
+    // stack buffer below the transaction and installation frames.
+    for index in 0..512 {
+        if index % 64 == 0 {
+            memory.check_budget()?;
+        }
+        let value = if index == u64::from(INTERCEPT_EXECUTE_SLOT) {
+            execute
+        } else if index == u64::from(INTERCEPT_DATA_SLOT) {
+            data
+        } else {
+            0
+        };
+        memory.store_entry(address + index * 8, value)?;
+    }
+    Ok(())
+}
+
 fn cpu_views(
     configuration: &mut RoadEptProfile,
     memory: &mut impl InterceptionMemory,
@@ -689,10 +723,7 @@ fn cpu_views(
         }
         configuration.cpu_data[cpu_index] = start | (configuration.data_ept & !MASK);
         configuration.cpu_lists[cpu_index] = end;
-        let mut list = [0; 4096];
-        list[..8].copy_from_slice(&configuration.ept.to_le_bytes());
-        list[8..16].copy_from_slice(&configuration.cpu_data[cpu_index].to_le_bytes());
-        memory.store_page(end, &list)?;
+        store_eptp_list(memory, end, configuration.ept, configuration.cpu_data[cpu_index])?;
         cpu_slot += 1;
     }
     Ok(())
@@ -854,12 +885,12 @@ fn install(
     }
     configuration.eptp_list =
         bank_base(configuration) + (INTERCEPT_TABLE_PAGES + 2 * HOOK_MAX_PAGES) as u64 * 4096;
-    let mut list = [0; 4096];
-    let execute = INTERCEPT_EXECUTE_SLOT as usize * 8;
-    let data = INTERCEPT_DATA_SLOT as usize * 8;
-    list[execute..execute + 8].copy_from_slice(&configuration.ept.to_le_bytes());
-    list[data..data + 8].copy_from_slice(&configuration.data_ept.to_le_bytes());
-    memory.store_page(configuration.eptp_list, &list)?;
+    store_eptp_list(
+        memory,
+        configuration.eptp_list,
+        configuration.ept,
+        configuration.data_ept,
+    )?;
     configuration.vmfunc = u64::from(flags & INTERCEPT_VMFUNC != 0);
     configuration.timing = u64::from(flags & INTERCEPT_TSC_OFFSET != 0);
     configuration.options = flags;
@@ -1263,19 +1294,11 @@ fn change_hooks(
             continue;
         }
         let shadow = bank_base(configuration) + (INTERCEPT_TABLE_PAGES + page_index) as u64 * 4096;
-        let mut bytes = [0; 4096];
-        for (chunk_index, chunk) in bytes.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-            if chunk_index % 32 == 0 {
-                memory.check_budget()?;
-            }
-            *chunk = memory
-                .table_entry(shadow + chunk_index as u64 * 8)?
-                .to_le_bytes();
-        }
         for hook in &mut pending[..count] {
             if hook.physical_address & !4095 == configuration.pages[page_index] {
+                memory.check_budget()?;
                 let offset = hook.physical_address as usize & 4095;
-                hook.bytes[..hook.length].copy_from_slice(&bytes[offset..offset + hook.length]);
+                memory.read(shadow + offset as u64, &mut hook.bytes[..hook.length])?;
             }
         }
     }
@@ -1505,6 +1528,10 @@ pub(crate) unsafe fn execute(
         if operation != INTERCEPT_STATUS
             && operation != HOOK_LIST
             && operation != INTERCEPT_CONTEXT_LIST
+            && !matches!(
+                operation,
+                WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK | CONTEXT_RECORD_GET | EVENT_FETCH
+            )
         {
             memory.quiesce()?;
             let mut result = (|| {
@@ -1518,7 +1545,14 @@ pub(crate) unsafe fn execute(
                 }
                 if matches!(
                     operation,
-                    HOOK_INSTALL | HOOK_ADD | DEBUG_SET | CPUID_SET | SYSCALL_SET
+                    HOOK_INSTALL
+                        | HOOK_ADD
+                        | DEBUG_SET
+                        | CPUID_SET
+                        | SYSCALL_SET
+                        | WATCH_SET
+                        | CONTEXT_SET
+                        | EVENT_SET
                 ) && !memory.available()
                 {
                     return Err(Error::Unsupported);
@@ -1544,14 +1578,17 @@ pub(crate) unsafe fn execute(
                         .store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
                 }
                 match operation {
-                    HOOK_INSTALL | DEBUG_SET | CPUID_SET | SYSCALL_SET => {
+                    HOOK_INSTALL | DEBUG_SET | CPUID_SET | SYSCALL_SET | WATCH_SET
+                    | CONTEXT_SET | EVENT_SET => {
                         let cpuid = if operation == CPUID_SET {
                             Some(cpuid_profile(packet, la57)?)
                         } else {
                             None
                         };
-                        if matches!(operation, CPUID_SET | SYSCALL_SET)
-                            && session.is_active()
+                        if matches!(
+                            operation,
+                            CPUID_SET | SYSCALL_SET | WATCH_SET | CONTEXT_SET | EVENT_SET
+                        ) && session.is_active()
                             && quad(packet, 80) != configuration.token
                         {
                             return Err(Error::Session);
@@ -1561,6 +1598,44 @@ pub(crate) unsafe fn execute(
                         } else {
                             None
                         };
+                        let watch = if operation == WATCH_SET {
+                            if session.observer().is_none() {
+                                return Err(Error::Unsupported);
+                            }
+                            Some(Observation::watch_targets(packet, la57)?)
+                        } else {
+                            None
+                        };
+                        if operation == CONTEXT_SET
+                            && (packet.len() != HEADER_BYTES || word(packet, 32) != 0)
+                        {
+                            return Err(Error::Bounds);
+                        }
+                        if operation == CONTEXT_SET && session.observer().is_none() {
+                            return Err(Error::Unsupported);
+                        }
+                        let events = if operation == EVENT_SET {
+                            if session.observer().is_none() {
+                                return Err(Error::Unsupported);
+                            }
+                            let config = EventConfig::parse(packet, la57)?;
+                            config.validate_identity(memory, la57, physical_bits)?;
+                            Some(config)
+                        } else {
+                            None
+                        };
+                        let probe_count = events.as_ref().map_or_else(
+                            || {
+                                if session.is_active() {
+                                    session
+                                        .observer()
+                                        .map_or(0, |observer| observer.events.config.probe_count)
+                                } else {
+                                    0
+                                }
+                            },
+                            |config| config.probe_count,
+                        );
                         let debug_count = if operation == DEBUG_SET {
                             word(packet, 32) as usize
                         } else if session.is_active() {
@@ -1573,7 +1648,19 @@ pub(crate) unsafe fn execute(
                                 || session.is_active()
                                     && unsafe { &*session.syscall.get() }.entry != 0,
                         );
-                        if debug_count + syscall_count > 4 {
+                        let watch_count = watch.as_ref().map_or_else(
+                            || {
+                                if session.is_active() {
+                                    session
+                                        .observer()
+                                        .map_or(0, |observer| observer.watch_count)
+                                } else {
+                                    0
+                                }
+                            },
+                            |(_, count)| *count,
+                        );
+                        if debug_count + syscall_count + watch_count + probe_count > 4 {
                             return Err(Error::Capacity);
                         }
                         let (duration, ticks) =
@@ -1581,12 +1668,19 @@ pub(crate) unsafe fn execute(
                         let token = configuration.token.checked_add(1).ok_or(Error::Capacity)?;
                         let flags = word(packet, 128);
                         if flags & !OPTIONS != 0
-                            || matches!(operation, DEBUG_SET | CPUID_SET | SYSCALL_SET)
-                                && flags
-                                    & (INTERCEPT_VMFUNC
-                                        | INTERCEPT_CONCURRENT_WRITES
-                                        | INTERCEPT_PERSISTENT_DATA)
-                                    != 0
+                            || matches!(
+                                operation,
+                                DEBUG_SET
+                                    | CPUID_SET
+                                    | SYSCALL_SET
+                                    | WATCH_SET
+                                    | CONTEXT_SET
+                                    | EVENT_SET
+                            ) && flags
+                                & (INTERCEPT_VMFUNC
+                                    | INTERCEPT_CONCURRENT_WRITES
+                                    | INTERCEPT_PERSISTENT_DATA)
+                                != 0
                             || operation == SYSCALL_SET
                                 && flags & !(INTERCEPT_TSC_OFFSET | INTERCEPT_NO_LEASE) != 0
                         {
@@ -1613,8 +1707,14 @@ pub(crate) unsafe fn execute(
                             configuration.debug_count = 0;
                             if session.observer().is_some() {
                                 let observer = unsafe { &mut *session.observer_ptr()? };
+                                observer.watch_count = 0;
+                                observer.context_enabled = false;
                                 observer.data_count = 0;
                                 observer.hook_flags.fill(0);
+                                observer.reset_watch();
+                                observer.reset_contexts();
+                                observer.reset_filters();
+                                observer.events.config = EventConfig::default();
                             }
                             unsafe {
                                 *session.cpuid.get() = CpuidProfile::default();
@@ -1655,6 +1755,25 @@ pub(crate) unsafe fn execute(
                             if flags & INTERCEPT_TSC_OFFSET != 0 {
                                 configuration.timing = 1;
                             }
+                        } else if let Some((targets, count)) = watch {
+                            let observer = unsafe { &mut *session.observer_ptr()? };
+                            observer.watch = targets;
+                            observer.watch_count = count;
+                            observer.reset_watch();
+                        } else if operation == CONTEXT_SET || operation == EVENT_SET {
+                            let observer = unsafe { &mut *session.observer_ptr()? };
+                            if let Some(events) = events {
+                                observer.events.config = events;
+                            } else {
+                                observer.context_enabled = true;
+                                observer.reset_contexts();
+                            }
+                            let clock_hz = memory.clock_hz();
+                            observer.sample_ticks = if memory.lease_available() && clock_hz != 0 {
+                                (clock_hz / 1000).max(2)
+                            } else {
+                                0
+                            };
                         } else {
                             set_debug(configuration, packet, la57)?;
                             if flags & INTERCEPT_TSC_OFFSET != 0 {
@@ -1671,6 +1790,10 @@ pub(crate) unsafe fn execute(
                         {
                             syscall.token = token;
                         }
+                        if let Ok(observer) = session.observer_ptr() {
+                            // A new token starts a new journal cursor and invocation scope.
+                            unsafe { &mut *observer }.events.reset();
+                        }
                         configuration.token = token;
                         session
                             .cause
@@ -1680,6 +1803,12 @@ pub(crate) unsafe fn execute(
                             .store(u64::from(INTERCEPT_ACTIVE), Ordering::Release);
                         configuration.timer_rate = memory.timer_rate();
                         arm_lease(session, memory, duration, ticks);
+                    }
+                    WATCH_FILTER_SET | CONTEXT_FILTER_SET => {
+                        if !session.is_active() || quad(packet, 80) != configuration.token {
+                            return Err(Error::Session);
+                        }
+                        unsafe { &mut *session.observer_ptr()? }.set_filter(packet, la57)?;
                     }
                     HOOK_ADD | HOOK_DROP | INTERCEPT_RENEW => {
                         if !session.is_active() || quad(packet, 80) != configuration.token {
@@ -1764,7 +1893,8 @@ pub(crate) unsafe fn execute(
                         configuration.extra_roots = roots;
                         configuration.generation = generation;
                     }
-                    HOOK_REMOVE | DEBUG_CLEAR | CPUID_CLEAR | SYSCALL_CLEAR | INTERCEPT_RELEASE => {
+                    HOOK_REMOVE | DEBUG_CLEAR | CPUID_CLEAR | SYSCALL_CLEAR | WATCH_CLEAR
+                    | CONTEXT_CLEAR | EVENT_CLEAR | INTERCEPT_RELEASE => {
                         if packet.len() != HEADER_BYTES || quad(packet, 80) != configuration.token {
                             return Err(Error::Session);
                         }
@@ -1791,6 +1921,20 @@ pub(crate) unsafe fn execute(
                         }
                         if matches!(operation, DEBUG_CLEAR | INTERCEPT_RELEASE) {
                             configuration.debug_count = 0;
+                        }
+                        if matches!(operation, WATCH_CLEAR | CONTEXT_CLEAR | EVENT_CLEAR)
+                            || operation == INTERCEPT_RELEASE && session.observer().is_some()
+                        {
+                            let observer = unsafe { &mut *session.observer_ptr()? };
+                            if matches!(operation, WATCH_CLEAR | INTERCEPT_RELEASE) {
+                                observer.watch_count = 0;
+                            }
+                            if matches!(operation, CONTEXT_CLEAR | INTERCEPT_RELEASE) {
+                                observer.context_enabled = false;
+                            }
+                            if matches!(operation, EVENT_CLEAR | INTERCEPT_RELEASE) {
+                                observer.events.config = EventConfig::default();
+                            }
                         }
                         if operation == CPUID_CLEAR || operation == INTERCEPT_RELEASE {
                             unsafe {
@@ -1826,6 +1970,25 @@ pub(crate) unsafe fn execute(
             memory.resume();
             result?;
         } else {
+            if matches!(
+                operation,
+                WATCH_FETCH | CONTEXT_SNAPSHOT | STACK_WALK | CONTEXT_RECORD_GET | EVENT_FETCH
+            ) {
+                if quad(packet, 80) != unsafe { &*session.configuration.get() }.token {
+                    return Err(Error::Session);
+                }
+                let observer = session.observer().ok_or(Error::Unsupported)?;
+                if operation == EVENT_FETCH {
+                    observer.events.fetch(packet)?;
+                } else if operation == CONTEXT_RECORD_GET {
+                    observer.get_context(packet)?;
+                } else if operation == STACK_WALK {
+                    observer.stack_walk(memory, packet, la57, physical_bits)?;
+                } else {
+                    observer.fetch(packet)?;
+                }
+                return Ok(());
+            }
             if operation == INTERCEPT_STATUS && packet.len() != HEADER_BYTES {
                 return Err(Error::Bounds);
             }
@@ -1947,6 +2110,8 @@ pub(crate) unsafe fn execute(
 #[cfg(target_os = "uefi")]
 pub(crate) mod runtime {
     use super::*;
+    use crate::memory::access::{page_mapping, resident, transfer};
+    use crate::memory::observation::{Event, EventRegion, InstructionRecord};
     use crate::vmx::resident::abi::{
         InterceptionCpuState, ResidentBootContext, ResidentEventContext,
     };
@@ -1984,6 +2149,34 @@ pub(crate) mod runtime {
 
     fn user_cet() -> [u64; 2] {
         unsafe { [crate::arch::read_msr(0x6a0), crate::arch::read_msr(0x6a7)] }
+    }
+
+    fn kernel_gs() -> u64 {
+        unsafe { crate::arch::read_msr(0xc000_0102) }
+    }
+
+    fn context_record(boot: &ResidentBootContext, frame: &[u64]) -> Result<ContextRecord, ()> {
+        let gs_base = read(GUEST_GS_BASE)?;
+        let cpl = read(GUEST_CS_SELECTOR)? & 3;
+        let thread_teb = if cpl == 0 && gs_base >> 63 != 0 {
+            kernel_gs()
+        } else {
+            gs_base
+        };
+        Ok(ContextRecord {
+            sequence: 0,
+            tsc: clock(),
+            cr3: read(GUEST_CR3)?,
+            rip: read(GUEST_RIP)?,
+            rsp: read(GUEST_RSP)?,
+            rbp: frame[4],
+            rflags: read(GUEST_RFLAGS)?,
+            gs_base,
+            thread_teb,
+            gprs: frame.try_into().map_err(|_| ())?,
+            cpu: boot.processor_number,
+            cpl,
+        })
     }
 
     fn route_syscall(
@@ -2117,19 +2310,35 @@ pub(crate) mod runtime {
             cpu.timer_pin = 0;
         }
         let configuration = unsafe { &*session.configuration.get() };
-        if active && session.tsc_hz.load(Ordering::Acquire) != 0 {
+        let sampling = session
+            .observer()
+            .filter(|observer| observer.context_enabled || observer.events.config.sample)
+            .map_or(0, |observer| observer.sample_ticks);
+        let sampling = if active && sampling != 0 && root_matches(configuration, read(GUEST_CR3)?) {
+            sampling
+        } else {
+            0
+        };
+        if active && (session.tsc_hz.load(Ordering::Acquire) != 0 || sampling != 0) {
             if cpu.timer_saved == 0 {
                 cpu.timer_pin = pin & (1 << 6);
                 cpu.timer_value = read(VMX_PREEMPTION_TIMER_VALUE)?;
                 cpu.timer_saved = 1;
             }
-            let remaining = session
-                .lease_deadline
-                .load(Ordering::Acquire)
-                .wrapping_sub(clock());
+            let remaining = if session.tsc_hz.load(Ordering::Acquire) != 0 {
+                session
+                    .lease_deadline
+                    .load(Ordering::Acquire)
+                    .wrapping_sub(clock())
+            } else {
+                sampling
+            };
             let remaining = if remaining as i64 <= 0 { 2 } else { remaining };
             let rate = configuration.timer_rate;
             let mut ticks = (remaining >> rate).clamp(2, u64::from(u32::MAX));
+            if sampling != 0 {
+                ticks = ticks.min((sampling >> rate).max(2));
+            }
             if configuration.options & INTERCEPT_PRIVATE_SHARED_DATA != 0
                 && root_matches(configuration, read(GUEST_CR3)?)
             {
@@ -2468,6 +2677,18 @@ pub(crate) mod runtime {
             exit_debug.fetch_and(!1, Ordering::Release);
         }
         boot.interception.exit_timer = boot.interception.timer_armed;
+        if boot.interception.snapshot_pending[0] != 0 {
+            let reason = boot.last_reason & 0xffff;
+            if reason == 1 || reason == 0 && (read(VM_EXIT_INTR_INFO)? >> 8) & 7 == 2 {
+                boot.interception.snapshot_pending[5] |= 1 << 63;
+            }
+        }
+        if boot.last_reason & 0xffff == 37
+            && boot.interception.snapshot_pending[0] != 0
+            && boot.interception.snapshot_pending[5] & (1 << 27) == 0
+        {
+            boot.interception.snapshot_exit_owned = 1;
+        }
         let progress = &session.ept_progress[boot.processor_number as usize];
         let previous = progress.load(Ordering::Relaxed);
         if previous & EPT_RETRY_LIMIT != 0 || boot.interception.data_pending != 0 {
@@ -2595,7 +2816,64 @@ pub(crate) mod runtime {
                 .store(u64::from(INTERCEPT_CAUSE_CONTEXT), Ordering::Release);
             revoke(session, boot, synchronize)?;
         }
+        if session.is_active()
+            && let Some(observer) = session.observer()
+            && observer.events.config.enabled
+            && root_matches(unsafe { &*session.configuration.get() }, read(GUEST_CR3)?)
+        {
+            let environment = resident::event_environment(boot);
+            let mut memory = resident::Memory {
+                environment: &environment,
+            };
+            if observer
+                .events
+                .config
+                .validate_identity(
+                    &mut memory,
+                    environment.guest_cr4 & (1 << 12) != 0,
+                    environment.physical_bits as u32,
+                )
+                .is_err()
+            {
+                session
+                    .cause
+                    .store(u64::from(INTERCEPT_CAUSE_CONTEXT), Ordering::Release);
+                revoke(session, boot, synchronize)?;
+            }
+        }
         let active = session.is_active() && boot.nested.active == 0;
+        if !active
+            || session.observer().is_none_or(|observer| {
+                !observer.events.config.enabled || !observer.events.config.snapshot_after
+            })
+            || boot.interception.snapshot_pending[0]
+                != unsafe { &*session.configuration.get() }.token
+        {
+            boot.interception.snapshot_pending = [0; 6];
+        }
+        if active
+            && let Some(observer) = session.observer()
+            && observer.events.take_arm_snapshot()
+        {
+            let configuration = unsafe { &*session.configuration.get() };
+            let context = ContextRecord {
+                cr3: configuration.roots[0],
+                cpu: boot.processor_number,
+                tsc: clock(),
+                cpl: 3,
+                ..ContextRecord::default()
+            };
+            record_event(
+                observer,
+                boot,
+                configuration,
+                context,
+                Event {
+                    kind: EVENT_ARM,
+                    ..Event::default()
+                },
+            );
+        }
         if !session.is_active() {
             // Another CPU may revoke while a rendezvous is already owned. Each
             // returning CPU restores guards before invalidating its base view.
@@ -2624,7 +2902,7 @@ pub(crate) mod runtime {
             cache.count = 0;
             cache.generation = 0;
             cpu.primary_bits = primary & PRIMARY_BITS;
-            cpu.exception_bit = exceptions & (1 << 1);
+            cpu.exception_bit = exceptions & EVENT_EXCEPTION_MASK;
             cpu.cr3_target_count = read(CR3_TARGET_COUNT)?;
             cpu.controls_saved = 1;
         }
@@ -2642,12 +2920,20 @@ pub(crate) mod runtime {
                     bits |= 1 << 23;
                     exception_bit |= 2;
                 }
-                if cpu.step_active != 0 {
+                if let Some(observer) = session.observer()
+                    && root_matches(configuration, read(GUEST_CR3)?)
+                {
+                    exception_bit |= observer.events.config.exceptions;
+                }
+                if cpu.step_active != 0 || cpu.snapshot_pending[0] != 0 {
                     bits |= 1 << 27;
                 }
             }
             write(CPU_BASED_VM_EXEC_CONTROL, (primary & !PRIMARY_BITS) | bits)?;
-            write(EXCEPTION_BITMAP, (exceptions & !(1 << 1)) | exception_bit)?;
+            write(
+                EXCEPTION_BITMAP,
+                (exceptions & !EVENT_EXCEPTION_MASK) | exception_bit,
+            )?;
             if !active {
                 let cache =
                     unsafe { &(*session.cr3_targets.get())[boot.processor_number as usize] };
@@ -2693,7 +2979,8 @@ pub(crate) mod runtime {
                 cpu.hook_generation = configuration.generation;
             }
             let syscall = unsafe { &*session.syscall.get() };
-            let mut desired = [(0u64, 0u64, 0u64, 0u32); 4];
+            let observer = session.observer();
+            let mut desired = [(0u64, 0u64, 0u64, 0u8); 4];
             let mut needed = 0;
             if target {
                 for debug in &configuration.debug[..configuration.debug_count] {
@@ -2713,10 +3000,50 @@ pub(crate) mod runtime {
                     desired[needed] = (syscall.entry, syscall.callback, 0, 2);
                     needed += 1;
                 }
+                if let Some(observer) = observer {
+                    for (slot, watch) in observer.watch[..observer.watch_count].iter().enumerate() {
+                        if needed >= 4 {
+                            return Err(());
+                        }
+                        desired[needed] = (watch.address, 0, watch.control, 3 + slot as u8);
+                        needed += 1;
+                    }
+                    if observer.events.accepting() && read(GUEST_CS_AR_BYTES)? & 0x2000 != 0 {
+                        for probe in
+                            &observer.events.config.probes[..observer.events.config.probe_count]
+                        {
+                            if needed >= 4 {
+                                return Err(());
+                            }
+                            let kind = match probe.kind {
+                                EVENT_ENTRY => 7,
+                                EVENT_RETURN => 8,
+                                EVENT_INSTRUCTION => 10,
+                                _ => 9,
+                            };
+                            desired[needed] = (probe.address, 0, 0, kind);
+                            needed += 1;
+                        }
+                    }
+                }
             }
             let free = (0..4)
                 .filter(|slot| cpu.guest_debug[5] & (3 << (slot * 2)) == 0)
                 .count();
+            if observer.is_some_and(|observer| {
+                observer.events.config.probes[..observer.events.config.probe_count]
+                    .iter()
+                    .any(|probe| probe.kind == EVENT_INSTRUCTION)
+            }) && target
+                && needed != 0
+                && (free < needed || cpu.guest_debug[5] & (1 << 13) != 0)
+            {
+                session
+                    .cause
+                    .store(u64::from(INTERCEPT_CAUSE_DEBUG_CAPACITY), Ordering::Release);
+                revoke(session, boot, synchronize)?;
+                return Ok(());
+            }
             if needed != 0 && free >= needed && cpu.guest_debug[5] & (1 << 13) == 0 {
                 let mut registers: [u64; 5] = cpu.guest_debug[..5].try_into().map_err(|_| ())?;
                 let mut dr7 = cpu.guest_debug[5];
@@ -2740,7 +3067,10 @@ pub(crate) mod runtime {
                         | (2 << (slot * 2));
                     next += 1;
                 }
-                cpu.debug_kinds = kinds;
+                cpu.debug_kinds = kinds.map(u32::from);
+                if let Some(observer) = observer {
+                    observer.set_overlay(boot.processor_number as usize, kinds);
+                }
                 cpu.debug_armed = 1;
                 cpu.debug_count = kinds
                     .iter()
@@ -3710,6 +4040,458 @@ pub(crate) mod runtime {
         Ok(1)
     }
 
+    fn record_event(
+        observer: &Observation,
+        boot: &ResidentBootContext,
+        profile: &RoadEptProfile,
+        context: ContextRecord,
+        mut event: Event,
+    ) -> u64 {
+        let environment = resident::event_environment(boot);
+        let la57 = environment.guest_cr4 & (1 << 12) != 0;
+        let mut memory = resident::Memory {
+            environment: &environment,
+        };
+        let mut read = |address, bytes: &mut [u8]| {
+            transfer(
+                &mut memory,
+                context.cr3,
+                address,
+                bytes,
+                la57,
+                environment.physical_bits as u32,
+                (false, true),
+            )
+        };
+        event.thread_id_status = Error::Unsupported as u64;
+        if observer.events.config.thread_id_offset != 0
+            && context.thread_teb != 0
+            && let Some(address) = context
+                .thread_teb
+                .checked_add(u64::from(observer.events.config.thread_id_offset))
+        {
+            let mut bytes = [0; 8];
+            let (done, status) = read(address, &mut bytes);
+            event.thread_id_status = status.err().map_or(0, |error| error as u64);
+            if done == 8 && event.thread_id_status == 0 {
+                event.thread_id = u64::from_le_bytes(bytes);
+            } else if event.thread_id_status == 0 {
+                event.thread_id_status = Error::Unmapped as u64;
+            }
+        }
+        if event.kind == EVENT_INSTRUCTION {
+            use yaxpeax_arch::LengthedInstruction;
+            use yaxpeax_x86::long_mode::{InstDecoder, Opcode, Operand};
+            let mut execution = [0; 15];
+            let mut original = [0; 15];
+            let count =
+                fetch_instruction(boot, profile, context.rip, &mut execution, &mut original);
+            event.instruction.status = Error::Unmapped as u64;
+            if let Ok(instruction) = InstDecoder::default().decode_slice(&execution[..count]) {
+                let length = instruction.len().to_const() as u64;
+                event.instruction = InstructionRecord {
+                    length,
+                    ..InstructionRecord::default()
+                };
+                if instruction.opcode() == Opcode::CALL {
+                    event.instruction.status = Error::Unsupported as u64;
+                    match instruction.operand(0) {
+                        Operand::ImmediateI32 { imm } => {
+                            event.instruction.kind = CALL_DIRECT;
+                            event.instruction.target =
+                                context.rip.wrapping_add(length).wrapping_add(imm as u64);
+                            event.instruction.status = 0;
+                        }
+                        Operand::Register { reg } => {
+                            event.instruction.kind = CALL_REGISTER;
+                            if let Some((number, _, _)) = register_location(reg) {
+                                event.instruction.source = number as u64;
+                            }
+                            if let Ok(target) = register_value(&context.gprs, reg) {
+                                event.instruction.target = target;
+                                event.instruction.status = 0;
+                            }
+                        }
+                        operand if operand.is_memory() => {
+                            event.instruction.kind = CALL_MEMORY;
+                            if let Ok(address) =
+                                effective_address(&context.gprs, &instruction, 0, length)
+                            {
+                                event.instruction.source = address;
+                                let mut pointer = [0; 8];
+                                let (done, status) = read(address, &mut pointer);
+                                event.instruction.status =
+                                    status.err().map_or(0, |error| error as u64);
+                                if done == pointer.len() && event.instruction.status == 0 {
+                                    event.instruction.target = u64::from_le_bytes(pointer);
+                                } else if event.instruction.status == 0 {
+                                    event.instruction.status = Error::Unmapped as u64;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if event.kind == EVENT_SOFTWARE_EXCEPTION {
+            // AMD64 RtlDispatchException takes EXCEPTION_RECORD* in RCX.
+            let mut exception = [0; 24];
+            if read(context.gprs[1], &mut exception).1.is_ok() {
+                event.detail = u64::from(word(&exception, 0));
+                event.auxiliary = u64::from(word(&exception, 4));
+                event.address = quad(&exception, 16);
+            } else {
+                event.detail = u64::MAX;
+            }
+        }
+        let mut return_bytes = [0; 8];
+        let return_rip = if event.kind == EVENT_ENTRY
+            && context.rsp & 7 == 0
+            && read(context.rsp, &mut return_bytes).1.is_ok()
+        {
+            let address = u64::from_le_bytes(return_bytes);
+            if observer.events.config.probes[..observer.events.config.probe_count]
+                .iter()
+                .any(|probe| probe.kind == EVENT_RETURN && probe.address == address)
+            {
+                address
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let shadow = vmread(EPT_POINTER).ok() == Some(profile.ept) && profile.hook_count != 0;
+        let mut stack_base = [0; 8];
+        if context.cpl == 3
+            && observer.events.config.probe_count != 0
+            && let Some(address) = context.thread_teb.checked_add(8)
+        {
+            if read(address, &mut stack_base).1.is_err() {
+                stack_base.fill(0);
+            }
+        }
+        let mut sequence = 0;
+        observer.events.correlate(
+            context,
+            event,
+            return_rip,
+            u64::from_le_bytes(stack_base),
+            |event| {
+                sequence = observer.events.emit(context, event, |bytes| {
+                    let mut offset = 0;
+                    for (index, (region, capacity)) in [
+                        (
+                            EventRegion {
+                                address: context.rip,
+                                length: if event.kind == EVENT_ARM {
+                                    0
+                                } else {
+                                    EVENT_CODE_BYTES
+                                },
+                                ..EventRegion::default()
+                            },
+                            EVENT_CODE_BYTES,
+                        ),
+                        (
+                            EventRegion {
+                                address: context.rsp,
+                                length: if event.kind == EVENT_ARM {
+                                    0
+                                } else {
+                                    observer.events.config.stack_bytes
+                                },
+                                ..EventRegion::default()
+                            },
+                            EVENT_STACK_BYTES,
+                        ),
+                    ]
+                    .into_iter()
+                    .chain(
+                        observer
+                            .events
+                            .config
+                            .regions
+                            .iter()
+                            .map(|region| (*region, EVENT_REGION_BYTES)),
+                    )
+                    .enumerate()
+                    {
+                        let (header, payload) = bytes
+                            [offset..offset + EVENT_SEGMENT_HEADER + capacity]
+                            .split_at_mut(EVENT_SEGMENT_HEADER);
+                        let length = region.length;
+                        let mut address = region.address;
+                        let mut source = region.address;
+                        let mut scalar = region.address;
+                        let mut source_status = Ok(());
+                        if event.kind == EVENT_ARM && region.kind != 0 {
+                            source_status = Err(Error::Unsupported);
+                        }
+                        if region.kind == ARGUMENT_REGISTER {
+                            let number = region.address as usize;
+                            scalar = if number == 4 {
+                                context.rsp
+                            } else {
+                                context.gprs
+                                    [[0, 1, 2, 3, 0, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14][number]]
+                            };
+                            address = scalar;
+                        } else if region.kind == ARGUMENT_STACK {
+                            if let Some(location) = context.rsp.checked_add(region.address) {
+                                source = location;
+                                let mut value = [0; 8];
+                                let (done, status) = read(source, &mut value);
+                                source_status = status.and(if done == 8 {
+                                    Ok(())
+                                } else {
+                                    Err(Error::Unmapped)
+                                });
+                                scalar = u64::from_le_bytes(value);
+                                address = scalar;
+                            } else {
+                                source_status = Err(Error::Bounds);
+                            }
+                        }
+                        let initial_pointer = address;
+                        if region.kind != 0 && source_status.is_ok() {
+                            if let Some(adjusted) =
+                                address.checked_add_signed(i64::from(region.pointer_offset))
+                            {
+                                address = adjusted;
+                            } else {
+                                source_status = Err(Error::Bounds);
+                            }
+                        }
+                        for _ in 1..region.depth {
+                            if source_status.is_err() {
+                                break;
+                            }
+                            let mut value = [0; 8];
+                            let (done, status) = read(address, &mut value);
+                            source_status = status.and(if done == 8 {
+                                Ok(())
+                            } else {
+                                Err(Error::Unmapped)
+                            });
+                            if source_status.is_ok() {
+                                address = u64::from_le_bytes(value);
+                            }
+                        }
+                        if region.kind != 0 && address.checked_add(length as u64).is_none() {
+                            // Keep an invalid pointer in the argument metadata, while giving
+                            // the failed segment a representable range for offline decoding.
+                            source_status = Err(Error::Bounds);
+                            address = 0;
+                        }
+                        let mut copied = 0;
+                        let argument_status = source_status;
+                        if length != 0 {
+                            let mut position = 0;
+                            for page in header[64..].chunks_exact_mut(EVENT_PAGE_BYTES) {
+                                if position == length {
+                                    break;
+                                }
+                                let Some(page_address) = address.checked_add(position as u64)
+                                else {
+                                    source_status = Err(Error::Bounds);
+                                    break;
+                                };
+                                let requested =
+                                    (4096 - (page_address as usize & 4095)).min(length - position);
+                                let mut page_memory = resident::Memory {
+                                    environment: &environment,
+                                };
+                                let mapping = page_mapping(
+                                    &mut page_memory,
+                                    context.cr3,
+                                    page_address,
+                                    la57,
+                                    environment.physical_bits as u32,
+                                );
+                                let (done, mut status) =
+                                    if argument_status.is_err() && region.kind != 0 {
+                                        (0, argument_status)
+                                    } else {
+                                        transfer(
+                                            &mut page_memory,
+                                            context.cr3,
+                                            page_address,
+                                            &mut payload[position..position + requested],
+                                            la57,
+                                            environment.physical_bits as u32,
+                                            (false, context.cpl == 3),
+                                        )
+                                    };
+                                if let Ok(before) = &mapping {
+                                    match page_mapping(
+                                        &mut page_memory,
+                                        context.cr3,
+                                        page_address,
+                                        la57,
+                                        environment.physical_bits as u32,
+                                    ) {
+                                        Ok(after)
+                                            if before.pte_fingerprint == after.pte_fingerprint
+                                                && before.physical_address
+                                                    == after.physical_address => {}
+                                        Ok(_) => status = Err(Error::Remapped),
+                                        Err(error) => status = Err(error),
+                                    }
+                                } else if status.is_ok() {
+                                    status = Err(Error::Unmapped);
+                                }
+                                let (physical, fingerprint, permissions, page_size) = mapping
+                                    .map_or((0, 0, 0, 0), |mapping| {
+                                        (
+                                            mapping.physical_address,
+                                            mapping.pte_fingerprint,
+                                            mapping.permissions,
+                                            mapping.page_size,
+                                        )
+                                    });
+                                for (value, slot) in [page_address, physical, fingerprint]
+                                    .into_iter()
+                                    .zip(page[..24].chunks_exact_mut(8))
+                                {
+                                    slot.copy_from_slice(&value.to_le_bytes());
+                                }
+                                for (value, slot) in [
+                                    requested as u32,
+                                    done as u32,
+                                    status.err().map_or(0, |error| error as u32),
+                                    permissions,
+                                    position as u32,
+                                    page_size as u32,
+                                ]
+                                .into_iter()
+                                .zip(page[24..].chunks_exact_mut(4))
+                                {
+                                    slot.copy_from_slice(&value.to_le_bytes());
+                                }
+                                copied += done;
+                                if source_status.is_ok() {
+                                    source_status = status;
+                                }
+                                position += requested;
+                            }
+                            if index == 0 && shadow && copied != 0 && source_status.is_ok() {
+                                let mut original = [0; EVENT_CODE_BYTES];
+                                let done = resident::instruction_bytes_in(
+                                    &environment,
+                                    profile,
+                                    address,
+                                    &mut payload[..copied],
+                                    &mut original[..copied],
+                                );
+                                if done != length {
+                                    source_status = Err(Error::Unmapped);
+                                }
+                            }
+                        }
+                        header[..8].copy_from_slice(&address.to_le_bytes());
+                        header[8..10].copy_from_slice(&(length as u16).to_le_bytes());
+                        header[10..12].copy_from_slice(&(copied as u16).to_le_bytes());
+                        header[12..16].copy_from_slice(
+                            &source_status
+                                .err()
+                                .map_or(0, |error| error as u32)
+                                .to_le_bytes(),
+                        );
+                        for (value, slot) in [
+                            source,
+                            scalar,
+                            initial_pointer,
+                            address,
+                            region.depth as u64 | (u64::from(region.pointer_offset as u16) << 48),
+                            region.kind,
+                        ]
+                        .into_iter()
+                        .zip(header[16..64].chunks_exact_mut(8))
+                        {
+                            slot.copy_from_slice(&value.to_le_bytes());
+                        }
+                        offset += EVENT_SEGMENT_HEADER + capacity;
+                    }
+                });
+            },
+        );
+        sequence
+    }
+
+    fn finish_snapshot(
+        session: &Session,
+        boot: &mut ResidentBootContext,
+        frame: &[u64],
+        confirmed: bool,
+    ) -> Result<u64, ()> {
+        let pending = boot.interception.snapshot_pending;
+        boot.interception.snapshot_pending = [0; 6];
+        write(
+            CPU_BASED_VM_EXEC_CONTROL,
+            (read(CPU_BASED_VM_EXEC_CONTROL)? & !(1 << 27))
+                | boot.interception.primary_bits & (1 << 27),
+        )?;
+        if session.is_active()
+            && let Some(observer) = session.observer()
+        {
+            let configuration = unsafe { &*session.configuration.get() };
+            let context = context_record(boot, frame)?;
+            if observer.events.config.enabled
+                && observer.events.config.snapshot_after
+                && pending[0] == configuration.token
+                && pending[1] == context.cr3
+                && pending[2] == context.thread_teb
+            {
+                let environment = resident::event_environment(boot);
+                let mut memory = resident::Memory {
+                    environment: &environment,
+                };
+                observer
+                    .events
+                    .config
+                    .validate_identity(
+                        &mut memory,
+                        environment.guest_cr4 & (1 << 12) != 0,
+                        environment.physical_bits as u32,
+                    )
+                    .map_err(|_| {
+                        session
+                            .cause
+                            .store(u64::from(INTERCEPT_CAUSE_CONTEXT), Ordering::Release);
+                    })?;
+                record_event(
+                    observer,
+                    boot,
+                    configuration,
+                    context,
+                    Event {
+                        kind: EVENT_AFTER,
+                        detail: pending[3],
+                        auxiliary: pending[4],
+                        address: context.rip,
+                        instruction: InstructionRecord {
+                            // MTF can follow native exception delivery instead of retiring the probe.
+                            status: if confirmed
+                                && pending[5] & (1 << 63) == 0
+                                && pending[5] & 3 == context.cpl
+                            {
+                                0
+                            } else {
+                                Error::Unsupported as u64
+                            },
+                            source: boot.last_reason & 0xffff,
+                            ..InstructionRecord::default()
+                        },
+                        ..Event::default()
+                    },
+                );
+            }
+        }
+        Ok(pending[5] & (1 << 27))
+    }
+
     fn dispatch(
         session: &Session,
         boot: &mut ResidentBootContext,
@@ -3725,21 +4507,128 @@ pub(crate) mod runtime {
             session.exit_debug[boot.processor_number as usize].load(Ordering::Acquire) & 1;
         let armed = boot.interception.debug_armed != 0 || exit_armed != 0;
         let kinds = if armed {
-            core::array::from_fn(|index| {
-                let target = boot.interception.debug_targets[index];
-                if index < boot.interception.debug_count && target != [0; 2] {
-                    boot.interception.debug_kinds[index]
-                } else {
-                    0
-                }
-            })
+            if let Some(observer) = session.observer() {
+                observer.overlay(boot.processor_number as usize)
+            } else {
+                core::array::from_fn(|index| {
+                    let target = boot.interception.debug_targets[index];
+                    if index < boot.interception.debug_count && target != [0; 2] {
+                        boot.interception.debug_kinds[index] as u8
+                    } else {
+                        0
+                    }
+                })
+            }
         } else {
             [0; 4]
         };
         restore_debug(&mut boot.interception)?;
         let reason = boot.last_reason & 0xffff;
+        if session.is_active()
+            && boot.nested.active == 0
+            && let Some(observer) = session.observer()
+            && observer.events.config.enabled
+            && root_matches(unsafe { &*session.configuration.get() }, read(GUEST_CR3)?)
+        {
+            let environment = resident::event_environment(boot);
+            let mut memory = resident::Memory {
+                environment: &environment,
+            };
+            if observer
+                .events
+                .config
+                .validate_identity(
+                    &mut memory,
+                    environment.guest_cr4 & (1 << 12) != 0,
+                    environment.physical_bits as u32,
+                )
+                .is_err()
+            {
+                session
+                    .cause
+                    .store(u64::from(INTERCEPT_CAUSE_CONTEXT), Ordering::Release);
+                revoke(session, boot, synchronize)?;
+            }
+        }
         if reason != 48 && reason != 52 {
             session.ept_progress[boot.processor_number as usize].store(0, Ordering::Relaxed);
+        }
+        if reason == 37 && boot.interception.snapshot_pending[0] != 0 {
+            if finish_snapshot(session, boot, frame, true)? == 0 && boot.interception.exit_step == 0
+            {
+                return Ok(1);
+            }
+        } else if reason == 0 && boot.interception.snapshot_pending[0] != 0 {
+            let info = read(VM_EXIT_INTR_INFO)?;
+            if info & (1 << 31) != 0 && matches!((info >> 8) & 7, 3 | 5 | 6) {
+                let confirmed = info & 255 == 1 && boot.last_qualification & (1 << 14) != 0;
+                finish_snapshot(session, boot, frame, confirmed)?;
+            }
+        }
+        if session.is_active() && boot.nested.active == 0 {
+            if let Some(observer) = session.observer()
+                && (observer.context_enabled || observer.events.config.enabled)
+            {
+                let configuration = unsafe { &*session.configuration.get() };
+                if root_matches(configuration, read(GUEST_CR3)?)
+                    && read(GUEST_IA32_EFER)? & 0x400 != 0
+                {
+                    let context = context_record(boot, frame)?;
+                    if observer.context_enabled || observer.events.config.sample {
+                        if let Some(context) = observer.capture(context, None) {
+                            record_event(
+                                observer,
+                                boot,
+                                configuration,
+                                context,
+                                Event {
+                                    kind: EVENT_CONTEXT,
+                                    detail: reason,
+                                    ..Event::default()
+                                },
+                            );
+                        }
+                    }
+                    if reason == 0 && context.cpl == 3 {
+                        let info = read(VM_EXIT_INTR_INFO)?;
+                        let vector = info & 255;
+                        if info & (1 << 31) != 0
+                            && matches!((info >> 8) & 7, 3 | 5 | 6)
+                            && observer.events.config.exceptions & (1 << vector.min(63)) != 0
+                        {
+                            let owned = kinds.iter().enumerate().fold(0, |mask, (index, kind)| {
+                                mask | if *kind == 0 { 0 } else { 1 << index }
+                            });
+                            if vector != 1
+                                || boot.last_qualification & 0xe00f & !owned != 0
+                                || boot.last_qualification & owned == 0
+                            {
+                                record_event(
+                                    observer,
+                                    boot,
+                                    configuration,
+                                    context,
+                                    Event {
+                                        kind: EVENT_EXCEPTION,
+                                        detail: info,
+                                        auxiliary: if info & (1 << 11) != 0 {
+                                            read(VM_EXIT_INTR_ERROR_CODE)?
+                                        } else {
+                                            0
+                                        },
+                                        address: if vector == 14 {
+                                            boot.last_qualification
+                                        } else {
+                                            0
+                                        },
+                                        ..Event::default()
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
         let stepped = boot.interception.exit_step != 0;
         finish_step(session, boot, synchronize)?;
@@ -3782,6 +4671,9 @@ pub(crate) mod runtime {
             }
         }
         if reason == 37 && stepped {
+            return Ok(1);
+        }
+        if reason == 37 && boot.interception.snapshot_exit_owned != 0 {
             return Ok(1);
         }
         if reason == 48 {
@@ -3979,6 +4871,70 @@ pub(crate) mod runtime {
                 && boot.interception.debug_generation == configuration.generation
                 && root_matches(configuration, read(GUEST_CR3)?);
             if owned_hits != 0 {
+                if current && let Some(observer) = session.observer() {
+                    let hits = kinds.iter().enumerate().filter(|(index, kind)| {
+                        owned_hits & (1 << index) != 0 && (3..=10).contains(*kind)
+                    });
+                    let mut context = None;
+                    // Record every observation before changing the guest frame or setting RF.
+                    for (index, &kind) in hits {
+                        let captured = match context {
+                            Some(context) => context,
+                            None => {
+                                let captured = context_record(boot, frame)?;
+                                context = Some(captured);
+                                captured
+                            }
+                        };
+                        let target = boot.interception.debug_targets[index][0];
+                        if kind <= 6 {
+                            let slot = usize::from(kind - 3);
+                            if let Some(watch) = observer.capture(captured, Some(slot)) {
+                                record_event(
+                                    observer,
+                                    boot,
+                                    configuration,
+                                    watch,
+                                    Event {
+                                        kind: EVENT_WATCH,
+                                        detail: slot as u64,
+                                        address: target,
+                                        ..Event::default()
+                                    },
+                                );
+                            }
+                            session.hits.fetch_add(1, Ordering::Relaxed);
+                        } else if rip == target && (kind == 10 || captured.cpl == 3) {
+                            let sequence = record_event(
+                                observer,
+                                boot,
+                                configuration,
+                                captured,
+                                Event {
+                                    kind: match kind {
+                                        7 => EVENT_ENTRY,
+                                        8 => EVENT_RETURN,
+                                        10 => EVENT_INSTRUCTION,
+                                        _ => EVENT_SOFTWARE_EXCEPTION,
+                                    },
+                                    address: rip,
+                                    ..Event::default()
+                                },
+                            );
+                            if kind == 10 && observer.events.config.snapshot_after && sequence != 0
+                            {
+                                boot.interception.snapshot_pending = [
+                                    configuration.token,
+                                    captured.cr3,
+                                    captured.thread_teb,
+                                    captured.rip,
+                                    sequence,
+                                    (boot.interception.primary_bits & (1 << 27)) | captured.cpl,
+                                ];
+                            }
+                        }
+                    }
+                }
                 write(
                     GUEST_PENDING_DBG_EXCEPTIONS,
                     read(GUEST_PENDING_DBG_EXCEPTIONS)? & !owned_hits,
@@ -4142,7 +5098,24 @@ pub(crate) mod runtime {
                     synchronize,
                     unsafe { &mut *fx_state.cast::<[u8; 512]>() },
                 ),
-                1 => apply(session, boot, synchronize).map(|()| 0),
+                1 => (|| {
+                    if session.is_active()
+                        && boot.interception.snapshot_pending[0] != 0
+                        && matches!(boot.last_reason & 0xffff, 10 | 28 | 29 | 31 | 32 | 48 | 59)
+                        && read(GUEST_RIP)? != boot.interception.snapshot_pending[3]
+                    {
+                        if frame.is_null() || !(frame as usize).is_multiple_of(8) {
+                            return Err(());
+                        }
+                        finish_snapshot(
+                            session,
+                            boot,
+                            unsafe { core::slice::from_raw_parts(frame, 15) },
+                            true,
+                        )?;
+                    }
+                    apply(session, boot, synchronize).map(|()| 0)
+                })(),
                 2 => {
                     let _ = session.cause.compare_exchange(
                         u64::from(INTERCEPT_CAUSE_NONE),
@@ -4285,6 +5258,7 @@ pub(crate) mod runtime {
             }
         };
         if phase == 0 && outcome != u64::MAX {
+            boot.interception.snapshot_exit_owned = 0;
             session.exit_debug[boot.processor_number as usize].fetch_and(!1, Ordering::AcqRel);
         }
         outcome

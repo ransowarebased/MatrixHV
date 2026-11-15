@@ -33,6 +33,7 @@ for declaration, replacement in [
     ('fn page_byte(', 'fn page_byte(address: u64, value: Option<u8>) -> u8 { crate::hardware::page_byte(address, value) }'),
     ('fn clock()', 'fn clock() -> u64 { crate::hardware::clock() }'),
     ('fn user_cet()', 'fn user_cet() -> [u64; 2] { crate::hardware::STATE.with(|state| state.borrow().user_cet) }'),
+    ('fn kernel_gs()', 'fn kernel_gs() -> u64 { crate::hardware::STATE.with(|state| state.borrow().kernel_gs) }'),
     ('fn syscall_msrs()', 'fn syscall_msrs() -> [u64; 2] { crate::hardware::syscall_msrs() }'),
     ('fn original_value(', 'fn original_value(address: u64, width: usize, value: Option<u64>) -> u64 { crate::hardware::original_value(address, width, value) }'),
 ]:
@@ -50,6 +51,13 @@ runtime = runtime[:start] + '''        if !no_flush && read(SECONDARY_VM_EXEC_CO
 assert 'core::arch::asm!' not in runtime
 engine = source[:source.index('pub(crate) trait InterceptionMemory')]
 engine = engine.replace('use crate::memory::access::{PhysicalMemory, page_mapping};', '')
+engine = engine.replace('use crate::memory::observation::{EventConfig, Observation};',
+                        'use crate::memory::observation::Observation;')
+engine = engine.replace('#[cfg(target_os = "uefi")]\nuse crate::memory::observation::ContextRecord;',
+                        'use crate::memory::observation::ContextRecord;')
+engine = engine.replace('use crate::memory::observation::{EventConfig, Observation};',
+                        'use crate::memory::observation::Observation;')
+engine = engine.replace('#[cfg(target_os = \"uefi\")]\nuse crate::memory::observation::ContextRecord;', 'use crate::memory::observation::ContextRecord;')
 for declaration in ['fn observer_ptr(', 'fn has_features(']:
     engine = engine.replace(item(engine, declaration), '')
 engine = re.sub(r'const OPTIONS: u32 = .*?;', '', engine, flags=re.S)
@@ -60,10 +68,12 @@ engine = engine.replace('        self.splits.get_mut().fill(BaseSplit::default()
                         '        for split in self.splits.get_mut() { split.storage.fill(0); }')
 engine += '\n'.join(item(source, declaration) for declaration in ['fn bank_base(', 'fn expired(', 'fn lock_refresh(', 'fn data_root(', 'fn data_leaves(', 'fn root_matches(', 'fn baseline_page(', 'fn merge_byte(', 'fn cpuid_values(']) + '\n' + runtime
 abi = (project / 'src/vmx/resident/abi.rs').read_text()
-cpu = 'use core::sync::atomic::AtomicU64;\n#[repr(C)]\n#[derive(Default)]\n' + item(abi, 'pub struct InterceptionCpuState')
+cpu = 'use core::sync::atomic::AtomicU64;\n#[repr(C)]\n' + item(abi, 'pub struct InterceptionCpuState') + '\n' + item(abi, 'impl Default for InterceptionCpuState')
 vmcs = (project / 'src/vmx/vmcs.rs').read_text()
 constants = '\n'.join(re.findall(r'pub const \w+: u64 = (?:0x[0-9a-fA-F_]+|\d+);', vmcs))
 access = (project / "src/memory/access.rs").read_text()
+access = access.split('#[cfg(any(target_os = "uefi", test))]')[0]
+(output / 'access.rs').write_text(access)
 definitions = '''pub use matrixhv_sdk::protocol;
 pub mod arch {
     pub struct Leaf { pub eax: u32 }
@@ -75,11 +85,11 @@ pub mod arch {
 }
 pub mod memory {
     pub mod access {
-        use crate::protocol::memory::Error;
-''' + item(access, 'pub trait PhysicalMemory') + '''
+        include!("access.rs");
         pub mod resident {
             use super::{Error, PhysicalMemory};
             use crate::vmx::resident::abi::ResidentBootContext;
+            use crate::memory::interception::RoadEptProfile;
             pub struct Environment { pub guest_cr4: u64, pub physical_bits: u64 }
             pub struct Memory<'a> { pub environment: &'a Environment }
             pub fn event_environment(_: &ResidentBootContext) -> Environment {
@@ -96,6 +106,11 @@ pub mod memory {
                 fn write(&mut self, _: u64, _: &[u8]) -> Result<(), Error> {
                     Err(Error::Permission)
                 }
+            }
+            pub(crate) fn instruction_bytes_in(_: &Environment, _: &RoadEptProfile, _: u64,
+                execution: &mut [u8], original: &mut [u8]) -> usize {
+                original.copy_from_slice(execution);
+                execution.len()
             }
         }
     }

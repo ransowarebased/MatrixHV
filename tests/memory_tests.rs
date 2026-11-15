@@ -1240,6 +1240,46 @@ fn resident_info_returns_observed_roots_without_treating_them_as_validated() {
 }
 
 #[test]
+fn resident_event_transport_preserves_capture_counts_and_format_version() {
+    use crate::memory::interception::Session;
+    use crate::memory::observation::{ContextRecord, Event, Observation};
+    use neo::memory::{InterceptionRequest, decode_event_batch, interception_packet};
+
+    let request = interception_packet(&InterceptionRequest {
+        operation: EVENT_FETCH,
+        token: 9,
+        ..Default::default()
+    })
+    .unwrap();
+    let (_machine, mut environment, buffer, _) = Machine::setup(&request);
+    let mut session = unsafe {
+        Box::from_raw(std::alloc::alloc_zeroed(std::alloc::Layout::new::<Session>()).cast::<Session>())
+    };
+    let mut observation = unsafe {
+        Box::from_raw(
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<Observation>()).cast::<Observation>(),
+        )
+    };
+    session.initialize(0, 1);
+    session.configuration.get_mut().token = 9;
+    session.observation = &*observation as *const _ as u64;
+    environment.interception_session = &*session as *const _ as u64;
+    environment.synchronize = tracking_barrier as *const () as u64;
+    observation.events.config.max_events = 3;
+    observation
+        .events
+        .emit(ContextRecord::default(), Event::default(), |_| {});
+
+    let response = native_tracking_request(&environment, &[buffer], &request);
+    assert_eq!(word(&response, 40), 0);
+    let batch = decode_event_batch(&response).unwrap();
+    assert_eq!(batch.captured_hits, 1);
+    assert_eq!(batch.hit_limit, 3);
+    assert_eq!(batch.head, 1);
+    assert!(batch.records.is_empty());
+}
+
+#[test]
 fn resident_transport_copies_the_packet_once_and_returns_item_results_and_identity() {
     let request = packet(
         READ,

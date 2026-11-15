@@ -3273,9 +3273,10 @@ def prepare_boot_state(project: Path):
     output.mkdir(parents=True, exist_ok=True)
     legacy_abi = (project / "src/vmx/resident/abi.rs").read_text()
     debug_kinds = "    pub debug_kinds: [u32; 4],\n"
-    assert legacy_abi.count(debug_kinds) == 1
+    debug_kinds_init = "            debug_kinds: [0; 4],\n"
+    assert legacy_abi.count(debug_kinds) == legacy_abi.count(debug_kinds_init) == 1
     (output / "previous-interception-abi.rs").write_text(
-        legacy_abi.replace(debug_kinds, ""), encoding="utf-8")
+        legacy_abi.replace(debug_kinds, "").replace(debug_kinds_init, ""), encoding="utf-8")
     legacy_nested = (project / "src/vmx/nested.rs").read_text()
     for field in ("inherited_l1_dr7", "inherited_l1_debugctl"):
         declaration = f"    pub {field}: u64,\n"

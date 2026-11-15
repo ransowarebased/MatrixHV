@@ -36,12 +36,14 @@ use super::state::configure_resident_host;
 use super::vmcs::{HOST_RIP, HOST_RSP, vmwrite};
 use crate::vmx::hyperv;
 pub(crate) const BOOT_GUEST_STACK_PAGES: usize = 64;
-pub(crate) const HOST_STACK_PAGES: usize = 4;
+// Resident Rust services share this stack with the dispatcher and NMI entry.
+// Keep headroom beyond the compiled interception transaction call chain.
+pub(crate) const HOST_STACK_PAGES: usize = 8;
 use crate::vmx::nested::{NestedVmxCapabilities, native_vmcs_shadowing_available};
 
 const PAGE_SIZE: usize = 4096;
 const GUEST_STACK_PAGES: usize = 64;
-const HOST_EXIT_STACK_PAGES: usize = 4;
+const HOST_EXIT_STACK_PAGES: usize = HOST_STACK_PAGES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PersistentVcpuError {

@@ -17,8 +17,9 @@ count_match = re.search(r"ROOT_HISTORY_COUNT: usize = (\d+);", protocol)
 if count_match is None:
     raise ValueError("Root-history size was not found")
 count = int(count_match.group(1))
-if count != 16:
-    raise ValueError("Update the root-history fixture for the new history size")
+if count == 0 or count & (count - 1):
+    raise ValueError("Root-history size must be a power of two")
+(output / "count.rs").write_text(f"const HISTORY_COUNT: usize = {count};\n", encoding="utf-8")
 macro = match.group(0)
 for name, value in {
     "event_memory_kernel_cr3": 0,

@@ -53,6 +53,7 @@ if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
 
 $CargoArguments = @(
     'rustc',
+    '--locked',
     '--manifest-path', $ManifestPath,
     '--target', $TargetTriple,
     '--target-dir', $CargoTargetRoot,
@@ -62,12 +63,27 @@ $CargoArguments = @(
 if ($Configuration -eq 'Release') {
     $CargoArguments += '--release'
 }
-$CargoArguments += @('--', '-Dwarnings', '--emit=obj,link')
+$CargoArguments += @('--', '-Dwarnings', '--emit=obj,link,asm')
 
 Write-Host "Building $BinaryName ($Configuration) for $TargetTriple..."
 & $CargoCommand.Source @CargoArguments
 if ($LASTEXITCODE -ne 0) {
     throw "cargo build failed with exit code $LASTEXITCODE."
+}
+
+$ResidentObject = Get-ChildItem -LiteralPath (Join-Path $CargoTargetRoot "$TargetTriple\$CargoProfile\deps") -Filter "$BinaryName-*.o" |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($null -eq $ResidentObject) {
+    throw 'The embedded resident object was not produced.'
+}
+$PythonCommand = Get-Command python -ErrorAction Stop
+if ($Configuration -eq 'Release') {
+    $ResidentAssembly = [System.IO.Path]::ChangeExtension($ResidentObject.FullName, '.s')
+    $StackReport = Join-Path $OutputRoot 'resident-stack.json'
+    & $PythonCommand.Source (Join-Path $ProjectRoot 'tests/check_resident_stack.py') --assembly $ResidentAssembly --output $StackReport
+    if ($LASTEXITCODE -ne 0) {
+        throw "Resident stack budget check failed with exit code $LASTEXITCODE."
+    }
 }
 
 $BuiltBinary = Join-Path $CargoTargetRoot "$TargetTriple\$CargoProfile\$BinaryName.efi"
@@ -85,12 +101,6 @@ if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
 }
 Copy-Item -LiteralPath $ConfigPath -Destination $StagedConfig -Force
 
-$ResidentObject = Get-ChildItem -LiteralPath (Join-Path $CargoTargetRoot "$TargetTriple\$CargoProfile\deps") -Filter "$BinaryName-*.o" |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
-if ($null -eq $ResidentObject) {
-    throw 'The embedded resident object was not produced.'
-}
-$PythonCommand = Get-Command python -ErrorAction Stop
 $UpdatePackage = Join-Path $OutputRoot 'MatrixHV.mxcore'
 & $PythonCommand.Source (Join-Path $PSScriptRoot 'build_update.py') package --object $ResidentObject.FullName --efi $StagedBinary --output $UpdatePackage
 if ($LASTEXITCODE -ne 0) {

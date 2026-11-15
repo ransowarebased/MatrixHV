@@ -25,6 +25,7 @@ pub(crate) struct PageMapping {
     pub pte_fingerprint: u64,
     pub page_size: u64,
     pub present: bool,
+    pub permissions: u32,
 }
 
 pub(crate) fn page_mapping(
@@ -47,6 +48,7 @@ pub(crate) fn page_mapping(
     }
     let mut table = cr3 & mask;
     let mut fingerprint = 0xcbf2_9ce4_8422_2325u64;
+    let mut permissions = 15u32;
     let mut shift = if la57 { 48 } else { 39 };
     loop {
         let pointer = table + ((address >> shift) & 511) * 8;
@@ -66,10 +68,20 @@ pub(crate) fn page_mapping(
                 pte_fingerprint: fingerprint,
                 page_size,
                 present: false,
+                permissions: 0,
             });
         }
         if entry & 0x000f_ffff_ffff_f000 & !mask != 0 {
             return Err(Error::Bounds);
+        }
+        if entry & 2 == 0 {
+            permissions &= !2;
+        }
+        if entry & 4 == 0 {
+            permissions &= !4;
+        }
+        if entry & (1 << 63) != 0 {
+            permissions &= !8;
         }
         let large = shift != 12 && entry & 128 != 0;
         if large && shift != 21 && shift != 30 {
@@ -85,6 +97,7 @@ pub(crate) fn page_mapping(
                 pte_fingerprint: fingerprint,
                 page_size,
                 present: true,
+                permissions,
             });
         }
         table = entry & mask;
@@ -397,7 +410,7 @@ pub fn execute(
     if quad(packet, 0) != MEMORY_MAGIC
         || word(packet, 8) != MEMORY_VERSION
         || word(packet, 36) as usize != packet.len()
-        || word(packet, 44) != 0
+        || operation != EVENT_SET && word(packet, 44) != 0
     {
         return Err(Error::Format);
     }
@@ -421,6 +434,19 @@ pub fn execute(
             | CPUID_CLEAR
             | SYSCALL_SET
             | SYSCALL_CLEAR
+            | WATCH_SET
+            | WATCH_CLEAR
+            | WATCH_FETCH
+            | CONTEXT_SET
+            | CONTEXT_CLEAR
+            | CONTEXT_SNAPSHOT
+            | STACK_WALK
+            | WATCH_FILTER_SET
+            | CONTEXT_FILTER_SET
+            | CONTEXT_RECORD_GET
+            | EVENT_SET
+            | EVENT_CLEAR
+            | EVENT_FETCH
     ) {
         return memory.intercept(packet, la57, physical_bits);
     }
@@ -1316,8 +1342,11 @@ pub(crate) mod resident {
         }
         let result = execute(&mut memory, packet, la57, physical_bits);
         set_word(packet, 40, result.err().map_or(0, |error| error as u32));
-        packet[48..56].copy_from_slice(&environment.caller_cr3.to_le_bytes());
-        packet[56..64].copy_from_slice(&environment.syscall.to_le_bytes());
+        // Event batches own these fields for the capture count and format version.
+        if word(packet, 12) != EVENT_FETCH {
+            packet[48..56].copy_from_slice(&environment.caller_cr3.to_le_bytes());
+            packet[56..64].copy_from_slice(&environment.syscall.to_le_bytes());
+        }
         if word(packet, 12) == INFO {
             packet[64..72].copy_from_slice(&environment.kernel_cr3.to_le_bytes());
             set_word(
@@ -1332,6 +1361,20 @@ pub(crate) mod resident {
                         | CPUID_UNGATED_CAPABILITY
                         | PRIVATE_SHARED_DATA_CAPABILITY
                         | SYSCALL_PROFILE_CAPABILITY
+                        | if unsafe {
+                            &*(environment.interception_session
+                                as *const crate::memory::interception::Session)
+                        }
+                        .observation
+                            != 0
+                        {
+                            OBSERVATION_CAPABILITY
+                                | OBSERVATION_FILTER_CAPABILITY
+                                | EVENT_CAPABILITY
+                                | EVENT_V3_CAPABILITY
+                        } else {
+                            0
+                        }
                 } else {
                     0
                 },

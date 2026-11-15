@@ -106,7 +106,6 @@ pub struct ResidentEventContext {
 pub struct RootFxState(pub [u8; 512]);
 
 #[repr(C)]
-#[derive(Default)]
 pub struct InterceptionCpuState {
     pub controls_saved: u64,
     pub primary_bits: u64,
@@ -153,6 +152,62 @@ pub struct InterceptionCpuState {
     pub runtime_diagnostics: [u64; crate::protocol::memory::INTERCEPT_DIAGNOSTIC_WORDS],
     pub sync_diagnostics: [u64; crate::protocol::memory::EPT_SYNC_DIAGNOSTIC_WORDS],
     pub debug_kinds: [u32; 4],
+    pub snapshot_pending: [u64; 6],
+    pub snapshot_exit_owned: u64,
+}
+
+impl Default for InterceptionCpuState {
+    fn default() -> Self {
+        Self {
+            controls_saved: 0,
+            primary_bits: 0,
+            exception_bit: 0,
+            debug_armed: 0,
+            guest_debug: [0; 6],
+            applied_ept: 0,
+            debug_targets: [[0; 2]; 4],
+            debug_count: 0,
+            debug_token: 0,
+            debug_generation: 0,
+            exit_ept: 0,
+            hook_pages: [0; crate::protocol::memory::HOOK_MAX_PAGES],
+            hook_count: 0,
+            hook_token: 0,
+            step_active: 0,
+            step_cr3: 0,
+            exit_step: 0,
+            vmfunc_armed: 0,
+            vmfunc_saved: 0,
+            vmfunc_secondary: 0,
+            vmfunc_control: 0,
+            vmfunc_list: 0,
+            cooperative_data: 0,
+            cooperative_cr3: 0,
+            exit_vmfunc: 0,
+            cr3_target_count: 0,
+            timer_saved: 0,
+            timer_pin: 0,
+            timer_value: 0,
+            timer_armed: 0,
+            exit_timer: 0,
+            data_address: 0,
+            data_linear: 0,
+            data_qualification: 0,
+            hook_generation: 0,
+            timing_saved: 0,
+            timing_offset: 0,
+            timing_start: 0,
+            data_pending: 0,
+            data_rip: 0,
+            refresh_owned: 0,
+            split_flush_epoch: AtomicU64::new(0),
+            runtime_diagnostics: [0; crate::protocol::memory::INTERCEPT_DIAGNOSTIC_WORDS],
+            sync_diagnostics: [0; crate::protocol::memory::EPT_SYNC_DIAGNOSTIC_WORDS],
+            debug_kinds: [0; 4],
+            snapshot_pending: [0; 6],
+            snapshot_exit_owned: 0,
+        }
+    }
 }
 
 #[repr(C, align(16))]
