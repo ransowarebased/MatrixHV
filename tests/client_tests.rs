@@ -24,6 +24,7 @@ fn event_decoder_rejects_unpublished_records_wrong_versions_and_inconsistent_cou
     packet[32..36].copy_from_slice(&1u32.to_le_bytes());
     assert!(decode_event_batch(&packet).is_err());
     put(&mut packet, HEADER_BYTES, 1);
+    put(&mut packet, 88, 1);
     put(&mut packet, 104, 1);
     put(
         &mut packet,
@@ -39,6 +40,47 @@ fn event_decoder_rejects_unpublished_records_wrong_versions_and_inconsistent_cou
         EVENT_FORMAT_VERSION,
     );
     packet[32..36].copy_from_slice(&2u32.to_le_bytes());
+    assert!(decode_event_batch(&packet).is_err());
+}
+
+#[test]
+fn event_decoder_rejects_replayed_records_and_nonprogressing_response_cursors() {
+    use matrixhv_sdk::memory::{InterceptionRequest, decode_event_batch, interception_packet};
+    use matrixhv_sdk::protocol::memory::*;
+    let mut packet = interception_packet(&InterceptionRequest {
+        operation: EVENT_FETCH,
+        token: 1,
+        cursor: 7,
+        count: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let put = |bytes: &mut [u8], offset: usize, value: u64| {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    };
+    put(&mut packet, 56, EVENT_FORMAT_VERSION);
+    put(&mut packet, 88, 8);
+    put(&mut packet, 104, 12);
+    put(&mut packet, HEADER_BYTES, 8);
+    put(
+        &mut packet,
+        HEADER_BYTES + CONTEXT_RECORD_BYTES + 56,
+        EVENT_FORMAT_VERSION,
+    );
+    assert_eq!(decode_event_batch(&packet).unwrap().next, 8);
+    for next in [0, 7, 9, 12] {
+        put(&mut packet, 88, next);
+        assert!(decode_event_batch(&packet).is_err());
+    }
+    put(&mut packet, 88, 8);
+    for sequence in [6, 7] {
+        put(&mut packet, HEADER_BYTES, sequence);
+        assert!(decode_event_batch(&packet).is_err());
+    }
+    packet[32..36].copy_from_slice(&0u32.to_le_bytes());
+    put(&mut packet, 88, 7);
+    assert!(decode_event_batch(&packet).unwrap().records.is_empty());
+    put(&mut packet, 88, 0);
     assert!(decode_event_batch(&packet).is_err());
 }
 

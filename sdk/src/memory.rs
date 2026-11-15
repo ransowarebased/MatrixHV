@@ -127,7 +127,7 @@ pub fn decode_event_batch(bytes: &[u8]) -> Result<EventBatch<'_>, String> {
         return Err("invalid event response size or version".into());
     }
     let mut records = Vec::with_capacity(count);
-    let mut previous = 0;
+    let mut previous = quad(bytes, 64);
     for record in body.chunks_exact(EVENT_RECORD_BYTES).take(count) {
         let sequence = quad(record, 0);
         if quad(record, CONTEXT_RECORD_BYTES + 56) != EVENT_FORMAT_VERSION
@@ -139,6 +139,9 @@ pub fn decode_event_batch(bytes: &[u8]) -> Result<EventBatch<'_>, String> {
         }
         previous = sequence;
         records.push(record);
+    }
+    if quad(bytes, 88) != previous {
+        return Err("event response cursor does not match its records".into());
     }
     Ok(EventBatch {
         token: quad(bytes, 80),

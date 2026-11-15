@@ -9,6 +9,29 @@ import threading
 import time
 
 
+def capture_available(status):
+    return status.get("matrixhv_protocol") == 10 and status.get("memory_event_v3") is True
+
+
+def fetch_records(neo, token, cpu_count):
+    records = []
+    for cpu in range(cpu_count):
+        cursor = 0
+        while True:
+            batch = neo("session", "fetch", token, cpu, cursor, 1)
+            assert int(batch["dropped"], 16) == 0
+            if not batch["records"]:
+                break
+            next_cursor = int(batch["next"], 16)
+            if next_cursor <= cursor:
+                raise RuntimeError("Event fetch did not advance its cursor")
+            records.extend(batch["records"])
+            cursor = next_cursor
+            if cursor >= int(batch["head"], 16):
+                break
+    return records
+
+
 class FixtureProcess:
     def __init__(self, binary):
         self.process = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -75,12 +98,12 @@ def main():
 
     if args.capture:
         status = neo("status")
-        available = status.get("matrixhv_protocol") == 10 and status.get("memory_event_v2")
+        available = capture_available(status)
         (output / "capture-preflight.json").write_text(json.dumps({
             "status": "PASS" if available else "UNAVAILABLE",
             "required_protocol": 10, "observed": status}, indent=2))
         if not available:
-            raise RuntimeError("This test requires a booted MatrixHV protocol 10 core with event-v2 capture")
+            raise RuntimeError("This test requires a booted MatrixHV protocol 10 core with event-v3 capture")
 
     fixture = FixtureProcess(binary)
     evidence = {"status": "RUNNING", "capture": args.capture, "checks": []}
@@ -180,16 +203,7 @@ def main():
                            "--instruction", ready["direct_probe"], *options)["token"]
 
             def fetch(label):
-                records = []
-                for cpu in range(status["logical_processor_count"]):
-                    cursor = 0
-                    for _ in range(6):
-                        batch = neo("session", "fetch", token, cpu, cursor, 3)
-                        records.extend(batch["records"])
-                        cursor = batch["next"]
-                        assert int(batch["dropped"], 16) == 0
-                        if len(batch["records"]) < 3:
-                            break
+                records = fetch_records(neo, token, status["logical_processor_count"])
                 path = output / f"{label}-{time.time_ns()}.json"
                 path.write_text(json.dumps(records, indent=2))
                 return records

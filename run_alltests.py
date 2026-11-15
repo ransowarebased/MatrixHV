@@ -39,6 +39,7 @@ def run_component(project, component, release=False):
         )
         execute([str(binary)], project)
     if component == "resident":
+        execute([sys.executable, str(project / "tests/debugger_capture_tests.py")], project)
         execute([sys.executable, str(project / "tests/resident_stack_tests.py")], project)
         execute([sys.executable, str(project / "tests/check_resident_stack.py"), "--build"], project)
         execute([sys.executable, str(project / "tests/run_update_tests.py")], project)
