@@ -1267,7 +1267,6 @@ call .Lresident_nested_eptp_sync_poll
 mov edx, 1
 call .Lresident_interception_callback
 call .Lresident_interception_safe_point_timer
-call .Lresident_interception_clock_commit
 call .Lresident_deliver_pending_nmi
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 1
 mfence

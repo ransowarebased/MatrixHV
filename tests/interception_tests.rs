@@ -18,7 +18,6 @@ struct Machine {
     clock: u64,
     clock_hz: u64,
     lease_available: bool,
-    timing_available: bool,
     syscall_cr4: u64,
     syscall_cet: bool,
     denied_guard: Option<u64>,
@@ -43,7 +42,6 @@ impl Machine {
             clock: 1000,
             clock_hz: 1000,
             lease_available: true,
-            timing_available: true,
             syscall_cr4: 0,
             syscall_cet: false,
             denied_guard: None,
@@ -135,9 +133,6 @@ impl InterceptionMemory for Machine {
     }
     fn lease_available(&self) -> bool {
         self.lease_available
-    }
-    fn timing_available(&self) -> bool {
-        self.timing_available
     }
     fn quiesce(&mut self) -> Result<(), Error> {
         self.events.push("quiesce");
@@ -1834,7 +1829,7 @@ fn leases_renew_without_changing_ids_and_expired_tokens_cannot_reactivate() {
 }
 
 #[test]
-fn watchdog_and_timing_capabilities_are_checked_before_publication() {
+fn watchdog_capability_is_checked_before_publication() {
     let mut machine = Machine::new();
     let mut session = session();
     machine.lease_available = false;
@@ -1843,28 +1838,73 @@ fn watchdog_and_timing_capabilities_are_checked_before_publication() {
         execute(&mut session, &mut machine, &mut install),
         Err(Error::Unsupported)
     );
-    machine.lease_available = true;
-    machine.timing_available = false;
-    let mut timing = packet(&[
-        "hook",
-        "install",
-        "0x3000",
-        "0x400008",
-        "cc",
-        "--tsc-offset",
-    ]);
-    assert_eq!(
-        execute(&mut session, &mut machine, &mut timing),
-        Err(Error::Unsupported)
-    );
     assert!(!session.is_active());
-    machine.timing_available = true;
-    execute(&mut session, &mut machine, &mut timing).unwrap();
-    assert_eq!(word(&timing, 128), INTERCEPT_TSC_OFFSET);
-    let mut release = packet(&["hook", "release", "1"]);
-    execute(&mut session, &mut machine, &mut release).unwrap();
-    assert_eq!(word(&release, 112), INTERCEPT_DISABLED);
-    assert_eq!(word(&release, 128), 0);
+}
+
+#[test]
+fn retired_tsc_compensation_flag_is_rejected_before_publication() {
+    for mut request in [
+        packet(&["hook", "install", "0x3000", "0x400008", "cc"]),
+        packet(&["debug-registers", "set", "0x3000", "0x400008", "0x400010"]),
+        cpuid_request(),
+    ] {
+        let mut machine = Machine::new();
+        let mut session = session();
+        request[128..132].copy_from_slice(&2_u32.to_le_bytes());
+        assert_eq!(
+            execute(&mut session, &mut machine, &mut request),
+            Err(Error::Format)
+        );
+        assert!(!session.is_active());
+        assert_eq!(machine.events.last(), Some(&"resume"));
+        assert_eq!(unsafe { &*session.configuration.get() }.token, 0);
+    }
+}
+
+#[test]
+fn removed_tsc_option_is_rejected_by_hook_debug_and_cpuid_parsers() {
+    for command in [
+        vec![
+            "hook",
+            "install",
+            "0x3000",
+            "0x400008",
+            "cc",
+            "--tsc-offset",
+        ],
+        vec![
+            "debug-registers",
+            "set",
+            "0x3000",
+            "0x400008",
+            "0x400010",
+            "--tsc-offset",
+        ],
+        vec![
+            "cpuid",
+            "set",
+            "0x3000",
+            "--record",
+            "1",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "0xffffffff",
+            "--tsc-offset",
+        ],
+    ] {
+        let arguments = command
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        assert!(interception_packet(&arguments).is_err());
+    }
 }
 
 #[test]
@@ -2680,7 +2720,7 @@ fn watch_and_context_packets_share_the_lease_and_preserve_fetch_cursors() {
 fn observation_filter_commands_require_the_active_token_and_leave_session_abi_unchanged() {
     use crate::memory::observation::ContextRecord;
     use neo::memory::{InterceptionRequest, ObservationFilter, interception_packet};
-    assert_eq!(core::mem::size_of::<Session>(), 824_424);
+    assert_eq!(core::mem::size_of::<Session>(), 824_400);
     let mut machine = Machine::new();
     let (mut session, observation) = observed_session();
     let mut request = interception_packet(&InterceptionRequest {
@@ -3022,4 +3062,70 @@ fn process_identity_guards_validate_before_publishing_or_replacing_an_event_conf
             .filter(|event| **event == "resume")
             .count()
     );
+}
+
+#[test]
+fn observation_profiles_reject_retired_flags_and_private_shared_data_and_reset_prior_counters() {
+    use core::sync::atomic::Ordering;
+    use neo::memory::{InterceptionRequest, interception_packet};
+    for operation in [WATCH_SET, CONTEXT_SET, EVENT_SET] {
+        let mut machine = Machine::new();
+        let (mut session, _observation) = observed_session();
+        session.hits.store(7, Ordering::Relaxed);
+        session.data_exits.store(0x40a0, Ordering::Relaxed);
+        session.write_windows.store(11, Ordering::Relaxed);
+
+        let mut request = InterceptionRequest {
+            operation,
+            cr3: ROOT,
+            watchpoints: if operation == WATCH_SET {
+                vec![(0x400008, 3, 8)]
+            } else {
+                Vec::new()
+            },
+            event_probes: if operation == EVENT_SET {
+                vec![(0x400100, EVENT_INSTRUCTION)]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let mut raw_private = interception_packet(&request).unwrap();
+        raw_private[128..132].copy_from_slice(&INTERCEPT_PRIVATE_SHARED_DATA.to_le_bytes());
+        assert_eq!(
+            execute(&mut session, &mut machine, &mut raw_private),
+            Err(Error::Format)
+        );
+        assert!(!session.is_active());
+
+        let mut retired = interception_packet(&request).unwrap();
+        retired[128..132].copy_from_slice(&2_u32.to_le_bytes());
+        assert_eq!(
+            execute(&mut session, &mut machine, &mut retired),
+            Err(Error::Format)
+        );
+        assert!(!session.is_active());
+
+        let mut packet = interception_packet(&request).unwrap();
+        execute(&mut session, &mut machine, &mut packet).unwrap();
+        assert!(session.is_active());
+        assert_eq!(word(&packet, 128) & 2, 0);
+        assert_eq!(quad(&packet, 88), 0);
+        assert_eq!(quad(&packet, 96), 0);
+        assert_eq!(quad(&packet, 120), 0);
+        assert_eq!(quad(&packet, 72), 0);
+        assert_eq!(session.hits.load(Ordering::Relaxed), 0);
+        assert_eq!(session.data_exits.load(Ordering::Relaxed), 0);
+        assert_eq!(session.write_windows.load(Ordering::Relaxed), 0);
+
+        request.token = quad(&packet, 80);
+        let mut release = interception_packet(&InterceptionRequest {
+            operation: INTERCEPT_RELEASE,
+            token: request.token,
+            ..Default::default()
+        })
+        .unwrap();
+        execute(&mut session, &mut machine, &mut release).unwrap();
+        assert!(!session.is_active());
+    }
 }

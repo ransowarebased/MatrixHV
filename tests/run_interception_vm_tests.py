@@ -217,7 +217,6 @@ def main():
                 ("hook", "install", root, fixture["first"], "b833000000", "--vmfunc"),
                 ("hook", "install", root, fixture["first"], "b833000000", "--concurrent-writes"),
                 ("hook", "install", root, fixture["first"], "b833000000", "--persistent-data"),
-                ("hook", "install", root, fixture["first"], "b833000000", "--tsc-offset"),
                 ("debug-registers", "set", root, fixture["first"], fixture["second"]),
             ):
                 text = neo(*command, expected=1)
@@ -231,7 +230,7 @@ def main():
             passed("Unsupported watchdog rejects hook/DR modes without publishing a profile or changing code")
             (output / "skipped.json").write_text(json.dumps({
                 "reason": "Target lacks the required VMX preemption timer; runtime interception was explicitly skipped",
-                "scenarios": ["EPT hooks", "dynamic patches", "context aliases", "merge", "DR redirects", "VMFUNC", "lease expiry", "TSC offset"],
+                "scenarios": ["EPT hooks", "dynamic patches", "context aliases", "merge", "DR redirects", "VMFUNC", "lease expiry"],
             }, indent=2))
             return
 
@@ -362,23 +361,6 @@ def main():
         assert neo("hook", "context-list", token).count("context_cr3=") == 1
         release()
         passed("CR3 PCID aliases retain scope and are enumerated once")
-
-        text = neo("hook", "install", root, fixture["first"], "b833000000", "--tsc-offset",
-                   *(["--no-lease"] if arguments.no_lease else ["--lease-ms", "600000"]), expected=None)
-        if "state=active" in text:
-            token = field(text, "token")
-            expect_execution(51)
-            status = neo("hook", "status")
-            assert int(field(status, "compensated_ticks")) > 0, status
-            release()
-            expect_execution(17)
-            passed("TSC compensation accumulates root time and restores execution on release")
-        else:
-            assert "unsupported paging mode" in text, text
-            status = neo("hook", "status")
-            assert field(status, "state") == "disabled", status
-            expect_execution(17)
-            passed("Unsupported TSC compensation is rejected without publishing a profile")
 
         if arguments.no_lease:
             (output / "skipped.json").write_text(json.dumps({

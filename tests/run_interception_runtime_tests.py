@@ -165,7 +165,6 @@ sync = (project / 'src/vmx/asm/eptp_switch.S').read_text()
 exits = (project / 'src/vmx/asm/exits.S').read_text()
 bridge = control[control.index('.Lresident_interception_callback:'):control.index('.Lresident_dispatch_update_l2_reject:')]
 bridge += sync[sync.index('.Lresident_nested_eptp_sync_enter:'):sync.index('// The copied Rust callback')]
-bridge += exits[exits.index('.Lresident_interception_clock_commit:'):exits.index('// Separate emulated VMCS access')]
 bridge += exits[exits.index('.Lresident_host_sync_nmi_entry_guard:'):exits.index('.Lresident_host_arm_nmi_window:')]
 assert 'mov rdx, qword ptr [rsp + 120]\ncall .Lresident_host_sync_nmi_entry_guard\ncall .Lresident_nested_eptp_sync_host_nmi' in exits
 transitions = [
@@ -249,7 +248,7 @@ bindings = {
 for name, field in {
     'controls': 'controls_saved', 'debug_armed': 'debug_armed', 'ept': 'applied_ept',
     'exit_ept': 'exit_ept', 'exit_step': 'exit_step', 'exit_vmfunc': 'exit_vmfunc',
-    'hook_count': 'hook_count', 'timing_saved': 'timing_saved',
+    'hook_count': 'hook_count',
 }.items():
     bindings['b_interception_' + name] = 'ResidentBootContext, interception.' + field
 used = set(re.findall(r'\{(\w+)\}', bridge))

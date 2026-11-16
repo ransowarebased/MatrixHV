@@ -854,15 +854,6 @@ cmp qword ptr [r12 + {b_canary_end}], rax
 jne matrixhv_resident_island_fatal
 cmp qword ptr [r12 + {b_processor_number}], 64
 jae matrixhv_resident_island_fatal
-cmp qword ptr [r12 + {b_interception_timing_saved}], 0
-je .Lresident_interception_clock_sampled
-lfence
-rdtsc
-lfence
-shl rdx, 32
-or rax, rdx
-mov qword ptr [r12 + {b_interception_timing_start}], rax
-.Lresident_interception_clock_sampled:
 mov qword ptr [r12 + {b_root_vmx_active}], 1
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
 .Lresident_dispatch_entry_unsafe_done:
@@ -1174,14 +1165,6 @@ mov qword ptr [r12 + {b_watchdog_phase}], 2
 resident_telemetry_counter inc, {b_watchdog_resume_failures}, {b_telemetry_active}
 matrixhv_diagnostic_vmresume_failure
 jmp .Lresident_dispatch_halt
-// Timing runs inside the entry gate while host-NMI callbacks are excluded.
-.Lresident_interception_clock_commit:
-cmp qword ptr [r12 + {b_interception_timing_saved}], 0
-je .Lresident_interception_clock_ready
-mov edx, 5
-call .Lresident_interception_callback
-.Lresident_interception_clock_ready:
-ret
 // Separate emulated VMCS access, entry, EPT invalidation, and other exit costs.
 matrixhv_island_profile
 matrixhv_island_halt_observation

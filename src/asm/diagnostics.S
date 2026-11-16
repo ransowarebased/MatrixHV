@@ -243,7 +243,8 @@ mov rcx, rdx
 shr rdx, 32
 jmp .Lresident_dispatch_cpuid_diagnostic_store
 .Lresident_dispatch_cpuid_exit_clock:
-mov rax, qword ptr [r8 + {b_interception_timing_saved}]
+// Preserve the diagnostic ABI: compensation is always disabled.
+xor eax, eax
 mov rdx, qword ptr [r8 + {b_watchdog_tsc_hz}]
 jmp .Lresident_dispatch_cpuid_vmx_pair
 .Lresident_dispatch_cpuid_control_stage:

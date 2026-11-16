@@ -9,7 +9,6 @@ use crate::protocol::memory::*;
 
 const MASK: u64 = 0x000f_ffff_ffff_f000;
 const OPTIONS: u32 = INTERCEPT_VMFUNC
-    | INTERCEPT_TSC_OFFSET
     | INTERCEPT_CONCURRENT_WRITES
     | INTERCEPT_PERSISTENT_DATA
     | INTERCEPT_NO_LEASE
@@ -88,7 +87,6 @@ pub(crate) struct RoadEptProfile {
     pub bank: usize,
     pub timer_rate: u32,
     pub generation: u64,
-    pub timing: u64,
     pub options: u32,
     pub cpu_data: [u64; 64],
     pub cpu_lists: [u64; 64],
@@ -156,7 +154,6 @@ pub(crate) struct Session {
     pub lease_deadline: AtomicU64,
     pub lease_ms: AtomicU64,
     pub tsc_hz: AtomicU64,
-    pub timing_ticks: AtomicU64,
     refresh_lock: AtomicU64,
     splits: UnsafeCell<[BaseSplit; INTERCEPT_BASE_TABLE_PAGES]>,
     pub split_epoch: AtomicU64,
@@ -170,10 +167,10 @@ pub(crate) struct Session {
     pub observation: u64,
 }
 const _: () = assert!(core::mem::offset_of!(Session, active) == 0);
-// ABI 7 requires a fresh allocation for the expanded registered-root arrays.
-const _: () = assert!(core::mem::offset_of!(Session, cpuid) == 822_624);
-const _: () = assert!(core::mem::size_of::<Session>() == 824_424);
-const _: () = assert!(core::mem::offset_of!(Session, observation) == 824_416);
+// ABI 9 requires a fresh allocation after removing exit-time compensation state.
+const _: () = assert!(core::mem::offset_of!(Session, cpuid) == 822_600);
+const _: () = assert!(core::mem::size_of::<Session>() == 824_400);
+const _: () = assert!(core::mem::offset_of!(Session, observation) == 824_392);
 
 impl Session {
     pub(crate) fn initialize(&mut self, pool_base: u64, cpu_mask: u64) {
@@ -191,7 +188,6 @@ impl Session {
         self.lease_deadline.store(0, Ordering::Relaxed);
         self.lease_ms.store(0, Ordering::Relaxed);
         self.tsc_hz.store(0, Ordering::Relaxed);
-        self.timing_ticks.store(0, Ordering::Relaxed);
         self.refresh_lock.store(0, Ordering::Relaxed);
         self.splits.get_mut().fill(BaseSplit::default());
         self.split_epoch.store(0, Ordering::Relaxed);
@@ -273,7 +269,6 @@ pub(crate) trait InterceptionMemory: PhysicalMemory {
     fn clock_hz(&self) -> u64;
     fn timer_rate(&self) -> u32;
     fn lease_available(&self) -> bool;
-    fn timing_available(&self) -> bool;
 }
 
 fn expired(session: &Session, now: u64) -> bool {
@@ -723,7 +718,12 @@ fn cpu_views(
         }
         configuration.cpu_data[cpu_index] = start | (configuration.data_ept & !MASK);
         configuration.cpu_lists[cpu_index] = end;
-        store_eptp_list(memory, end, configuration.ept, configuration.cpu_data[cpu_index])?;
+        store_eptp_list(
+            memory,
+            end,
+            configuration.ept,
+            configuration.cpu_data[cpu_index],
+        )?;
         cpu_slot += 1;
     }
     Ok(())
@@ -743,9 +743,6 @@ fn install(
         return Err(Error::Format);
     }
     if flags & INTERCEPT_VMFUNC != 0 && !memory.vmfunc_available() {
-        return Err(Error::Unsupported);
-    }
-    if flags & INTERCEPT_TSC_OFFSET != 0 && !memory.timing_available() {
         return Err(Error::Unsupported);
     }
     if hooks.is_empty() || hooks.len() > HOOK_MAX_PATCHES {
@@ -892,7 +889,6 @@ fn install(
         configuration.data_ept,
     )?;
     configuration.vmfunc = u64::from(flags & INTERCEPT_VMFUNC != 0);
-    configuration.timing = u64::from(flags & INTERCEPT_TSC_OFFSET != 0);
     configuration.options = flags;
     cpu_views(configuration, memory, page_count)?;
     memory.check_budget()?;
@@ -1395,11 +1391,6 @@ fn change_hooks(
                 | INTERCEPT_PERSISTENT_DATA
                 | INTERCEPT_NO_LEASE
                 | INTERCEPT_PRIVATE_SHARED_DATA))
-            | (if configuration.timing != 0 {
-                INTERCEPT_TSC_OFFSET
-            } else {
-                0
-            })
     };
     // Peers remain parked while guards are restored and the spare bank is built.
     // Retire both old roots before publication; failed builds retain the old bank.
@@ -1679,15 +1670,12 @@ pub(crate) unsafe fn execute(
                             ) && flags
                                 & (INTERCEPT_VMFUNC
                                     | INTERCEPT_CONCURRENT_WRITES
-                                    | INTERCEPT_PERSISTENT_DATA)
+                                    | INTERCEPT_PERSISTENT_DATA
+                                    | INTERCEPT_PRIVATE_SHARED_DATA)
                                 != 0
-                            || operation == SYSCALL_SET
-                                && flags & !(INTERCEPT_TSC_OFFSET | INTERCEPT_NO_LEASE) != 0
+                            || operation == SYSCALL_SET && flags & !INTERCEPT_NO_LEASE != 0
                         {
                             return Err(Error::Format);
-                        }
-                        if flags & INTERCEPT_TSC_OFFSET != 0 && !memory.timing_available() {
-                            return Err(Error::Unsupported);
                         }
                         let roots = [
                             root(quad(packet, 16), physical_bits)?,
@@ -1722,8 +1710,10 @@ pub(crate) unsafe fn execute(
                             unsafe {
                                 *session.syscall.get() = SyscallProfile::default();
                             }
-                            configuration.timing = 0;
                             configuration.extra_roots.fill(0);
+                            session.hits.store(0, Ordering::Relaxed);
+                            session.data_exits.store(0, Ordering::Relaxed);
+                            session.write_windows.store(0, Ordering::Relaxed);
                             session.hook_records.store(0, Ordering::Relaxed);
                             retire_splits(session, configuration, memory, &[])?;
                         }
@@ -1745,15 +1735,9 @@ pub(crate) unsafe fn execute(
                             unsafe {
                                 *session.syscall.get() = syscall;
                             }
-                            if flags & INTERCEPT_TSC_OFFSET != 0 {
-                                configuration.timing = 1;
-                            }
                         } else if let Some(cpuid) = cpuid {
                             unsafe {
                                 *session.cpuid.get() = cpuid;
-                            }
-                            if flags & INTERCEPT_TSC_OFFSET != 0 {
-                                configuration.timing = 1;
                             }
                         } else if let Some((targets, count)) = watch {
                             let observer = unsafe { &mut *session.observer_ptr()? };
@@ -1776,9 +1760,6 @@ pub(crate) unsafe fn execute(
                             };
                         } else {
                             set_debug(configuration, packet, la57)?;
-                            if flags & INTERCEPT_TSC_OFFSET != 0 {
-                                configuration.timing = 1;
-                            }
                         }
                         let profile = unsafe { &mut *session.cpuid.get() };
                         if operation == CPUID_SET || profile.token == configuration.token {
@@ -2065,10 +2046,6 @@ pub(crate) unsafe fn execute(
                         | INTERCEPT_PRIVATE_SHARED_DATA)
             } else {
                 0
-            }) | (if session.is_active() && configuration.timing != 0 {
-                INTERCEPT_TSC_OFFSET
-            } else {
-                0
             }) | (if session.is_active() && session.lease_ms.load(Ordering::Acquire) == 0 {
                 INTERCEPT_NO_LEASE
             } else {
@@ -2098,7 +2075,7 @@ pub(crate) unsafe fn execute(
         packet[144..152].copy_from_slice(&configuration.generation.to_le_bytes());
         packet[152..160]
             .copy_from_slice(&session.hook_records.load(Ordering::Relaxed).to_le_bytes());
-        packet[72..80].copy_from_slice(&session.timing_ticks.load(Ordering::Relaxed).to_le_bytes());
+        packet[72..80].fill(0);
         packet[44..48]
             .copy_from_slice(&(configuration.registered_roots().count() as u32).to_le_bytes());
         Ok(())
@@ -2267,36 +2244,6 @@ pub(crate) mod runtime {
         frame[0] = frame[1];
         frame[1] = profile.callback;
         Ok(1)
-    }
-
-    fn configure_timing(boot: &mut ResidentBootContext, enabled: bool) -> Result<(), ()> {
-        let cpu = &mut boot.interception;
-        if enabled {
-            if cpu.timing_saved == 0 {
-                cpu.timing_offset = read(TSC_OFFSET)?;
-                cpu.timing_start = 0;
-                cpu.timing_saved = 1;
-            }
-        } else if cpu.timing_saved != 0 {
-            write(TSC_OFFSET, cpu.timing_offset)?;
-            cpu.timing_saved = 0;
-            cpu.timing_start = 0;
-        }
-        Ok(())
-    }
-
-    fn compensate_timing(session: &Session, boot: &mut ResidentBootContext) -> Result<(), ()> {
-        let cpu = &mut boot.interception;
-        let start = core::mem::replace(&mut cpu.timing_start, 0);
-        if cpu.timing_saved == 0 || start == 0 || !session.is_active() {
-            return Ok(());
-        }
-        let elapsed = clock().wrapping_sub(start);
-        if elapsed as i64 > 0 {
-            write(TSC_OFFSET, read(TSC_OFFSET)?.wrapping_sub(elapsed))?;
-            session.timing_ticks.fetch_add(elapsed, Ordering::Relaxed);
-        }
-        Ok(())
     }
 
     fn configure_timer(
@@ -2769,7 +2716,6 @@ pub(crate) mod runtime {
         let mut result = Ok(());
         for outcome in [
             configure_vmfunc(boot, configuration, false),
-            configure_timing(boot, false),
             configure_timer(session, boot, false),
             restore_debug(&mut boot.interception),
             base(boot),
@@ -2886,10 +2832,6 @@ pub(crate) mod runtime {
             }
         }
         configure_timer(session, boot, active)?;
-        configure_timing(
-            boot,
-            active && unsafe { &*session.configuration.get() }.timing != 0,
-        )?;
         let primary = read(CPU_BASED_VM_EXEC_CONTROL)?;
         let exceptions = read(EXCEPTION_BITMAP)?;
         let cpu = &mut boot.interception;
@@ -4921,6 +4863,9 @@ pub(crate) mod runtime {
                                     ..Event::default()
                                 },
                             );
+                            if sequence != 0 {
+                                session.hits.fetch_add(1, Ordering::Relaxed);
+                            }
                             if kind == 10 && observer.events.config.snapshot_after && sequence != 0
                             {
                                 boot.interception.snapshot_pending = [
@@ -5193,7 +5138,6 @@ pub(crate) mod runtime {
                         })
                 }
                 4 => observe_exit(session, boot, synchronize).map(|()| 0),
-                5 => compensate_timing(session, boot).map(|()| 0),
                 _ => Err(()),
             }
         };

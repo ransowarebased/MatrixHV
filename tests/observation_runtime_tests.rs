@@ -36,6 +36,7 @@ fn expanded_region_capture_keeps_every_region_and_rejects_excess_probes() {
     }
     scenario.call(1);
     assert_eq!(scenario.exit(0, 1), 1);
+    assert_eq!(scenario.session.hits.load(Ordering::Acquire), 1);
     let mut packet = query(EVENT_FETCH, 1, 0);
     observation.events.fetch(&mut packet).unwrap();
     assert_eq!(word(&packet, 32), 1);

@@ -27,11 +27,7 @@ mod control {
             model: *mut Model,
             processor: u64,
         ) -> u64;
-        fn test_control_write_native_segments(
-            shared: *mut u64,
-            model: *mut Model,
-            processor: u64,
-        );
+        fn test_control_write_native_segments(shared: *mut u64, model: *mut Model, processor: u64);
         fn test_control_off(shared: *mut u64, model: *mut Model, processor: u64) -> u64;
         fn test_control_cleanup(shared: *mut u64, model: *mut Model, processor: u64) -> u64;
         fn test_control_dispatch(
@@ -277,8 +273,14 @@ mod control {
             ],
         );
         let probe = offset("event_control_probe_states") + scenario.processor * PROBE_WORDS;
-        assert_eq!(scenario.shared[probe + offset("probe_guest_cs_selector")], 16);
-        assert_eq!(scenario.shared[probe + offset("probe_guest_fs_selector")], 67);
+        assert_eq!(
+            scenario.shared[probe + offset("probe_guest_cs_selector")],
+            16
+        );
+        assert_eq!(
+            scenario.shared[probe + offset("probe_guest_fs_selector")],
+            67
+        );
         assert_eq!(
             scenario.shared[probe + offset("probe_guest_tr_base")],
             0xffff800012340000,
@@ -2216,23 +2218,22 @@ mod telemetry {
     }
 
     #[test]
-    fn exit_clock_diagnostics_report_compensation_and_full_width_frequency() {
+    fn exit_clock_diagnostics_report_no_compensation_and_full_width_frequency() {
         let mut context = [0; 1024];
         let mut remote = [0u64; 1024];
         let mut shared = [0; 1024];
         shared[offset("event_cpu_contexts") + 1] = remote.as_mut_ptr() as u64;
-        remote[offset("b_interception_timing_saved")] = 1;
         remote[offset("b_watchdog_tsc_hz")] = 0x1122334455667788;
+        std::hint::black_box(&remote);
         assert_eq!(
             diagnostic(&mut context, &mut shared, (2 << 16) | 55),
-            [1, 0, 0x55667788, 0x11223344]
+            [0, 0, 0x55667788, 0x11223344]
         );
         assert_eq!(
             diagnostic(&mut context, &mut shared, (3 << 16) | 55),
             [0; 4]
         );
         assert_ne!(diagnostic(&mut context, &mut shared, 34)[0] & (1 << 17), 0);
-        assert_eq!(remote[offset("b_interception_timing_saved")], 1);
     }
 
     #[test]

@@ -122,11 +122,13 @@ fn tampering_and_another_signer_are_rejected() {
 }
 
 #[test]
-fn packages_using_the_previous_host_stack_contract_require_a_reboot() {
-    let (mut bytes, abi, key) = package(2);
-    bytes[28..32].copy_from_slice(&7_u32.to_le_bytes());
-    resign(&mut bytes);
-    assert_eq!(Package::parse(&bytes, abi, &key).unwrap_err(), Error::Abi);
+fn packages_using_previous_host_stack_or_compensation_state_require_a_reboot() {
+    for previous_abi in [7_u32, 8] {
+        let (mut bytes, abi, key) = package(2);
+        bytes[28..32].copy_from_slice(&previous_abi.to_le_bytes());
+        resign(&mut bytes);
+        assert_eq!(Package::parse(&bytes, abi, &key).unwrap_err(), Error::Abi);
+    }
 }
 
 #[test]

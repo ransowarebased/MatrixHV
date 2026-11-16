@@ -6,7 +6,8 @@ pub const PACKAGE_MAGIC: &[u8; 8] = b"MATRIXUP";
 pub const PACKAGE_VERSION: u32 = 1;
 // Expanded events, root history and 32 KiB host stacks require fresh allocations.
 // Live updates retain the boot-time stacks and cannot upgrade a 16 KiB host.
-pub const STATE_ABI: u32 = 8;
+// ABI 9 also removes compensation fields from the boot and interception state.
+pub const STATE_ABI: u32 = 9;
 pub const HEADER_BYTES: usize = 256;
 pub const BANK_BYTES: usize = 256 * 1024;
 pub const BANK_PAGES: usize = BANK_BYTES / 4096;

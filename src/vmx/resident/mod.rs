@@ -1188,10 +1188,6 @@ global_asm!(
         + core::mem::offset_of!(abi::InterceptionCpuState, vmfunc_armed),
     b_interception_exit_vmfunc = const core::mem::offset_of!(ResidentBootContext, interception)
         + core::mem::offset_of!(abi::InterceptionCpuState, exit_vmfunc),
-    b_interception_timing_saved = const core::mem::offset_of!(ResidentBootContext, interception)
-        + core::mem::offset_of!(abi::InterceptionCpuState, timing_saved),
-    b_interception_timing_start = const core::mem::offset_of!(ResidentBootContext, interception)
-        + core::mem::offset_of!(abi::InterceptionCpuState, timing_start),
     matrixhv_status_leaf = const MATRIXHV_STATUS_LEAF,
     matrixhv_status_signature_eax = const MATRIXHV_STATUS_SIGNATURE_EAX,
     matrixhv_status_signature_ebx = const MATRIXHV_STATUS_SIGNATURE_EBX,

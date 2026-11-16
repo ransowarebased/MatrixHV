@@ -327,7 +327,7 @@ pub mod memory {
         2 * intercept_bank_pages(cpu_mask) + INTERCEPT_BASE_TABLE_PAGES
     }
     pub const INTERCEPT_VMFUNC: u32 = 1;
-    pub const INTERCEPT_TSC_OFFSET: u32 = 2;
+    // Bit 1 is retired; preserve the remaining wire flag values.
     pub const INTERCEPT_CONCURRENT_WRITES: u32 = 4;
     pub const INTERCEPT_PERSISTENT_DATA: u32 = 8;
     pub const INTERCEPT_NO_LEASE: u32 = 16;
@@ -352,7 +352,7 @@ pub mod memory {
     pub const EPT_DIAGNOSTIC_CAPABILITY: u32 = 1 << 16;
     pub const EPT_DIAGNOSTIC_SUBLEAF: u32 = 0x400;
     // Runtime words are (attempts, successes, failures) for dispatch, apply,
-    // revoke, flush, observe, timing and recovery, then failure phase/RIP/GPA.
+    // revoke, flush, observe, reserved and recovery, then failure phase/RIP/GPA.
     // Failure phase uses phase + 1 so zero denotes no recorded failure.
     pub const INTERCEPT_RUNTIME_PHASES: usize = 7;
     pub const INTERCEPT_DIAGNOSTIC_WORDS: usize = 24;

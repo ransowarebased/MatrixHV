@@ -918,44 +918,6 @@ pub(crate) mod resident {
                 self.environment.guest_cr4,
             ]
         }
-        fn timing_available(&self) -> bool {
-            #[cfg(target_os = "uefi")]
-            {
-                use crate::vmx::resident::abi::{ResidentBootContext, ResidentEventContext};
-                let boot =
-                    unsafe { &*(self.environment.boot_context as *const ResidentBootContext) };
-                let event = unsafe { &*(boot.event_context as *const ResidentEventContext) };
-                // Independent per-CPU offsets break Windows' common TSC clock
-                // even when Hyper-V reference time is not advertised.
-                if event
-                    .cpu_contexts
-                    .iter()
-                    .filter(|address| **address != 0)
-                    .count()
-                    > 1
-                {
-                    return false;
-                }
-                for address in event.cpu_contexts.iter().filter(|address| **address != 0) {
-                    let cpu = unsafe { &*(*address as *const ResidentBootContext) };
-                    // Reference-TSC pages assume an invariant, common clock.
-                    // CPU-local compensation cannot satisfy that contract.
-                    if cpu.hyperv_timing_supported != 0 {
-                        return false;
-                    }
-                }
-                use crate::vmx::vmcs::{
-                    CPU_BASED_VM_EXEC_CONTROL, SECONDARY_VM_EXEC_CONTROL, vmread,
-                };
-                crate::arch::leaf(0x80000007).edx & (1 << 8) != 0
-                    && vmread(CPU_BASED_VM_EXEC_CONTROL).is_ok_and(|value| value & 8 != 0)
-                    && vmread(SECONDARY_VM_EXEC_CONTROL).is_ok_and(|value| value & (1 << 25) == 0)
-            }
-            #[cfg(not(target_os = "uefi"))]
-            {
-                true
-            }
-        }
         fn clock(&self) -> u64 {
             crate::memory::tracking::TrackingMemory::clock(self)
         }

@@ -2667,23 +2667,14 @@ fn queued_old_generation_fault_retries_after_dynamic_publication() {
 }
 
 #[test]
-fn assembly_callback_excludes_sync_nmi_during_rust_timing_and_restores_the_prior_gate() {
+fn assembly_callback_excludes_sync_nmi_during_rust_and_restores_the_prior_gate() {
     for safe in [0, 1] {
         let mut scenario = Scenario::new();
-        scenario.session.configuration.get_mut().timing = 1;
         scenario.boot.telemetry_active = 1;
         scenario.boot.sync_safe = safe;
-        hardware::write(TSC_OFFSET, 1000).unwrap();
-        assert_eq!(
-            unsafe { matrixhv_test_callback(&mut scenario.boot, 1, scenario.frame.as_mut_ptr()) },
-            0
-        );
-        assert_eq!(scenario.boot.sync_safe, safe);
-        scenario.boot.interception.timing_start = 100;
-        hardware::STATE.with(|state| state.borrow_mut().clock = 160);
         INTERRUPT_AT_CLOCK.with(|pointer| pointer.set(&mut scenario.boot));
         assert_eq!(
-            unsafe { matrixhv_test_callback(&mut scenario.boot, 5, scenario.frame.as_mut_ptr()) },
+            unsafe { matrixhv_test_callback(&mut scenario.boot, 1, scenario.frame.as_mut_ptr()) },
             0
         );
         assert_eq!(INTERRUPT_RESULT.with(|result| result.get()), (0, 1));
@@ -2693,13 +2684,8 @@ fn assembly_callback_excludes_sync_nmi_during_rust_timing_and_restores_the_prior
             scenario.boot.interception.runtime_diagnostics[3..6],
             [1, 1, 0]
         );
-        assert_eq!(hardware::read(TSC_OFFSET), Ok(940));
-        scenario.boot.interception.timing_start = 200;
-        hardware::STATE.with(|state| state.borrow_mut().clock = 230);
         unsafe { matrixhv_test_gate(&mut scenario.boot) };
         assert_eq!(scenario.boot.sync_safe, 1);
-        assert_eq!(scenario.boot.interception.timing_start, 0);
-        assert_eq!(hardware::read(TSC_OFFSET), Ok(910));
     }
 }
 
@@ -2773,33 +2759,28 @@ fn watchdog_uses_the_earlier_diagnostic_deadline_and_preserves_its_timer() {
 }
 
 #[test]
-fn timing_compensation_subtracts_each_root_interval_once_and_restores_the_existing_offset() {
+fn interception_lifecycle_leaves_the_hardware_tsc_offset_untouched() {
     let mut scenario = Scenario::new();
-    scenario.session.configuration.get_mut().timing = 1;
     hardware::write(TSC_OFFSET, 1000).unwrap();
-    scenario.call(1);
-    for (start, end, expected) in [(100, 160, 940), (200, 230, 910)] {
-        scenario.boot.interception.timing_start = start;
-        hardware::STATE.with(|state| state.borrow_mut().clock = end);
-        assert_eq!(scenario.call(5), 0);
-        assert_eq!(hardware::read(TSC_OFFSET), Ok(expected));
-        assert_eq!(scenario.call(5), 0);
-        assert_eq!(hardware::read(TSC_OFFSET), Ok(expected));
+    hardware::STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.fail_reads.insert(TSC_OFFSET, 1);
+        state.fail_writes.insert(TSC_OFFSET, 1);
+    });
+    for root in [0x3007, 0x4000, 0x5000] {
+        hardware::write(GUEST_CR3, root).unwrap();
+        assert_eq!(scenario.call(1), 0);
+        assert_eq!(scenario.exit(10, 0), 0);
+        assert!(scenario.session.is_active());
     }
-    assert_eq!(
-        scenario
-            .session
-            .timing_ticks
-            .load(std::sync::atomic::Ordering::Acquire),
-        90
-    );
-    scenario
-        .session
-        .active
-        .store(0, std::sync::atomic::Ordering::Release);
-    scenario.call(1);
-    assert_eq!(hardware::read(TSC_OFFSET), Ok(1000));
-    assert_eq!(scenario.boot.interception.timing_saved, 0);
+    scenario.session.active.store(0, Ordering::Release);
+    assert_eq!(scenario.call(1), 0);
+    hardware::STATE.with(|state| {
+        let state = state.borrow();
+        assert_eq!(state.fields[&TSC_OFFSET], 1000);
+        assert_eq!(state.fail_reads[&TSC_OFFSET], 1);
+        assert_eq!(state.fail_writes[&TSC_OFFSET], 1);
+    });
 }
 
 #[test]
@@ -3349,7 +3330,6 @@ fn recovery_requests_retry_only_for_ept_dispatch_and_forwards_other_phases() {
         (2, 48, 0),
         (3, 48, 0),
         (4, 48, 0),
-        (5, 48, 0),
     ] {
         let mut scenario = Scenario::new();
         scenario.boot.telemetry_active = 1;
@@ -3363,12 +3343,7 @@ fn recovery_requests_retry_only_for_ept_dispatch_and_forwards_other_phases() {
                 scenario.boot.interception.data_pending = 1;
                 GUEST_RIP
             }
-            _ => {
-                scenario.boot.interception.timing_saved = 1;
-                scenario.boot.interception.timing_start = 1;
-                hardware::STATE.with(|state| state.borrow_mut().clock = 2);
-                TSC_OFFSET
-            }
+            _ => unreachable!(),
         };
         hardware::STATE.with(|state| {
             let mut state = state.borrow_mut();
