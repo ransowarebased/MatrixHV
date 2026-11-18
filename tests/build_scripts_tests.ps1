@@ -16,8 +16,12 @@ New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
 try {
     $config = Join-Path $testRoot 'MatrixConfig.bin'
     & $makeConfig -OutputPath $config -Logger false -VtNested false | Out-Null
+    [System.IO.File]::AppendAllText($config, "MeasuredBootEmulation=true`n")
     & $makeConfig -OutputPath $config -VtEvmcs true | Out-Null
     $configText = [System.IO.File]::ReadAllText($config)
+    if ($configText.Contains('MeasuredBootEmulation')) {
+        throw 'Configuration regeneration retained a removed setting.'
+    }
     foreach ($expected in @('logger=false', 'cpuidpresence=true', 'VtNested=true', 'VtEvmcs=true')) {
         if (-not $configText.Contains($expected)) {
             throw "Configuration did not preserve or normalize $expected"
