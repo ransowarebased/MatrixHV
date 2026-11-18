@@ -40,6 +40,7 @@ pub enum ParseError {
 
 pub fn parse(bytes: &[u8]) -> Result<MatrixConfig, ParseError> {
     let text = str::from_utf8(bytes).map_err(|_| ParseError::InvalidEncoding)?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut config = MatrixConfig::default();
     let mut has_header = false;
 

@@ -13,6 +13,8 @@
 
 // INIT resets the AP guest into wait-for-SIPI while its VMCS and root resources stay live.
 .Lresident_ap_init:
+    cmp qword ptr [r12 + {b_nested_active}], 0
+    jne .Lresident_dispatch_resume
     cmp qword ptr [r12 + {b_ap_started}], 1
     jne .Lresident_dispatch_unsupported
     resident_telemetry_counter inc, {b_init_count}, {b_telemetry_active}

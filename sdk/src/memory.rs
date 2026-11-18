@@ -119,16 +119,16 @@ pub fn decode_event_batch(bytes: &[u8]) -> Result<EventBatch<'_>, String> {
     }
     let body = &bytes[HEADER_BYTES..];
     let count = word(bytes, 32) as usize;
-    if body.len() % EVENT_RECORD_BYTES != 0
+    if !body.len().is_multiple_of(EVENT_RECORD_BYTES)
         || count > body.len() / EVENT_RECORD_BYTES
         || count > EVENT_FETCH_MAX
         || quad(bytes, 56) != EVENT_FORMAT_VERSION
     {
         return Err("invalid event response size or version".into());
     }
-    let mut records = Vec::with_capacity(count);
+    let mut records: Vec<&[u8]> = Vec::with_capacity(count);
     let mut previous = quad(bytes, 64);
-    for record in body.chunks_exact(EVENT_RECORD_BYTES).take(count) {
+    for record in body.as_chunks::<EVENT_RECORD_BYTES>().0.iter().take(count) {
         let sequence = quad(record, 0);
         if quad(record, CONTEXT_RECORD_BYTES + 56) != EVENT_FORMAT_VERSION
             || sequence == 0
@@ -360,6 +360,10 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
             bytes
         }
         EVENT_SET => {
+            use crate::protocol::memory::{
+                ARGUMENT_MAX_DEPTH, ARGUMENT_MAX_STACK_OFFSET, ARGUMENT_REGISTER, ARGUMENT_STACK,
+                EVENT_INSTRUCTION, EVENT_REGION_BYTES,
+            };
             let regions = &request.event_regions;
             let probes = &request.event_probes;
             if regions.len() + request.event_arguments.len() > EVENT_REGIONS || probes.len() > 4 {
@@ -367,12 +371,24 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
                     "event capture accepts up to {EVENT_REGIONS} regions and four probes"
                 ));
             }
+            if request.flags & INTERCEPT_NO_LEASE != 0
+                && probes.iter().any(|&(_, kind)| kind == EVENT_INSTRUCTION)
+            {
+                return Err("instruction capture requires a lease".into());
+            }
+            // A noncanonical raw address can alias a tagged argument descriptor.
+            if regions.iter().any(|&(address, length)| {
+                address == 0
+                    || !matches!(address >> 56, 0 | 0xff)
+                    || !(1..=EVENT_REGION_BYTES as u64).contains(&length)
+                    || address
+                        .checked_add(length - 1)
+                        .is_none_or(|end| end >> 56 != address >> 56)
+            }) {
+                return Err("invalid event capture region address or length".into());
+            }
             let mut descriptors = regions.clone();
             for argument in &request.event_arguments {
-                use crate::protocol::memory::{
-                    ARGUMENT_MAX_DEPTH, ARGUMENT_MAX_STACK_OFFSET, ARGUMENT_REGISTER,
-                    ARGUMENT_STACK, EVENT_REGION_BYTES,
-                };
                 if argument.pointer_depth > ARGUMENT_MAX_DEPTH
                     || argument.copy_bytes > EVENT_REGION_BYTES
                     || (argument.pointer_depth == 0) != (argument.copy_bytes == 0)
@@ -417,7 +433,7 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
             for (value, slot) in request
                 .event_identity
                 .iter()
-                .zip(bytes[96..120].chunks_exact_mut(8))
+                .zip(bytes[96..120].as_chunks_mut::<8>().0.iter_mut())
             {
                 slot.copy_from_slice(&value.to_le_bytes());
             }
@@ -447,14 +463,18 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
             );
             for (pair, descriptor) in descriptors.iter().chain(probes).zip(
                 bytes[HEADER_BYTES..HEADER_BYTES + (descriptors.len() + probes.len()) * 16]
-                    .chunks_exact_mut(16),
+                    .as_chunks_mut::<16>()
+                    .0
+                    .iter_mut(),
             ) {
                 descriptor[..8].copy_from_slice(&pair.0.to_le_bytes());
                 descriptor[8..].copy_from_slice(&pair.1.to_le_bytes());
             }
             for (guard, descriptor) in request.event_guards.iter().zip(
                 bytes[HEADER_BYTES + (descriptors.len() + probes.len()) * 16..]
-                    .chunks_exact_mut(EVENT_GUARD_BYTES),
+                    .as_chunks_mut::<EVENT_GUARD_BYTES>()
+                    .0
+                    .iter_mut(),
             ) {
                 if guard.cr3 & 0x000f_ffff_ffff_f000 == 0
                     || guard.mask == 0
@@ -464,7 +484,7 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
                 }
                 for (value, slot) in [guard.cr3, guard.address, guard.expected, guard.mask]
                     .into_iter()
-                    .zip(descriptor.chunks_exact_mut(8))
+                    .zip(descriptor.as_chunks_mut::<8>().0.iter_mut())
                 {
                     slot.copy_from_slice(&value.to_le_bytes());
                 }
@@ -495,7 +515,10 @@ pub fn interception_packet(request: &InterceptionRequest) -> Result<Vec<u8>, Str
         }
         INTERCEPT_CONTEXT_ADD | INTERCEPT_CONTEXT_REMOVE => {
             if request.contexts.is_empty() || request.contexts.len() > ROOT_HISTORY_COUNT - 2 {
-                return Err("context change requires 1..14 CR3 roots".into());
+                return Err(format!(
+                    "context change requires 1..={} CR3 roots",
+                    ROOT_HISTORY_COUNT - 2
+                ));
             }
             let mut bytes = vec![0; HEADER_BYTES + request.contexts.len() * 8];
             bytes[32..36].copy_from_slice(&(request.contexts.len() as u32).to_le_bytes());
@@ -668,7 +691,7 @@ pub fn decode_page_batch(bytes: &[u8], root: u64, cursor: u64) -> Result<PageBat
     if count > TRACK_MAX_PAGES
         || bytes.len() < HEADER_BYTES + count * TRACK_TARGET_BYTES
         || !matches!(limit, 0x8000_0000_0000 | 0x100_0000_0000_0000)
-        || next <= cursor
+        || next <= cursor && !(next == limit && cursor == limit && count == 0)
         || next > limit
         || next & 4095 != 0
     {

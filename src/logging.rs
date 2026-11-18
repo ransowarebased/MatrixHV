@@ -1,12 +1,11 @@
 use core::arch::asm;
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 const LOG_BUFFER_CAPACITY: usize = 512;
 pub(crate) const SERIAL_SINK: u8 = 1;
 pub(crate) const FRAMEBUFFER_SINK: u8 = 2;
 static BACKEND: AtomicU8 = AtomicU8::new(LogBackend::Disabled as u8);
-static SERIAL_PRESENT: AtomicBool = AtomicBool::new(false);
 static LOG_ADAPTER: LogAdapter = LogAdapter;
 
 #[repr(u8)]
@@ -62,23 +61,21 @@ impl LogBuffer {
 impl Write for LogBuffer {
     fn write_str(&mut self, value: &str) -> fmt::Result {
         let remaining = self.bytes.len().saturating_sub(self.length);
-        if value.len() > remaining {
-            return Err(fmt::Error);
-        }
+        let length = value.floor_char_boundary(value.len().min(remaining));
 
-        let end = self.length + value.len();
-        self.bytes[self.length..end].copy_from_slice(value.as_bytes());
+        let end = self.length + length;
+        self.bytes[self.length..end].copy_from_slice(&value.as_bytes()[..length]);
         self.length = end;
-        Ok(())
+        if length == value.len() {
+            Ok(())
+        } else {
+            Err(fmt::Error)
+        }
     }
 }
 
-pub fn initialize() {
-    let selected = select_backend(enabled(), initialize_serial);
-    SERIAL_PRESENT.store(
-        selected == LogBackend::SerialAndFramebuffer,
-        Ordering::Release,
-    );
+pub fn initialize(enabled: bool) {
+    let selected = select_backend(enabled, initialize_serial);
     BACKEND.store(selected as u8, Ordering::Release);
     let _ = log::set_logger(&LOG_ADAPTER);
     log::set_max_level(if selected == LogBackend::Disabled {
@@ -90,11 +87,6 @@ pub fn initialize() {
 
 pub fn enabled() -> bool {
     backend() != LogBackend::Disabled
-}
-
-pub fn set_enabled(enabled: bool) {
-    let selected = select_backend(enabled, || SERIAL_PRESENT.load(Ordering::Acquire));
-    BACKEND.store(selected as u8, Ordering::Release);
 }
 
 pub(crate) fn backend() -> LogBackend {

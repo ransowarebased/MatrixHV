@@ -90,7 +90,7 @@ pub fn run_boot_loader(
         core::ptr::copy_nonoverlapping(
             &update.transaction.status,
             core::ptr::addr_of_mut!((*(event_context as *mut ResidentEventContext)).update_status)
-                .cast::<crate::update::Status>(),
+                .cast::<matrixhv_sdk::update::Status>(),
             1,
         );
     }
@@ -102,6 +102,7 @@ pub fn run_boot_loader(
     crate::diagnostics::stage("resident EPT setup");
     let mut ept = ept::IdentityEpt::build(
         crate::boot::firmware::memory_descriptors().map_err(ResidentProbeError::Allocation)?,
+        1 + ap_resources.len(),
     )?;
     let pci_bar_ranges = crate::boot::firmware::pci_bar_ranges()?;
     ept.map_pci_bars(&pci_bar_ranges)?;
@@ -153,6 +154,7 @@ pub fn run_boot_loader(
     crate::diagnostics::stage("resident nested EPT setup");
     let mut ept12_template = ept::IdentityEpt::build(
         crate::boot::firmware::memory_descriptors().map_err(ResidentProbeError::Allocation)?,
+        0,
     )?;
     ept12_template.map_high_address_gaps()?;
     cpu_resources.prepare_nested_ept(&ept, &ept12_template)?;
@@ -691,7 +693,8 @@ fn protect_update_memory(
     zero_page: u64,
 ) -> Result<(), ResidentProbeError> {
     use crate::memory::host::PAGE_SIZE;
-    use crate::update::{BANK_PAGES, EmbeddedImage, MAX_PACKAGE_BYTES, RuntimeContext};
+    use crate::update::RuntimeContext;
+    use matrixhv_sdk::update::{BANK_PAGES, EmbeddedImage, MAX_PACKAGE_BYTES};
     let event = unsafe { &*(event_context as *const ResidentEventContext) };
     let update = unsafe { &mut *(event.update_context_physical as *mut RuntimeContext) };
     for bank in 0..2 {

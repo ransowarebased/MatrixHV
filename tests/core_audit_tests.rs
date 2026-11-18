@@ -144,7 +144,7 @@ mod ept {
         let root = allocate_table(&mut pages).unwrap();
         IdentityEpt {
             pages,
-            protection_pool: ProtectionTablePool::allocate().unwrap(),
+            protection_pool: ProtectionTablePool::allocate(0).unwrap(),
             root,
             ept_pointer: root.physical_address | 0x1e,
             mapped_end,
@@ -348,6 +348,32 @@ mod ept {
     }
 
     #[test]
+    fn scaled_protection_pool_handles_fragmented_allocations_for_64_cpus() {
+        let mut ept = IdentityEpt::build(
+            vec![MemoryDescriptor {
+                phys_start: 0,
+                page_count: 1024,
+                ty: MemoryType::CONVENTIONAL,
+                att: MemoryAttribute::WRITE_BACK,
+            }],
+            64,
+        )
+        .unwrap();
+        ept.map_high_address_gaps().unwrap();
+        let regions: Vec<_> = (0..64 * 16)
+            .map(|index| (0x4_0000_0000 + index * EPT_2MB_PAGE_SIZE, 1))
+            .collect();
+        ept.conceal_guest_access_to_regions(&regions, 0x1000)
+            .unwrap();
+        let (_, capacity, used) = ept.protection_table_pool();
+        assert_eq!(
+            capacity,
+            EPT_PROTECTION_TABLE_PAGES + 64 * EPT_PROTECTION_TABLE_PAGES_PER_CPU
+        );
+        assert!(used >= regions.len());
+    }
+
+    #[test]
     fn invalid_region_batches_preserve_preceding_mappings() {
         let address = 0x3000;
         let mut ept = empty_identity_page(address);
@@ -425,12 +451,15 @@ mod ept {
 
     #[test]
     fn built_tables_and_high_gap_leaves_support_protection_and_cloning() {
-        let mut ept = IdentityEpt::build(vec![MemoryDescriptor {
-            phys_start: 0,
-            page_count: 1024,
-            ty: MemoryType::CONVENTIONAL,
-            att: MemoryAttribute::WRITE_BACK,
-        }])
+        let mut ept = IdentityEpt::build(
+            vec![MemoryDescriptor {
+                phys_start: 0,
+                page_count: 1024,
+                ty: MemoryType::CONVENTIONAL,
+                att: MemoryAttribute::WRITE_BACK,
+            }],
+            0,
+        )
         .unwrap();
         assert_eq!(ept.map_high_address_gaps().unwrap(), EPT_512GB_PAGE_SIZE);
         ept.conceal_guest_access_to_regions(&[(0x4_0000_0000, 2)], 0x1000)

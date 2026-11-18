@@ -6,16 +6,19 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$BuildRoot = [System.IO.Path]::GetFullPath('D:\Projetos\MatrixHV\builds')
-$ExpectedBuildRoot = [System.IO.Path]::GetFullPath('D:\Projetos\MatrixHV\builds')
-
-if (-not $BuildRoot.Equals($ExpectedBuildRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Refusing to clean unexpected build root: $BuildRoot"
-}
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+$BuildRoot = Join-Path $ProjectRoot 'builds'
 
 if (Test-Path -LiteralPath $BuildRoot -PathType Container) {
     if ($PSCmdlet.ShouldProcess($BuildRoot, 'Remove all build artifacts')) {
-        Get-ChildItem -LiteralPath $BuildRoot -Force | Remove-Item -Recurse -Force
+        $Directory = Get-Item -LiteralPath $BuildRoot -Force
+        if (($Directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
+            (Get-ChildItem -LiteralPath $BuildRoot -Force -Recurse -Attributes ReparsePoint | Select-Object -First 1)) {
+            throw "Refusing to clean a build tree with reparse points: $BuildRoot"
+        }
+        Get-ChildItem -LiteralPath $BuildRoot -Force | ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force
+        }
         Write-Host "Cleaned build artifacts: $BuildRoot"
     }
 }

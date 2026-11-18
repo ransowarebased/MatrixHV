@@ -48,6 +48,10 @@ mod order {
         assert!(parsed.is_active());
         assert_eq!(parsed.description.len(), "VeraCrypt".len() * 2);
         assert!(parsed.image_file_path_matches(r"\efi\veracrypt\dcsboot.efi"));
+        assert_eq!(
+            String::from_utf16(&parsed.image_file_path().unwrap()).unwrap(),
+            r"\EFI\VeraCrypt\DcsBoot.efi"
+        );
         assert_eq!(parsed.image_path[0..4], [4, 1, 42, 0]);
         assert_eq!(parsed.optional_data, [0x12, 0x34, 0x56]);
         assert!(!parsed.image_file_path_matches(r"\EFI\Microsoft\Boot\bootmgfw.efi"));
@@ -86,6 +90,51 @@ mod order {
         option[4..6].copy_from_slice(&path_size.to_le_bytes());
         let parsed = parse_boot_option(&option).unwrap();
         assert!(!parsed.image_file_path_matches(r"\EFI\VeraCrypt\DcsBoot.efi"));
+    }
+
+    #[test]
+    fn multi_instance_boot_options_select_and_terminate_each_matching_path() {
+        let image_offset = 6 + ("VeraCrypt".len() + 1) * 2;
+        let wanted = r"\EFI\VeraCrypt\DcsBoot.efi";
+        let mut option = load_option(r"\EFI\other.efi", &[]);
+        let mut fallback = load_option(wanted, &[])[image_offset..].to_vec();
+        for partition in [2_u8, 3] {
+            let end_subtype = option.len() - 3;
+            option[end_subtype] = 1;
+            fallback[4] = partition;
+            option.extend_from_slice(&fallback);
+        }
+        let path_size = (option.len() - image_offset) as u16;
+        option[4..6].copy_from_slice(&path_size.to_le_bytes());
+        option.extend_from_slice(&[0xab, 0xcd]);
+        let parsed = parse_boot_option(&option).unwrap();
+        let paths = parsed
+            .matching_image_instances(wanted)
+            .map(boot_order::standalone_device_path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths.iter().map(|path| path[4]).collect::<Vec<_>>(), [2, 3]);
+        for path in paths {
+            assert_eq!(path.len(), fallback.len());
+            assert_eq!(&path[path.len() - 4..], &[0x7f, 0xff, 4, 0]);
+        }
+        assert_eq!(parsed.optional_data, [0xab, 0xcd]);
+    }
+
+    #[test]
+    fn bsp_only_boot_requires_one_enabled_cpu_and_no_online_capable_aps() {
+        let mut table = vec![0; 44];
+        let bsp = [9, 16, 0, 0, 0x34, 0x12, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0];
+        table.extend(bsp);
+        assert!(madt_has_only_bsp(&table, 0x1234));
+        assert!(!madt_has_only_bsp(&table, 0x1235));
+        table.extend([0, 8, 2, 8, 0, 0, 0, 0]);
+        assert!(madt_has_only_bsp(&table, 0x1234));
+        for flags in [1, 2] {
+            table[64] = flags;
+            assert!(!madt_has_only_bsp(&table, 0x1234));
+        }
+        assert!(!madt_has_only_bsp(&table[..65], 0x1234));
     }
 
     #[test]
@@ -197,6 +246,12 @@ mod config {
             boot::parse(b"logger=false\n"),
             Err(boot::ParseError::MissingHeader)
         );
+    }
+
+    #[test]
+    fn editor_saved_utf8_bom_does_not_hide_the_header() {
+        let config = boot::parse(b"\xef\xbb\xbfMATRIXHV_CONFIG_V2\r\nlogger=false\r\n").unwrap();
+        assert!(!config.logger);
     }
 
     #[test]

@@ -91,13 +91,12 @@ def main():
     args = parser.parse_args()
     if args.build:
         target = project / "builds/resident-stack/target"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        args.assembly = target.parent / "MatrixHV.s"
         subprocess.run(["cargo", "rustc", "--locked", "--release", "--target", "x86_64-unknown-uefi",
-                        "--target-dir", str(target), "--bin", "MatrixHV", "--", "-Dwarnings", "--emit=asm,link"],
+                        "--target-dir", str(target), "--bin", "MatrixHV", "--", "-Dwarnings",
+                        f"--emit=asm={args.assembly},link"],
                        cwd=project, check=True)
-        candidates = list((target / "x86_64-unknown-uefi/release/deps").glob("MatrixHV-*.s"))
-        if len(candidates) != 1:
-            raise ValueError("Expected exactly one freshly compiled resident assembly artifact")
-        args.assembly = candidates[0]
     result = check(args.assembly, project / "src/vmx/vcpu.rs")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")

@@ -117,6 +117,9 @@ def prepare_boot_order(project: Path):
     start = source.index("fn same_hd_partition(")
     end = source.index("\npub fn initialize_boot_environment(", start)
     parser += "\n" + source[start:end]
+    start = source.index("fn madt_has_only_bsp(")
+    end = source.index("\npub(crate) fn calibrate_reference_tsc(", start)
+    parser += "\n" + source[start:end]
     (output / "definitions.rs").write_text(parser, encoding="utf-8")
 
 
@@ -306,9 +309,10 @@ def prepare_logger(project: Path):
         return source[start:end]
     backend = "#[derive(Clone, Copy, Debug, Eq, PartialEq)]\n" + item(runtime, "pub(crate) enum LogBackend")
     selector = item(runtime, "fn select_backend(")
-    toggle = item(runtime, "pub fn set_enabled(")
-    active_backend = item(runtime, "pub(crate) fn backend(")
     probe = item(runtime, "fn probe_com1(")
+    buffer = "\n".join(item(runtime, declaration) for declaration in (
+        "struct LogBuffer", "impl LogBuffer", "impl Write for LogBuffer",
+    ))
     serial_guard = "\n".join(item(runtime, declaration) for declaration in (
         "struct SerialLockGuard", "impl SerialLockGuard", "impl Drop for SerialLockGuard",
     ))
@@ -317,16 +321,13 @@ def prepare_logger(project: Path):
     ))
     firmware_guard = item(screen, "fn firmware_calls_allowed(")
     constants = "\n".join(
-        re.findall(r"(?:pub\(crate\) )?const (?:COM1|TRANSMIT_EMPTY|TX_WAIT_LIMIT):[^;]+;", runtime)
+        re.findall(r"(?:pub\(crate\) )?const (?:COM1|TRANSMIT_EMPTY|TX_WAIT_LIMIT|LOG_BUFFER_CAPACITY):[^;]+;", runtime)
         + re.findall(r"pub\(crate\) const (?:SERIAL_SINK|FRAMEBUFFER_SINK):[^;]+;", runtime)
     )
-    backend_state = "\n".join(re.findall(
-        r"static (?:BACKEND|SERIAL_PRESENT):[^;]+;", runtime
-    ))
     (output / "definitions.rs").write_text("\n".join([
-        "use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};",
-        backend, backend_state, selector, toggle, active_backend, probe, firmware_guard, constants,
-        serial_state, serial_guard,
+        "use core::fmt::{self, Write};",
+        "use core::sync::atomic::{AtomicU64, Ordering};",
+        backend, selector, probe, firmware_guard, constants, buffer, serial_state, serial_guard,
     ]), encoding="utf-8")
 
 
@@ -2343,7 +2344,7 @@ def prepare_resident_msr(project: Path):
         'b_last_qualification': 0, 'b_nested_l1_cr4': 8,
         'b_nested_vmx_cr0_fixed0': 16, 'b_nested_vmx_cr0_fixed1': 24,
         'b_nested_vmx_cr4_fixed0': 32, 'b_nested_vmx_cr4_fixed1': 40,
-        'b_nested_active': 48,
+        'b_nested_active': 48, 'b_nested_expose_vmx': 112, 'cr4_vmxe': 1 << 13,
         'guest_rsp': 0, 'cr0_read_shadow': 1, 'guest_cr0': 2,
         'guest_cr4': 3, 'cr4_read_shadow': 4, 'cr0_guest_host_mask': 5,
         'cr4_guest_host_mask': 6, 'guest_efer': 7, 'vm_entry_controls': 8,
@@ -3263,12 +3264,15 @@ def prepare_boot_state(project: Path):
         project / "src/vmx/vmcs12.rs").read_text()
     collector = ast.parse((project / "tests/collect_boot_state.py").read_text())
     functions = [node for node in collector.body if isinstance(node, ast.FunctionDef)
-                 and node.name in ("structure", "append_u64_fields")]
+                 and node.name in ("structure", "append_u64_fields", "plain_layout", "runtime_update_layout")]
     namespace = {"resident": resident, "nested": nested, "re": re,
                  "protocol": (project / PROTOCOL_SOURCE).read_text(encoding="utf-8"),
                  "fields": {}, "formats": {}, "offset": 0}
     exec(compile(ast.Module(body=functions, type_ignores=[]), "collect_boot_state.py", "exec"), namespace)
     namespace["append_u64_fields"](namespace["structure"](resident, "ResidentBootContext"), "")
+    update_fields, update_prefix_size, _ = namespace["runtime_update_layout"](project)
+    assert update_fields["abi"] == 8 and update_fields["public_key"] == 28
+    assert update_fields["transaction"] == update_prefix_size == 2264
     output = project / "builds/boot-state-tests"
     output.mkdir(parents=True, exist_ok=True)
     legacy_abi = (project / "src/vmx/resident/abi.rs").read_text()
@@ -3341,7 +3345,9 @@ def prepare_smp(project: Path):
     output.mkdir(parents=True, exist_ok=True)
     source = (project / "src/boot/smp.rs").read_text(encoding="utf-8")
     opening = source[source.index("fn open_mp_services("):source.index("pub(crate) fn enumerate(")]
-    batch = source[source.index("struct ApBatchEntry {"):]
+    batch = source[source.index("struct ApBatchEntry {"):].replace(
+        "super::firmware::single_boot_processor(arch::apic_id())", "confirmed_single_processor()"
+    )
     vcpu = (project / "src/vmx/vcpu.rs").read_text(encoding="utf-8")
     start = vcpu.rindex("#[unsafe(no_mangle)]", 0, vcpu.index("unsafe extern \"efiapi\" fn matrixhv_ap_prepare("))
     end = vcpu.index("#[unsafe(no_mangle)]", vcpu.index("pub(crate) fn matrixhv_ap_launch_asm(", start))

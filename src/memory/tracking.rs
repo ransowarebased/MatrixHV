@@ -119,7 +119,7 @@ fn start(
         page.status = 0;
         page.sha256.fill(0);
         memory.read(page.initial_gpa, &mut page.data)?;
-        page.initial_sha256 = Sha256::digest(&page.data).into();
+        page.initial_sha256 = Sha256::digest(page.data.as_slice()).into();
         page.data.fill(0);
     }
     for page in &mut session.pages[..count] {
@@ -178,7 +178,7 @@ fn stop(session: &mut Session, memory: &mut impl TrackingMemory) {
             // copying. Remapped frames are never dumped as the original page.
             match memory.read(page.initial_gpa, &mut page.data) {
                 Ok(()) => {
-                    page.sha256 = Sha256::digest(&page.data).into();
+                    page.sha256 = Sha256::digest(page.data.as_slice()).into();
                     page.flags |= TRACK_DUMP_VALID;
                     if page.sha256 != page.initial_sha256 {
                         page.flags |= TRACK_HASH_CHANGED;

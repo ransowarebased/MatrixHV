@@ -11,8 +11,21 @@ path = "src/lib.rs"
 [features]
 default = ["client"]
 client = []
+update = ["dep:ed25519-dalek", "dep:sha2"]
+
+[dependencies]
+ed25519-dalek = { version = "2.2.0", default-features = false, optional = true }
+sha2 = { version = "0.10.9", default-features = false, optional = true }
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+sha2 = { version = "0.10.9", default-features = false, features = ["force-soft"], optional = true }
 
 [[test]]
 name = "client"
 path = "../tests/client_tests.rs"
 required-features = ["client"]
+
+[[test]]
+name = "update"
+path = "../tests/update_tests.rs"
+required-features = ["update"]

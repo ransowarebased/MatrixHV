@@ -5896,6 +5896,7 @@ fn lifecycle(probe_active: bool, telemetry_active: bool) -> u64 {
     vmread_bitmap[shadow_byte] = 0xaf;
     context[offset("b_nested_shadow_vmread_bitmap")] = vmread_bitmap.as_mut_ptr() as u64;
     context[offset("b_nested_l1_cr4")] = 1 << 13;
+    context[offset("b_nested_expose_vmx")] = 1;
     context[offset("b_nested_vmx_cr0_fixed1")] = u64::MAX;
     context[offset("b_nested_vmx_cr4_fixed1")] = u64::MAX;
     context[offset("b_nested_feature_control")] = 5;
@@ -5946,6 +5947,7 @@ fn vmxon_checks_virtual_cr0_cr4_fixed_masks_before_reading_the_operand() {
         state[offset("b_test_cr0")] = cr0;
         state[offset("b_test_cr4")] = cr4 | (1 << 13);
         state[offset("b_nested_l1_cr4")] = cr4 & (1 << 13);
+        state[offset("b_nested_expose_vmx")] = 1;
         state[offset("b_nested_vmx_cr0_fixed0")] = 0x80000021;
         state[offset("b_nested_vmx_cr0_fixed1")] = 0xffff_ffff;
         state[offset("b_nested_vmx_cr4_fixed0")] = 0x2020;
@@ -5967,6 +5969,7 @@ fn vmxon_checks_virtual_cr0_cr4_fixed_masks_before_reading_the_operand() {
     }
     let mut state = [0_u64; 64];
     state[offset("b_nested_l1_cr4")] = 0x2000;
+    state[offset("b_nested_expose_vmx")] = 1;
     state[offset("b_nested_feature_control")] = 5;
     state[offset("b_test_cr0")] = 1 << 31;
     state[offset("b_test_cr0_mask")] = 1 << 31;
@@ -6044,6 +6047,7 @@ fn runtime_update_freezes_new_nested_sessions_until_completion_or_cancellation()
         let mut state = [0_u64; 64];
         state[offset("b_test_update_context")] = &phase as *const u32 as u64;
         state[offset("b_nested_l1_cr4")] = 1 << 13;
+        state[offset("b_nested_expose_vmx")] = 1;
         state[offset("b_nested_feature_control")] = 5;
         state[offset("b_nested_vmx_basic")] = revision;
         state[offset("b_nested_vmx_cr0_fixed1")] = u64::MAX;

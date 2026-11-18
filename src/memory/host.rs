@@ -107,6 +107,8 @@ impl Drop for ResidentPages {
 const PAGE_TABLE_ENTRIES: usize = 512;
 const INITIAL_HOST_PAGE_TABLE_PAGES: usize = 256;
 const MAX_HOST_PAGE_TABLE_PAGES: usize = 32_768;
+// Runtime code and update banks need private 4 KiB leaves after cloning.
+const HOST_PAGE_TABLE_SPLIT_RESERVE: usize = 32;
 const PAGE_PRESENT: u64 = 1;
 const PAGE_LARGE: u64 = 1 << 7;
 const PHYSICAL_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -170,13 +172,15 @@ impl HostAddressSpace {
             };
 
             match clone_result {
-                Ok(host_root) => {
+                Ok(host_root)
+                    if self.arena.pages() - table_count >= HOST_PAGE_TABLE_SPLIT_RESERVE =>
+                {
                     self.report.source_cr3 = source_cr3;
                     self.report.host_cr3 = host_root | (source_cr3 & CR3_LOW_MASK);
                     self.report.table_pages = table_count;
                     return Ok(self.report);
                 }
-                Err(HostPagingError::TableCapacityExceeded { .. }) => {
+                Ok(_) | Err(HostPagingError::TableCapacityExceeded { .. }) => {
                     let capacity = self.arena.pages();
                     let next_capacity = capacity
                         .checked_mul(2)
@@ -201,38 +205,61 @@ impl HostAddressSpace {
         self.report
     }
 
-    pub(crate) fn protect_page(&mut self, address: u64, flags: u64) -> Result<u64, HostPagingError> {
+    pub(crate) fn protect_page(
+        &mut self,
+        address: u64,
+        flags: u64,
+    ) -> Result<u64, HostPagingError> {
         let mut table = self.report.host_cr3 & PHYSICAL_ADDRESS_MASK;
         for level in (1..=4).rev() {
             let index = ((address >> (12 + (level - 1) * 9)) & 511) as usize;
             let pointer = unsafe { (table as *mut u64).add(index) };
             let entry = unsafe { pointer.read() };
-            if entry & PAGE_PRESENT == 0 { return Err(HostPagingError::InvalidSourceRoot); }
+            if entry & PAGE_PRESENT == 0 {
+                return Err(HostPagingError::InvalidSourceRoot);
+            }
             if level == 1 {
-                unsafe { pointer.write((entry & PHYSICAL_ADDRESS_MASK) | flags); }
+                unsafe {
+                    pointer.write((entry & PHYSICAL_ADDRESS_MASK) | flags);
+                }
                 return Ok(pointer as u64);
             }
             if level <= 3 && entry & PAGE_LARGE != 0 {
                 if self.report.table_pages >= self.arena.pages() {
-                    return Err(HostPagingError::TableCapacityExceeded { capacity: self.arena.pages() });
+                    return Err(HostPagingError::TableCapacityExceeded {
+                        capacity: self.arena.pages(),
+                    });
                 }
-                let child = self.arena.physical_address() + (self.report.table_pages * PAGE_SIZE) as u64;
+                let child =
+                    self.arena.physical_address() + (self.report.table_pages * PAGE_SIZE) as u64;
                 self.report.table_pages += 1;
                 let stride = 1_u64 << (12 + (level - 2) * 9);
                 let base = (entry & PHYSICAL_ADDRESS_MASK) & !(stride * 512 - 1);
                 let mut child_flags = entry & !PHYSICAL_ADDRESS_MASK;
-                if level == 3 { child_flags |= entry & (1 << 12); }
+                if level == 3 {
+                    child_flags |= entry & (1 << 12);
+                }
                 if level == 2 {
                     child_flags &= !PAGE_LARGE;
-                    if entry & (1 << 12) != 0 { child_flags |= 1 << 7; }
+                    if entry & (1 << 12) != 0 {
+                        child_flags |= 1 << 7;
+                    }
                 }
                 for child_index in 0..512 {
-                    unsafe { (child as *mut u64).add(child_index).write(base + child_index as u64 * stride | child_flags); }
+                    unsafe {
+                        (child as *mut u64)
+                            .add(child_index)
+                            .write((base + child_index as u64 * stride) | child_flags);
+                    }
                 }
-                unsafe { pointer.write(child | 3); }
+                unsafe {
+                    pointer.write(child | 3);
+                }
                 table = child;
             } else {
-                unsafe { pointer.write((entry | 2) & !(1 << 63)); }
+                unsafe {
+                    pointer.write((entry | 2) & !(1 << 63));
+                }
                 table = entry & PHYSICAL_ADDRESS_MASK;
             }
         }

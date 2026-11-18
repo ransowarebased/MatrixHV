@@ -136,6 +136,12 @@ def plain_layout(source, name, stop=None):
     return members, (cursor + alignment - 1) // alignment * alignment, alignment
 
 
+def runtime_update_layout(project):
+    source = "\n".join((project / path).read_text(encoding="utf-8")
+                       for path in ("src/update.rs", "sdk/src/update.rs"))
+    return plain_layout(source, "RuntimeContext", "transaction")
+
+
 try:
     if not ida_idp.set_processor_type("metapc", ida_idp.SETPROC_LOADER):
         raise RuntimeError("Intel x86 processor module unavailable")
@@ -316,8 +322,7 @@ try:
             layout_source = resident + (project / "src/vmx/bridge.rs").read_text() + protocol
             event_fields, event_size, _ = plain_layout(layout_source, "ResidentEventContext")
             cpu_fields, cpu_size, _ = plain_layout(layout_source, "ControlCpuState")
-            update_source = (project / "src/update.rs").read_text()
-            update_fields, update_prefix_size, _ = plain_layout(update_source, "RuntimeContext", "transaction")
+            update_fields, update_prefix_size, _ = runtime_update_layout(project)
             event_data = idc.get_bytes(event_address, event_size, True)
             if event_data is None or len(event_data) != event_size:
                 raise RuntimeError("Cannot read resident runtime update state")

@@ -2,7 +2,7 @@
 
 MatrixHV is an experimental Intel VT-x (VMX) pre-boot hypervisor written in Rust (`#![no_std]`) and assembly for the `x86_64-unknown-uefi` target. It executes as a UEFI application, establishes a resident virtualization environment across all logical processors (bootstrap processor and application processors), initializes Extended Page Tables (EPT), and chainloads an EFI boot target (such as the Windows Boot Manager) under hardware virtualization.
 
-MatrixHV exposes a versioned instrumentation ABI through `matrixhv-protocol` and a reusable Rust client through `matrixhv-client`. Independent projects can call the operations exposed by a running MatrixHV core. Client programs run in the guest OS. The hypervisor performs the operations it exposes in VMX root. [Neo](https://github.com/ransowarebased/Neo) is a separate client for control and telemetry.
+MatrixHV exposes its versioned instrumentation ABI and Rust client through `matrixhv-sdk`. Client programs run in the guest OS and call operations exposed by the resident core. [Neo](https://github.com/ransowarebased/Neo) uses the SDK for control, telemetry, and analysis.
 
 ---
 
@@ -34,9 +34,7 @@ To ensure clarity and avoid unrealistic expectations:
 
 ```
 MatrixHV/
-├── crates/
-│   ├── matrixhv-protocol/      # Shared #[repr(C)] host/guest ABI (no_std)
-│   └── matrixhv-client/        # Host-side packet builders + CPUID memory transport API
+├── sdk/                        # Shared protocol, guest client, and signed update package parser
 ├── src/
 │   ├── main.rs                 # UEFI entry point and boot coordination
 │   ├── arch.rs                 # Low-level x86-64 MSR, CPUID, and register access
@@ -49,7 +47,7 @@ MatrixHV/
 │   ├── memory/                 # Memory access, tracking, and interception engines
 │   │   ├── access.rs           # Physical and virtual memory translation
 │   │   ├── interception.rs     # EPT split views, CPUID profiles, and syscall interception
-│   │   ├── observation.rs      # Hook data-shadow metadata (watch/context/event capture removed)
+│   │   ├── observation.rs      # Watchpoints, context snapshots, and event capture
 │   │   └── tracking.rs         # Accessed and dirty bit tracking
 │   ├── update.rs               # Authenticated resident runtime hot-swap engine
 │   ├── diagnostics.rs          # Diagnostic utilities and hardware checks
@@ -85,14 +83,15 @@ The resulting UEFI binary will be produced at:
 
 ### 2. Integrate a host program
 
-Pin the client crate to a compatible MatrixHV revision in your project's Cargo manifest:
+The manifest entry below uses the SDK from the corresponding MatrixHV checkout.
+
 ```toml
-matrixhv-client = { git = "https://github.com/ransowarebased/MatrixHV", rev = "50292addaf4347a6eae58e1f594e4bbeeb978798" }
+matrixhv-sdk = { version = "1.0.0", path = "../MatrixHV/sdk" }
 ```
 
-The client provides packet builders and the transport for the public memory and instrumentation ABI. The shared protocol crate defines the wire layouts and constants. See [Neo](https://github.com/ransowarebased/Neo) for a separate project that consumes both crates.
+`matrixhv_sdk::protocol` defines the wire layouts and constants. The default `client` feature provides packet builders and CPUID transport. The optional `update` feature provides the signed package parser and update ABI shared with Neo.
 
-MatrixHV retains VM-exit diagnostics, Intel PT, and resident status. Protocol 9 retires application watchpoints, context sampling, stack walking, and event capture. For user-mode Windows debugging, use [x64dbg](https://x64dbg.com/). Boot the new EFI when migrating from protocol 8 because the resident state layout changed.
+The current status protocol is 10. It includes resident diagnostics, Intel PT, application watchpoints, context sampling, and event capture.
 
 ### 3. Automated Packaging Pipeline
 
@@ -135,7 +134,7 @@ MatrixHV includes mock hardware test runners to validate instruction handlers, E
 python run_alltests.py
 
 # Run host API tests without a resident hypervisor
-cargo test --locked -p matrixhv-client
+cargo test --locked -p matrixhv-sdk --features update
 ```
 
 CLI, telemetry, and host-agent tests live in the Neo repository: https://github.com/ransowarebased/Neo.

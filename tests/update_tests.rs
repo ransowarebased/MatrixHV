@@ -1,5 +1,5 @@
-use crate::update::*;
 use ed25519_dalek::{Signer, SigningKey};
+use matrixhv_sdk::update::*;
 
 fn package(version: u64) -> (Vec<u8>, Abi, [u8; 32]) {
     let key = SigningKey::from_bytes(&[0x21; 32]);
@@ -423,4 +423,61 @@ fn older_versions_and_wrong_cpu_identities_never_complete_a_transaction() {
     );
     assert_eq!(state.status.verified_mask, 0);
     assert_eq!(state.finish(10, active()), Err(Error::Retained));
+}
+
+#[test]
+fn preflight_accepts_only_matching_supported_resident_state_versions() {
+    for state_abi in [
+        STATE_ABI_INITIAL,
+        STATE_ABI_DATA_SHADOW,
+        STATE_ABI_VIRTUAL_TSC,
+        STATE_ABI_GUEST_TIME_TSC,
+        STATE_ABI_DEBUGGER,
+        STATE_ABI_EXTENDED_HOOKS,
+        STATE_ABI_EXTENDED_CAPTURE,
+        STATE_ABI_HOST_STACK,
+        STATE_ABI_UNCOMPENSATED_TSC,
+    ] {
+        let (mut bytes, abi, key) = package(2);
+        bytes[28..32].copy_from_slice(&state_abi.to_le_bytes());
+        resign(&mut bytes);
+
+        assert!(supports_state_abi(state_abi));
+        assert!(Package::parse_for_state(&bytes, abi, &key, state_abi).is_ok());
+        let other = if state_abi == STATE_ABI {
+            STATE_ABI_DATA_SHADOW
+        } else {
+            STATE_ABI
+        };
+        assert_eq!(
+            Package::parse_for_state(&bytes, abi, &key, other).unwrap_err(),
+            Error::Abi
+        );
+        assert_eq!(
+            Package::parse_for_state(&bytes, abi, &key, STATE_ABI + 1).unwrap_err(),
+            Error::Abi
+        );
+        if state_abi == STATE_ABI {
+            assert!(Package::parse(&bytes, abi, &key).is_ok());
+        } else {
+            assert_eq!(Package::parse(&bytes, abi, &key).unwrap_err(), Error::Abi);
+        }
+
+        for offset in [40, 80, 84, 88, 92] {
+            let mut incompatible = bytes.clone();
+            let value = u32::from_le_bytes(incompatible[offset..offset + 4].try_into().unwrap());
+            incompatible[offset..offset + 4].copy_from_slice(&(value + 1).to_le_bytes());
+            resign(&mut incompatible);
+            assert_eq!(
+                Package::parse_for_state(&incompatible, abi, &key, state_abi).unwrap_err(),
+                Error::Abi
+            );
+        }
+        assert_eq!(
+            Package::parse_for_state(&bytes, abi, &[0; 32], state_abi).unwrap_err(),
+            Error::Signature
+        );
+    }
+    assert!(!supports_state_abi(0));
+    assert!(!supports_state_abi(STATE_ABI + 1));
 }

@@ -102,6 +102,13 @@ mov eax, r10d
 and eax, 0xffff
 cmp eax, {vmfunc_reason}
 je .Lresident_nested_vmfunc
+cmp eax, {vmcall_reason}
+jne .Lresident_nested_l2_probe_diagnostic
+mov rax, {update_vmcall}
+cmp qword ptr [rsp], rax
+je .Lresident_nested_l2_reflect_generic
+mov eax, {vmcall_reason}
+.Lresident_nested_l2_probe_diagnostic:
 cmp qword ptr [r12 + {b_telemetry_probe_active}], 0
 je .Lresident_nested_l2_reflect_generic
 cmp qword ptr [r12 + {b_nested_l2_exit_count}], 3
@@ -2722,6 +2729,34 @@ jnc .Lresident_nested_validate_host_state
 cmp word ptr [r12 + {b_nested_vmcs12_vpid}], 0
 je .Lresident_nested_validate_invalid_controls
 .Lresident_nested_validate_host_state:
+bt dword ptr [r12 + {b_nested_vmcs12_vm_exit_controls}], 19
+jnc .Lresident_nested_validate_host_efer
+mov r11, qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 27 * 8]
+mov ecx, 8
+mov edx, 0xf3 // Valid PAT types: UC, WC, WT, WP, WB and UC-.
+.Lresident_nested_validate_host_pat_byte:
+movzx eax, r11b
+cmp eax, 7
+ja .Lresident_nested_validate_invalid_host_state
+bt edx, eax
+jnc .Lresident_nested_validate_invalid_host_state
+shr r11, 8
+dec ecx
+jnz .Lresident_nested_validate_host_pat_byte
+.Lresident_nested_validate_host_efer:
+bt dword ptr [r12 + {b_nested_vmcs12_vm_exit_controls}], 21
+jnc .Lresident_nested_validate_host_rip
+mov r11, qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 28 * 8]
+test r11, ~0xd01
+jnz .Lresident_nested_validate_invalid_host_state
+and r11d, 0x500
+xor eax, eax
+bt dword ptr [r12 + {b_nested_vmcs12_vm_exit_controls}], 9
+setc al
+imul eax, eax, 0x500
+cmp r11d, eax
+jne .Lresident_nested_validate_invalid_host_state
+.Lresident_nested_validate_host_rip:
 mov rax, qword ptr [r12 + {b_nested_vmcs12_host_rip}]
 mov r11, rax
 shl r11, 16
@@ -4714,6 +4749,8 @@ jmp .Lresident_nested_succeed
 mov r10d, {invalid_invalidation_operand_error}
 jmp .Lresident_nested_vmfail_with_error
 .Lresident_dispatch_vmxon:
+cmp qword ptr [r12 + {b_nested_expose_vmx}], 0
+je .Lresident_nested_inject_ud
 call .Lresident_nested_update_gate
 jc .Lresident_nested_vmfail_invalid_flags
 resident_telemetry_counter inc, {b_nested_vmxon_count}, {b_telemetry_active}

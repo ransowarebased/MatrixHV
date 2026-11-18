@@ -44,7 +44,19 @@ fn open_mp_services() -> Result<boot::ScopedProtocol<MpServices>, Status> {
 }
 
 pub(crate) fn enumerate() -> Result<TopologyReport, Status> {
-    let mp = open_mp_services()?;
+    let mp = match open_mp_services() {
+        Ok(mp) => mp,
+        Err(Status::NOT_FOUND) if super::firmware::single_boot_processor(arch::apic_id()) => {
+            return Ok(TopologyReport {
+                total_processors: 1,
+                enabled_processors: 1,
+                current_processor: 0,
+                bsp_processor: 0,
+                first_enabled_ap: None,
+            });
+        }
+        Err(status) => return Err(status),
+    };
     let count = mp
         .get_number_of_processors()
         .map_err(|error| error.status())?;
@@ -94,6 +106,9 @@ pub(crate) fn enabled_application_processors() -> Result<Vec<usize>, Status> {
         return Err(Status::UNSUPPORTED);
     }
     let mut ap_resources = Vec::new();
+    if topology.first_enabled_ap.is_none() {
+        return Ok(ap_resources);
+    }
     let mp = open_mp_services()?;
     for processor_number in 0..topology.total_processors {
         let info = mp
@@ -336,7 +351,15 @@ struct ApBatchContext {
 }
 
 pub(crate) fn launch_all(launches: &mut [ResidentApLaunch<'_>]) -> Result<(), ResidentProbeError> {
-    let mp = open_mp_services().map_err(ResidentProbeError::Allocation)?;
+    let mp = match open_mp_services() {
+        Ok(mp) => mp,
+        Err(Status::NOT_FOUND)
+            if launches.is_empty() && super::firmware::single_boot_processor(arch::apic_id()) =>
+        {
+            return Ok(());
+        }
+        Err(status) => return Err(ResidentProbeError::Allocation(status)),
+    };
     let count = mp
         .get_number_of_processors()
         .map_err(|error| ResidentProbeError::Allocation(error.status()))?;

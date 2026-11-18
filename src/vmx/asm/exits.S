@@ -178,6 +178,18 @@ je .Lresident_dispatch_vmware_hypercall
 jmp .Lresident_dispatch_hyperv_hypercall
 matrixhv_resident_hyperv_hypercall
 .Lresident_dispatch_vmware_hypercall:
+call .Lresident_guest_privilege
+jc .Lresident_dispatch_inject_ud
+// Query the outer hypervisor from VMX root before issuing privileged port I/O.
+mov eax, 0x40000000
+xor ecx, ecx
+cpuid
+cmp ebx, 0x61774d56 // VMwa
+jne .Lresident_dispatch_inject_ud
+cmp ecx, 0x4d566572 // reVM
+jne .Lresident_dispatch_inject_ud
+cmp edx, 0x65726177 // ware
+jne .Lresident_dispatch_inject_ud
 mov rax, qword ptr [rsp + 0]
 mov rcx, qword ptr [rsp + 8]
 mov rdx, qword ptr [rsp + 16]
@@ -885,6 +897,7 @@ mov qword ptr [r12 + {b_interception_exit_step}], rax
 mov rax, qword ptr [r12 + {b_interception_vmfunc}]
 mov qword ptr [r12 + {b_interception_exit_vmfunc}], rax
 mov edx, 4
+xor r8d, r8d
 call .Lresident_interception_callback
 matrixhv_island_control_rearm
 call .Lresident_nested_eptp_sync_poll
@@ -970,16 +983,6 @@ mov rax, cr3
 cmp rax, qword ptr [r12 + {b_expected_host_cr3}]
 jne .Lresident_dispatch_host_cr3_mismatch
 matrixhv_island_first_exit_visual
-mov eax, dword ptr [r12 + {b_last_reason}]
-and eax, 0xffff
-cmp eax, {vmcall_reason}
-jne .Lresident_update_l2_checked
-mov rax, {update_vmcall}
-cmp qword ptr [rsp], rax
-jne .Lresident_update_l2_checked
-cmp qword ptr [r12 + {b_nested_l2_active}], 0
-jne .Lresident_dispatch_update_l2_reject
-.Lresident_update_l2_checked:
 cmp qword ptr [r12 + {b_nested_l2_active}], 1
 je .Lresident_nested_l2_route
 .Lresident_dispatch_l1:
@@ -1177,8 +1180,17 @@ jmp .Lresident_terminal_halt
 .macro matrixhv_island_cr_access
 .Lresident_ap_cr_access:
     mov r11, [r12 + {b_last_qualification}]
-    test r11d, 0x30
-    jnz .Lresident_dispatch_unsupported
+    mov r14d, r11d
+    and r14d, 0x30
+    jz .Lap_cr_mov_to
+    cmp r14d, 0x10
+    je .Lresident_dispatch_unsupported
+    // CLTS and LMSW target CR0; LMSW carries its source in bits 31:16.
+    mov r10d, r11d
+    shr r10d, 16
+    and r10d, 15
+    jmp .Lap_cr_value
+.Lap_cr_mov_to:
     mov eax, r11d
     shr eax, 8
     and eax, 15
@@ -1242,7 +1254,12 @@ jmp .Lresident_terminal_halt
     and r9, rdi
     or r9, rsi
     cmp ebx, 0
-    je .Lap_write_cr0
+    je .Lap_cr0_operation
+    test r10d, {cr4_vmxe}
+    jz .Lap_cr4_exposure_ready
+    cmp qword ptr [r12 + {b_nested_expose_vmx}], 0
+    je .Lresident_dispatch_inject_gp
+.Lap_cr4_exposure_ready:
     mov rsi, [r12 + {b_nested_vmx_cr4_fixed1}]
     not rsi
     test r10, rsi
@@ -1305,6 +1322,22 @@ jmp .Lresident_terminal_halt
     jc .Lresident_dispatch_vmwrite_failed
     jz .Lresident_dispatch_vmwrite_failed
     jmp .Lap_cr_done
+.Lap_cr0_operation:
+    cmp r14d, 0x20
+    jne .Lap_cr0_check_lmsw
+    mov r10, r8
+    and r10, -9
+    jmp .Lap_write_cr0
+.Lap_cr0_check_lmsw:
+    cmp r14d, 0x30
+    jne .Lap_write_cr0
+    // LMSW replaces bits 3:0, preserving PE if already set.
+    mov rsi, r8
+    and esi, 1
+    or r10d, esi
+    mov rsi, r8
+    and rsi, -16
+    or r10, rsi
 // Unrestricted guest allows PE/PG to clear; NE and VMXE remain set in the hardware state.
 .Lap_write_cr0:
     mov rsi, r10

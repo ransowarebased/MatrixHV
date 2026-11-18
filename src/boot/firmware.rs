@@ -133,49 +133,86 @@ mod boot_order {
             self.attributes & LOAD_OPTION_ACTIVE != 0
         }
 
-        pub(crate) fn image_file_path(&self) -> Option<Vec<u16>> {
-            let mut offset = 0;
-            let mut path = Vec::new();
-            let separator = u16::from(b'\\');
-            while offset < self.image_path.len() {
-                let node_size =
-                    u16::from_le_bytes([self.image_path[offset + 2], self.image_path[offset + 3]])
-                        as usize;
-                let node = &self.image_path[offset..offset + node_size];
-                if node[0] == DEVICE_PATH_END_TYPE {
-                    break;
-                }
-                if node[0] == DEVICE_PATH_MEDIA_TYPE && node[1] == DEVICE_PATH_FILE_SUBTYPE {
-                    let mut characters = node[DEVICE_PATH_HEADER_SIZE..]
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|character| u16::from_le_bytes([character[0], character[1]]))
-                        .take_while(|character| *character != 0)
-                        .peekable();
-                    if let Some(first) = characters.peek().copied() {
-                        if path.last() == Some(&separator) && first == separator {
-                            characters.next();
-                        } else if path.last() != Some(&separator) && first != separator {
-                            path.push(separator);
-                        }
-                        path.extend(characters);
+        fn image_instances(&self) -> impl Iterator<Item = &[u8]> {
+            let mut remaining = self.image_path;
+            core::iter::from_fn(move || {
+                let mut offset = 0;
+                while offset < remaining.len() {
+                    let is_end = remaining[offset] == DEVICE_PATH_END_TYPE;
+                    offset +=
+                        u16::from_le_bytes([remaining[offset + 2], remaining[offset + 3]]) as usize;
+                    if is_end {
+                        let (instance, rest) = remaining.split_at(offset);
+                        remaining = rest;
+                        return Some(instance);
                     }
                 }
-                offset += node_size;
-            }
-            (!path.is_empty()).then_some(path)
+                None
+            })
+        }
+
+        pub(crate) fn image_file_path(&self) -> Option<Vec<u16>> {
+            self.image_instances().next().and_then(instance_file_path)
+        }
+
+        pub(crate) fn matching_image_instances<'a>(
+            &'a self,
+            expected: &'a str,
+        ) -> impl Iterator<Item = &'a [u8]> {
+            self.image_instances().filter(move |instance| {
+                instance_file_path(instance).is_some_and(|path| {
+                    path.len() == expected.len()
+                        && path.iter().zip(expected.bytes()).all(|(actual, wanted)| {
+                            u8::try_from(*actual)
+                                .is_ok_and(|actual| actual.eq_ignore_ascii_case(&wanted))
+                        })
+                })
+            })
         }
 
         pub(crate) fn image_file_path_matches(&self, expected: &str) -> bool {
-            self.image_file_path().is_some_and(|path| {
-                path.len() == expected.len()
-                    && path.iter().zip(expected.bytes()).all(|(actual, wanted)| {
-                        u8::try_from(*actual)
-                            .is_ok_and(|actual| actual.eq_ignore_ascii_case(&wanted))
-                    })
-            })
+            self.matching_image_instances(expected).next().is_some()
         }
+    }
+
+    pub(crate) fn standalone_device_path(instance: &[u8]) -> Vec<u8> {
+        let mut bytes = instance.to_vec();
+        let end_subtype = bytes.len() - DEVICE_PATH_HEADER_SIZE + 1;
+        bytes[end_subtype] = DEVICE_PATH_END_ENTIRE;
+        bytes
+    }
+
+    fn instance_file_path(instance: &[u8]) -> Option<Vec<u16>> {
+        let mut offset = 0;
+        let mut path = Vec::new();
+        let separator = u16::from(b'\\');
+        while offset < instance.len() {
+            let node_size =
+                u16::from_le_bytes([instance[offset + 2], instance[offset + 3]]) as usize;
+            let node = &instance[offset..offset + node_size];
+            if node[0] == DEVICE_PATH_END_TYPE {
+                break;
+            }
+            if node[0] == DEVICE_PATH_MEDIA_TYPE && node[1] == DEVICE_PATH_FILE_SUBTYPE {
+                let mut characters = node[DEVICE_PATH_HEADER_SIZE..]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|character| u16::from_le_bytes([character[0], character[1]]))
+                    .take_while(|character| *character != 0)
+                    .peekable();
+                if let Some(first) = characters.peek().copied() {
+                    if path.last() == Some(&separator) && first == separator {
+                        characters.next();
+                    } else if path.last() != Some(&separator) && first != separator {
+                        path.push(separator);
+                    }
+                    path.extend(characters);
+                }
+            }
+            offset += node_size;
+        }
+        (!path.is_empty()).then_some(path)
     }
 
     pub(crate) fn parse_boot_option(bytes: &[u8]) -> Result<BootOption<'_>, ParseError> {
@@ -381,22 +418,32 @@ pub(crate) fn load_veracrypt_boot_option(
     option: &VeraCryptBootOption,
 ) -> Result<uefi::Handle, Status> {
     let parsed = option.parsed();
-    let device_path =
-        <&DevicePath>::try_from(parsed.image_path).map_err(|_| Status::COMPROMISED_DATA)?;
+    let mut last_status = Status::NOT_FOUND;
+    for instance in parsed.matching_image_instances(VERACRYPT_BOOT_PATH_TEXT) {
+        let path = boot_order::standalone_device_path(instance);
+        match load_veracrypt_path(option.number, &path) {
+            Ok(handle) => return Ok(handle),
+            Err(status) => last_status = status,
+        }
+    }
+    Err(last_status)
+}
+
+fn load_veracrypt_path(number: u16, path: &[u8]) -> Result<uefi::Handle, Status> {
+    let device_path = <&DevicePath>::try_from(path).map_err(|_| Status::COMPROMISED_DATA)?;
     let first_node = device_path
         .node_iter()
         .next()
         .ok_or(Status::COMPROMISED_DATA)?;
     crate::diagnostics::message(format_args!(
         "Boot{:04X} first node type={:#x} subtype={:#x}",
-        option.number,
+        number,
         first_node.device_type().0,
         first_node.sub_type().0
     ));
     if first_node.full_type() != (DeviceType::MEDIA, DeviceSubType::MEDIA_HARD_DRIVE) {
         crate::diagnostics::message(format_args!(
-            "Boot{:04X} LoadImage original full path",
-            option.number
+            "Boot{number:04X} LoadImage original full path"
         ));
         return boot::load_image(
             boot::image_handle(),
@@ -408,11 +455,10 @@ pub(crate) fn load_veracrypt_boot_option(
         .map_err(|error| error.status());
     }
     let suffix_offset = usize::from(first_node.length());
-    let suffix = <&DevicePath>::try_from(&parsed.image_path[suffix_offset..])
-        .map_err(|_| Status::COMPROMISED_DATA)?;
+    let suffix =
+        <&DevicePath>::try_from(&path[suffix_offset..]).map_err(|_| Status::COMPROMISED_DATA)?;
     crate::diagnostics::message(format_args!(
-        "Boot{:04X} expanding original HD short path",
-        option.number
+        "Boot{number:04X} expanding original HD short path"
     ));
     let handles = boot::find_handles::<SimpleFileSystem>().map_err(|error| error.status())?;
     let mut matched = false;
@@ -439,8 +485,7 @@ pub(crate) fn load_veracrypt_boot_option(
         }
         matched = true;
         crate::diagnostics::message(format_args!(
-            "Boot{:04X} matched volume handle={:#x}",
-            option.number,
+            "Boot{number:04X} matched volume handle={:#x}",
             handle.as_ptr() as usize
         ));
         let full_path = volume_path
@@ -455,26 +500,19 @@ pub(crate) fn load_veracrypt_boot_option(
             },
         ) {
             Ok(child_handle) => {
-                crate::diagnostics::message(format_args!(
-                    "Boot{:04X} expanded LoadImage OK",
-                    option.number
-                ));
+                crate::diagnostics::message(format_args!("Boot{number:04X} expanded LoadImage OK"));
                 return Ok(child_handle);
             }
             Err(error) => {
                 last_status = error.status();
                 crate::diagnostics::message(format_args!(
-                    "Boot{:04X} expanded LoadImage: {last_status:?}",
-                    option.number
+                    "Boot{number:04X} expanded LoadImage: {last_status:?}"
                 ));
             }
         }
     }
     if !matched {
-        crate::diagnostics::error(format_args!(
-            "Boot{:04X} HD partition not found",
-            option.number
-        ));
+        crate::diagnostics::error(format_args!("Boot{number:04X} HD partition not found"));
     }
     Err(last_status)
 }
@@ -559,7 +597,9 @@ pub(crate) fn volume_contains(device_handle: uefi::Handle, path: &CStr16) -> boo
     };
 
     root.open(path, FileMode::Read, FileAttribute::empty())
-        .is_ok()
+        .ok()
+        .and_then(|file| file.into_regular_file())
+        .is_some()
 }
 
 pub(crate) fn configure_image_load_options(
@@ -710,7 +750,10 @@ pub(crate) fn pci_bar_ranges() -> Result<Vec<(u64, u64)>, PciDiscoveryError> {
                     &mut resources,
                 )
             };
-            if status == Status::UNSUPPORTED {
+            if matches!(
+                status,
+                Status::UNSUPPORTED | Status::INVALID_PARAMETER | Status::NOT_FOUND
+            ) {
                 continue;
             }
             if status != Status::SUCCESS {
@@ -904,6 +947,47 @@ fn acpi_root() -> Option<usize> {
     })
 }
 
+pub(crate) fn single_boot_processor(apic_id: u32) -> bool {
+    acpi_root()
+        .and_then(|address| unsafe { acpi_find_table(address, b"APIC") })
+        .is_some_and(|madt| madt_has_only_bsp(madt, apic_id))
+}
+
+fn madt_has_only_bsp(madt: &[u8], bsp_apic_id: u32) -> bool {
+    let Some(mut entries) = madt.get(44..) else {
+        return false;
+    };
+    let mut found_bsp = false;
+    while let Some(&kind) = entries.first() {
+        let Some(length) = entries.get(1).map(|&length| usize::from(length)) else {
+            return false;
+        };
+        if length < 2 || length > entries.len() {
+            return false;
+        }
+        let (entry, next) = entries.split_at(length);
+        entries = next;
+        let (apic_id, flags) = match kind {
+            0 if length >= 8 => (u32::from(entry[3]), &entry[4..8]),
+            9 if length >= 16 => (
+                u32::from_le_bytes(entry[4..8].try_into().unwrap()),
+                &entry[8..12],
+            ),
+            0 | 9 => return false,
+            _ => continue,
+        };
+        let flags = u32::from_le_bytes(flags.try_into().unwrap());
+        // Online-capable CPUs can be started by the OS even if disabled at boot.
+        if flags & 3 != 0 {
+            if apic_id != bsp_apic_id || flags & 1 == 0 || found_bsp {
+                return false;
+            }
+            found_bsp = true;
+        }
+    }
+    found_bsp
+}
+
 pub(crate) fn calibrate_reference_tsc() -> u64 {
     let Some((port, mask)) = acpi_root().and_then(|address| unsafe { acpi_pm_timer(address) }) else {
         return 0;
@@ -937,10 +1021,10 @@ pub(crate) fn calibrate_reference_tsc() -> u64 {
 
 // Only firmware-installed ACPI pointers are dereferenced, before VMXON/EBS.
 unsafe fn acpi_pm_timer(address: usize) -> Option<(u16, u32)> {
-    acpi_pm_timer_register(unsafe { acpi_fadt(address) }?)
+    acpi_pm_timer_register(unsafe { acpi_find_table(address, b"FACP") }?)
 }
 
-unsafe fn acpi_fadt(address: usize) -> Option<&'static [u8]> {
+unsafe fn acpi_find_table(address: usize, signature: &[u8; 4]) -> Option<&'static [u8]> {
     if address == 0 {
         return None;
     }
@@ -978,7 +1062,7 @@ unsafe fn acpi_fadt(address: usize) -> Option<&'static [u8]> {
         let Some(child) = (unsafe { acpi_table(u64::from_le_bytes(bytes) as usize) }) else {
             continue;
         };
-        if &child[..4] == b"FACP" {
+        if &child[..4] == signature {
             return Some(child);
         }
     }

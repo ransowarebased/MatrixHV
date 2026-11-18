@@ -310,15 +310,17 @@ fn target_translate(
         memory.read(table + ((address >> shift) & 511) * 8, &mut bytes)?;
         let entry = u64::from_le_bytes(bytes);
         if entry & 1 == 0 {
-            if entry == 0 && depth == 0 && address >> 63 == 0 {
-                if let Some(value) = space.committed_protection {
-                    protection(u64::from(value), 31, write)?;
-                    return if write {
-                        Err(Error::DemandZeroWrite)
-                    } else {
-                        Ok(Backing::Zero)
-                    };
-                }
+            if entry == 0
+                && depth == 0
+                && address >> 63 == 0
+                && let Some(value) = space.committed_protection
+            {
+                protection(u64::from(value), 31, write)?;
+                return if write {
+                    Err(Error::DemandZeroWrite)
+                } else {
+                    Ok(Backing::Zero)
+                };
             }
             return if shift == 12 {
                 soft_backing(memory, space, entry, address, write, depth)

@@ -1086,6 +1086,7 @@ test r9, r9
 jz .Lresident_nested_eptp_sync_recover_flush
 mov qword ptr [r9], 2
 mov edx, 2
+xor r8d, r8d
 call .Lresident_interception_callback
 cmp rax, -1
 je .Lresident_dispatch_halt
@@ -1218,6 +1219,7 @@ mov qword ptr [r9], r8
 ret
 .Lresident_nested_eptp_sync_flush_local:
 mov edx, 3
+xor r8d, r8d
 call .Lresident_interception_callback
 cmp rax, -1
 je .Lresident_dispatch_halt
@@ -1265,6 +1267,12 @@ ret
 mov qword ptr [r12 + {b_nested_eptp_sync_safe}], 0
 call .Lresident_nested_eptp_sync_poll
 mov edx, 1
+xor r8d, r8d
+cmp qword ptr [r12 + {b_nested_l2_active}], 0
+jne .Lresident_nested_eptp_sync_enter_callback
+// This helper is called directly from the dispatcher with the GPR frame above its return address.
+lea r8, [rsp + 8]
+.Lresident_nested_eptp_sync_enter_callback:
 call .Lresident_interception_callback
 call .Lresident_interception_safe_point_timer
 call .Lresident_deliver_pending_nmi
@@ -1321,6 +1329,7 @@ inc qword ptr [r12 + {b_watchdog_sequence}]
 .Lresident_nested_eptp_sync_nmi_poll:
 call .Lresident_nested_eptp_sync_poll
 mov edx, 1
+xor r8d, r8d
 call .Lresident_interception_callback
 call .Lresident_interception_safe_point_timer
 call .Lresident_deliver_pending_nmi

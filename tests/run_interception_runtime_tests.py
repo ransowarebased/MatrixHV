@@ -163,7 +163,7 @@ pub mod vmx {
 control = (project / 'src/vmx/asm/control.S').read_text()
 sync = (project / 'src/vmx/asm/eptp_switch.S').read_text()
 exits = (project / 'src/vmx/asm/exits.S').read_text()
-bridge = control[control.index('.Lresident_interception_callback:'):control.index('.Lresident_dispatch_update_l2_reject:')]
+bridge = control[control.index('.Lresident_interception_callback:'):control.index('.Lresident_dispatch_update:')]
 bridge += sync[sync.index('.Lresident_nested_eptp_sync_enter:'):sync.index('// The copied Rust callback')]
 bridge += exits[exits.index('.Lresident_host_sync_nmi_entry_guard:'):exits.index('.Lresident_host_arm_nmi_window:')]
 assert 'mov rdx, qword ptr [rsp + 120]\ncall .Lresident_host_sync_nmi_entry_guard\ncall .Lresident_nested_eptp_sync_host_nmi' in exits
@@ -237,6 +237,7 @@ bindings = {
     'event_interception_entry': 'ResidentEventContext, interception_entry',
     'b_nested_eptp_sync_safe': 'ResidentBootContext, sync_safe',
     'b_nested_eptp_sync_nmi': 'ResidentBootContext, sync_nmi',
+    'b_nested_l2_active': 'ResidentBootContext, nested.l2_active',
     'b_watchdog_phase': 'ResidentBootContext, watchdog_phase',
     'b_watchdog_sequence': 'ResidentBootContext, watchdog_sequence',
     'b_telemetry_active': 'ResidentBootContext, telemetry_active',

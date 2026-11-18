@@ -45,7 +45,7 @@ impl ContextRecord {
         ]);
         words[9..24].copy_from_slice(&self.gprs);
         words[24..].copy_from_slice(&[self.cpu, self.cpl]);
-        for (value, chunk) in words.iter().zip(bytes.chunks_exact_mut(8)) {
+        for (value, chunk) in words.iter().zip(bytes.as_chunks_mut::<8>().0.iter_mut()) {
             chunk.copy_from_slice(&value.to_le_bytes());
         }
     }
@@ -668,7 +668,10 @@ impl EventConfig {
             return Err(Error::Format);
         }
         for (guard, descriptor) in config.guards[..guard_count].iter_mut().zip(
-            packet[HEADER_BYTES + (regions + probe_count) * 16..].chunks_exact(EVENT_GUARD_BYTES),
+            packet[HEADER_BYTES + (regions + probe_count) * 16..]
+                .as_chunks::<EVENT_GUARD_BYTES>()
+                .0
+                .iter(),
         ) {
             *guard = IdentityGuard {
                 cr3: quad(descriptor, 0),
@@ -835,7 +838,9 @@ impl Events {
         };
         packet[HEADER_BYTES..].fill(0);
         for (index, record) in packet[HEADER_BYTES..]
-            .chunks_exact_mut(EVENT_RECORD_BYTES)
+            .as_chunks_mut::<EVENT_RECORD_BYTES>()
+            .0
+            .iter_mut()
             .take(returned)
             .enumerate()
         {
@@ -910,8 +915,12 @@ impl Events {
             event.address,
         ]
         .into_iter()
-        .zip(record[CONTEXT_RECORD_BYTES..CONTEXT_RECORD_BYTES + 56].chunks_exact_mut(8))
-        {
+        .zip(
+            record[CONTEXT_RECORD_BYTES..CONTEXT_RECORD_BYTES + 56]
+                .as_chunks_mut::<8>()
+                .0
+                .iter_mut(),
+        ) {
             bytes.copy_from_slice(&value.to_le_bytes());
         }
         for (value, bytes) in [
@@ -925,7 +934,9 @@ impl Events {
         .into_iter()
         .zip(
             record[CONTEXT_RECORD_BYTES + 56..CONTEXT_RECORD_BYTES + 56 + EVENT_INSTRUCTION_BYTES]
-                .chunks_exact_mut(8),
+                .as_chunks_mut::<8>()
+                .0
+                .iter_mut(),
         ) {
             bytes.copy_from_slice(&value.to_le_bytes());
         }
@@ -937,7 +948,9 @@ impl Events {
             .chain([event.thread_id, event.thread_id_status])
             .zip(
                 record[EVENT_RECORD_HEADER - EVENT_IDENTITY_BYTES..EVENT_RECORD_HEADER]
-                    .chunks_exact_mut(8),
+                    .as_chunks_mut::<8>()
+                    .0
+                    .iter_mut(),
             )
         {
             slot.copy_from_slice(&value.to_le_bytes());

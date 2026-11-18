@@ -846,7 +846,7 @@ fn ad_bitmap_validates_ranges_sizes_and_padding_before_access() {
         (1, 1),
         (0, 0),
         (0, AD_MAX_PAGES + 1),
-        (u64::MAX & !4095, 1),
+        (!4095, 1),
         ((1 << 48) - 4096, 2),
     ] {
         assert!(neo::memory::bitmap_packet(start, count).is_err());
@@ -1253,11 +1253,14 @@ fn resident_event_transport_preserves_capture_counts_and_format_version() {
     .unwrap();
     let (_machine, mut environment, buffer, _) = Machine::setup(&request);
     let mut session = unsafe {
-        Box::from_raw(std::alloc::alloc_zeroed(std::alloc::Layout::new::<Session>()).cast::<Session>())
+        Box::from_raw(
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<Session>()).cast::<Session>(),
+        )
     };
     let mut observation = unsafe {
         Box::from_raw(
-            std::alloc::alloc_zeroed(std::alloc::Layout::new::<Observation>()).cast::<Observation>(),
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<Observation>())
+                .cast::<Observation>(),
         )
     };
     session.initialize(0, 1);

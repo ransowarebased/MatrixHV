@@ -279,17 +279,18 @@ impl ResidentCode {
             if event_context == 0 {
                 length.div_ceil(PAGE_SIZE)
             } else {
-                crate::update::BANK_PAGES
+                matrixhv_sdk::update::BANK_PAGES
             },
             AddressConstraint::Any,
             RESIDENT_CODE_MEMORY_TYPE,
         )
         .map_err(ResidentProbeError::Allocation)?;
-        if length > crate::update::BANK_BYTES || code_end <= start || code_end > end {
+        if length > matrixhv_sdk::update::BANK_BYTES || code_end <= start || code_end > end {
             return Err(ResidentProbeError::InvalidCodeLayout);
         }
-        let identity =
-            unsafe { crate::update::hash(core::slice::from_raw_parts(start as *const u8, length)) };
+        let identity = unsafe {
+            matrixhv_sdk::update::hash(core::slice::from_raw_parts(start as *const u8, length))
+        };
         unsafe {
             core::ptr::copy_nonoverlapping(start as *const u8, pages.pointer().as_ptr(), length);
             pages
@@ -395,9 +396,8 @@ fn prepare_runtime_update(
     code: &ResidentCode,
     event: *mut ResidentEventContext,
 ) -> Result<(), ResidentProbeError> {
-    use crate::update::{
-        Abi, BANK_BYTES, EmbeddedImage, MAX_PACKAGE_BYTES, RuntimeContext, STATE_ABI,
-    };
+    use crate::update::RuntimeContext;
+    use matrixhv_sdk::update::{Abi, BANK_BYTES, EmbeddedImage, MAX_PACKAGE_BYTES, STATE_ABI};
     let (source_base, source_bytes) =
         crate::boot::firmware::loaded_image_extent().map_err(ResidentProbeError::Allocation)?;
     let source = unsafe { core::slice::from_raw_parts(source_base as *const u8, source_bytes) };
@@ -427,7 +427,7 @@ fn prepare_runtime_update(
         (*event).callback_image_base = root_image.physical_address();
         (*event).callback_image_bytes = source_bytes as u64;
         (*event).callback_image_version = core_version();
-        (*event).callback_image_hash = crate::update::hash(core::slice::from_raw_parts(
+        (*event).callback_image_hash = matrixhv_sdk::update::hash(core::slice::from_raw_parts(
             root_image.pointer().as_ptr(),
             source_bytes,
         ));
@@ -789,18 +789,17 @@ global_asm!(
     event_context_size = const size_of::<ResidentEventContext>(),
     nested_context_size = const size_of::<NestedVmxState>(),
     core_version = const core_version(),
-    state_abi = const crate::update::STATE_ABI,
-    update_vmcall = const crate::update::UPDATE_VMCALL,
-    update_result = const crate::update::UPDATE_RESULT,
-    update_request_size = const crate::update::REQUEST_BYTES,
-    update_buffer_size = const crate::update::REQUEST_BYTES + crate::update::CHUNK_BYTES,
+    state_abi = const matrixhv_sdk::update::STATE_ABI,
+    update_vmcall = const matrixhv_sdk::update::UPDATE_VMCALL,
+    update_result = const matrixhv_sdk::update::UPDATE_RESULT,
+    update_request_size = const matrixhv_sdk::update::REQUEST_BYTES,
+    update_buffer_size = const matrixhv_sdk::update::REQUEST_BYTES + matrixhv_sdk::update::CHUNK_BYTES,
     update_context_scratch = const core::mem::offset_of!(crate::update::RuntimeContext, scratch),
     update_context_phase = const core::mem::offset_of!(crate::update::RuntimeContext, transaction)
-        + core::mem::offset_of!(crate::update::Transaction, status) + core::mem::offset_of!(crate::update::Status, phase),
+        + core::mem::offset_of!(matrixhv_sdk::update::Transaction, status) + core::mem::offset_of!(matrixhv_sdk::update::Status, phase),
     update_context_transaction = const core::mem::offset_of!(crate::update::RuntimeContext, transaction)
-        + core::mem::offset_of!(crate::update::Transaction, status) + core::mem::offset_of!(crate::update::Status, transaction),
-    update_status_qwords = const size_of::<crate::update::Status>() / 8,
-    update_status_error = const core::mem::offset_of!(crate::update::Status, error),
+        + core::mem::offset_of!(matrixhv_sdk::update::Transaction, status) + core::mem::offset_of!(matrixhv_sdk::update::Status, transaction),
+    update_status_qwords = const size_of::<matrixhv_sdk::update::Status>() / 8,
     event_update_status = const core::mem::offset_of!(ResidentEventContext, update_status),
     event_update_public_key = const core::mem::offset_of!(ResidentEventContext, update_public_key),
     event_update_abi = const core::mem::offset_of!(ResidentEventContext, update_abi),

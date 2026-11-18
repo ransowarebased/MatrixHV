@@ -31,6 +31,7 @@ const EPT_1GB_PAGE_SIZE: u64 = 1024 * 1024 * 1024;
 const EPT_512GB_PAGE_SIZE: u64 = 512 * EPT_1GB_PAGE_SIZE;
 const EPT_ENTRY_COUNT: usize = 512;
 const EPT_PROTECTION_TABLE_PAGES: usize = 128;
+const EPT_PROTECTION_TABLE_PAGES_PER_CPU: usize = 16;
 
 const EPT_CAP_PAGE_WALK_LENGTH_4: u64 = 1 << 6;
 const EPT_CAP_MEMORY_TYPE_UC: u64 = 1 << 8;
@@ -225,8 +226,13 @@ struct ProtectionTablePool {
 }
 
 impl ProtectionTablePool {
-    fn allocate() -> Result<Self, EptError> {
-        let pages = ResidentPages::allocate(EPT_PROTECTION_TABLE_PAGES, AddressConstraint::Any)
+    fn allocate(protected_cpus: usize) -> Result<Self, EptError> {
+        // Each CPU can have independently placed stacks, VMCS, bitmaps and trace buffers.
+        let page_count = protected_cpus
+            .checked_mul(EPT_PROTECTION_TABLE_PAGES_PER_CPU)
+            .and_then(|extra| EPT_PROTECTION_TABLE_PAGES.checked_add(extra))
+            .ok_or(EptError::AddressOverflow)?;
+        let pages = ResidentPages::allocate(page_count, AddressConstraint::Any)
             .map_err(EptError::Allocation)?;
         Ok(Self {
             pages,
@@ -252,7 +258,10 @@ impl ProtectionTablePool {
 }
 
 impl IdentityEpt {
-    pub fn build(mut descriptors: Vec<MemoryDescriptor>) -> Result<Self, EptError> {
+    pub fn build(
+        mut descriptors: Vec<MemoryDescriptor>,
+        protected_cpus: usize,
+    ) -> Result<Self, EptError> {
         let capabilities = unsafe { arch::read_msr(arch::IA32_VMX_EPT_VPID_CAP) };
         if capabilities & EPT_CAP_PAGE_WALK_LENGTH_4 == 0 {
             return Err(EptError::FourLevelWalkUnavailable);
@@ -271,7 +280,7 @@ impl IdentityEpt {
         }
         let mtrrs = MtrrState::capture();
         let large_pages_supported = capabilities & EPT_CAP_2MB_PAGE != 0;
-        let protection_pool = ProtectionTablePool::allocate()?;
+        let protection_pool = ProtectionTablePool::allocate(protected_cpus)?;
 
         descriptors.retain(|descriptor| descriptor.page_count != 0);
         if descriptors.is_empty() {
@@ -417,7 +426,7 @@ impl IdentityEpt {
         if next_table_index != table_page_count {
             return Err(EptError::InvalidPageTable);
         }
-        let protection_pool = ProtectionTablePool::allocate()?;
+        let protection_pool = ProtectionTablePool::allocate(0)?;
         let ept_pointer = root.physical_address | (self.ept_pointer & !EPT_ADDRESS_MASK);
         Ok(Self {
             pages: alloc::vec![table_pages],
@@ -430,7 +439,7 @@ impl IdentityEpt {
     }
 
     pub fn sparse_shadow(&self) -> Result<Self, EptError> {
-        let protection_pool = ProtectionTablePool::allocate()?;
+        let protection_pool = ProtectionTablePool::allocate(0)?;
         let mut pages = Vec::new();
         let root = allocate_table(&mut pages)?;
         let ept_pointer = root.physical_address | (self.ept_pointer & !EPT_ADDRESS_MASK);

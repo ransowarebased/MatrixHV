@@ -380,8 +380,8 @@ fn segment_from_gdt(selector: u16, gdtr: DescriptorTablePointer) -> SegmentState
 
     let descriptor_address = gdtr.base.wrapping_add(table_offset as u64) as *const u64;
     let descriptor = unsafe { descriptor_address.read_unaligned() };
-    let access = ((descriptor >> 40) & 0xff) as u32;
-    if access & 0x10 == 0 && table_offset + 15 > usize::from(gdtr.limit) {
+    let mut access = ((descriptor >> 40) & 0xff) as u32;
+    if access & 0x80 == 0 || access & 0x10 == 0 && table_offset + 15 > usize::from(gdtr.limit) {
         return SegmentState {
             selector,
             base: 0,
@@ -401,6 +401,9 @@ fn segment_from_gdt(selector: u16, gdtr: DescriptorTablePointer) -> SegmentState
     if access & 0x10 == 0 {
         let high = unsafe { descriptor_address.add(1).read_unaligned() } & 0xffff_ffff;
         base |= high << 32;
+    } else {
+        // Loaded code and data segments have the accessed bit set in the hidden descriptor.
+        access |= 1;
     }
 
     SegmentState {

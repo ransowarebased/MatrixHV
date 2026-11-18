@@ -378,11 +378,6 @@ ret
 .Lresident_interception_callback_failed:
 mov qword ptr [r12 + {b_stop_result}], 0x4342
 jmp .Lresident_dispatch_halt
-.Lresident_dispatch_update_l2_reject:
-mov rax, 14
-mov rdi, qword ptr [r12 + {b_event_context}]
-mov dword ptr [rdi + {event_update_status} + {update_status_error}], eax
-jmp .Lresident_update_return
 .Lresident_dispatch_update:
 call .Lresident_pt_leave
 mov qword ptr [r12 + {b_pt_armed}], 0
@@ -513,6 +508,7 @@ and qword ptr [r12 + {b_nested_l1_cr4}], ~{cr4_vmxe}
 .Lresident_update_retire_clear:
 vmclear qword ptr [r12 + {b_nested_vmcs02_region}]
 jna .Lresident_update_retire_failed
+mov qword ptr [r12 + {b_nested_vmcs02_launched}], 0
 cmp qword ptr [r12 + {b_nested_shadow_vmcs_region}], 0
 je .Lresident_update_retire_reset
 vmclear qword ptr [r12 + {b_nested_shadow_vmcs_region}]
@@ -522,7 +518,6 @@ mov qword ptr [r12 + {b_nested_active}], 0
 mov qword ptr [r12 + {b_nested_current_vmcs}], -1
 mov qword ptr [r12 + {b_nested_current_vmcs_is_shadow}], 0
 mov qword ptr [r12 + {b_nested_vmxon_region}], 0
-mov qword ptr [r12 + {b_nested_vmcs02_launched}], 0
 mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], 0
 mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending} + 8], 0
 mov qword ptr [r12 + {b_nested_vmcs02_guest_cache_valid}], 0
@@ -679,8 +674,10 @@ call .Lresident_advance_guest_rip
 jmp .Lresident_dispatch_resume
 .Lresident_dispatch_control_off_prepare:
 mov edx, 2
+xor r8d, r8d
 call .Lresident_interception_callback
 mov edx, 1
+mov r8, rsp
 call .Lresident_interception_callback
 call .Lresident_interception_safe_point_timer
 mov rdi, qword ptr [r12 + {b_event_context}]
@@ -1563,6 +1560,7 @@ jna .Lresident_control_on_root_failed
 resident_control_on_restore_host {host_rip}, 21
 resident_control_on_restore_host {host_idtr_base}, 16
 .Lresident_control_on_primary_vmcs:
+// VMCLEAR preserves VMCS01 fields, including its configured shadow VMCS link.
 vmclear qword ptr [r9 + {control_cpu_vmcs_region}]
 jna .Lresident_control_on_root_failed
 resident_control_native_checkpoint 10
@@ -1627,7 +1625,6 @@ resident_control_on_write {guest_pending_dbg_exceptions}, 0
 resident_control_on_write {guest_interruptibility_info}, 0
 resident_control_on_write {guest_activity_state}, 0
 resident_control_on_write {vm_entry_intr_info_field}, 0
-resident_control_on_write {vmcs_link_pointer}, -1
 resident_control_on_write_msr 0x1d9, {guest_ia32_debugctl}, 0
 resident_control_on_write_msr 0x277, {guest_pat}, 1
 resident_control_on_write_msr 0xc0000080, {guest_efer}, 2
@@ -2115,6 +2112,8 @@ ret
 .Lresident_bridge_apic_id:
 mov eax, 0
 cpuid
+cmp eax, 0xb
+jb .Lresident_bridge_apic_leaf_1
 cmp eax, 0x1f
 jb .Lresident_bridge_apic_leaf_b
 mov eax, 0x1f
@@ -2128,6 +2127,7 @@ xor ecx, ecx
 cpuid
 test ebx, ebx
 jnz .Lresident_bridge_apic_ready
+.Lresident_bridge_apic_leaf_1:
 mov eax, 1
 cpuid
 mov edx, ebx
@@ -2184,6 +2184,12 @@ mov r11, qword ptr [r12 + {b_last_reason}]
 test r11d, 0x80000000
 jnz .Lresident_control_on_entry_failed
 lock btr qword ptr [rdi + {event_control_rearm_mask}], rcx
+// Native CONTROL_ON cleared VMCS02 before loading it. Its physical boot
+// context is writable again at this first VM exit.
+mov qword ptr [r12 + {b_nested_vmcs02_launched}], 0
+mov qword ptr [r12 + {b_nested_vmcs02_guest_cache_valid}], 0
+mov qword ptr [r12 + {b_nested_vmcs02_control_cache_valid}], 0
+mov qword ptr [r12 + {b_nested_vmcs02_control_cache_valid} + 8], 0
 mov eax, {vm_entry_msr_load_count}
 mov r11, qword ptr [rip + matrixhv_resident_island_msr_switch_count]
 vmwrite rax, r11

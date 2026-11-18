@@ -24,6 +24,7 @@
 
 .Lresident_rebuild_ept_cache:
 mov edx, 2
+xor r8d, r8d
 call .Lresident_interception_callback
     push rbx
     push rbp
@@ -170,9 +171,17 @@ call .Lresident_interception_callback
     mov eax, edx
 .Lresident_cache_leaf_type_ready:
     shl eax, 3
-    and r13, -57
-    or r13, rax
-    mov [rsi], r13
+    mov ecx, eax
+    mov rax, r13
+.Lresident_cache_update_leaf_retry:
+    // Preserve any accessed or dirty update made by a hardware EPT walk.
+    mov r11, rax
+    and r11, -57
+    or r11, rcx
+    cmp r11, rax
+    je .Lresident_cache_next_entry
+    lock cmpxchg qword ptr [rsi], r11
+    jne .Lresident_cache_update_leaf_retry
 .Lresident_cache_next_entry:
     add rsi, 8
     dec ebx

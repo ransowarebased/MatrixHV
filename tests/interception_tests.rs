@@ -21,6 +21,7 @@ struct Machine {
     syscall_cr4: u64,
     syscall_cet: bool,
     denied_guard: Option<u64>,
+    deny_resident_reads: bool,
     reclamation_allowed: bool,
     reclamation_ready: bool,
     failed_stores: BTreeMap<u64, usize>,
@@ -45,6 +46,7 @@ impl Machine {
             syscall_cr4: 0,
             syscall_cet: false,
             denied_guard: None,
+            deny_resident_reads: false,
             reclamation_allowed: true,
             reclamation_ready: true,
             failed_stores: BTreeMap::new(),
@@ -90,6 +92,9 @@ impl Machine {
 
 impl PhysicalMemory for Machine {
     fn read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), Error> {
+        if self.deny_resident_reads && address >= 0x1000_0000 {
+            return Err(Error::Permission);
+        }
         let page = self.pages.get(&(address & !4095)).ok_or(Error::Unmapped)?;
         let start = address as usize & 4095;
         bytes.copy_from_slice(&page[start..start + bytes.len()]);
@@ -159,15 +164,14 @@ impl InterceptionMemory for Machine {
         ))
     }
     fn store_entry(&mut self, address: u64, value: u64) -> Result<(), Error> {
-        if value & 128 == 0 {
-            if let Some(remaining) = self
+        if value & 128 == 0
+            && let Some(remaining) = self
                 .failed_links
                 .get_mut(&address)
                 .filter(|remaining| **remaining != 0)
-            {
-                *remaining -= 1;
-                return Err(Error::Permission);
-            }
+        {
+            *remaining -= 1;
+            return Err(Error::Permission);
         }
         let failed = self
             .failed_stores
@@ -177,15 +181,14 @@ impl InterceptionMemory for Machine {
             *remaining -= 1;
             return Err(Error::Permission);
         }
-        if value & 2 == 0 {
-            if let Some(remaining) = self
+        if value & 2 == 0
+            && let Some(remaining) = self
                 .failed_guards
                 .get_mut(&address)
                 .filter(|remaining| **remaining != 0)
-            {
-                *remaining -= 1;
-                return Err(Error::Permission);
-            }
+        {
+            *remaining -= 1;
+            return Err(Error::Permission);
         }
         if self.denied_guard == Some(address) && value & 2 == 0 {
             return Err(Error::Permission);
@@ -507,9 +510,7 @@ fn syscall_clear_without_other_profiles_disables_the_session_and_expiry_restores
 #[test]
 fn private_shared_data_traps_scoped_accesses_and_preserves_native_storage() {
     let mut machine = Machine::new();
-    machine
-        .store_entry(0x4000 + ((0x7ffe0000_u64 >> 30) & 511) * 8, 0x5007)
-        .unwrap();
+    machine.store_entry(0x4000 + 8, 0x5007).unwrap();
     machine
         .store_entry(0x5000 + ((0x7ffe0000_u64 >> 21) & 511) * 8, 0x7007)
         .unwrap();
@@ -650,9 +651,7 @@ fn private_shared_data_rejects_partial_pages_other_addresses_and_vmfunc() {
         ),
     ] {
         let mut machine = Machine::new();
-        machine
-            .store_entry(0x4000 + ((0x7ffe0000_u64 >> 30) & 511) * 8, 0x5007)
-            .unwrap();
+        machine.store_entry(0x4000 + 8, 0x5007).unwrap();
         machine
             .store_entry(0x5000 + ((0x7ffe0000_u64 >> 21) & 511) * 8, 0x7007)
             .unwrap();
@@ -1231,7 +1230,7 @@ fn nonuniform_children_and_preexisting_tables_are_never_reclaimed_as_owned_split
     machine.store_entry(0x2000, 0x9007).unwrap();
     for index in 0..512 {
         machine
-            .store_entry(0x9000 + index * 8, index * 0x20_0000 | 0xb7)
+            .store_entry(0x9000 + index * 8, (index * 0x20_0000) | 0xb7)
             .unwrap();
     }
     let mut session = session();
@@ -2290,6 +2289,7 @@ fn a_no_op_patch_does_not_block_later_original_changes() {
 fn dynamic_hook_rebuilds_preserve_original_bytes_adopted_by_three_way_merges() {
     for patch in ["90", "cc"] {
         let mut machine = Machine::new();
+        machine.deny_resident_reads = true;
         let mut session = session();
         let mut install = packet(&[
             "hook",

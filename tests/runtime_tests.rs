@@ -136,18 +136,15 @@ mod logger {
     }
 
     #[test]
-    fn configuration_toggle_preserves_detected_serial_port() {
-        SERIAL_PRESENT.store(true, Ordering::Release);
-        set_enabled(true);
-        assert_eq!(backend(), LogBackend::SerialAndFramebuffer);
-        set_enabled(false);
-        assert_eq!(backend(), LogBackend::Disabled);
-        set_enabled(true);
-        assert_eq!(backend(), LogBackend::SerialAndFramebuffer);
-        SERIAL_PRESENT.store(false, Ordering::Release);
-        set_enabled(true);
-        assert_eq!(backend(), LogBackend::Framebuffer);
-        set_enabled(false);
+    fn oversized_log_messages_keep_their_utf8_prefix() {
+        let mut buffer = LogBuffer::new();
+        let prefix = "a".repeat(LOG_BUFFER_CAPACITY - 3);
+        buffer.write_str(&prefix).unwrap();
+        assert!(buffer.write_str("é🚀").is_err());
+        let text = buffer.as_str().unwrap();
+        assert!(text.starts_with(&prefix));
+        assert!(text.ends_with('é'));
+        assert_eq!(text.len(), LOG_BUFFER_CAPACITY - 1);
     }
 
     #[test]

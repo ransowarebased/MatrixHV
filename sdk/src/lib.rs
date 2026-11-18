@@ -5,6 +5,8 @@
 #![cfg_attr(any(not(feature = "client"), target_os = "uefi"), no_std)]
 
 pub mod protocol;
+#[cfg(feature = "update")]
+pub mod update;
 
 #[cfg(all(feature = "client", not(target_os = "uefi")))]
 pub mod memory;

@@ -736,9 +736,9 @@ fn install(
     hooks: &[Hook],
     hook_flags: &[u32],
     flags: u32,
-    la57: bool,
-    physical_bits: u32,
+    address_space: (bool, u32),
 ) -> Result<(), Error> {
+    let (la57, physical_bits) = address_space;
     if flags & !OPTIONS != 0 {
         return Err(Error::Format);
     }
@@ -902,10 +902,10 @@ fn install(
     // Keep the validated guard set available to the transaction's cleanup even
     // if a later table write fails before publication.
     configuration.hook_count = page_count;
-    for index in 0..page_count {
+    for (index, entry) in original_entries[..page_count].iter().enumerate() {
         let pointer = configuration.base_leaves[index];
         if pointer != 0 {
-            memory.store_entry(pointer, original_entries[index] & !2)?;
+            memory.store_entry(pointer, entry & !2)?;
         }
     }
     Ok(())
@@ -999,13 +999,12 @@ pub(crate) unsafe fn write_original(
             let result = (|| {
                 memory.write_original(address, bytes, false)?;
                 write_committed = true;
-                if session.is_active() {
-                    if let Some(index) = configuration.pages[..configuration.hook_count]
+                if session.is_active()
+                    && let Some(index) = configuration.pages[..configuration.hook_count]
                         .iter()
                         .position(|page| *page == address & !4095)
-                    {
-                        refresh_page(configuration, memory, index)?;
-                    }
+                {
+                    refresh_page(configuration, memory, index)?;
                 }
                 Ok(())
             })();
@@ -1037,13 +1036,12 @@ pub(crate) unsafe fn write_original(
             memory.write_original(address, bytes, false)?;
             write_committed = true;
             let configuration = unsafe { &*session.configuration.get() };
-            if session.is_active() {
-                if let Some(index) = configuration.pages[..configuration.hook_count]
+            if session.is_active()
+                && let Some(index) = configuration.pages[..configuration.hook_count]
                     .iter()
                     .position(|page| *page == address & !4095)
-                {
-                    refresh_page(configuration, memory, index)?;
-                }
+            {
+                refresh_page(configuration, memory, index)?;
             }
             Ok(())
         })();
@@ -1294,7 +1292,17 @@ fn change_hooks(
             if hook.physical_address & !4095 == configuration.pages[page_index] {
                 memory.check_budget()?;
                 let offset = hook.physical_address as usize & 4095;
-                memory.read(shadow + offset as u64, &mut hook.bytes[..hook.length])?;
+                // The shadow belongs to the resident pool, which is concealed in EPT01.
+                let mut copied = 0;
+                while copied < hook.length {
+                    let position = offset + copied;
+                    let word = memory.table_entry(shadow + (position & !7) as u64)?;
+                    let start = position & 7;
+                    let length = (hook.length - copied).min(8 - start);
+                    hook.bytes[copied..copied + length]
+                        .copy_from_slice(&word.to_le_bytes()[start..start + length]);
+                    copied += length;
+                }
             }
         }
     }
@@ -1415,8 +1423,7 @@ fn change_hooks(
             &pending[..count],
             &pending_flags[..count],
             flags,
-            la57,
-            physical_bits,
+            (la57, physical_bits),
         )
     });
     configuration.base_pool_used = staged.base_pool_used;
@@ -3023,9 +3030,9 @@ pub(crate) mod runtime {
                 load_debug(&registers);
                 write(GUEST_DR7, dr7)?;
             }
-            if cpu.step_active != 0 && cpu.step_cr3 == cr3 && configuration.hook_count != 0 {
-                data_root(configuration, boot.processor_number as usize)
-            } else if (native || persistent) && cpu.cooperative_data != 0 {
+            if (cpu.step_active != 0 && cpu.step_cr3 == cr3 && configuration.hook_count != 0)
+                || ((native || persistent) && cpu.cooperative_data != 0)
+            {
                 data_root(configuration, boot.processor_number as usize)
             } else if target && configuration.hook_count != 0 {
                 configuration.ept
@@ -3279,7 +3286,7 @@ pub(crate) mod runtime {
     }
 
     fn original_value(address: u64, width: usize, value: Option<u64>) -> u64 {
-        if address as usize % width == 0 {
+        if (address as usize).is_multiple_of(width) {
             // Match aligned x86 scalar-load atomicity when peers are running.
             // A byte-at-a-time emulated load could tear across a concurrent store.
             unsafe {
@@ -3571,10 +3578,10 @@ pub(crate) mod runtime {
             Err(()) => return Ok(Emulation::Unsupported),
         };
         // Reject non-GPR destinations before writing any architectural state.
-        if let Operand::Register { reg } = &left {
-            if register_location(*reg).is_none() {
-                return Ok(Emulation::Unsupported);
-            }
+        if let Operand::Register { reg } = &left
+            && register_location(*reg).is_none()
+        {
+            return Ok(Emulation::Unsupported);
         }
         let sign = 1u64 << (width * 8 - 1);
         let result = match opcode {
@@ -3661,14 +3668,14 @@ pub(crate) mod runtime {
         if stores_result {
             if memory_index == 0 {
                 original_value(address, width, Some(result));
-            } else if let Operand::Register { reg } = left {
-                if set_register(frame, reg, result).is_err() {
-                    return if restore(values.len()) {
-                        Err(())
-                    } else {
-                        Ok(Emulation::Fatal)
-                    };
-                }
+            } else if let Operand::Register { reg } = left
+                && set_register(frame, reg, result).is_err()
+            {
+                return if restore(values.len()) {
+                    Err(())
+                } else {
+                    Ok(Emulation::Fatal)
+                };
             }
         }
         Ok(Emulation::Completed)
@@ -3702,18 +3709,17 @@ pub(crate) mod runtime {
         let Some(width) = instruction.mem_size().and_then(|size| size.bytes_size()) else {
             return Ok(Emulation::Unsupported);
         };
-        if ![1, 2, 4, 8].contains(&width) || boot.interception.data_address % u64::from(width) != 0
+        if ![1, 2, 4, 8].contains(&width)
+            || !boot
+                .interception
+                .data_address
+                .is_multiple_of(u64::from(width))
         {
             return Ok(Emulation::Unsupported);
         }
         // A scalar load has no shared EPT mutation and requires no parked peer,
         // refresh merge, or guest MTF instruction window.
-        let outcome = emulate_mixed(
-            boot,
-            frame,
-            &instruction,
-            instruction.len().to_const() as u64,
-        )?;
+        let outcome = emulate_mixed(boot, frame, &instruction, instruction.len().to_const())?;
         if matches!(outcome, Emulation::Completed) {
             boot.interception.cooperative_data = 0;
             boot.interception.data_pending = 0;
@@ -3774,38 +3780,37 @@ pub(crate) mod runtime {
                 && execution[..length] == original[..length]
             {
                 use yaxpeax_x86::long_mode::{InstDecoder, Opcode, Operand};
-                if let Ok(instruction) = InstDecoder::default().decode_slice(&execution[..count]) {
-                    if !instruction.prefixes.lock()
-                        && !instruction.prefixes.rep_any()
-                        && matches!(instruction.operand(0), Operand::Register { .. })
-                        && instruction.operand(1).is_memory()
-                        && matches!(
-                            instruction.opcode(),
-                            Opcode::MOV
-                                | Opcode::MOVZX
-                                | Opcode::MOVSX
-                                | Opcode::MOVSXD
-                                | Opcode::ADD
-                                | Opcode::SUB
-                                | Opcode::CMP
-                                | Opcode::AND
-                                | Opcode::OR
-                                | Opcode::XOR
-                                | Opcode::TEST
-                        )
-                    {
-                        // Execute exactly one unchanged, read-only instruction on
-                        // this CPU's original view. Peers keep the patched view.
-                        for pointer in data_leaves(configuration, boot.processor_number as usize) {
-                            entry_bits(*pointer, 4, 2);
-                        }
-                        boot.interception.step_active = 4;
-                        boot.interception.step_cr3 = read(GUEST_CR3)? & MASK;
-                        boot.interception.cooperative_data = 0;
-                        boot.interception.data_pending = 0;
-                        invalidate(private)?;
-                        return Ok(1);
+                if let Ok(instruction) = InstDecoder::default().decode_slice(&execution[..count])
+                    && !instruction.prefixes.lock()
+                    && !instruction.prefixes.rep_any()
+                    && matches!(instruction.operand(0), Operand::Register { .. })
+                    && instruction.operand(1).is_memory()
+                    && matches!(
+                        instruction.opcode(),
+                        Opcode::MOV
+                            | Opcode::MOVZX
+                            | Opcode::MOVSX
+                            | Opcode::MOVSXD
+                            | Opcode::ADD
+                            | Opcode::SUB
+                            | Opcode::CMP
+                            | Opcode::AND
+                            | Opcode::OR
+                            | Opcode::XOR
+                            | Opcode::TEST
+                    )
+                {
+                    // Execute exactly one unchanged, read-only instruction on
+                    // this CPU's original view. Peers keep the patched view.
+                    for pointer in data_leaves(configuration, boot.processor_number as usize) {
+                        entry_bits(*pointer, 4, 2);
                     }
+                    boot.interception.step_active = 4;
+                    boot.interception.step_cr3 = read(GUEST_CR3)? & MASK;
+                    boot.interception.cooperative_data = 0;
+                    boot.interception.data_pending = 0;
+                    invalidate(private)?;
+                    return Ok(1);
                 }
             }
         }
@@ -3837,44 +3842,43 @@ pub(crate) mod runtime {
                 session.write_windows.fetch_add(1, Ordering::Relaxed);
                 return Ok(1);
             }
-            if access & 0x2000 != 0 {
-                if let Ok(instruction) =
+            if access & 0x2000 != 0
+                && let Ok(instruction) =
                     yaxpeax_x86::long_mode::InstDecoder::default().decode_slice(&execution[..count])
-                {
-                    let outcome = emulate_mixed(boot, frame, &instruction, length as u64)?;
-                    if matches!(outcome, Emulation::Fatal) {
-                        return Ok(u64::MAX);
+            {
+                let outcome = emulate_mixed(boot, frame, &instruction, length as u64)?;
+                if matches!(outcome, Emulation::Fatal) {
+                    return Ok(u64::MAX);
+                }
+                if matches!(outcome, Emulation::Completed) {
+                    session.ept_progress[boot.processor_number as usize]
+                        .store(0, Ordering::Relaxed);
+                    if let Err(error) = refresh(configuration, boot, synchronize) {
+                        session.cause.store(
+                            u64::from(if error == Error::Busy {
+                                INTERCEPT_CAUSE_RENDEZVOUS
+                            } else {
+                                INTERCEPT_CAUSE_MERGE
+                            }),
+                            Ordering::Release,
+                        );
+                        session
+                            .active
+                            .store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
                     }
-                    if matches!(outcome, Emulation::Completed) {
-                        session.ept_progress[boot.processor_number as usize]
-                            .store(0, Ordering::Relaxed);
-                        if let Err(error) = refresh(configuration, boot, synchronize) {
-                            session.cause.store(
-                                u64::from(if error == Error::Busy {
-                                    INTERCEPT_CAUSE_RENDEZVOUS
-                                } else {
-                                    INTERCEPT_CAUSE_MERGE
-                                }),
-                                Ordering::Release,
-                            );
-                            session
-                                .active
-                                .store(u64::from(INTERCEPT_REVOKED), Ordering::Release);
+                    release_refresh(session, boot);
+                    let reset = reset_step(boot);
+                    if !concurrent {
+                        unsafe {
+                            synchronize(boot as *mut _ as u64, 1);
+                            synchronize(boot as *mut _ as u64, 2);
                         }
-                        release_refresh(session, boot);
-                        let reset = reset_step(boot);
-                        if !concurrent {
-                            unsafe {
-                                synchronize(boot as *mut _ as u64, 1);
-                                synchronize(boot as *mut _ as u64, 2);
-                            }
-                        }
-                        reset?;
-                        if !session.is_active() {
-                            revoke(session, boot, synchronize)?;
-                        }
-                        return Ok(1);
                     }
+                    reset?;
+                    if !session.is_active() {
+                        revoke(session, boot, synchronize)?;
+                    }
+                    return Ok(1);
                 }
             }
         }
@@ -4002,7 +4006,7 @@ pub(crate) mod runtime {
                 bytes,
                 la57,
                 environment.physical_bits as u32,
-                (false, true),
+                (false, context.cpl == 3),
             )
         };
         event.thread_id_status = Error::Unsupported as u64;
@@ -4030,7 +4034,7 @@ pub(crate) mod runtime {
                 fetch_instruction(boot, profile, context.rip, &mut execution, &mut original);
             event.instruction.status = Error::Unmapped as u64;
             if let Ok(instruction) = InstDecoder::default().decode_slice(&execution[..count]) {
-                let length = instruction.len().to_const() as u64;
+                let length = instruction.len().to_const();
                 event.instruction = InstructionRecord {
                     length,
                     ..InstructionRecord::default()
@@ -4109,10 +4113,9 @@ pub(crate) mod runtime {
         if context.cpl == 3
             && observer.events.config.probe_count != 0
             && let Some(address) = context.thread_teb.checked_add(8)
+            && read(address, &mut stack_base).1.is_err()
         {
-            if read(address, &mut stack_base).1.is_err() {
-                stack_base.fill(0);
-            }
+            stack_base.fill(0);
         }
         let mut sequence = 0;
         observer.events.correlate(
@@ -4231,7 +4234,11 @@ pub(crate) mod runtime {
                         let argument_status = source_status;
                         if length != 0 {
                             let mut position = 0;
-                            for page in header[64..].chunks_exact_mut(EVENT_PAGE_BYTES) {
+                            for page in header[64..]
+                                .as_chunks_mut::<EVENT_PAGE_BYTES>()
+                                .0
+                                .iter_mut()
+                            {
                                 if position == length {
                                     break;
                                 }
@@ -4295,7 +4302,7 @@ pub(crate) mod runtime {
                                     });
                                 for (value, slot) in [page_address, physical, fingerprint]
                                     .into_iter()
-                                    .zip(page[..24].chunks_exact_mut(8))
+                                    .zip(page[..24].as_chunks_mut::<8>().0.iter_mut())
                                 {
                                     slot.copy_from_slice(&value.to_le_bytes());
                                 }
@@ -4308,7 +4315,7 @@ pub(crate) mod runtime {
                                     page_size as u32,
                                 ]
                                 .into_iter()
-                                .zip(page[24..].chunks_exact_mut(4))
+                                .zip(page[24..].as_chunks_mut::<4>().0.iter_mut())
                                 {
                                     slot.copy_from_slice(&value.to_le_bytes());
                                 }
@@ -4350,7 +4357,7 @@ pub(crate) mod runtime {
                             region.kind,
                         ]
                         .into_iter()
-                        .zip(header[16..64].chunks_exact_mut(8))
+                        .zip(header[16..64].as_chunks_mut::<8>().0.iter_mut())
                         {
                             slot.copy_from_slice(&value.to_le_bytes());
                         }
@@ -4507,66 +4514,65 @@ pub(crate) mod runtime {
                 finish_snapshot(session, boot, frame, confirmed)?;
             }
         }
-        if session.is_active() && boot.nested.active == 0 {
-            if let Some(observer) = session.observer()
-                && (observer.context_enabled || observer.events.config.enabled)
+        if session.is_active()
+            && boot.nested.active == 0
+            && let Some(observer) = session.observer()
+            && (observer.context_enabled || observer.events.config.enabled)
+        {
+            let configuration = unsafe { &*session.configuration.get() };
+            if root_matches(configuration, read(GUEST_CR3)?) && read(GUEST_IA32_EFER)? & 0x400 != 0
             {
-                let configuration = unsafe { &*session.configuration.get() };
-                if root_matches(configuration, read(GUEST_CR3)?)
-                    && read(GUEST_IA32_EFER)? & 0x400 != 0
+                let context = context_record(boot, frame)?;
+                if (observer.context_enabled || observer.events.config.sample)
+                    && let Some(context) = observer.capture(context, None)
                 {
-                    let context = context_record(boot, frame)?;
-                    if observer.context_enabled || observer.events.config.sample {
-                        if let Some(context) = observer.capture(context, None) {
+                    record_event(
+                        observer,
+                        boot,
+                        configuration,
+                        context,
+                        Event {
+                            kind: EVENT_CONTEXT,
+                            detail: reason,
+                            ..Event::default()
+                        },
+                    );
+                }
+                if reason == 0 && context.cpl == 3 {
+                    let info = read(VM_EXIT_INTR_INFO)?;
+                    let vector = info & 255;
+                    if info & (1 << 31) != 0
+                        && matches!((info >> 8) & 7, 3 | 5 | 6)
+                        && observer.events.config.exceptions & (1 << vector.min(63)) != 0
+                    {
+                        let owned = kinds.iter().enumerate().fold(0, |mask, (index, kind)| {
+                            mask | if *kind == 0 { 0 } else { 1 << index }
+                        });
+                        if vector != 1
+                            || boot.last_qualification & 0xe00f & !owned != 0
+                            || boot.last_qualification & owned == 0
+                        {
                             record_event(
                                 observer,
                                 boot,
                                 configuration,
                                 context,
                                 Event {
-                                    kind: EVENT_CONTEXT,
-                                    detail: reason,
+                                    kind: EVENT_EXCEPTION,
+                                    detail: info,
+                                    auxiliary: if info & (1 << 11) != 0 {
+                                        read(VM_EXIT_INTR_ERROR_CODE)?
+                                    } else {
+                                        0
+                                    },
+                                    address: if vector == 14 {
+                                        boot.last_qualification
+                                    } else {
+                                        0
+                                    },
                                     ..Event::default()
                                 },
                             );
-                        }
-                    }
-                    if reason == 0 && context.cpl == 3 {
-                        let info = read(VM_EXIT_INTR_INFO)?;
-                        let vector = info & 255;
-                        if info & (1 << 31) != 0
-                            && matches!((info >> 8) & 7, 3 | 5 | 6)
-                            && observer.events.config.exceptions & (1 << vector.min(63)) != 0
-                        {
-                            let owned = kinds.iter().enumerate().fold(0, |mask, (index, kind)| {
-                                mask | if *kind == 0 { 0 } else { 1 << index }
-                            });
-                            if vector != 1
-                                || boot.last_qualification & 0xe00f & !owned != 0
-                                || boot.last_qualification & owned == 0
-                            {
-                                record_event(
-                                    observer,
-                                    boot,
-                                    configuration,
-                                    context,
-                                    Event {
-                                        kind: EVENT_EXCEPTION,
-                                        detail: info,
-                                        auxiliary: if info & (1 << 11) != 0 {
-                                            read(VM_EXIT_INTR_ERROR_CODE)?
-                                        } else {
-                                            0
-                                        },
-                                        address: if vector == 14 {
-                                            boot.last_qualification
-                                        } else {
-                                            0
-                                        },
-                                        ..Event::default()
-                                    },
-                                );
-                            }
                         }
                     }
                 }
@@ -5044,12 +5050,13 @@ pub(crate) mod runtime {
                     unsafe { &mut *fx_state.cast::<[u8; 512]>() },
                 ),
                 1 => (|| {
-                    if session.is_active()
+                    if !frame.is_null()
+                        && session.is_active()
                         && boot.interception.snapshot_pending[0] != 0
                         && matches!(boot.last_reason & 0xffff, 10 | 28 | 29 | 31 | 32 | 48 | 59)
                         && read(GUEST_RIP)? != boot.interception.snapshot_pending[3]
                     {
-                        if frame.is_null() || !(frame as usize).is_multiple_of(8) {
+                        if !(frame as usize).is_multiple_of(8) {
                             return Err(());
                         }
                         finish_snapshot(

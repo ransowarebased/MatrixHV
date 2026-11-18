@@ -61,6 +61,8 @@ struct Firmware {
     callbacks: Option<Vec<usize>>,
     who_error: Option<usize>,
     count_error: Option<Status>,
+    mp_missing: bool,
+    confirmed_single_processor: bool,
     info_error: Option<usize>,
     startup_error: Option<Status>,
     startup_count: usize,
@@ -83,6 +85,8 @@ impl Firmware {
             callbacks: None,
             who_error: None,
             count_error: None,
+            mp_missing: false,
+            confirmed_single_processor: false,
             info_error: None,
             startup_error: None,
             startup_count: 0,
@@ -98,6 +102,10 @@ thread_local! {
     static CURRENT_PROCESSOR: Cell<usize> = const { Cell::new(0) };
 }
 
+fn confirmed_single_processor() -> bool {
+    FIRMWARE.with(|firmware| firmware.borrow().confirmed_single_processor)
+}
+
 mod uefi {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct Status(u8);
@@ -107,6 +115,7 @@ mod uefi {
         pub const ACCESS_DENIED: Self = Self(2);
         pub const DEVICE_ERROR: Self = Self(3);
         pub const TIMEOUT: Self = Self(4);
+        pub const NOT_FOUND: Self = Self(5);
     }
 
     pub struct Error(pub Status);
@@ -160,6 +169,9 @@ mod uefi {
 
         pub fn get_handle_for_protocol<P>() -> Result<usize, Error> {
             assert!(core::any::type_name::<P>().ends_with("MpServices"));
+            if FIRMWARE.with(|firmware| firmware.borrow().mp_missing) {
+                return Err(Error(Status::NOT_FOUND));
+            }
             Ok(1)
         }
 
@@ -405,6 +417,22 @@ fn empty_batch_succeeds_only_when_no_ap_is_enabled() {
     reset(&[true, false, false]);
     assert_eq!(run_batch(&[], None), (Ok(()), Vec::new()));
     FIRMWARE.with(|firmware| assert_eq!(firmware.borrow().startup_count, 0));
+}
+
+#[test]
+fn missing_mp_services_require_a_confirmed_bsp_only_topology() {
+    reset(&[true]);
+    FIRMWARE.with(|firmware| firmware.borrow_mut().mp_missing = true);
+    assert_eq!(
+        run_batch(&[], None).0,
+        Err(ResidentProbeError::Allocation(Status::NOT_FOUND))
+    );
+    FIRMWARE.with(|firmware| firmware.borrow_mut().confirmed_single_processor = true);
+    assert_eq!(run_batch(&[], None).0, Ok(()));
+    assert_eq!(
+        run_batch(&[1], None).0,
+        Err(ResidentProbeError::Allocation(Status::NOT_FOUND))
+    );
 }
 
 #[test]

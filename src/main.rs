@@ -16,21 +16,20 @@ use uefi::{Status, entry};
 
 #[entry]
 fn main() -> Status {
-    crate::logging::set_enabled(true);
-    crate::diagnostics::begin();
-    crate::logging::phase("logger.detect_com1");
-    crate::logging::initialize();
-    crate::logging::phase("boot.entry");
     let active_config = match crate::boot::firmware::load_from_boot_volume() {
         Ok(config) => config,
         Err(error) => {
+            crate::logging::initialize(true);
+            crate::diagnostics::begin();
             crate::logging::error(format_args!("failed to load \\MatrixConfig.bin: {error:?}"));
             crate::diagnostics::hold_on_failure();
             return Status::ABORTED;
         }
     };
     crate::boot::guest::configure(active_config);
-    crate::logging::set_enabled(active_config.logger);
+    crate::logging::initialize(active_config.logger);
+    crate::diagnostics::begin();
+    crate::logging::phase("boot.entry");
     crate::logging::info(format_args!(
         "config cpuidpresence={} logger={} vt_nested={} vt_evmcs={} vmx_test={}",
         active_config.cpuid_presence,

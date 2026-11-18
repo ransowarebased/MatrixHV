@@ -22,6 +22,7 @@ const CR3: usize = VMCS + 12;
 const TR_AR: usize = VMCS + 13;
 const PDPTR0: usize = VMCS + 14;
 const PDPTE_HOST: usize = 39;
+const EXPOSE_VMX: usize = 14;
 const PE: u64 = 1;
 const ET: u64 = 1 << 4;
 const NE: u64 = 1 << 5;
@@ -45,6 +46,7 @@ fn context() -> [u64; 40] {
     context[4] = VMXE;
     context[5] = 0x01ff_ffff;
     context[13] = 48;
+    context[EXPOSE_VMX] = 1;
     context[CR0] = PE | ET | NE;
     context[CR0_SHADOW] = PE | ET | NE;
     context[CR0_MASK] = PG | CD | NW | NE | PE;
@@ -86,6 +88,25 @@ fn invalid_cr4_reserved_bits_fault_before_shadow_and_nested_state_changes() {
     let mut context = context();
     context[5] &= !(1 << 22);
     reject(context, 4, VMXE | (1 << 22));
+}
+
+#[test]
+fn cr4_honors_the_nested_vmx_policy_before_committing_a_write() {
+    let mut denied = context();
+    denied[EXPOSE_VMX] = 0;
+    reject(denied, 4, VMXE);
+    assert_eq!(write(&mut denied, 4, PAE), 1);
+    assert_eq!(denied[CR4_SHADOW], PAE);
+}
+
+#[test]
+fn clts_and_lmsw_preserve_unmodified_cr0_bits() {
+    let mut cpu = context();
+    assert_eq!(write(&mut cpu, 0x30 | (0x8 << 16), 0), 1);
+    assert_eq!(cpu[CR0] & 15, 9);
+    assert_eq!(write(&mut cpu, 0x20, 0), 1);
+    assert_eq!(cpu[CR0] & 15, 1);
+    assert_eq!(cpu[CR0] & (ET | NE), ET | NE);
 }
 
 fn long_context() -> [u64; 40] {
