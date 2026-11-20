@@ -635,6 +635,15 @@ mod hyperv_time {
     }
 
     #[test]
+    fn native_vapic_exposes_assist_page_access_without_enlightened_vmcs() {
+        let mut scenario = Scenario::new();
+        scenario.context[4] = 0;
+        scenario.context[8] = 1;
+        assert_ne!(scenario.features(0x4000_0003)[0] & (1 << 4), 0);
+        assert_eq!(scenario.features(0x4000_000a), [0; 4]);
+    }
+
+    #[test]
     fn cpuid_exposes_reference_time_only_when_supported_and_keeps_evmcs_optional() {
         let mut scenario = Scenario::new();
         assert_eq!(scenario.features(0x4000_0003), [0x272, 0, 0, 0]);
@@ -1161,6 +1170,20 @@ mod msr {
     }
 
     #[test]
+    fn native_vapic_routes_synthetic_apic_msrs_without_evmcs() {
+        for (synthetic_msr, native_msr) in [(0x40000070, 0x80b), (0x40000071, 0x830), (0x40000072, 0x808)] {
+            let mut context = [0_u64, 0xfee00c00, 0, 0, 0, 1];
+            let mut registers = [0, synthetic_msr, 0];
+            assert_eq!(unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) }, 1);
+            assert_eq!(context[2], native_msr);
+        }
+        let mut context = [0_u64, 0xfee00c00, 0, 0, 0, 0];
+        let mut registers = [0, 0x40000070, 0];
+        assert_eq!(unsafe { test_hyperv_apic(context.as_mut_ptr(), registers.as_mut_ptr(), 1) }, 1);
+        assert_eq!(context[2], 0x40000070);
+    }
+
+    #[test]
     fn hyperv_apic_routes_x2apic_access_and_rejects_reserved_writes() {
         for (synthetic_msr, native_msr) in [
             (0x4000_0070, 0x80b),
@@ -1382,7 +1405,7 @@ mod msr {
 
     unsafe extern "C" {
         fn test_merge_msr_bitmaps(l0: *const u8, composed: *mut u8, l1: *const u8);
-        fn test_update_msr_policy(bitmap_slot: *const u64, phase: *const u32) -> u64;
+        fn test_update_msr_policy(bitmap_slot: *mut u64, phase: *const u32) -> u64;
     }
 
     #[test]
@@ -1400,11 +1423,12 @@ mod msr {
     fn completed_update_changes_only_the_hwp_write_bit_and_keeps_l1_policy() {
         for phase in 0_u32..=8 {
             let mut l0 = ResidentPages::new();
-            let bitmap_slot = l0.bytes.as_mut_ptr() as u64;
+            let mut bitmap_slot = [l0.bytes.as_mut_ptr() as u64, 1];
             assert_eq!(
-                unsafe { test_update_msr_policy(&bitmap_slot, &phase) },
+                unsafe { test_update_msr_policy(bitmap_slot.as_mut_ptr(), &phase) },
                 0x1234
             );
+            assert_eq!(bitmap_slot[1], u64::from(phase != 5));
             for (offset, byte) in l0.bytes.iter().copied().enumerate() {
                 let expected = if phase == 5 && offset == 0x8ee {
                     0xef
@@ -1430,7 +1454,9 @@ mod msr {
                 assert!(composed.intercepts(0x774, false));
             }
         }
-        assert_eq!(unsafe { test_update_msr_policy(&0, &5) }, 0x1234);
+        let mut absent = [0, 1];
+        assert_eq!(unsafe { test_update_msr_policy(absent.as_mut_ptr(), &5) }, 0x1234);
+        assert_eq!(absent[1], 1);
     }
 
     #[test]
@@ -2108,6 +2134,23 @@ mod telemetry {
     }
 
     #[test]
+    fn nested_memory_diagnostic_is_bounded_and_preserves_full_entry_bits() {
+        let mut context = [0; 1024];
+        let mut shared = [0; 1024];
+        let first = offset("b_nested_memory_diagnostics");
+        let fields = [2, 4, 0x1234_5678_9000, 0x8000_0000_1234_0037, 39, 1];
+        context[first..first + 6].copy_from_slice(&fields);
+        for index in 0..3 {
+            let values = diagnostic(&mut context, &mut shared, 0x3a0 + index);
+            let left = u64::from(values[0]) | (u64::from(values[1]) << 32);
+            let right = u64::from(values[2]) | (u64::from(values[3]) << 32);
+            assert_eq!([left, right], [fields[index as usize * 2], fields[index as usize * 2 + 1]]);
+        }
+        assert_eq!(diagnostic(&mut context, &mut shared, 0x3a3), [0; 4]);
+        assert_eq!(&context[first..first + 6], &fields);
+    }
+
+    #[test]
     fn callback_identity_reports_the_retained_image_and_each_entry_point() {
         let mut context = [0; 1024];
         let mut shared = [0; 1024];
@@ -2221,6 +2264,48 @@ mod telemetry {
         );
         assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 8), [0; 4]);
         assert_eq!(diagnostic(&mut context, &mut shared, 36), [2, 0, 0, 0]);
+    }
+
+    #[test]
+    fn l2_wrmsr_remote_queries_preserve_full_width_counters_and_bound_the_profile() {
+        let mut context = [0; 1024];
+        let mut remote = [0_u64; 1024];
+        let mut shared = [0; 1024];
+        shared[offset("event_cpu_contexts") + 1] = remote.as_mut_ptr() as u64;
+        for index in 0..14 {
+            remote[offset("b_nested_l2_wrmsr_profile") + index] =
+                0x1234567800000000 + index as u64;
+        }
+        remote[offset("b_nested_vmcs12_primary_control")] = 1 << 31;
+        remote[offset("b_nested_vmcs12_secondary_control")] = 0x12;
+        remote[offset("b_nested_last_merged_secondary_controls")] = 0x92;
+        std::hint::black_box(&remote);
+        for index in 0..7 {
+            assert_eq!(diagnostic(&mut context, &mut shared, (2 << 16) | (0x390 + index)),
+                [index * 2, 0x12345678, index * 2 + 1, 0x12345678]);
+        }
+        assert_eq!(diagnostic(&mut context, &mut shared, (2 << 16) | 0x397), [0x12, 0, 0x92, 0]);
+        remote[offset("b_nested_vmcs12_primary_control")] = 0;
+        std::hint::black_box(&remote);
+        assert_eq!(diagnostic(&mut context, &mut shared, (2 << 16) | 0x397), [0, 0, 0x92, 0]);
+        assert_eq!(diagnostic(&mut context, &mut shared, (2 << 16) | 0x398), [0; 4]);
+        assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 0x390), [0; 4]);
+    }
+
+    #[test]
+    fn remote_ept_revalidation_diagnostics_are_full_width_and_bounded() {
+        let mut context = [0; 1024];
+        let mut remote = [0_u64; 1024];
+        let mut shared = [0; 1024];
+        shared[offset("event_cpu_contexts") + 1] = remote.as_mut_ptr() as u64;
+        let base = offset("b_nested_ept02_revalidation_stats");
+        remote[base..base + 4].copy_from_slice(&[0x1122334455667788, 2, 4096, 512]);
+        std::hint::black_box(&remote);
+        assert_eq!(diagnostic(&mut context, &mut shared, (2 << 16) | 0x3b0),
+            [0x55667788, 0x11223344, 2, 0]);
+        assert_eq!(diagnostic(&mut context, &mut shared, (2 << 16) | 0x3b1), [4096, 0, 512, 0]);
+        assert_eq!(diagnostic(&mut context, &mut shared, (2 << 16) | 0x3b2), [0; 4]);
+        assert_eq!(diagnostic(&mut context, &mut shared, (3 << 16) | 0x3b0), [0; 4]);
     }
 
     #[test]

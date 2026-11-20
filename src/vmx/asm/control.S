@@ -155,7 +155,8 @@ call .Lresident_control_capture_native
 .Lresident_dispatch_memory:
 // Packet address and byte count are carried in guest RDX and R8.
 cmp qword ptr [r12 + {b_nested_l2_active}], 0
-jne .Lresident_memory_unsupported
+jne .Lresident_nested_memory_request
+.Lresident_memory_context_ready:
 mov eax, {vm_entry_controls}
 vmread rax, rax
 jna .Lresident_dispatch_vmread_failed
@@ -472,6 +473,7 @@ test r11, r11
 jz .Lresident_update_msr_policy_done
 // VMCS02 still ORs L1 intercepts into its separate composed bitmap.
 lock and byte ptr [r11 + {hwp_request_write_byte}], {hwp_request_write_mask}
+mov qword ptr [r12 + {b_nested_msr_bitmap_cached_mode}], 0
 .Lresident_update_msr_policy_done:
 ret
 .Lresident_update_retire_nested:

@@ -6,6 +6,9 @@ use access::{PhysicalMemory, execute, transfer, translate};
 use neo::memory::{Item, packet};
 use std::collections::BTreeMap;
 
+#[path = "nested_memory_tests.rs"]
+mod nested_memory_tests;
+
 #[derive(Default)]
 struct Ram {
     pages: BTreeMap<u64, Vec<u8>>,

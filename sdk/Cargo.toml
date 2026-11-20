@@ -8,6 +8,11 @@ description = "MatrixHV instrumentation ABI and Rust client API"
 [lib]
 path = "src/lib.rs"
 
+[[example]]
+name = "l2_memory_probe"
+path = "../tests/l2_memory_probe.rs"
+required-features = ["client"]
+
 [features]
 default = ["client"]
 client = []

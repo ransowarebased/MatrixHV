@@ -63,6 +63,22 @@ mov ecx, dword ptr [r9 + {event_post_ebs_cpu_mask}]
 mov edx, dword ptr [r9 + {event_halted_cpu_mask}]
 jmp .Lresident_dispatch_cpuid_diagnostic_store
 .Lresident_dispatch_cpuid_diagnostic_extended:
+cmp ecx, {ept_revalidation_subleaf}
+jb .Lresident_dispatch_cpuid_revalidation_done
+cmp ecx, {ept_revalidation_subleaf} + 2
+jb .Lresident_dispatch_cpuid_revalidation
+.Lresident_dispatch_cpuid_revalidation_done:
+cmp ecx, {l2_memory_diagnostic_subleaf}
+jb .Lresident_dispatch_cpuid_memory_diagnostics_done
+cmp ecx, {l2_memory_diagnostic_subleaf} + 3
+jb .Lresident_dispatch_cpuid_memory_diagnostics
+.Lresident_dispatch_cpuid_memory_diagnostics_done:
+cmp ecx, {l2_wrmsr_profile_subleaf}
+jb .Lresident_dispatch_cpuid_l2_wrmsr_profile_done
+cmp ecx, {l2_wrmsr_profile_subleaf} + {l2_wrmsr_profile_words} / 2
+jb .Lresident_dispatch_cpuid_l2_wrmsr_profile
+je .Lresident_dispatch_cpuid_l2_apic_controls
+.Lresident_dispatch_cpuid_l2_wrmsr_profile_done:
 cmp ecx, {vmcall_snapshot_subleaf}
 jb .Lresident_dispatch_cpuid_vmcall_snapshot_done
 cmp ecx, {vmcall_snapshot_subleaf} + {vmcall_snapshot_words} / 2
@@ -104,6 +120,8 @@ cmp ecx, 33
 je .Lresident_dispatch_cpuid_fault_high
 cmp ecx, 34
 je .Lresident_dispatch_cpuid_capabilities
+cmp ecx, {resident_session_subleaf}
+je .Lresident_dispatch_cpuid_resident_session
 cmp ecx, 35
 je .Lresident_dispatch_cpuid_lease
 cmp ecx, 36
@@ -206,6 +224,26 @@ jmp .Lresident_dispatch_cpuid_vmx_pair
 sub ecx, 4
 lea r9, [rip + .Lresident_diagnostic_pair_offsets]
 jmp .Lresident_dispatch_cpuid_pair_load
+.Lresident_dispatch_cpuid_l2_wrmsr_profile:
+sub ecx, {l2_wrmsr_profile_subleaf}
+lea r10, [r8 + {b_nested_l2_wrmsr_profile}]
+jmp .Lresident_dispatch_cpuid_ept_diagnostic_pair
+.Lresident_dispatch_cpuid_revalidation:
+sub ecx, {ept_revalidation_subleaf}
+lea r10, [r8 + {b_nested_ept02_revalidation_stats}]
+jmp .Lresident_dispatch_cpuid_ept_diagnostic_pair
+.Lresident_dispatch_cpuid_memory_diagnostics:
+sub ecx, {l2_memory_diagnostic_subleaf}
+lea r10, [r8 + {b_nested_memory_diagnostics}]
+jmp .Lresident_dispatch_cpuid_ept_diagnostic_pair
+.Lresident_dispatch_cpuid_l2_apic_controls:
+xor eax, eax
+bt dword ptr [r8 + {b_nested_vmcs12_primary_control}], 31
+jnc .Lresident_dispatch_cpuid_l2_apic_controls_ready
+mov eax, dword ptr [r8 + {b_nested_vmcs12_secondary_control}]
+.Lresident_dispatch_cpuid_l2_apic_controls_ready:
+mov rdx, qword ptr [r8 + {b_nested_last_merged_secondary_controls}]
+jmp .Lresident_dispatch_cpuid_vmx_pair
 .Lresident_dispatch_cpuid_profile_pair:
 sub ecx, 38
 lea r9, [rip + .Lresident_profile_pair_offsets]
@@ -218,6 +256,20 @@ mov rcx, rdx
 shr rdx, 32
 mov rbx, rax
 shr rbx, 32
+jmp .Lresident_dispatch_cpuid_diagnostic_store
+.Lresident_dispatch_cpuid_resident_session:
+// Only aligned atomic scalar observations from the L0-owned allocation.
+// This is not an L2 session inventory or a coherent profile snapshot.
+mov r10, qword ptr [r9 + {event_interception_context}]
+xor eax, eax
+xor ebx, ebx
+xor ecx, ecx
+xor edx, edx
+test r10, r10
+jz .Lresident_dispatch_cpuid_diagnostic_store
+mov eax, 1
+mov ebx, dword ptr [r10 + {interception_active}]
+mov ecx, dword ptr [r10 + {interception_cause}]
 jmp .Lresident_dispatch_cpuid_diagnostic_store
 .Lresident_dispatch_cpuid_nested_state:
 mov eax, dword ptr [r8 + {b_nested_active}]

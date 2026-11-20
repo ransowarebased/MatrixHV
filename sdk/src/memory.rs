@@ -763,7 +763,18 @@ pub fn invoke(bytes: &mut [u8]) -> Result<(), String> {
             );
         }
         if signature != MEMORY_SIGNATURE {
-            return Err("MatrixHV memory transport is unavailable; boot the updated EFI and enable MatrixHV on this CPU".into());
+            let state = crate::runtime::query();
+            return Err(if state.present {
+                if state.caller_l2 && !state.l2_memory_advertised {
+                    "MatrixHV memory transport is unavailable from L2; L0 diagnostics remain available, but L2 memory access is unsupported"
+                } else if state.caller_l2 {
+                    "MatrixHV memory transport is unavailable from L2 despite advertised support; L0 diagnostics remain available"
+                } else {
+                    "MatrixHV memory transport is unavailable on this CPU; L0 is present; advertised capabilities do not establish transport availability"
+                }
+            } else {
+                "MatrixHV is not present on this CPU"
+            }.into());
         }
         if status != 0 {
             bytes[40..44].copy_from_slice(&(status as u32).to_le_bytes());
@@ -807,6 +818,7 @@ pub fn status_text(status: u32) -> &'static str {
         13 => "virtual page mapping changed during the session",
         14 => "original write committed; a page merge conflict revoked interception",
         15 => "original write committed; interception refresh or retirement failed",
+        16 => "L2 target bytes were written but response delivery failed; do not retry blindly",
         ROAD_STATUS_DEMAND_ZERO => "DEMAND_ZERO (zero-filled read)",
         _ => "unknown status",
     }

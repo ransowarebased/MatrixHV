@@ -63,6 +63,8 @@ def run_component(project, component, release=False):
         execute([str(proof_binary)], project)
     if component == "nested":
         execute([sys.executable, str(project / "tests/run_nested_probe_tests.py")], project)
+        execute([sys.executable, str(project / "tests/run_nested_host_restore_tests.py")], project)
+        execute([sys.executable, str(project / "tests/run_l2_kernel_root_tests.py")], project)
 
 
 def main():

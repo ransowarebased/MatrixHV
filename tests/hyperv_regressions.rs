@@ -1,5 +1,63 @@
 include!("../builds/evmcs-tests/physical-width.rs");
 
+#[test]
+fn clean_evmcs_imports_every_ungrouped_input_and_invalidates_caches_on_remap() {
+    use crate::hyperv::EnlightenedVmcs;
+    use std::mem::offset_of;
+    let mut assist = Box::new(EvmcsTestPage([0; 4096]));
+    let mut page = Box::new(EvmcsTestPage([0; 4096]));
+    let mut replacement = Box::new(EvmcsTestPage([0; 4096]));
+    let mut state = nested_state(0);
+    let address = page.0.as_ptr() as u64;
+    state.evmcs_enabled = 1;
+    state.vp_assist_msr = assist.0.as_ptr() as u64 | 1;
+    let mut ept = EvmcsTestEpt::new(&mut state);
+    ept.map(state.vp_assist_msr & !4095, state.vp_assist_msr & !4095, 7);
+    ept.map(address, address, 7);
+    assist.0[crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET..][..4]
+        .copy_from_slice(&1_u32.to_le_bytes());
+    write_page_u64(&mut assist, crate::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET, address);
+    page.0[..4].copy_from_slice(&crate::hyperv::EVMCS_VERSION.to_le_bytes());
+    page.0[offset_of!(EnlightenedVmcs, enlightenments_control)..][..4]
+        .copy_from_slice(&2_u32.to_le_bytes());
+    assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
+    assert_eq!(state.evmcs_clean_fields, 0);
+    assert_eq!(state.evmcs_enlightenments_control, 2);
+    state.evmcs_entry_validated = 1;
+    state.msr_bitmap_cached_mode = 1;
+    page.0[offset_of!(EnlightenedVmcs, clean_fields)..][..4]
+        .copy_from_slice(&0x7fff_u32.to_le_bytes());
+    let always = [5, 6, 7, 9, 10, 12, 96, 97, 98, 99, 100, 103, 104, 105];
+    let fields = field_map();
+    for index in always {
+        let (offset, flags) = fields[index];
+        let value = (index as u64 + 1) * 0x1001;
+        page.0[offset..offset + usize::from(flags & 15)]
+            .copy_from_slice(&value.to_le_bytes()[..usize::from(flags & 15)]);
+    }
+    write_page_u64(&mut page, offset_of!(EnlightenedVmcs, guest_cr3), 0x12345000);
+    assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
+    for index in always {
+        assert_eq!(state.vmcs12.extended_fields[index], (index as u64 + 1) * 0x1001);
+    }
+    assert_eq!(state.vmcs12.extended_fields[30], 0);
+    assert_eq!(state.evmcs_entry_validated, 1);
+    assert_eq!(state.msr_bitmap_cached_mode, 1);
+    page.0[offset_of!(EnlightenedVmcs, clean_fields)..][..4]
+        .copy_from_slice(&(0x7fff_u32 & !(1 << 6)).to_le_bytes());
+    assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
+    assert_eq!(state.evmcs_entry_validated, 0);
+    replacement.0[..4].copy_from_slice(&crate::hyperv::EVMCS_VERSION.to_le_bytes());
+    replacement.0[offset_of!(EnlightenedVmcs, clean_fields)..][..4]
+        .copy_from_slice(&0x7fff_u32.to_le_bytes());
+    ept.map(address, replacement.0.as_ptr() as u64, 7);
+    state.evmcs_entry_validated = 1;
+    assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
+    assert_eq!(state.evmcs_clean_fields, 0);
+    assert_eq!(state.evmcs_entry_validated, 0);
+    assert_eq!(state.msr_bitmap_cached_mode, 0);
+}
+
 unsafe extern "win64" {
     fn test_entry_event(state: *mut NestedVmxState) -> u32;
     fn test_tsc_composition(state: *mut NestedVmxState) -> u64;

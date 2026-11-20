@@ -886,6 +886,78 @@ pub(crate) mod resident {
         }
     }
 
+    impl crate::memory::nested::HostMemory for Memory<'_> {
+        fn kernel_roots(
+            &mut self,
+            ept12: u64,
+            syscall: u64,
+            cr4: u64,
+            roots: &mut [u64; ROOT_HISTORY_COUNT],
+        ) {
+            roots.fill(0);
+            #[cfg(target_os = "uefi")]
+            if self.environment.boot_context != 0 {
+                use crate::vmx::resident::abi::{ResidentBootContext, ResidentEventContext};
+                let boot = self.environment.boot_context as *const ResidentBootContext;
+                let event = unsafe { (*boot).event_context } as *const ResidentEventContext;
+                if !event.is_null() {
+                    for cpu in unsafe { &(*event).cpu_contexts } {
+                        if *cpu == 0 {
+                            continue;
+                        }
+                        let cpu = *cpu as *const ResidentBootContext;
+                        let entries = unsafe {
+                            core::ptr::addr_of!((*cpu).nested.kernel_roots).cast::<[u64; 4]>()
+                        };
+                        for index in 0..8 {
+                            let observed = unsafe { entries.add(index).read_volatile() };
+                            crate::memory::nested::admit_kernel_root(
+                                observed, ept12, syscall, cr4, roots,
+                            );
+                        }
+                    }
+                }
+            }
+            let _ = (ept12, syscall, cr4);
+        }
+        fn record(&mut self, phase: u64, address: u64, entry: u64, level: u64, status: u64) {
+            #[cfg(target_os = "uefi")]
+            if self.environment.boot_context != 0 {
+                let boot = self.environment.boot_context
+                    as *mut crate::vmx::resident::abi::ResidentBootContext;
+                let fields = unsafe {
+                    core::ptr::addr_of_mut!((*boot).nested.memory_diagnostics).cast::<u64>()
+                };
+                // One writer per resident CPU. Odd sequence marks an active
+                // request; the private diagnostic reader checks it again.
+                unsafe {
+                    if phase == 1 {
+                        fields.write_volatile(fields.read_volatile().wrapping_add(1) | 1);
+                    }
+                    fields.add(1).write_volatile(phase);
+                    if phase <= 2 {
+                        fields.add(2).write_volatile(address);
+                        fields.add(3).write_volatile(entry);
+                        fields.add(4).write_volatile(level);
+                    }
+                    fields.add(5).write_volatile(status);
+                    if phase >= 3 {
+                        fields.write_volatile(fields.read_volatile().wrapping_add(1) & !1);
+                    }
+                }
+            }
+            let _ = (phase, address, entry, level, status);
+        }
+
+        fn validate(&mut self, address: u64, write: bool) -> Result<(), Error> {
+            self.mapped(address, write).map(|_| ())
+        }
+
+        fn synchronize(&mut self, operation: u64) -> bool {
+            self.environment.synchronize != 0 && Memory::synchronize(self, operation) != 0
+        }
+    }
+
     impl Memory<'_> {
         fn synchronize(&self, operation: u64) -> u64 {
             let callback: unsafe extern "efiapi" fn(u64, u64) -> u64 =
@@ -1267,6 +1339,34 @@ pub(crate) mod resident {
             return Error::Bounds as u64;
         }
         let environment = unsafe { &*environment };
+        #[cfg(target_os = "uefi")]
+        if environment.boot_context != 0 {
+            let boot = unsafe {
+                &*(environment.boot_context
+                    as *const crate::vmx::resident::abi::ResidentBootContext)
+            };
+            if boot.nested.l2_active != 0 {
+                let mut environment = *environment;
+                environment.ept = boot.nested.ept01_pointer;
+                environment.kernel_cr3 = 0;
+                environment.root_history = 0;
+                environment.interception_session = 0;
+                environment.tracking_session = 0;
+                let mut memory = Memory {
+                    environment: &environment,
+                };
+                let packet = unsafe { core::slice::from_raw_parts_mut(scratch, length) };
+                return crate::memory::nested::request(
+                    &mut memory,
+                    &environment,
+                    boot.nested.ept12_pointer,
+                    caller_address,
+                    packet,
+                )
+                .err()
+                .map_or(0, |error| error as u64);
+            }
+        }
         let la57 = environment.guest_cr4 & (1 << 12) != 0;
         let physical_bits = environment.physical_bits as u32;
         let mut memory = Memory { environment };

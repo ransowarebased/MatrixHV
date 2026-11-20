@@ -31,7 +31,7 @@ def read_resident_assembly(project: Path) -> str:
     macros = "\n".join(
         (project / "src/asm" / name if name in ("diagnostics.S", "ap_startup.S")
          else assembly / name).read_text(encoding="utf-8")
-        for name in ("nested.S", "hyperv.S", "exits.S", "msr.S", "control.S", "diagnostics.S", "boot_diagnostics.S", "ept_cache.S", "eptp_switch.S", "ap_startup.S")
+        for name in ("nested.S", "nested_intercept.S", "hyperv.S", "exits.S", "msr.S", "control.S", "diagnostics.S", "boot_diagnostics.S", "ept_cache.S", "eptp_switch.S", "ap_startup.S")
     )
     lines = macros.splitlines(keepends=True)
     definitions = {}
@@ -855,7 +855,7 @@ def prepare_native_shadow(project: Path):
         "vmptrld_invalid_physical_address_error": 9, "vmptrld_vmxon_pointer_error": 10,
         "vmptrld_incorrect_revision_error": 11,
         "vmcs_unsupported_component_error": 12,
-        "vmwrite_read_only_component_error": 13, "vmcs12_extended_field_count": 122,
+        "vmwrite_read_only_component_error": 13, "vmcs12_extended_field_count": 127,
         "vmcs_field_guest_rip": 0x681e, "vmcs_field_guest_rsp": 0x681c,
         "vmcs_field_guest_rflags": 0x6820, "vmcs_field_host_rsp": 0x6c14,
         "vmcs_field_host_rip": 0x6c16, "vmcs_field_instruction_error": 0x4400,
@@ -871,7 +871,7 @@ def prepare_native_shadow(project: Path):
     cursor = 0
     for name in fields:
         offsets[name] = cursor
-        cursor += 122 * 8 if name == "b_nested_vmcs12_extended_fields" else 8
+        cursor += 127 * 8 if name == "b_nested_vmcs12_extended_fields" else 8
     values = constants | offsets
     assembly = re.sub(r"\{(\w+)\}", lambda match: str(values[match[1]]), assembly)
     (output / "handlers.S").write_text(assembly, encoding="utf-8")
@@ -1018,6 +1018,7 @@ def prepare_nested_ept(project: Path):
         "inc qword ptr [r12 + {test_flushes}]\n"
         "mov qword ptr [r12 + {test_kind}], rax\n"
         "mov rax, qword ptr [rsp]\nmov qword ptr [r12 + {test_tag}], rax\n"
+        "mov rax, qword ptr [rsp + 8]\nmov qword ptr [r12 + {test_linear}], rax\n"
         "mov eax, 1\ntest eax, eax",
     ).replace(
         "call .Lresident_nested_write_vmcs02_control",
@@ -1109,6 +1110,8 @@ def prepare_nested_ept(project: Path):
         ".Lresident_nested_write_vmcs02_control", ".Ltest_capture_vmcs02_control"
     )
     merge_assembly = merge_assembly.replace("mov rax, 0x2026", "mov rax, 3").replace("mov rax, 0x2028", "mov rax, 4")
+    for index, encoding in enumerate([0x201c, 0x201e, 0x2020, 0x2022]):
+        merge_assembly = merge_assembly.replace(f"mov rax, {encoding:#x}", f"mov rax, {5 + index}")
     merge_assembly = merge_assembly.replace(".Lresident_nested_eptp_before_root_write", ".Ltest_shadow_root_write").replace(".Lresident_ept01_page_is_readable", ".Ltest_shadow_translate")
     merge_assembly += (
         "\nret\n.Ltest_capture_vmcs02_control:\n"
@@ -1153,6 +1156,16 @@ def prepare_nested_regressions(project: Path):
         begin = source.index(start)
         return source[begin:source.index(end, begin)]
     assembly = "\n".join([
+        block('.Lresident_nested_profile_l2_wrmsr:', '.Lresident_nested_msr_exit_requested:'),
+        '.Ltest_instruction_context:\n' + block(
+            'movzx eax, r10w\ncmp eax, 63',
+            '.Lresident_nested_l2_instruction_context_ready:',
+        ) + '.Lresident_nested_l2_instruction_context_ready:\nret\n',
+        '.Ltest_x2apic_dependencies:\n' + block(
+            '.Lresident_nested_validate_tpr_shadow_done:',
+            'mov r11, qword ptr [r12 + {b_nested_vmcs12_vm_exit_msr_store_addr}]',
+        ).replace('.Lresident_nested_validate_invalid_controls', '.Ltest_x2apic_invalid')
+        + 'mov eax, 1\nret\n.Ltest_x2apic_invalid:\nxor eax, eax\nret\n',
         block('.Lresident_nested_msr_exit_requested:', '.Lresident_nested_read_gpr:'),
         block('.Lresident_nested_operand_width:', '.Lresident_nested_physical_address_is_valid:'),
         block('.Lresident_ept01_page_is_readable:', '.Lresident_dispatch_xsetbv:'),
@@ -1197,6 +1210,7 @@ def prepare_nested_regressions(project: Path):
         'vm_entry_intr_info_field': 13, 'vm_entry_exception_error_code': 14,
         'exit_intr_info': 13, 'exit_intr_error_code': 14,
         'rdmsr_reason': 31, 'wrmsr_reason': 32,
+        'exit_instruction_info': 16, 'guest_linear_address': 17,
         'nested_guest_msr_list_capacity': 512,
         'spec_ctrl_msr': 0x48, 'kernel_gs_base_msr': 0xc0000102,
         'tsc_aux_msr': 0xc0000103, 'star_msr': 0xc0000081,
@@ -1241,7 +1255,24 @@ def prepare_nested_regressions(project: Path):
         je .Ltest_regression_route_msr
         cmp edx, 10
         je .Ltest_regression_internal
+        cmp edx, 11
+        je .Ltest_regression_profile
+        cmp edx, 12
+        je .Ltest_regression_x2apic_dependencies
+        cmp edx, 13
+        je .Ltest_regression_instruction_context
         ud2
+    .Ltest_regression_profile:
+        mov ecx, r8d
+        call .Lresident_nested_profile_l2_wrmsr
+        jmp .Ltest_regression_return
+    .Ltest_regression_x2apic_dependencies:
+        call .Ltest_x2apic_dependencies
+        jmp .Ltest_regression_return
+    .Ltest_regression_instruction_context:
+        mov r10, r8
+        call .Ltest_instruction_context
+        jmp .Ltest_regression_return
     .Ltest_regression_read:
         mov ecx, r8d
         call .Lresident_nested_read_operand_range
@@ -1345,6 +1376,7 @@ def prepare_nested_regressions(project: Path):
         pop rbx
         ret
     .Ltest_regression_vmread:
+        inc qword ptr [r12 + {test_vmreads}]
         mov r11, [r12 + {test_vmcs} + rax * 8]
         cmp r12, 0
         ret
@@ -1407,7 +1439,8 @@ def prepare_nested_regressions(project: Path):
     .text
     """
     assembly = wrapper + assembly
-    sizes = {'test_vmcs': 18, 'test_controls': 18, 'b_nested_operand_data': 2}
+    sizes = {'test_vmcs': 18, 'test_controls': 18, 'b_nested_operand_data': 2,
+             'b_nested_l2_wrmsr_profile': 14, 'b_nested_vmcs12_extended_fields': 127}
     offsets = {}
     cursor = 0
     for name in sorted(set(re.findall(r'\{((?:b_|test_)\w+)\}', assembly))):
@@ -2456,7 +2489,7 @@ def prepare_resident_msr(project: Path):
                            assembly_source.index('.Lresident_dispatch_rdmsr_guest_os_id:')]
     apic += assembly_source[assembly_source.index('.Lresident_dispatch_wrmsr_hyperv_apic:'):
                             assembly_source.index('.Lresident_dispatch_wrmsr_guest_os_id:')]
-    apic = apic.replace('{b_nested_evmcs_enabled}', '0').replace('{apic_base_msr}', '27')
+    apic = apic.replace('{b_nested_evmcs_enabled}', '0').replace('{b_nested_expose_vmx}', '40').replace('{apic_base_msr}', '27')
     apic = re.sub(r'^rdmsr$', 'mov rax, [r12 + 8]\nmov rdx, rax\nshr rdx, 32', apic, flags=re.MULTILINE)
     apic_wrapper = """
     .text
@@ -2743,6 +2776,7 @@ def prepare_resident_msr(project: Path):
     policy = assembly_source[policy_start:policy_end]
     hwp_index = int(re.search(r'const IA32_HWP_REQUEST_MSR: u32 = (0x[0-9a-f]+);', source)[1], 0)
     policy_constants = {"update_context_phase": 0, "b_nested_l0_msr_bitmap": 0,
+                        "b_nested_msr_bitmap_cached_mode": 8,
                         "hwp_request_write_byte": 2048 + (hwp_index >> 3),
                         "hwp_request_write_mask": 255 ^ (1 << (hwp_index & 7))}
     policy = re.sub(r'\{(\w+)\}', lambda match: str(policy_constants[match[1]]), policy)
@@ -2819,12 +2853,12 @@ def prepare_resident_telemetry(project: Path):
         if name == next(item for item in names if item.startswith("event_")):
             cursor = 0
         offsets[name] = cursor
-        cursor += 4096 if name == "event_control_cpu_states" else 1024 if name == "b_nested_exit_reason_counts" else 512 if name == "event_cpu_contexts" else (
+        cursor += 4096 if name == "event_control_cpu_states" else 48 if name == "b_nested_memory_diagnostics" else 112 if name == "b_nested_l2_wrmsr_profile" else 1024 if name == "b_nested_exit_reason_counts" else 512 if name == "event_cpu_contexts" else (
             192 * 8 if name == "b_nested_failure_trace" else (
             56 if name in {"b_watchdog_before", "b_watchdog_after", "b_watchdog_resume", "b_entry_failure_guest"}
             else 192 if name == "b_interception_runtime_diagnostics"
             else 64 if name == "b_interception_sync_diagnostics"
-            else 32 if name in {"b_nested_exit_handler_cycles", "event_callback_image_hash"} else 8
+            else 32 if name in {"b_nested_exit_handler_cycles", "b_nested_ept02_revalidation_stats", "event_callback_image_hash"} else 8
             )
         )
     constants = {
@@ -2843,6 +2877,11 @@ def prepare_resident_telemetry(project: Path):
         "exit_timing_subleaf": 55,
         "callback_identity_subleaf": 0x610,
         "vmcall_snapshot_subleaf": 0x620, "vmcall_snapshot_words": 32,
+        "l2_wrmsr_profile_subleaf": 0x390, "l2_wrmsr_profile_words": 14,
+        "ept_revalidation_subleaf": 0x3b0,
+        "l2_memory_diagnostic_subleaf": 0x3a0,
+        "resident_session_subleaf": 0x380,
+        "interception_active": 0, "interception_cause": 8,
         "guest_rip": 0, "guest_rsp": 1, "guest_rflags": 2,
         "guest_cr0": 3, "guest_cr3": 4, "guest_cr4": 5, "guest_efer": 6,
         "control_cpu_state_size": 64, "control_cpu_stage": 0, "control_cpu_phase": 8,
@@ -3358,6 +3397,21 @@ def prepare_boot_state(project: Path):
         initializer = f"            {field}: 0,\n"
         assert legacy_nested.count(declaration) == legacy_nested.count(initializer) == 1
         legacy_nested = legacy_nested.replace(declaration, "").replace(initializer, "")
+    legacy_nested = legacy_nested.replace("    pub l2_wrmsr_profile: [u64; 14],\n", "").replace(
+        "            l2_wrmsr_profile: [0; 14],\n", "")
+    legacy_nested = legacy_nested.replace("    pub memory_diagnostics: [u64; 6],\n", "").replace(
+        "            memory_diagnostics: [0; 6],\n", "")
+    legacy_nested = legacy_nested.replace("    pub kernel_root_cursor: u64,\n", "").replace(
+        "            kernel_root_cursor: 0,\n", "")
+    legacy_nested = legacy_nested.replace("    pub kernel_roots: [[u64; 4]; 8],\n", "").replace(
+        "            kernel_roots: [[0; 4]; 8],\n", "")
+    legacy_nested = legacy_nested.replace("    pub ept02_revalidation_stats: [u64; 4],\n", "").replace(
+        "            ept02_revalidation_stats: [0; 4],\n", "")
+    legacy_nested = "".join(legacy_nested.rsplit("    pub host_ept_vpid_cap: u64,\n", 1)).replace(
+        "            host_ept_vpid_cap: capabilities.host_ept_vpid_cap,\n", "")
+    for field in ("evmcs_clean_fields", "evmcs_enlightenments_control", "evmcs_entry_validated", "msr_bitmap_cached_hpa", "msr_bitmap_cached_mode"):
+        legacy_nested = legacy_nested.replace(f"    pub {field}: u64,\n", "").replace(
+            f"            {field}: 0,\n", "")
     legacy_nested = legacy_nested.replace('use super::vmcs12::', 'use crate::vmx::vmcs12::')
     (output / "legacy-nested.rs").write_text(legacy_nested, encoding="utf-8")
     legacy_abi = legacy_abi.replace('use crate::vmx::nested::NestedVmxState;',
@@ -3401,12 +3455,13 @@ def prepare_boot_state(project: Path):
     epoch_offset = session_fields["splits"] + split_size * split_count
     harness += f'assert_eq!(offset_of!(InterceptionPrefix, split_epoch), {epoch_offset});\n'
     harness += 'let nested_delta = size_of::<vmx::nested::NestedVmxState>() - size_of::<legacy_nested::NestedVmxState>();\n'
-    harness += 'assert_eq!(nested_delta, 2 * size_of::<u64>());\n'
+    harness += 'assert_eq!(nested_delta, (2 + 14 + 6 + 4 + 1 + 1 + 32 + 5) * size_of::<u64>());\n'
+    harness += 'let nested_aligned_delta = (offset_of!(legacy_abi::ResidentBootContext, original_idtr) + size_of::<[u8; 10]>() + nested_delta).next_multiple_of(std::mem::align_of::<abi::RootFxState>()) - offset_of!(legacy_abi::ResidentBootContext, root_fx_state);\n'
     harness += 'assert_eq!(size_of::<ResidentBootContext>() - size_of::<previous_boot_diagnostic_abi::ResidentBootContext>(), 272, "boot diagnostics must reject incompatible live-update packages by boot_bytes");\n'
     harness += 'assert_eq!(offset_of!(ResidentBootContext, nmi_entry_retries), offset_of!(previous_boot_diagnostic_abi::ResidentBootContext, nmi_entry_retries));\n'
     harness += 'assert_eq!(size_of::<ResidentBootContext>() - size_of::<previous_interception_abi::ResidentBootContext>(), 16, "debug ownership state must reject older live-update packages by boot_bytes");\n'
     harness += 'assert_eq!(offset_of!(ResidentBootContext, intel_pt), offset_of!(previous_interception_abi::ResidentBootContext, intel_pt) + 16);\n'
-    harness += 'assert_eq!(size_of::<ResidentBootContext>() - size_of::<legacy_abi::ResidentBootContext>(), nested_delta + 2 * size_of::<u64>(), "new nested debug and NMI state must reject legacy live-update packages by boot_bytes");\n'
+    harness += 'assert_eq!(size_of::<ResidentBootContext>() - size_of::<legacy_abi::ResidentBootContext>(), nested_aligned_delta + 2 * size_of::<u64>(), "new nested debug and NMI state must reject legacy live-update packages by boot_bytes");\n'
     for name, format_code in namespace["formats"].items():
         path = name
         displacement = ""
@@ -3415,8 +3470,8 @@ def prepare_boot_state(project: Path):
             element = "u64" if format_code == "<Q" else "u32"
             displacement = f" + {index} * size_of::<{element}>()"
         harness += f'println!("{name}={{}}", offset_of!(ResidentBootContext, {path}){displacement});\n'
-        if not name.startswith("boot_diagnostic") and name not in ("nmi_injected", "nmi_entry_retries", "nested.inherited_l1_dr7", "nested.inherited_l1_debugctl"):
-            harness += f'assert_eq!(offset_of!(ResidentBootContext, {path}), offset_of!(legacy_abi::ResidentBootContext, {path}) + if offset_of!(ResidentBootContext, {path}) >= offset_of!(ResidentBootContext, original_gdtr) {{ nested_delta }} else {{ 0 }}, "legacy field offset changed: {name}");\n'
+        if not name.startswith(("boot_diagnostic", "nested.l2_wrmsr_profile", "nested.memory_diagnostics", "nested.ept02_revalidation_stats", "nested.kernel_roots")) and name not in ("nmi_injected", "nmi_entry_retries", "nested.inherited_l1_dr7", "nested.inherited_l1_debugctl", "nested.host_ept_vpid_cap", "nested.kernel_root_cursor", "nested.evmcs_clean_fields", "nested.evmcs_enlightenments_control", "nested.evmcs_entry_validated", "nested.msr_bitmap_cached_hpa", "nested.msr_bitmap_cached_mode"):
+            harness += f'assert_eq!(offset_of!(ResidentBootContext, {path}), offset_of!(legacy_abi::ResidentBootContext, {path}) + if offset_of!(ResidentBootContext, {path}) >= offset_of!(ResidentBootContext, root_fx_state) {{ nested_aligned_delta }} else if offset_of!(ResidentBootContext, {path}) >= offset_of!(ResidentBootContext, original_gdtr) {{ nested_delta }} else {{ 0 }}, "legacy field offset changed: {name}");\n'
     harness += "}\n"
     source_path = output / "layout.rs"
     executable = output / "layout.exe"

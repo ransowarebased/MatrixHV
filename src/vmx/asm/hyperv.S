@@ -94,7 +94,10 @@ jmp .Lresident_dispatch_cpuid_advance
 .Lresident_dispatch_cpuid_evmcs_features:
 mov qword ptr [rsp + 0], {hv_base_access}
 cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+jne .Lresident_dispatch_cpuid_apic_features
+cmp qword ptr [r12 + {b_nested_expose_vmx}], 0
 je .Lresident_dispatch_cpuid_time_features
+.Lresident_dispatch_cpuid_apic_features:
 // VP Assist Page access is required before L1 can enable enlightened VM entries.
 or qword ptr [rsp + 0], {hv_apic_access}
 .Lresident_dispatch_cpuid_time_features:
@@ -123,6 +126,7 @@ jmp .Lresident_dispatch_cpuid_advance
 cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
 je .Lresident_dispatch_cpuid_advance
 mov qword ptr [rsp + 0], {hv_evmcs_versions}
+or qword ptr [rsp + 0], {hv_enlightened_msr_bitmap}
 jmp .Lresident_dispatch_cpuid_advance
 .endm
 
@@ -146,12 +150,18 @@ mov r11, qword ptr [r9 + r10]
 jmp .Lresident_dispatch_rdmsr_nested_value
 .Lresident_dispatch_rdmsr_vp_assist:
 cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+jne .Lresident_dispatch_rdmsr_vp_assist_owned
+cmp qword ptr [r12 + {b_nested_expose_vmx}], 0
 je .Lresident_dispatch_rdmsr_passthrough
+.Lresident_dispatch_rdmsr_vp_assist_owned:
 mov r11, qword ptr [r12 + {b_nested_vp_assist_msr}]
 jmp .Lresident_dispatch_rdmsr_nested_value
 .Lresident_dispatch_rdmsr_hyperv_apic:
 cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+jne .Lresident_dispatch_rdmsr_hyperv_apic_owned
+cmp qword ptr [r12 + {b_nested_expose_vmx}], 0
 je .Lresident_dispatch_rdmsr_passthrough
+.Lresident_dispatch_rdmsr_hyperv_apic_owned:
 cmp ecx, {hv_eoi_msr}
 je .Lresident_dispatch_inject_gp
 call .Lresident_hyperv_apic_address
@@ -353,7 +363,10 @@ call .Lresident_advance_guest_rip
 jmp .Lresident_dispatch_resume
 .Lresident_dispatch_wrmsr_vp_assist:
 cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+jne .Lresident_dispatch_wrmsr_vp_assist_owned
+cmp qword ptr [r12 + {b_nested_expose_vmx}], 0
 je .Lresident_dispatch_wrmsr_passthrough
+.Lresident_dispatch_wrmsr_vp_assist_owned:
 mov r11d, dword ptr [rsp + 0]
 mov r10d, dword ptr [rsp + 16]
 shl r10, 32
@@ -367,7 +380,8 @@ jz .Lresident_dispatch_inject_gp
 call .Lresident_ept01_page_is_writable
 test eax, eax
 jz .Lresident_dispatch_inject_gp
-// Never offer lazy EOI before root maintains the assist-page handshake.
+// Native interrupts remain owned by L1's physical APIC. It must issue the
+// physical EOI; NoEoiRequired stays clear in either VMCS mode.
 // Preserve the nested fields on repeated writes to the same VP Assist page.
 mov dword ptr [r11], 0
 .Lresident_dispatch_wrmsr_vp_assist_store:
@@ -380,7 +394,10 @@ call .Lresident_advance_guest_rip
 jmp .Lresident_dispatch_resume
 .Lresident_dispatch_wrmsr_hyperv_apic:
 cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+jne .Lresident_dispatch_wrmsr_hyperv_apic_owned
+cmp qword ptr [r12 + {b_nested_expose_vmx}], 0
 je .Lresident_dispatch_wrmsr_passthrough
+.Lresident_dispatch_wrmsr_hyperv_apic_owned:
 cmp ecx, {hv_icr_msr}
 je .Lresident_dispatch_wrmsr_hyperv_apic_valid
 cmp dword ptr [rsp + 16], 0
@@ -861,6 +878,7 @@ jne .Lresident_hyperv_evmcs_select_changed
 mov r8d, dword ptr [r13 + {evmcs_clean_fields}]
 jmp .Lresident_hyperv_evmcs_select_fields_ready
 .Lresident_hyperv_evmcs_select_changed:
+mov qword ptr [r12 + {b_nested_msr_bitmap_cached_mode}], 0
 mov qword ptr [r12 + {b_nested_current_vmcs}], rax
 mov qword ptr [r12 + {b_nested_current_vmcs_hpa}], r13
 mov qword ptr [r12 + {b_nested_current_vmcs_is_shadow}], 0
@@ -875,7 +893,20 @@ cld
 rep stosq
 xor r8d, r8d
 .Lresident_hyperv_evmcs_select_fields_ready:
+mov qword ptr [r12 + {b_nested_evmcs_clean_fields}], r8
+mov eax, dword ptr [r13 + {evmcs_enlightenments_control}]
+mov qword ptr [r12 + {b_nested_evmcs_enlightenments_control}], rax
+mov eax, r8d
+and eax, 0x6058
+cmp eax, 0x6058
+je .Lresident_hyperv_evmcs_select_validation_ready
+mov qword ptr [r12 + {b_nested_evmcs_entry_validated}], 0
+.Lresident_hyperv_evmcs_select_validation_ready:
 lea rsi, [rip + .Lresident_evmcs_field_map]
+mov eax, r8d
+and eax, 0x7fff
+cmp eax, 0x7fff
+je .Lresident_hyperv_evmcs_select_always_fields
 xor r9d, r9d
 .Lresident_hyperv_evmcs_select_field:
 test dword ptr [rsi + r9 * 8 + 4], r8d
@@ -903,6 +934,20 @@ mov qword ptr [r12 + {b_nested_vmcs12_extended_fields} + r9 * 8], r11
 inc r9d
 cmp r9d, {nested_extended_field_count}
 jne .Lresident_hyperv_evmcs_select_field
+jmp .Lresident_hyperv_evmcs_select_basic_fields
+.Lresident_hyperv_evmcs_select_always_fields:
+// TLFS NONE fields remain live even when every clean group is unchanged.
+.irp field_index, 5, 6, 7, 9, 10, 12, 100
+movzx edx, word ptr [rsi + \field_index * 8]
+mov r11d, dword ptr [r13 + rdx]
+mov qword ptr [r12 + {b_nested_vmcs12_extended_fields} + \field_index * 8], r11
+.endr
+.irp field_index, 96, 97, 98, 99, 103, 104, 105
+movzx edx, word ptr [rsi + \field_index * 8]
+mov r11, qword ptr [r13 + rdx]
+mov qword ptr [r12 + {b_nested_vmcs12_extended_fields} + \field_index * 8], r11
+.endr
+.Lresident_hyperv_evmcs_select_basic_fields:
 mov r11, qword ptr [r13 + {evmcs_guest_rip}]
 mov qword ptr [r12 + {b_nested_vmcs12_guest_rip}], r11
 mov r11, qword ptr [r13 + {evmcs_guest_rsp}]
@@ -1407,6 +1452,17 @@ mov dword ptr [r11 + {evmcs_exit_instruction_error}], r10d
 .long 0
 .short 0, 0
 .long 0
+// Native APICv fields have no eVMCS v1 representation.
+.short 0, 0
+.long 0
+.short 0, 0
+.long 0
+.short 0, 0
+.long 0
+.short 0, 0
+.long 0
+.short 0, 0
+.long 0
 .endm
 
 // VMLAUNCH adapter: select the VP Assist eVMCS and project its initial launch state. R12/frame preserved, scratch GPRs/flags changed; invalid selection jumps to nested VMfail, otherwise falls through with ordinary VMCS12 semantics.
@@ -1450,6 +1506,8 @@ jne .Lresident_nested_vmfail_invalid_no_current_vmcs
 // VMX lifecycle reset: R12=context. Clear only the owner's active selection; no GPR, flag, stack or SIMD changes. Ordinary VMCS and VMX lifecycle state remain caller-owned.
 .macro resident_hyperv_evmcs_reset
 mov qword ptr [r12 + {b_nested_evmcs_active}], 0
+mov qword ptr [r12 + {b_nested_msr_bitmap_cached_mode}], 0
+mov qword ptr [r12 + {b_nested_evmcs_entry_validated}], 0
 .endm
 
 // Diagnostic accessor: R12=context, RAX receives active selection. All other GPRs, flags, stack and SIMD remain unchanged.

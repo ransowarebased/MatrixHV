@@ -114,6 +114,21 @@ pub const MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF: u32 = 0x620;
 pub const MATRIXHV_VMCALL_SNAPSHOT_WORDS: usize = 32;
 pub const MATRIXHV_EXIT_TIMING_CAPABILITY: u32 = 1 << 17;
 pub const MATRIXHV_EXIT_TIMING_SUBLEAF: u32 = 55;
+pub const MATRIXHV_RESIDENT_SESSION_CAPABILITY: u32 = 1 << 22;
+pub const MATRIXHV_RESIDENT_SESSION_SUBLEAF: u32 = 0x380;
+pub const MATRIXHV_L2_MEMORY_CAPABILITY: u32 = 1 << 24;
+pub const MATRIXHV_L2_MEMORY_DIAGNOSTIC_CAPABILITY: u32 = 1 << 25;
+pub const MATRIXHV_L2_MEMORY_DIAGNOSTIC_SUBLEAF: u32 = 0x3a0;
+pub const MATRIXHV_L2_WRMSR_PROFILE_CAPABILITY: u32 = 1 << 23;
+pub const MATRIXHV_L2_WRMSR_PROFILE_SUBLEAF: u32 = 0x390;
+// Total, exclusive classes (x2APIC, synthetic APIC, other synthetic, SPEC_CTRL,
+// other), four x2APIC registers, three synthetic APIC registers, last ECX.
+pub const MATRIXHV_L2_WRMSR_PROFILE_WORDS: usize = 14;
+pub const MATRIXHV_EPT_REVALIDATION_CAPABILITY: u32 = 1 << 26;
+pub const MATRIXHV_EPT_REVALIDATION_SUBLEAF: u32 = 0x3b0;
+const _: () = assert!(MATRIXHV_EPT_REVALIDATION_CAPABILITY
+    & (MATRIXHV_L2_MEMORY_DIAGNOSTIC_CAPABILITY | MATRIXHV_L2_WRMSR_PROFILE_CAPABILITY) == 0);
+const _: () = assert!(MATRIXHV_EPT_REVALIDATION_SUBLEAF >= MATRIXHV_L2_MEMORY_DIAGNOSTIC_SUBLEAF + 3);
 // The resident L1 contract excludes legacy hardware task switching and SMX.
 // Query this subleaf before booting a guest that requires either facility.
 pub const MATRIXHV_GUEST_CONTRACT_SUBLEAF: u32 = 54;
@@ -150,6 +165,11 @@ pub mod memory {
     pub const AD_BITMAP: u32 = 3;
     pub const AD_ENABLED: u32 = 1 << 0;
     pub const AD_LARGE_PAGE: u32 = 1 << 1;
+    // INFO reports a scoped L2 transport supporting INFO/READ/WRITE only.
+    pub const L2_MEMORY_CAPABILITY: u32 = 1 << 10;
+    // INFO roots are scoped L2 observations with a current executable LSTAR
+    // mapping. Clients must still validate the loaded kernel image identity.
+    pub const L2_KERNEL_ROOT_CAPABILITY: u32 = 1 << 11;
     pub const AD_MAX_PAGES: usize = (BUFFER_BYTES - HEADER_BYTES) / 2 * 8;
     pub const AD_START: u32 = 4;
     pub const AD_STOP: u32 = 5;
@@ -493,6 +513,8 @@ pub mod memory {
         Remapped = 13,
         MergeConflict = 14,
         WriteCommitted = 15,
+        // Transport failure after at least one L2 target store; never retry blindly.
+        WriteResponseLost = 16,
     }
 
     pub fn word(bytes: &[u8], offset: usize) -> u32 {

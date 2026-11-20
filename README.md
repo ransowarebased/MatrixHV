@@ -15,6 +15,8 @@ MatrixHV operates as a Type-1 (bare-metal) thin hypervisor initializing during t
 - **Identity & Split EPT**: Implements an identity-mapped Extended Page Table baseline with split-view execute/read permissions, dynamic Copy-on-Write (CoW) page table splitting, and per-core alternate EPT banks.
 - **Process-Scoped Instrumentation**: Interception sessions can be scoped to selected guest address spaces and use leases for automatic reclamation.
 - **Nested VMX (Research / Partial)**: Emulates a restricted contract of Intel VMX instructions (VMXON/VMXOFF, VMCLEAR, VMPTRLD/VMPTRST, VMREAD/VMWRITE, VMLAUNCH/VMRESUME), shadow VMCS12 state management, and exit reflection to L1.
+- **Scoped L2 Memory Access**: Supports `INFO`, `READ`, and `WRITE` through the caller's current EPT12 context and the protected EPT01 backend. Kernel-root discovery uses scoped CR3/LSTAR observations; clients must still validate the kernel image identity.
+- **Nested Runtime Diagnostics**: Reports resident interception allocation state, L2 memory diagnostics, observed L2 WRMSR exit classes, requested and active nested APIC controls, and EPT revalidation counters. Hyper-V enlightened MSR bitmap caching respects eVMCS clean fields and control changes.
 - **Intel PT Diagnostics**: Support for Intel Processor Trace logging and performance counters.
 - **Authenticated Hot Update**: Cryptographically signed in-memory resident core replacement mechanism (`update.rs`).
 
@@ -26,6 +28,8 @@ To ensure clarity and avoid unrealistic expectations:
 
 - **Hardware Architecture**: MatrixHV requires an **Intel x86-64 processor** with VMX and EPT support. **AMD processors (SVM / AMD-V) are not supported.**
 - **Nested Virtualization is Experimental**: The nested VMX implementation covers a restricted architectural subset for hypervisor research. It does **not** provide full, bug-free compatibility with nested Hyper-V, Windows Virtualization-Based Security (VBS/HVCI), VMware, or KVM.
+- **L2 Scope**: L2 memory access does not expose the L1 address space or provide L2 interception/session inventory. Advertised capabilities do not prove transport availability on the current CPU. The SDK rejects deactivation and hot-update preflight when nested virtualization is active or active CPU coverage cannot be verified.
+- **Write Completion**: Memory status `16` (`WriteResponseLost`) means L2 target bytes were written but the response could not be delivered. Inspect the result before retrying a write.
 - **Firmware Signing**: Loading development UEFI binaries requires a firmware configuration that permits unsigned or custom test-signed EFI applications (e.g., Secure Boot disabled or custom platform keys enrolled).
 
 ---
@@ -46,6 +50,7 @@ MatrixHV/
 │   │   └── vcpu.rs             # Virtual CPU state machine and per-core orchestration
 │   ├── memory/                 # Memory access, tracking, and interception engines
 │   │   ├── access.rs           # Physical and virtual memory translation
+│   │   ├── nested.rs           # Scoped L2 memory transport and kernel-root validation
 │   │   ├── interception.rs     # EPT split views, CPUID profiles, and syscall interception
 │   │   ├── observation.rs      # Watchpoints, context snapshots, and event capture
 │   │   └── tracking.rs         # Accessed and dirty bit tracking
@@ -91,7 +96,7 @@ matrixhv-sdk = { version = "1.0.0", path = "../MatrixHV/sdk" }
 
 `matrixhv_sdk::protocol` defines the wire layouts and constants. The default `client` feature provides packet builders and CPUID transport. The optional `update` feature provides the signed package parser and update ABI shared with Neo.
 
-The current status protocol is 10. It includes resident diagnostics, Intel PT, application watchpoints, context sampling, and event capture.
+The current status protocol is 10. It includes resident diagnostics, Intel PT, application watchpoints, context sampling, and event capture. Query capability bits before using optional diagnostic subleaves. `matrixhv_sdk::runtime::query()` reports L0 presence, registered CPU coverage, nested/L2 masks, and caller level independently of memory transport availability.
 
 ### 3. Automated Packaging Pipeline
 
@@ -135,7 +140,27 @@ python run_alltests.py
 
 # Run host API tests without a resident hypervisor
 cargo test --locked -p matrixhv-sdk --features update
+
+# Validate the resident session diagnostic handler separately
+python tests/run_resident_session_tests.py
 ```
+
+The main runner includes nested host-state restoration and L2 kernel-root tests. Host tests exercise synthetic hardware state; runtime behavior still requires validation after booting the updated EFI.
+
+For a post-boot probe from an L2 guest, read and optionally write only the probe process's own allocation:
+
+```powershell
+cargo run --locked -p matrixhv-sdk --example l2_memory_probe
+cargo run --locked -p matrixhv-sdk --example l2_memory_probe -- --write-self --kernel-root
+```
+
+To collect an interval profile using a compatible Neo binary:
+
+```powershell
+python tests/collect_l2_wrmsr_profile.py --neo ..\Neo\target\release\neo.exe --seconds 30 --output builds/l2-wrmsr-profile
+```
+
+The collector restores the previous telemetry enable state and writes captures plus `summary.json`. Counts cover observed L2 WRMSR exits; sequential counter snapshots provide approximate interval deltas.
 
 CLI, telemetry, and host-agent tests live in the Neo repository: https://github.com/ransowarebased/Neo.
 

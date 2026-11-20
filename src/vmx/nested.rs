@@ -76,9 +76,12 @@ pub const VMX_PRIMARY_KVM_EXITING_CONTROLS: u32 = VMX_PRIMARY_INTERRUPT_WINDOW_E
 pub const VMX_SECONDARY_ENABLE_EPT: u32 = 1 << 1;
 pub const VMX_SECONDARY_DESCRIPTOR_TABLE_EXITING: u32 = 1 << 2;
 pub const VMX_SECONDARY_ENABLE_RDTSCP: u32 = 1 << 3;
+pub const VMX_SECONDARY_VIRTUALIZE_X2APIC: u32 = 1 << 4;
 pub const VMX_SECONDARY_ENABLE_VPID: u32 = 1 << 5;
 pub const VMX_SECONDARY_WBINVD_EXITING: u32 = 1 << 6;
 pub const VMX_SECONDARY_UNRESTRICTED_GUEST: u32 = 1 << 7;
+pub const VMX_SECONDARY_APIC_REGISTER_VIRTUALIZATION: u32 = 1 << 8;
+pub const VMX_SECONDARY_VIRTUAL_INTERRUPT_DELIVERY: u32 = 1 << 9;
 pub const VMX_SECONDARY_RDRAND_EXITING: u32 = 1 << 11;
 pub const VMX_SECONDARY_ENABLE_INVPCID: u32 = 1 << 12;
 pub const VMX_SECONDARY_ENABLE_VM_FUNCTIONS: u32 = 1 << 13;
@@ -160,6 +163,7 @@ pub struct NestedVmxCapabilities {
     pub revision_id: u32,
     pub host_procbased_ctls2: u64,
     pub host_misc: u64,
+    pub host_ept_vpid_cap: u64,
     pub feature_control: u64,
     pub vmx_basic: u64,
     pub vmx_pinbased_ctls: u64,
@@ -188,6 +192,7 @@ impl NestedVmxCapabilities {
             revision_id,
             host_procbased_ctls2: 0,
             host_misc: 0,
+            host_ept_vpid_cap: 0,
             feature_control: IA32_FEATURE_CONTROL_LOCKED | IA32_FEATURE_CONTROL_VMX_OUTSIDE_SMX,
             vmx_basic: u64::from(revision_id)
                 | (VMX_REGION_SIZE << 32)
@@ -262,6 +267,21 @@ impl NestedVmxCapabilities {
         );
         let secondary_rdtscp =
             restrict_control(host.procbased_ctls2, VMX_SECONDARY_ENABLE_RDTSCP, 0);
+        let secondary_x2apic = if control_may_be_one(selected_primary, VMX_PRIMARY_TPR_SHADOW) {
+            restrict_control(host.procbased_ctls2, VMX_SECONDARY_VIRTUALIZE_X2APIC, 0)
+        } else {
+            0
+        };
+        let secondary_apic_registers = if control_may_be_one(selected_primary, VMX_PRIMARY_TPR_SHADOW) {
+            restrict_control(host.procbased_ctls2, VMX_SECONDARY_APIC_REGISTER_VIRTUALIZATION, 0)
+        } else {
+            0
+        };
+        let secondary_interrupt_delivery = if control_may_be_one(selected_primary, VMX_PRIMARY_TPR_SHADOW) {
+            restrict_control(host.procbased_ctls2, VMX_SECONDARY_VIRTUAL_INTERRUPT_DELIVERY, 0)
+        } else {
+            0
+        };
         let secondary_wbinvd =
             restrict_control(host.procbased_ctls2, VMX_SECONDARY_WBINVD_EXITING, 0);
         let secondary_unrestricted =
@@ -281,6 +301,9 @@ impl NestedVmxCapabilities {
             secondary_ept
                 | secondary_descriptor_table
                 | secondary_rdtscp
+                | secondary_x2apic
+                | secondary_apic_registers
+                | secondary_interrupt_delivery
                 | secondary_wbinvd
                 | secondary_unrestricted
                 | secondary_rdrand
@@ -363,6 +386,7 @@ impl NestedVmxCapabilities {
             vmx_entry_ctls: entry_ctls,
             host_procbased_ctls2: host.procbased_ctls2,
             host_misc: host.misc,
+            host_ept_vpid_cap: host.ept_vpid_cap,
             // Preserve native activity states, EFER.LMA capture, shadow write
             // semantics and zero-length event injection. PT and dual-monitor
             // SMM are not virtualized; CR3 targets and MSR lists have local limits.
@@ -664,6 +688,18 @@ pub struct NestedVmxState {
     pub l2_nmi_exit_pending: u64,
     pub inherited_l1_dr7: u64,
     pub inherited_l1_debugctl: u64,
+    pub l2_wrmsr_profile: [u64; 14],
+    pub memory_diagnostics: [u64; 6],
+    pub kernel_root_cursor: u64,
+    // Per-CPU observations hold EPT12, CR3, LSTAR, CR4. EPT12 publishes last.
+    pub kernel_roots: [[u64; 4]; 8],
+    pub ept02_revalidation_stats: [u64; 4],
+    pub host_ept_vpid_cap: u64,
+    pub evmcs_clean_fields: u64,
+    pub evmcs_enlightenments_control: u64,
+    pub evmcs_entry_validated: u64,
+    pub msr_bitmap_cached_hpa: u64,
+    pub msr_bitmap_cached_mode: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -868,6 +904,17 @@ impl NestedVmxState {
             l2_nmi_exit_pending: 0,
             inherited_l1_dr7: 0,
             inherited_l1_debugctl: 0,
+            l2_wrmsr_profile: [0; 14],
+            memory_diagnostics: [0; 6],
+            kernel_root_cursor: 0,
+            kernel_roots: [[0; 4]; 8],
+            ept02_revalidation_stats: [0; 4],
+            host_ept_vpid_cap: capabilities.host_ept_vpid_cap,
+            evmcs_clean_fields: 0,
+            evmcs_enlightenments_control: 0,
+            evmcs_entry_validated: 0,
+            msr_bitmap_cached_hpa: 0,
+            msr_bitmap_cached_mode: 0,
         }
     }
 

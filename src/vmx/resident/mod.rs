@@ -846,6 +846,7 @@ global_asm!(
     include_str!("../asm/ept_cache.S"),
     include_str!("../asm/eptp_switch.S"),
     include_str!("../asm/nested.S"),
+    include_str!("../asm/nested_intercept.S"),
     include_str!("../asm/hyperv.S"),
     include_str!("../asm/exits.S"),
     include_str!("../asm/msr.S"),
@@ -1157,6 +1158,7 @@ global_asm!(
     hv_invariant_tsc_access = const crate::vmx::hyperv::HYPERV_INVARIANT_TSC_ACCESS,
     hv_evmcs_recommendation = const crate::vmx::hyperv::HYPERV_EVMCS_RECOMMENDATION,
     hv_evmcs_versions = const crate::vmx::hyperv::HYPERV_EVMCS_VERSIONS,
+    hv_enlightened_msr_bitmap = const crate::vmx::hyperv::HYPERV_ENLIGHTENED_MSR_BITMAP,
     hv_build_number = const crate::vmx::hyperv::HYPERV_BUILD_NUMBER,
     hv_product_version = const crate::vmx::hyperv::HYPERV_PRODUCT_VERSION,
     hv_hardware_in_use = const crate::vmx::hyperv::HYPERV_HARDWARE_IN_USE,
@@ -1243,7 +1245,14 @@ global_asm!(
         | crate::protocol::MATRIXHV_INTEL_PT_CAPABILITY
         | crate::protocol::MATRIXHV_CALLBACK_IDENTITY_CAPABILITY
         | crate::protocol::MATRIXHV_INTEL_PT_RING_CAPABILITY
-        | crate::protocol::MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY,
+        | crate::protocol::MATRIXHV_VMCALL_SNAPSHOT_CAPABILITY
+        | crate::protocol::MATRIXHV_RESIDENT_SESSION_CAPABILITY
+        | crate::protocol::MATRIXHV_L2_MEMORY_CAPABILITY
+        | crate::protocol::MATRIXHV_L2_MEMORY_DIAGNOSTIC_CAPABILITY
+        | crate::protocol::MATRIXHV_L2_WRMSR_PROFILE_CAPABILITY
+        | crate::protocol::MATRIXHV_EPT_REVALIDATION_CAPABILITY,
+    resident_session_subleaf = const crate::protocol::MATRIXHV_RESIDENT_SESSION_SUBLEAF,
+    interception_active = const core::mem::offset_of!(crate::memory::interception::Session, active),
     vmcall_snapshot_subleaf = const crate::protocol::MATRIXHV_VMCALL_SNAPSHOT_SUBLEAF,
     vmcall_snapshot_words = const crate::protocol::MATRIXHV_VMCALL_SNAPSHOT_WORDS,
     exit_timing_subleaf = const crate::protocol::MATRIXHV_EXIT_TIMING_SUBLEAF,
@@ -1444,6 +1453,8 @@ global_asm!(
     b_nested_vmx_misc = const BCTX_NESTED_VMX_MISC,
     b_nested_host_procbased_ctls2 = const BCTX_NESTED_HOST_PROCBASED_CTLS2,
     b_nested_host_misc = const BCTX_NESTED_HOST_MISC,
+    b_nested_host_ept_vpid_cap = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, host_ept_vpid_cap),
     b_nested_vmx_cr0_fixed0 = const BCTX_NESTED_VMX_CR0_FIXED0,
     b_nested_vmx_cr0_fixed1 = const BCTX_NESTED_VMX_CR0_FIXED1,
     b_nested_vmx_cr4_fixed0 = const BCTX_NESTED_VMX_CR4_FIXED0,
@@ -1486,6 +1497,17 @@ global_asm!(
     evmcs_exit_instruction_length = const core::mem::offset_of!(crate::vmx::hyperv::EnlightenedVmcs, exit_instruction_length),
     evmcs_exit_qualification = const core::mem::offset_of!(crate::vmx::hyperv::EnlightenedVmcs, exit_qualification),
     evmcs_clean_fields = const core::mem::offset_of!(crate::vmx::hyperv::EnlightenedVmcs, clean_fields),
+    evmcs_enlightenments_control = const core::mem::offset_of!(crate::vmx::hyperv::EnlightenedVmcs, enlightenments_control),
+    b_nested_evmcs_clean_fields = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, evmcs_clean_fields),
+    b_nested_evmcs_enlightenments_control = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, evmcs_enlightenments_control),
+    b_nested_evmcs_entry_validated = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, evmcs_entry_validated),
+    b_nested_msr_bitmap_cached_hpa = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, msr_bitmap_cached_hpa),
+    b_nested_msr_bitmap_cached_mode = const core::mem::offset_of!(ResidentBootContext, nested)
+        + core::mem::offset_of!(NestedVmxState, msr_bitmap_cached_mode),
     vp_assist_enlighten_vm_entry = const crate::vmx::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET,
     vp_assist_current_nested_vmcs = const crate::vmx::hyperv::VP_ASSIST_CURRENT_NESTED_VMCS_OFFSET,
     b_nested_last_operand = const BCTX_NESTED_LAST_OPERAND,
@@ -1601,6 +1623,15 @@ global_asm!(
     b_nested_l2_exit_count = const BCTX_NESTED_L2_EXIT_COUNT,
     b_nested_l2_last_exit_reason = const BCTX_NESTED_L2_LAST_EXIT_REASON,
     b_nested_reflected_exit_counts = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, reflected_exit_counts),
+    b_nested_l2_wrmsr_profile = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, l2_wrmsr_profile),
+    b_nested_ept02_revalidation_stats = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, ept02_revalidation_stats),
+    ept_revalidation_subleaf = const crate::protocol::MATRIXHV_EPT_REVALIDATION_SUBLEAF,
+    l2_wrmsr_profile_subleaf = const crate::protocol::MATRIXHV_L2_WRMSR_PROFILE_SUBLEAF,
+    l2_memory_diagnostic_subleaf = const crate::protocol::MATRIXHV_L2_MEMORY_DIAGNOSTIC_SUBLEAF,
+    b_nested_memory_diagnostics = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, memory_diagnostics),
+    b_nested_kernel_roots = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, kernel_roots),
+    b_nested_kernel_root_cursor = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, kernel_root_cursor),
+    l2_wrmsr_profile_words = const crate::protocol::MATRIXHV_L2_WRMSR_PROFILE_WORDS,
     b_nested_exit_started_tsc = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, exit_started_tsc),
     b_nested_exit_handler_cycles = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, exit_handler_cycles),
     b_nested_exit_reason_counts = const core::mem::offset_of!(ResidentBootContext, nested) + core::mem::offset_of!(NestedVmxState, exit_reason_counts),
@@ -1719,7 +1750,7 @@ global_asm!(
     vmcs12_revision_id_offset = const core::mem::offset_of!(NestedVmcs12State, revision_id),
     vmcs12_launch_state_offset = const core::mem::offset_of!(NestedVmcs12State, launch_state),
     vmcs12_vmclear_count_offset = const core::mem::offset_of!(NestedVmcs12State, vmclear_count),
-    nested_guest_state_table_count = const 49,
+    nested_guest_state_table_count = const 50,
     nested_host_state_table_count = const 18,
     vmcs_field_exit_qualification = const VMCS_FIELD_EXIT_QUALIFICATION,
     vmcs_field_guest_rflags = const VMCS_FIELD_GUEST_RFLAGS,

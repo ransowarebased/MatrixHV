@@ -11,4 +11,6 @@ pub mod update;
 #[cfg(all(feature = "client", not(target_os = "uefi")))]
 pub mod memory;
 #[cfg(all(feature = "client", not(target_os = "uefi")))]
+pub mod runtime;
+#[cfg(all(feature = "client", not(target_os = "uefi")))]
 pub use memory::*;

@@ -20,6 +20,7 @@ pub const HYPERV_FREQUENCY_QUERY: u32 = 0x100;
 pub const HYPERV_INVARIANT_TSC_ACCESS: u32 = 0x8000;
 pub const HYPERV_EVMCS_RECOMMENDATION: u32 = 0x4000;
 pub const HYPERV_EVMCS_VERSIONS: u32 = 0x101;
+pub const HYPERV_ENLIGHTENED_MSR_BITMAP: u32 = 0x80000;
 pub const HYPERV_PROCESSOR_LIMIT: u32 = 64;
 pub const HYPERV_BUILD_NUMBER: u32 = 1;
 pub const HYPERV_PRODUCT_VERSION: u32 = 1;
@@ -154,7 +155,8 @@ pub fn restrict_evmcs_secondary_capability(secondary_controls: u64, vt_evmcs: bo
         secondary_controls
             & !(u64::from(
                 crate::vmx::nested::VMX_SECONDARY_ENABLE_VM_FUNCTIONS
-                    | crate::vmx::nested::VMX_SECONDARY_VMCS_SHADOWING,
+                    | crate::vmx::nested::VMX_SECONDARY_VMCS_SHADOWING
+                    | crate::vmx::nested::VMX_SECONDARY_VIRTUAL_INTERRUPT_DELIVERY,
             ) << 32)
     } else {
         secondary_controls

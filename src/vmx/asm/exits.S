@@ -982,7 +982,10 @@ mov qword ptr [r12 + {b_last_normal_rip}], r11
 .Lresident_normal_exit_recorded:
 // Record a kernel-mode root for client-side introspection without OS offsets.
 cmp qword ptr [r12 + {b_nested_l2_active}], 0
-jne .Lresident_memory_root_observed
+je .Lresident_memory_record_l1
+call .Lresident_nested_observe_kernel_root
+jmp .Lresident_memory_root_observed
+.Lresident_memory_record_l1:
 mov eax, {guest_cs_ar_bytes}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
@@ -1116,6 +1119,7 @@ matrixhv_island_cpuid_standard
 matrixhv_resident_msr_access
 matrixhv_island_vmcall
 matrixhv_island_requests
+matrixhv_nested_memory_requests
 matrixhv_island_events
 matrixhv_island_timer_event
 matrixhv_island_sampling

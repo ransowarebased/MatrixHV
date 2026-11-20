@@ -15,6 +15,11 @@ pub const VMCS_FIELD_GUEST_FS_SELECTOR: u64 = 0x0808;
 pub const VMCS_FIELD_GUEST_GS_SELECTOR: u64 = 0x080a;
 pub const VMCS_FIELD_GUEST_LDTR_SELECTOR: u64 = 0x080c;
 pub const VMCS_FIELD_GUEST_TR_SELECTOR: u64 = 0x080e;
+pub const VMCS_FIELD_GUEST_INTERRUPT_STATUS: u64 = 0x0810;
+pub const VMCS_FIELD_EOI_EXIT_BITMAP0: u64 = 0x201c;
+pub const VMCS_FIELD_EOI_EXIT_BITMAP1: u64 = 0x201e;
+pub const VMCS_FIELD_EOI_EXIT_BITMAP2: u64 = 0x2020;
+pub const VMCS_FIELD_EOI_EXIT_BITMAP3: u64 = 0x2022;
 pub const VMCS_FIELD_HOST_ES_SELECTOR: u64 = 0x0c00;
 pub const VMCS_FIELD_HOST_CS_SELECTOR: u64 = 0x0c02;
 pub const VMCS_FIELD_HOST_SS_SELECTOR: u64 = 0x0c04;
@@ -142,7 +147,7 @@ pub const VMCS_SHADOW_READ_TRAP_MASK: u8 = !VMCS_SHADOW_READ_BYPASS_MASK;
 
 pub const VMCS_FIELD_VMREAD_BITMAP: u64 = 0x2026;
 pub const VMCS_FIELD_VMWRITE_BITMAP: u64 = 0x2028;
-pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 122;
+pub const VMCS12_EXTENDED_FIELD_COUNT: usize = 127;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Vmcs12ExtendedField {
@@ -639,6 +644,11 @@ pub const VMCS12_EXTENDED_FIELDS: [Vmcs12ExtendedField; VMCS12_EXTENDED_FIELD_CO
         encoding: VMCS_FIELD_VMWRITE_BITMAP,
         index: 121,
     },
+    Vmcs12ExtendedField { encoding: VMCS_FIELD_GUEST_INTERRUPT_STATUS, index: 122 },
+    Vmcs12ExtendedField { encoding: VMCS_FIELD_EOI_EXIT_BITMAP0, index: 123 },
+    Vmcs12ExtendedField { encoding: VMCS_FIELD_EOI_EXIT_BITMAP1, index: 124 },
+    Vmcs12ExtendedField { encoding: VMCS_FIELD_EOI_EXIT_BITMAP2, index: 125 },
+    Vmcs12ExtendedField { encoding: VMCS_FIELD_EOI_EXIT_BITMAP3, index: 126 },
 ];
 
 #[repr(C)]

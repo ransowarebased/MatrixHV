@@ -186,7 +186,7 @@ fn every_evmcs_mapping_matches_its_architectural_encoding_and_clean_group() {
             )
         };
     }
-    let expected: [(u64, usize, u16, u32); 122] = [
+    let expected: [(u64, usize, u16, u32); 127] = [
         field!(0x0000, vpid, 2, 512),
         field!(0x4000, pin_controls, 4, 8),
         field!(0x4002, processor_controls, 4, 16),
@@ -309,6 +309,11 @@ fn every_evmcs_mapping_matches_its_architectural_encoding_and_clean_group() {
         (0x2024, 0, 0, 0),
         (0x2026, 0, 0, 0),
         (0x2028, 0, 0, 0),
+        (0x810, 0, 0, 0),
+        (0x201c, 0, 0, 0),
+        (0x201e, 0, 0, 0),
+        (0x2020, 0, 0, 0),
+        (0x2022, 0, 0, 0),
     ];
     let actual = field_map();
     let source = include_str!("../src/vmx/asm/hyperv.S");
@@ -335,4 +340,15 @@ fn every_evmcs_mapping_matches_its_architectural_encoding_and_clean_group() {
         assert_eq!(actual[index], (offset, flags), "encoding {encoding:#x}");
         assert_eq!(masks[index], clean, "clean group for {encoding:#x}");
     }
+    let fast_path = source.split(".Lresident_hyperv_evmcs_select_always_fields:")
+        .nth(1).unwrap().split(".Lresident_hyperv_evmcs_select_basic_fields:").next().unwrap();
+    let mut fast_indices = Vec::new();
+    for line in fast_path.lines().filter_map(|line| line.strip_prefix(".irp field_index, ")) {
+        fast_indices.extend(line.split(',').map(|index| index.trim().parse::<usize>().unwrap()));
+    }
+    fast_indices.sort_unstable();
+    let always_indices: Vec<usize> = actual.iter().zip(masks.iter()).enumerate()
+        .filter(|(_, ((_, flags), clean))| **clean == 0 && flags & 0x40 == 0 && flags & 15 != 0)
+        .map(|(index, _)| index).collect();
+    assert_eq!(fast_indices, always_indices);
 }
