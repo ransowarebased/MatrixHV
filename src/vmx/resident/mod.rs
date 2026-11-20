@@ -40,16 +40,20 @@ use crate::protocol::{
     MATRIXHV_STATUS_SIGNATURE_EBX, MATRIXHV_STATUS_SIGNATURE_ECX,
 };
 use crate::vmx::hyperv::{
-    CPUID_HYPERVISOR_PRESENT_BIT, HYPERV_FEATURES_LEAF, HYPERV_GUEST_IDLE_ACCESS_MASK,
-    HYPERV_GUEST_IDLE_FEATURE_MASK, HYPERV_GUEST_OS_ID_MSR, HYPERV_HYPERCALL_MSR,
-    HYPERV_REFERENCE_COUNT_MSR, HYPERV_REFERENCE_TIME_MSR_SPAN, HYPERV_REFERENCE_TSC_MSR,
-    HYPERV_SIMP_MSR, HYPERV_SINT3_MSR, HYPERV_STIMER0_CONFIG_MSR, HYPERV_STIMER0_COUNT_MSR,
-    HYPERV_TSC_INVARIANT_CONTROL_MSR, HYPERV_VP_ASSIST_MSR, HYPERV_VP_INDEX_MSR,
-    HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START, native_hyperv_invariant_tsc,
-    native_hyperv_reference_tsc,
+    CPUID_HYPERVISOR_PRESENT_BIT, HYPERV_APIC_FREQUENCY_MSR, HYPERV_FEATURES_LEAF,
+    HYPERV_GUEST_IDLE_ACCESS_MASK, HYPERV_GUEST_IDLE_FEATURE_MASK, HYPERV_GUEST_OS_ID_MSR, HYPERV_HYPERCALL_MSR,
+    HYPERV_REENLIGHTENMENT_CONTROL_MSR, HYPERV_REFERENCE_COUNT_MSR, HYPERV_REFERENCE_TIME_MSR_SPAN,
+    HYPERV_REFERENCE_TSC_MSR, HYPERV_SIMP_MSR, HYPERV_SINT3_MSR, HYPERV_STIMER0_CONFIG_MSR,
+    HYPERV_STIMER0_COUNT_MSR, HYPERV_TSC_EMULATION_CONTROL_MSR, HYPERV_TSC_EMULATION_STATUS_MSR,
+    HYPERV_TSC_FREQUENCY_MSR, HYPERV_TSC_INVARIANT_CONTROL_MSR, HYPERV_VP_ASSIST_MSR,
+    HYPERV_VP_INDEX_MSR, HYPERVISOR_LEAF_END, HYPERVISOR_LEAF_START,
+    hyperv_cpuid15_timer_frequencies, native_hyperv_invariant_tsc, native_hyperv_reference_tsc,
 };
 use crate::vmx::nested::{
-    CPUID_OSXSAVE_BIT, CPUID_VMX_BIT, IA32_VMX_BASIC_MSR, IA32_VMX_CR0_FIXED0_MSR,
+    CPUID_LEAF7_EBX_NESTED_UNSUPPORTED_MASK, CPUID_LEAF7_ECX_NESTED_UNSUPPORTED_MASK,
+    CPUID_LEAF7_EDX_NESTED_UNSUPPORTED_MASK, CPUID_LEAFD_SUBLEAF0_EAX_NESTED_UNSUPPORTED_MASK,
+    CPUID_LEAFD_SUBLEAF1_ECX_NESTED_UNSUPPORTED_MASK, CPUID_OSXSAVE_BIT, CPUID_VMX_BIT,
+    IA32_VMX_BASIC_MSR, IA32_VMX_CR0_FIXED0_MSR,
     IA32_VMX_CR0_FIXED1_MSR, IA32_VMX_CR4_FIXED0_MSR, IA32_VMX_CR4_FIXED1_MSR,
     IA32_VMX_ENTRY_CTLS_MSR, IA32_VMX_EPT_VPID_CAP_MSR, IA32_VMX_EXIT_CTLS_MSR, IA32_VMX_MISC_MSR,
     IA32_VMX_PINBASED_CTLS_MSR, IA32_VMX_PROCBASED_CTLS_MSR, IA32_VMX_PROCBASED_CTLS2_MSR,
@@ -87,6 +91,58 @@ const EVENT_CONTEXT_CANARY: u64 = 0x4856_4556_4341_4e59;
 const EPT_TEST_READ_ACCESS: u64 = 1;
 const VMWARE_HYPERVISOR_MAGIC: u32 = 0x564d_5868;
 const VMWARE_HYPERVISOR_PORT: u16 = 0x5658;
+
+fn vmware_timer_frequencies() -> Option<(u64, u64)> {
+    let cpuid = core::arch::x86_64::__cpuid;
+    if cpuid(1).ecx & CPUID_HYPERVISOR_PRESENT_BIT == 0 || !native_hyperv_invariant_tsc() {
+        return None;
+    }
+    let vendor = cpuid(HYPERVISOR_LEAF_START);
+    if vendor.ebx.to_le_bytes() != *b"VMwa"
+        || vendor.ecx.to_le_bytes() != *b"reVM"
+        || vendor.edx.to_le_bytes() != *b"ware"
+    {
+        return None;
+    }
+    // VMware GETHZ supplies the guest's TSC rate and undivided local APIC rate.
+    let tsc_low: u32;
+    let tsc_high: u32;
+    let apic_hz: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "mov ebx, -1",
+            "in eax, dx",
+            "mov r8d, ebx",
+            "pop rbx",
+            inout("eax") VMWARE_HYPERVISOR_MAGIC => tsc_low,
+            inout("ecx") 45_u32 => apic_hz,
+            inout("edx") u32::from(VMWARE_HYPERVISOR_PORT) => _,
+            lateout("r8") tsc_high,
+            lateout("esi") _,
+            lateout("edi") _,
+        );
+    }
+    let tsc_hz = (u64::from(tsc_high) << 32) | u64::from(tsc_low);
+    ((10_000_001..=100_000_000_000).contains(&tsc_hz) && apic_hz != 0 && apic_hz != u32::MAX)
+        .then_some((tsc_hz, u64::from(apic_hz)))
+}
+
+fn native_timer_frequencies(calibrate: impl FnOnce() -> u64) -> Option<(u64, u64)> {
+    let cpuid = core::arch::x86_64::__cpuid;
+    if !native_hyperv_invariant_tsc() || cpuid(0).eax < 0x15 {
+        return None;
+    }
+    let frequency = cpuid(0x15);
+    if frequency.eax == 0 || frequency.ebx == 0 {
+        return None;
+    }
+    if frequency.ecx != 0 {
+        hyperv_cpuid15_timer_frequencies(frequency.eax, frequency.ebx, frequency.ecx, 0)
+    } else {
+        hyperv_cpuid15_timer_frequencies(frequency.eax, frequency.ebx, 0, calibrate())
+    }
+}
 
 const HOST_PAGE_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -611,8 +667,16 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
         .pointer()
         .as_ptr()
         .cast::<ResidentEventContext>();
-    let (hyperv_tsc_scale, hyperv_tsc_offset) =
-        native_hyperv_reference_tsc(crate::boot::firmware::calibrate_reference_tsc);
+    let (hyperv_tsc_frequency_hz, hyperv_apic_frequency_hz) = vmware_timer_frequencies()
+        .or_else(|| native_timer_frequencies(crate::boot::firmware::calibrate_reference_tsc))
+        .unwrap_or_default();
+    let (hyperv_tsc_scale, hyperv_tsc_offset) = native_hyperv_reference_tsc(
+        hyperv_tsc_frequency_hz,
+        crate::boot::firmware::calibrate_reference_tsc,
+    );
+    crate::logging::info(format_args!(
+        "Hyper-V timer frequencies: TSC={hyperv_tsc_frequency_hz} Hz APIC={hyperv_apic_frequency_hz} Hz"
+    ));
     unsafe {
         context.write(ResidentEventContext {
             magic: EVENT_CONTEXT_MAGIC,
@@ -662,6 +726,11 @@ pub fn arm_residency_events() -> Result<ResidentEventReport, ResidentProbeError>
             hyperv_hypercall_lock: AtomicU64::new(0),
             hyperv_tsc_invariant_supported: u64::from(native_hyperv_invariant_tsc()),
             hyperv_tsc_invariant_control: AtomicU64::new(0),
+            hyperv_reenlightenment_control: AtomicU64::new(0),
+            hyperv_tsc_emulation_control: AtomicU64::new(0),
+            hyperv_tsc_emulation_status: AtomicU64::new(0),
+            hyperv_tsc_frequency_hz,
+            hyperv_apic_frequency_hz,
             control_off_native_rip: 0,
             control_recovery_physical: 0,
             control_recovery_runtime: 0,
@@ -782,6 +851,7 @@ global_asm!(
     include_str!("../asm/msr.S"),
     include_str!("../asm/control.S"),
     include_str!("../../asm/diagnostics.S"),
+    include_str!("../asm/boot_diagnostics.S"),
     include_str!("../asm/pt.S"),
     include_str!("../asm/island.S"),
     p_root_rsp = const core::mem::offset_of!(ResidentContext, root_rsp),
@@ -1082,6 +1152,8 @@ global_asm!(
     hv_base_access = const crate::vmx::hyperv::HYPERV_BASE_ACCESS,
     hv_apic_access = const crate::vmx::hyperv::HYPERV_APIC_ACCESS,
     hv_time_access = const crate::vmx::hyperv::HYPERV_TIME_ACCESS,
+    hv_frequency_access = const crate::vmx::hyperv::HYPERV_FREQUENCY_ACCESS,
+    hv_frequency_query = const crate::vmx::hyperv::HYPERV_FREQUENCY_QUERY,
     hv_invariant_tsc_access = const crate::vmx::hyperv::HYPERV_INVARIANT_TSC_ACCESS,
     hv_evmcs_recommendation = const crate::vmx::hyperv::HYPERV_EVMCS_RECOMMENDATION,
     hv_evmcs_versions = const crate::vmx::hyperv::HYPERV_EVMCS_VERSIONS,
@@ -1113,7 +1185,12 @@ global_asm!(
     hyperv_stimer0_count_msr = const HYPERV_STIMER0_COUNT_MSR,
     hyperv_reference_tsc_msr = const HYPERV_REFERENCE_TSC_MSR,
     hyperv_reference_count_msr = const HYPERV_REFERENCE_COUNT_MSR,
+    hyperv_tsc_frequency_msr = const HYPERV_TSC_FREQUENCY_MSR,
+    hyperv_apic_frequency_msr = const HYPERV_APIC_FREQUENCY_MSR,
     hyperv_tsc_invariant_control_msr = const HYPERV_TSC_INVARIANT_CONTROL_MSR,
+    hyperv_reenlightenment_control_msr = const HYPERV_REENLIGHTENMENT_CONTROL_MSR,
+    hyperv_tsc_emulation_control_msr = const HYPERV_TSC_EMULATION_CONTROL_MSR,
+    hyperv_tsc_emulation_status_msr = const HYPERV_TSC_EMULATION_STATUS_MSR,
     hyperv_reference_time_msr_span = const HYPERV_REFERENCE_TIME_MSR_SPAN,
     hyperv_vp_assist_msr = const HYPERV_VP_ASSIST_MSR,
     efer_msr = const IA32_EFER_MSR,
@@ -1130,6 +1207,11 @@ global_asm!(
     cpuid_vmx_set_mask = const CPUID_VMX_BIT,
     cpuid_osxsave_set_mask = const CPUID_OSXSAVE_BIT,
     cpuid_osxsave_clear_mask = const !CPUID_OSXSAVE_BIT,
+    cpuid_leaf7_ebx_nested_clear_mask = const !CPUID_LEAF7_EBX_NESTED_UNSUPPORTED_MASK,
+    cpuid_leaf7_ecx_nested_clear_mask = const !CPUID_LEAF7_ECX_NESTED_UNSUPPORTED_MASK,
+    cpuid_leaf7_edx_nested_clear_mask = const !CPUID_LEAF7_EDX_NESTED_UNSUPPORTED_MASK,
+    cpuid_leafd0_eax_nested_clear_mask = const !CPUID_LEAFD_SUBLEAF0_EAX_NESTED_UNSUPPORTED_MASK,
+    cpuid_leafd1_ecx_nested_clear_mask = const !CPUID_LEAFD_SUBLEAF1_ECX_NESTED_UNSUPPORTED_MASK,
     cpuid_hypervisor_set_mask = const CPUID_HYPERVISOR_PRESENT_BIT,
     cpuid_hypervisor_clear_mask = const !CPUID_HYPERVISOR_PRESENT_BIT,
     ia32_lstar = const IA32_LSTAR_MSR,
@@ -1327,6 +1409,8 @@ global_asm!(
     b_diagnostic_rate = const BCTX_DIAGNOSTIC_RATE,
     b_diagnostic_deadline = const BCTX_DIAGNOSTIC_DEADLINE,
     b_diagnostic_samples = const BCTX_DIAGNOSTIC_SAMPLES,
+    b_boot_diagnostic = const core::mem::offset_of!(ResidentBootContext, boot_diagnostic),
+    b_boot_diagnostic_started_tsc = const core::mem::offset_of!(ResidentBootContext, boot_diagnostic_started_tsc),
     b_diagnostic_expired = const BCTX_DIAGNOSTIC_EXPIRED,
     b_last_normal_reason = const BCTX_LAST_NORMAL_REASON,
     b_last_normal_rip = const BCTX_LAST_NORMAL_RIP,
@@ -1659,6 +1743,11 @@ global_asm!(
     event_hyperv_reference_tsc_msr = const core::mem::offset_of!(ResidentEventContext, hyperv_reference_tsc_msr),
     event_hyperv_reference_tsc_lock = const core::mem::offset_of!(ResidentEventContext, hyperv_reference_tsc_lock),
     event_hyperv_reference_tsc_sequence = const core::mem::offset_of!(ResidentEventContext, hyperv_reference_tsc_sequence),
+    event_hyperv_reenlightenment_control = const core::mem::offset_of!(ResidentEventContext, hyperv_reenlightenment_control),
+    event_hyperv_tsc_emulation_control = const core::mem::offset_of!(ResidentEventContext, hyperv_tsc_emulation_control),
+    event_hyperv_tsc_emulation_status = const core::mem::offset_of!(ResidentEventContext, hyperv_tsc_emulation_status),
+    event_hyperv_tsc_frequency_hz = const core::mem::offset_of!(ResidentEventContext, hyperv_tsc_frequency_hz),
+    event_hyperv_apic_frequency_hz = const core::mem::offset_of!(ResidentEventContext, hyperv_apic_frequency_hz),
     event_post_ebs_cpu_mask = const EVENT_CTX_POST_EBS_CPU_MASK,
     event_diagnostic_halted = const EVENT_CTX_DIAGNOSTIC_HALTED,
     event_host_fault_vector = const EVENT_CTX_HOST_FAULT_VECTOR,

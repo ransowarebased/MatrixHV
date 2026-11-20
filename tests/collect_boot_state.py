@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import struct
 import sys
+import time
 import traceback
 
 import ida_dbg
@@ -29,6 +30,51 @@ sys.stderr = sys.stdout
 
 def structure(source, name):
     return source.split(f"struct {name} {{", 1)[1].split("\n}", 1)[0]
+
+
+def rust_usize(source, expression):
+    import ast
+
+    declarations = dict(re.findall(r"\bconst (\w+): usize\s*=\s*([^;]+);", source))
+    resolved = {}
+    resolving = set()
+    operations = {
+        ast.Add: lambda left, right: left + right,
+        ast.Sub: lambda left, right: left - right,
+        ast.Mult: lambda left, right: left * right,
+        ast.Div: lambda left, right: left // right,
+        ast.Mod: lambda left, right: left % right,
+        ast.LShift: lambda left, right: left << right,
+        ast.RShift: lambda left, right: left >> right,
+        ast.BitOr: lambda left, right: left | right,
+        ast.BitAnd: lambda left, right: left & right,
+    }
+
+    def evaluate(text):
+        text = re.sub(r"(?:\w+::)+(\w+)", r"\1", text.strip())
+        return visit(ast.parse(text, mode="eval").body)
+
+    def visit(node):
+        if isinstance(node, ast.Constant) and type(node.value) is int:
+            return node.value
+        if isinstance(node, ast.Name):
+            name = node.id
+            if name in resolved:
+                return resolved[name]
+            if name in resolving or name not in declarations:
+                raise ValueError(f"Unresolved Rust usize constant: {name}")
+            resolving.add(name)
+            resolved[name] = evaluate(declarations[name])
+            resolving.remove(name)
+            return resolved[name]
+        if isinstance(node, ast.BinOp) and type(node.op) in operations:
+            return operations[type(node.op)](visit(node.left), visit(node.right))
+        raise ValueError(f"Unsupported Rust usize expression: {ast.dump(node)}")
+
+    value = evaluate(expression)
+    if not 0 <= value <= 0xffffffffffffffff:
+        raise ValueError(f"Rust usize expression is out of range: {expression}")
+    return value
 
 
 resident = "\n".join((project / "src/vmx" / name).read_text()
@@ -64,9 +110,7 @@ def append_u64_fields(source, prefix):
             offset = (offset + 15) // 16 * 16 + 512
         elif (array := re.fullmatch(r"\[u8; ([\w:]+)\]", kind)):
             length = array[1].split("::")[-1]
-            offset += int(length) if length.isdecimal() else int(
-                re.search(r"const " + re.escape(length) + r": usize = (\d+)",
-                          protocol)[1])
+            offset += rust_usize(protocol, length)
         elif (array := re.fullmatch(r"\[\[u64; (\d+)\]; (\d+)\]", kind)):
             offset = (offset + 7) // 8 * 8 + 8 * int(array[1]) * int(array[2])
         elif (array := re.fullmatch(r"\[(u64|u32); ([\w:]+)\]", kind)):
@@ -74,10 +118,7 @@ def append_u64_fields(source, prefix):
             length = length.split("::")[-1]
             size = 8 if element == "u64" else 4
             offset = (offset + size - 1) // size * size
-            count = int(length) if length.isdecimal() else int(
-                re.search(r"const " + re.escape(length) + r": usize = (\d+)",
-                          resident + nested + protocol)[1]
-            )
+            count = rust_usize(resident + nested + protocol, length)
             for index in range(count):
                 if name == "flight_recorder_records" and index not in (0, count - 1):
                     offset += size
@@ -100,23 +141,16 @@ attached = False
 def plain_layout(source, name, stop=None):
     sizes = {"u8": (1, 1), "u16": (2, 2), "u32": (4, 4),
              "u64": (8, 8), "usize": (8, 8), "AtomicU64": (8, 8)}
-    constants = {"BANK_PAGES": 64}
-    constants.update({name: int(value) for name, value in re.findall(
-        r"(?:pub )?const (\w+): usize = (\d+);", source)})
-
     def size_of(kind):
         if kind in sizes:
             return sizes[kind]
         wrapper = re.fullmatch(r"UnsafeCell<(.*)>", kind)
         if wrapper:
             return size_of(wrapper[1])
-        array = re.fullmatch(r"\[(.*); ([\w:]+(?: - \d+)?)\]", kind)
+        array = re.fullmatch(r"\[(.*); (.+)\]", kind)
         if array:
             size, alignment = size_of(array[1])
-            terms = array[2].split(" - ")
-            count = int(terms[0]) if terms[0].isdecimal() else constants[terms[0].split("::")[-1]]
-            if len(terms) == 2:
-                count -= int(terms[1])
+            count = rust_usize(source, array[2])
             return size * count, alignment
         if f"struct {kind} {{" not in source:
             raise RuntimeError(f"Unsupported layout type: {name}: {kind}")
@@ -142,6 +176,23 @@ def runtime_update_layout(project):
     return plain_layout(source, "RuntimeContext", "transaction")
 
 
+def capture_cpu_state(thread, registers, cr3, read_bytes):
+    cpu = {"thread": thread, "registers": registers, "cr3": cr3,
+           "rip_bytes": None, "disassembly": []}
+    if registers.get("CS") == 0xf000:
+        cpu["instruction_capture"] = {
+            "status": "unavailable",
+            "reason": "Reset-style CS=0xf000: execution mode and hidden CS base are unavailable; RIP is a segment offset, not a verified linear address. CPU activity state is unknown.",
+        }
+        return cpu
+    instructions = read_bytes(registers["RIP"], 32, True)
+    if instructions is None or len(instructions) != 32:
+        raise RuntimeError(f"Cannot read instruction bytes for CPU {thread}")
+    cpu["rip_bytes"] = instructions.hex()
+    cpu["instruction_capture"] = {"status": "captured"}
+    return cpu
+
+
 try:
     if not ida_idp.set_processor_type("metapc", ida_idp.SETPROC_LOADER):
         raise RuntimeError("Intel x86 processor module unavailable")
@@ -155,6 +206,7 @@ try:
     attached = ida_dbg.get_process_state() != ida_dbg.DSTATE_NOTASK
     if event <= 0 or ida_dbg.get_process_state() != ida_dbg.DSTATE_SUSP:
         raise RuntimeError("Debugger did not suspend the VM")
+    result["capture_monotonic"] = time.monotonic()
     if ida_dbg.get_thread_qty() == 0:
         raise RuntimeError("Debugger returned no CPUs")
     names = [descriptor[0].upper() for descriptor in ida_idd.dbg_get_registers()]
@@ -162,13 +214,7 @@ try:
         thread = ida_dbg.getn_thread(index)
         ida_dbg.select_thread(thread)
         registers = dict(zip(names, (value.ival for value in ida_dbg.get_reg_vals(thread))))
-        rip = registers["RIP"]
-        instructions = idc.get_bytes(rip, 32, True)
-        if instructions is None or len(instructions) != 32:
-            raise RuntimeError(f"Cannot read instruction bytes for CPU {thread}")
-        cpu = {"thread": thread, "registers": registers,
-               "cr3": idc.send_dbg_command("r cr3"),
-               "rip_bytes": instructions.hex() if instructions else None}
+        cpu = capture_cpu_state(thread, registers, idc.send_dbg_command("r cr3"), idc.get_bytes)
         result["cpus"].append(cpu)
         print("CPU", json.dumps(cpu))
     print("PHYSICAL", idc.send_dbg_command("phys"))
@@ -307,7 +353,7 @@ try:
             session_fields, _, _ = plain_layout(interception_source, "Session", "splits")
             profile_fields, profile_size, _ = plain_layout(interception_source, "RoadEptProfile")
             _, split_size, _ = plain_layout(interception_source, "BaseSplit")
-            split_count = int(re.search(r"const INTERCEPT_BASE_TABLE_PAGES: usize = (\d+);", interception_source)[1])
+            split_count = rust_usize(interception_source, "INTERCEPT_BASE_TABLE_PAGES")
             pointer = idc.get_bytes(event_address + event_fields["interception_context_physical"], 8, True)
             session_address = struct.unpack("<Q", pointer)[0]
             profile_data = idc.get_bytes(session_address + session_fields["configuration"], profile_size, True)
@@ -327,6 +373,14 @@ try:
             if event_data is None or len(event_data) != event_size:
                 raise RuntimeError("Cannot read resident runtime update state")
             read_quad = lambda data, offset: struct.unpack_from("<Q", data, offset)[0]
+            result["event_timing"] = {
+                name: read_quad(event_data, event_fields[name])
+                for name in ("watchdog_tsc_hz", "visual_deadline_tsc")
+            }
+            result["hyperv"] = {
+                name.removeprefix("hyperv_"): read_quad(event_data, field_offset)
+                for name, field_offset in event_fields.items() if name.startswith("hyperv_")
+            }
             update_address = read_quad(event_data, event_fields["update_context_physical"])
             update_data = idc.get_bytes(update_address, update_prefix_size + 384, True)
             if update_data is None:
@@ -396,6 +450,8 @@ finally:
                 raise RuntimeError("Debugger remained attached after capture")
             # Decode only after detaching; copied bytes belong to this empty IDB.
             for cpu in result["cpus"]:
+                if cpu["instruction_capture"]["status"] != "captured":
+                    continue
                 rip = cpu["registers"]["RIP"]
                 code = bytes.fromhex(cpu["rip_bytes"])
                 start = rip & ~0xFFF

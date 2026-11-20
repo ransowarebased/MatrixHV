@@ -31,7 +31,7 @@ def read_resident_assembly(project: Path) -> str:
     macros = "\n".join(
         (project / "src/asm" / name if name in ("diagnostics.S", "ap_startup.S")
          else assembly / name).read_text(encoding="utf-8")
-        for name in ("nested.S", "hyperv.S", "exits.S", "msr.S", "control.S", "diagnostics.S", "ept_cache.S", "eptp_switch.S", "ap_startup.S")
+        for name in ("nested.S", "hyperv.S", "exits.S", "msr.S", "control.S", "diagnostics.S", "boot_diagnostics.S", "ept_cache.S", "eptp_switch.S", "ap_startup.S")
     )
     lines = macros.splitlines(keepends=True)
     definitions = {}
@@ -410,6 +410,7 @@ def prepare_evmcs(project: Path):
     cpuid = cpuid.replace('{hyperv_features_leaf}', '0x40000003')
     cpuid = cpuid.replace('{b_nested_evmcs_enabled}', '8').replace('{b_hyperv_timing_supported}', '0')
     cpuid = cpuid.replace('{b_event_context}', '16').replace('{event_hyperv_tsc_invariant_supported}', '0')
+    cpuid = cpuid.replace('{event_hyperv_apic_frequency_hz}', '8')
     cpuid_wrapper = """
     .text
     .globl test_evmcs_cpuid
@@ -888,7 +889,7 @@ def prepare_nested_ept(project: Path):
     switch_source = switch_source.replace("jna .Lresident_invalidation_failed", "jna .Lresident_dispatch_halt")
     switch_source = switch_source.replace("call .Lresident_interception_callback", "xor eax, eax")
     exit_msr_start = source.index('.Lresident_nested_capture_vmcs02_guest_state:')
-    exit_msr_end = source.index('lea rsi, [rip + .Lresident_nested_guest_state_table]', exit_msr_start)
+    exit_msr_end = source.index('.Lresident_nested_capture_vmcs02_fields:', exit_msr_start)
     exit_msr_assembly = source[exit_msr_start:exit_msr_end].replace(
         "vmread r11, rax",
         "mov r11, qword ptr [r12 + {test_hardware} + rax * 8]\n"
@@ -968,18 +969,14 @@ def prepare_nested_ept(project: Path):
         "inc qword ptr [r12 + {test_writes}]\nmov eax, 1\ntest eax, eax",
     )
     guest_assembly += "\n.Lresident_dispatch_vmwrite_failed:\nud2\n"
-    capture_start = source.index('.Lresident_nested_capture_vmcs02_guest_state_loop:')
-    capture_end = source.index('mov rax, {guest_gs_base}', capture_start)
+    capture_start = source.index('.Lresident_nested_capture_vmcs02_fields:')
     rare_start = source.index('.Lresident_nested_materialize_guest_field:')
     rare_end = source.index('.Lresident_nested_complete_vmcs02_msr_exit:', rare_start)
-    guest_assembly += "\n" + source[capture_start:capture_end].strip() + (
-        "\nmov rax, qword ptr [rip + .Lresident_nested_rare_guest_fields]\n"
-        "mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], rax\n"
-        "mov rax, qword ptr [rip + .Lresident_nested_rare_guest_fields + 8]\n"
-        "mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending} + 8], rax\nret\n"
+    guest_assembly += "\n" + source[capture_start:rare_start].replace(
+        "mov rax, {guest_gs_base}\n", "mov edx, 55\nmov rax, {guest_gs_base}\n"
     )
     guest_assembly += source[rare_start:rare_end].strip()
-    assert guest_assembly.count("vmread r11, rax") == 3
+    assert guest_assembly.count("vmread r11, rax") == 4
     guest_assembly = guest_assembly.replace(
         "vmread r11, rax",
         "cmp qword ptr [r12 + {test_selected_vmcs}], 2\n"
@@ -2106,8 +2103,8 @@ def prepare_hyperv_time(project: Path):
     source = (project / 'src/vmx/hyperv.rs').read_text(encoding='utf-8')
     scale = source[source.index('pub fn hyperv_reference_tsc_scale('):source.index('pub fn native_hyperv_reference_tsc(')]
     native = source[source.index('pub fn native_hyperv_reference_tsc('):source.index('pub fn restrict_evmcs_secondary_capability(')]
-    native = native.replace('pub fn native_hyperv_reference_tsc(calibrate: impl FnOnce() -> u64)',
-                            'fn native_hyperv_reference_tsc(cpuid: impl Fn(u32) -> core::arch::x86_64::CpuidResult, epoch: u64, calibrate: impl FnOnce() -> u64)')
+    native = native.replace('pub fn native_hyperv_reference_tsc(',
+                            'fn native_hyperv_reference_tsc(cpuid: impl Fn(u32) -> core::arch::x86_64::CpuidResult, epoch: u64, ')
     native = native.replace('pub fn native_hyperv_invariant_tsc()',
                             'fn native_hyperv_invariant_tsc(cpuid: impl Fn(u32) -> core::arch::x86_64::CpuidResult)')
     native = native.replace('    let cpuid = core::arch::x86_64::__cpuid;\n', '')
@@ -2119,13 +2116,15 @@ def prepare_hyperv_time(project: Path):
     (output / 'definitions.rs').write_text(scale, encoding='utf-8')
     source = read_resident_assembly(project)
     read = source[source.index('.Lresident_dispatch_rdmsr_reference_count:'):source.index('.Lresident_dispatch_rdmsr_zero:')]
+    read += source[source.index('.Lresident_dispatch_rdmsr_reenlightenment:'):source.index('.Lresident_dispatch_rdmsr_vp_assist:')]
     write = source[source.index('.Lresident_dispatch_wrmsr_reference_count:'):source.index('.Lresident_dispatch_xsetbv:')]
+    write += source[source.index('.Lresident_dispatch_wrmsr_reenlightenment:'):source.index('.Lresident_dispatch_wrmsr_vp_assist:')]
     read += source[source.index('.Lresident_dispatch_rdmsr_guest_os_id:'):source.index('.Lresident_dispatch_rdmsr_vp_index:')]
     write += source[source.index('.Lresident_dispatch_wrmsr_guest_os_id:'):source.index('.Lresident_dispatch_wrmsr_reference_count:')]
     cpuid = source[source.index('.Lresident_dispatch_cpuid_hypervisor_present:'):source.index('.Lresident_dispatch_cpuid_matrixhv:')]
-    route_start = source.index('cmp ecx, {hyperv_tsc_invariant_control_msr}')
+    route_start = source.index('cmp ecx, {hyperv_tsc_frequency_msr}')
     read_route = source[route_start:source.index('cmp ecx, {hyperv_reference_count_msr}', route_start)]
-    route_start = source.index('cmp ecx, {hyperv_tsc_invariant_control_msr}', route_start + len(read_route))
+    route_start = source.index('cmp ecx, {hyperv_reenlightenment_control_msr}', route_start + len(read_route))
     write_route = source[route_start:source.index('cmp ecx, {hyperv_reference_count_msr}', route_start)]
     routes = '.Ltest_time_rdmsr_route:\n' + read_route + 'jmp .Lresident_dispatch_rdmsr_passthrough\n'
     routes += '.Ltest_time_wrmsr_route:\n' + write_route + 'jmp .Lresident_dispatch_wrmsr_passthrough\n'
@@ -2143,6 +2142,17 @@ def prepare_hyperv_time(project: Path):
                'event_hyperv_tsc_invariant_supported': 64,
                'event_hyperv_tsc_invariant_control': 72,
                'hyperv_tsc_invariant_control_msr': 0x40000118,
+               'hyperv_tsc_frequency_msr': 0x40000022,
+               'hyperv_apic_frequency_msr': 0x40000023,
+               'hyperv_reenlightenment_control_msr': 0x40000106,
+               'hyperv_tsc_emulation_control_msr': 0x40000107,
+               'hyperv_tsc_emulation_status_msr': 0x40000108,
+               'event_hyperv_reenlightenment_control': 80,
+               'event_hyperv_tsc_emulation_control': 88,
+               'event_hyperv_tsc_emulation_status': 96,
+               'event_control_processor_count': 104,
+               'event_hyperv_tsc_frequency_hz': 112,
+               'event_hyperv_apic_frequency_hz': 120,
                'host_page_address_mask': 0x000ffffffffff000}
     assembly = re.sub(r'\{(\w+)\}', lambda match: str(offsets[match[1]]), assembly)
     assembly = re.sub(r'^rdtsc$', 'mov rax, [r12 + 16]\nmov rdx, rax\nshr rdx, 32\nmov eax, eax', assembly, flags=re.MULTILINE)
@@ -2164,6 +2174,10 @@ def prepare_hyperv_time(project: Path):
         mov [rsp], rax
         mov rax, [rdx + 8]
         mov [rsp + 16], rax
+        cmp r8d, 16
+        jae .Ltest_frequency_operation
+        cmp r8d, 10
+        jae .Ltest_migration_operation
         cmp r8d, 0
         je .Lresident_dispatch_rdmsr_reference_count
         cmp r8d, 1
@@ -2184,6 +2198,17 @@ def prepare_hyperv_time(project: Path):
         cmp r8d, 9
         je .Ltest_time_wrmsr_route
         jmp .Lresident_dispatch_wrmsr_hypercall
+    .Ltest_migration_operation:
+        mov ecx, r8d
+        sub ecx, 10
+        shr ecx, 1
+        add ecx, 0x40000106
+        test r8d, 1
+        jnz .Ltest_time_wrmsr_route
+        jmp .Ltest_time_rdmsr_route
+    .Ltest_frequency_operation:
+        lea ecx, [r8 + 0x40000022 - 16]
+        jmp .Ltest_time_rdmsr_route
     .Lresident_dispatch_rdmsr_nested_value:
         mov eax, r11d
         mov [rsp], rax
@@ -2979,6 +3004,8 @@ def prepare_resident_visual(project: Path):
     .Lresident_diagnostic_snapshot:
         inc qword ptr [r12 + {test_snapshot_count}]
         ret
+    .Lresident_boot_diagnostic_capture:
+        ret
     .Lresident_dispatch_unsupported:
     .Lresident_dispatch_vmread_failed:
         ud2
@@ -3264,7 +3291,7 @@ def prepare_boot_state(project: Path):
         project / "src/vmx/vmcs12.rs").read_text()
     collector = ast.parse((project / "tests/collect_boot_state.py").read_text())
     functions = [node for node in collector.body if isinstance(node, ast.FunctionDef)
-                 and node.name in ("structure", "append_u64_fields", "plain_layout", "runtime_update_layout")]
+                 and node.name in ("structure", "rust_usize", "append_u64_fields", "plain_layout", "runtime_update_layout", "capture_cpu_state")]
     namespace = {"resident": resident, "nested": nested, "re": re,
                  "protocol": (project / PROTOCOL_SOURCE).read_text(encoding="utf-8"),
                  "fields": {}, "formats": {}, "offset": 0}
@@ -3273,9 +3300,53 @@ def prepare_boot_state(project: Path):
     update_fields, update_prefix_size, _ = namespace["runtime_update_layout"](project)
     assert update_fields["abi"] == 8 and update_fields["public_key"] == 28
     assert update_fields["transaction"] == update_prefix_size == 2264
+    capture_cpu = namespace["capture_cpu_state"]
+    def reject_instruction_read(*arguments):
+        raise AssertionError(f"Reset-style RIP was treated as linear: {arguments}")
+    reset_cpu = capture_cpu(8, {"RIP": 0xfff0, "CS": 0xf000}, "cr3=0x0", reject_instruction_read)
+    assert reset_cpu["rip_bytes"] is None and reset_cpu["disassembly"] == []
+    assert reset_cpu["instruction_capture"]["status"] == "unavailable"
+    assert "segment offset" in reset_cpu["instruction_capture"]["reason"]
+    for rip, cs in ((0x6181079, 8), (0xfffff80000001000, 0x10)):
+        reads = []
+        def read_instructions(address, size, use_debugger):
+            reads.append((address, size, use_debugger))
+            return b"\x90" * size
+        cpu = capture_cpu(1, {"RIP": rip, "CS": cs}, "cr3=0x1000", read_instructions)
+        assert reads == [(rip, 32, True)]
+        assert cpu["rip_bytes"] == "90" * 32 and cpu["instruction_capture"]["status"] == "captured"
+    try:
+        capture_cpu(1, {"RIP": 0x6181079, "CS": 8}, "cr3=0x1000", lambda *arguments: None)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Unreadable active CPU instructions were accepted")
+    resolve = namespace["rust_usize"]
+    expressions = "const PAGES: usize = 77; const BANK: usize = 4 * PAGES;"
+    assert resolve(expressions, "BANK") == 308
+    assert resolve(expressions, "(crate::memory::BANK - 4) / 8") == 38
+    for expression in ("unknown", "PAGES()", "-1", "1.0", "True"):
+        try:
+            resolve(expressions, expression)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Unsupported layout expression accepted: {expression}")
+    interception = (project / "src/memory/interception.rs").read_text()
+    interception_source = interception + namespace["protocol"]
+    profile_fields, profile_size, _ = namespace["plain_layout"](interception_source, "RoadEptProfile")
+    session_fields, _, _ = namespace["plain_layout"](interception_source, "Session", "splits")
+    _, split_size, _ = namespace["plain_layout"](interception_source, "BaseSplit")
+    split_count = resolve(interception_source, "INTERCEPT_BASE_TABLE_PAGES")
     output = project / "builds/boot-state-tests"
     output.mkdir(parents=True, exist_ok=True)
     legacy_abi = (project / "src/vmx/resident/abi.rs").read_text()
+    previous_boot_diagnostic_abi = legacy_abi.replace(
+        "    pub boot_diagnostic: [u64; 32],\n", ""
+    ).replace("    pub boot_diagnostic_started_tsc: u64,\n", "").replace(
+        "            boot_diagnostic: [0; 32],\n", ""
+    ).replace("            boot_diagnostic_started_tsc: 0,\n", "")
+    (output / "previous-boot-diagnostic-abi.rs").write_text(previous_boot_diagnostic_abi, encoding="utf-8")
     debug_kinds = "    pub debug_kinds: [u32; 4],\n"
     debug_kinds_init = "            debug_kinds: [0; 4],\n"
     assert legacy_abi.count(debug_kinds) == legacy_abi.count(debug_kinds_init) == 1
@@ -3304,13 +3375,35 @@ def prepare_boot_state(project: Path):
     (output / "trace_state.rs").write_text(trace_source[trace_source.index("#[repr(C)]"):trace_source.index("pub(crate) fn supported")])
     harness += 'pub mod vmx { pub mod pt { include!("trace_state.rs"); } pub mod bridge { include!("../../src/vmx/bridge.rs"); } pub mod nested { include!("../../src/vmx/nested.rs"); } pub mod vmcs12 { include!("../../src/vmx/vmcs12.rs"); } }\n'
     harness += 'pub mod abi { include!("../../src/vmx/resident/abi.rs"); }\n'
+    harness += 'pub mod previous_boot_diagnostic_abi { include!("previous-boot-diagnostic-abi.rs"); }\n'
     harness += 'pub mod previous_interception_abi { include!("previous-interception-abi.rs"); }\n'
     harness += 'pub mod legacy_nested { include!("legacy-nested.rs"); }\n'
     harness += 'pub mod legacy_abi { include!("legacy-abi.rs"); }\n'
     harness += "use abi::ResidentBootContext;\n"
+    harness += 'use std::cell::UnsafeCell; use std::sync::atomic::AtomicU64;\n'
+    harness += 'use protocol::memory::{HOOK_MAX_PAGES, HOOK_MAX_PATCHES, ROOT_HISTORY_COUNT, INTERCEPT_BASE_TABLE_PAGES};\n'
+    for name in ("DebugTarget", "RoadEptProfile", "Hook", "BaseSplit"):
+        body = namespace["structure"](interception, name)
+        body = re.sub(r"(?m)^(\s+)(?!pub )(\w+:)", r"\1pub \2", body)
+        harness += ("#[repr(C)]\n" if name != "BaseSplit" else "")
+        harness += f"pub struct {name} {{{body}\n}}\n"
+    prefix = namespace["structure"](interception, "Session").split("    cr3_targets:", 1)[0]
+    prefix = re.sub(r"(?m)^(\s+)(?!pub )(\w+:)", r"\1pub \2", prefix)
+    harness += f"#[repr(C)]\npub struct InterceptionPrefix {{{prefix}\n}}\n"
     harness += "fn main() {\n"
+    harness += f'assert_eq!(INTERCEPT_BASE_TABLE_PAGES, {split_count});\n'
+    harness += f'assert_eq!(size_of::<BaseSplit>(), {split_size});\n'
+    harness += f'assert_eq!(size_of::<RoadEptProfile>(), {profile_size});\n'
+    for name, offset in profile_fields.items():
+        harness += f'assert_eq!(offset_of!(RoadEptProfile, {name}), {offset}, "profile field {name}");\n'
+    for name in ("configuration", "splits"):
+        harness += f'assert_eq!(offset_of!(InterceptionPrefix, {name}), {session_fields[name]}, "session field {name}");\n'
+    epoch_offset = session_fields["splits"] + split_size * split_count
+    harness += f'assert_eq!(offset_of!(InterceptionPrefix, split_epoch), {epoch_offset});\n'
     harness += 'let nested_delta = size_of::<vmx::nested::NestedVmxState>() - size_of::<legacy_nested::NestedVmxState>();\n'
     harness += 'assert_eq!(nested_delta, 2 * size_of::<u64>());\n'
+    harness += 'assert_eq!(size_of::<ResidentBootContext>() - size_of::<previous_boot_diagnostic_abi::ResidentBootContext>(), 272, "boot diagnostics must reject incompatible live-update packages by boot_bytes");\n'
+    harness += 'assert_eq!(offset_of!(ResidentBootContext, nmi_entry_retries), offset_of!(previous_boot_diagnostic_abi::ResidentBootContext, nmi_entry_retries));\n'
     harness += 'assert_eq!(size_of::<ResidentBootContext>() - size_of::<previous_interception_abi::ResidentBootContext>(), 16, "debug ownership state must reject older live-update packages by boot_bytes");\n'
     harness += 'assert_eq!(offset_of!(ResidentBootContext, intel_pt), offset_of!(previous_interception_abi::ResidentBootContext, intel_pt) + 16);\n'
     harness += 'assert_eq!(size_of::<ResidentBootContext>() - size_of::<legacy_abi::ResidentBootContext>(), nested_delta + 2 * size_of::<u64>(), "new nested debug and NMI state must reject legacy live-update packages by boot_bytes");\n'
@@ -3322,7 +3415,7 @@ def prepare_boot_state(project: Path):
             element = "u64" if format_code == "<Q" else "u32"
             displacement = f" + {index} * size_of::<{element}>()"
         harness += f'println!("{name}={{}}", offset_of!(ResidentBootContext, {path}){displacement});\n'
-        if name not in ("nmi_injected", "nmi_entry_retries", "nested.inherited_l1_dr7", "nested.inherited_l1_debugctl"):
+        if not name.startswith("boot_diagnostic") and name not in ("nmi_injected", "nmi_entry_retries", "nested.inherited_l1_dr7", "nested.inherited_l1_debugctl"):
             harness += f'assert_eq!(offset_of!(ResidentBootContext, {path}), offset_of!(legacy_abi::ResidentBootContext, {path}) + if offset_of!(ResidentBootContext, {path}) >= offset_of!(ResidentBootContext, original_gdtr) {{ nested_delta }} else {{ 0 }}, "legacy field offset changed: {name}");\n'
     harness += "}\n"
     source_path = output / "layout.rs"

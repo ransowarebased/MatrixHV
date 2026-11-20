@@ -122,6 +122,14 @@ pub const VMX_CR3_TARGET_COUNT: u64 = 4;
 
 pub const CPUID_VMX_BIT: u32 = 1 << 5;
 pub const CPUID_OSXSAVE_BIT: u32 = 1 << 27;
+// Features whose VMX controls or guest MSR contracts are not exposed to L1
+// nested hypervisors (SGX, MPX, WAITPKG, CET_SS, LA57, CET_IBT and their
+// matching XSAVE/XSS state bits).
+pub const CPUID_LEAF7_EBX_NESTED_UNSUPPORTED_MASK: u32 = (1 << 2) | (1 << 14);
+pub const CPUID_LEAF7_ECX_NESTED_UNSUPPORTED_MASK: u32 = (1 << 5) | (1 << 7) | (1 << 16);
+pub const CPUID_LEAF7_EDX_NESTED_UNSUPPORTED_MASK: u32 = 1 << 20;
+pub const CPUID_LEAFD_SUBLEAF0_EAX_NESTED_UNSUPPORTED_MASK: u32 = (1 << 3) | (1 << 4);
+pub const CPUID_LEAFD_SUBLEAF1_ECX_NESTED_UNSUPPORTED_MASK: u32 = (1 << 11) | (1 << 12);
 pub const NESTED_FAILURE_TRACE_CAPACITY: usize = 32;
 pub const NESTED_FAILURE_TRACE_WORD_COUNT: usize = 192;
 const _: () = assert!(NESTED_FAILURE_TRACE_WORD_COUNT == NESTED_FAILURE_TRACE_CAPACITY * 6);

@@ -185,6 +185,22 @@ mod cache {
         check(&state, 0x2000_0000, 4096, EptMemoryType::WriteCombining);
     }
 
+    #[test]
+    fn narrower_or_discontinuous_variable_mtrr_masks_follow_bitwise_matching() {
+        // A 36-bit BIOS UC mask on a 39-bit CPU leaves bits 38:36 clear in PHYSMASK.
+        // Hardware still matches (address & mask) == (base & mask), so high RAM at 4 GiB
+        // must remain WriteBack instead of collapsing into a 448 GiB UC span.
+        let mut state = state();
+        state.physical_mask = ((1_u64 << 39) - 1) & !0xfff;
+        state.variable_ranges[0] = [0x0000_0000_a000_0000, 0x0000_000f_e000_0800];
+        check(&state, 0x0000_0000_a000_0000, 0x20_0000, EptMemoryType::Uncacheable);
+        check(&state, 0x0000_0000_9000_0000, 0x20_0000, EptMemoryType::WriteBack);
+        check(&state, 0x0000_0001_0000_0000, 0x20_0000, EptMemoryType::WriteBack);
+        check(&state, 0x0000_0004_0000_0000, 4096, EptMemoryType::WriteBack);
+        // Hardware aliases bits 38:36 when those mask bits are clear.
+        check(&state, 0x0000_0010_a000_0000, 0x20_0000, EptMemoryType::Uncacheable);
+    }
+
     #[repr(C, align(4096))]
     struct Table([u64; 512]);
 
@@ -482,6 +498,8 @@ mod pci_bar {
         assert_eq!(read_pci_bar_range(io.as_ptr()), Ok(None));
         let unassigned = descriptor(0x4000_100000, 0, 0);
         assert_eq!(read_pci_bar_range(unassigned.as_ptr()), Ok(None));
+        let zero_base = descriptor(0, 0x1000_0000, 0);
+        assert_eq!(read_pci_bar_range(zero_base.as_ptr()), Ok(None));
     }
 
     #[test]

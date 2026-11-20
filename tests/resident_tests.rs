@@ -547,7 +547,7 @@ mod hyperv_time {
 
     struct Scenario {
         context: [u64; 11],
-        shared: Box<[u64; 10]>,
+        shared: Box<[u64; 16]>,
         page: Box<Page>,
         tables: Box<[Page; 4]>,
     }
@@ -563,6 +563,12 @@ mod hyperv_time {
                 0,
                 0,
                 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                8,
                 0,
                 0,
             ]);
@@ -668,7 +674,7 @@ mod hyperv_time {
         scenario.context[1] = 0;
         scenario.shared[8] = u64::from(native_hyperv_invariant_tsc(cpuid));
         assert_eq!(scenario.shared[8], 1);
-        assert_ne!(native_hyperv_reference_tsc(cpuid, 12345, || 0).0, 0);
+        assert_ne!(native_hyperv_reference_tsc(cpuid, 12345, 0, || 0).0, 0);
         assert_eq!(scenario.msr(9, 1), (1, 1));
         assert_eq!(scenario.msr(8, 0), (1, 1));
     }
@@ -2663,7 +2669,7 @@ mod visual {
 
     use core::arch::global_asm;
 
-    const WIDTH: usize = 512;
+    const WIDTH: usize = 640;
     const HEIGHT: usize = 384;
     const BACKGROUND: u32 = 0x1234_5678;
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -3166,7 +3172,7 @@ mod visual {
     }
 
     #[test]
-    fn framebuffer_window_starts_at_ebs_and_expires_after_forty_seconds() {
+    fn framebuffer_window_starts_at_ebs_and_expires_after_twenty_seconds() {
         let _guard = TEST_LOCK.lock().unwrap();
         let mut pixels = vec![BACKGROUND; WIDTH * HEIGHT];
         let mut event_context = context(&mut pixels);
@@ -3180,18 +3186,18 @@ mod visual {
         }
         assert!(pixels.iter().all(|&pixel| pixel == BACKGROUND));
         unsafe { matrixhv_resident_ebs_callback(0, &mut event_context) };
-        assert_eq!(event_context.visual_deadline, 5000);
+        assert_eq!(event_context.visual_deadline, 3000);
         unsafe {
-            test_visual_tsc = 4999;
+            test_visual_tsc = 2999;
             matrixhv_resident_ebs_callback(0, &mut event_context);
             matrixhv_resident_va_callback(0, &mut event_context);
             test_paint_hex(&event_context, u64::MAX, 0);
         }
-        assert_eq!(event_context.visual_deadline, 5000);
+        assert_eq!(event_context.visual_deadline, 3000);
         assert!(pixels.iter().any(|&pixel| pixel != BACKGROUND));
         pixels.fill(BACKGROUND);
         unsafe {
-            test_visual_tsc = 5000;
+            test_visual_tsc = 3000;
             test_paint_stage(&event_context, 1);
             test_paint_byte(&event_context, 0xff, 5);
             test_paint_hex(&event_context, u64::MAX, 0);
@@ -3213,7 +3219,7 @@ mod visual {
             test_set_backend(2);
         }
         assert_eq!(event_context.visual_base, 0);
-        assert_eq!(event_context.visual_deadline, 5000);
+        assert_eq!(event_context.visual_deadline, 3000);
         assert!(pixels.iter().all(|&pixel| pixel == BACKGROUND));
     }
 
@@ -3350,7 +3356,7 @@ mod visual {
                     test_paint_hex(&event_context, u64::MAX, row as u32);
                     test_paint_hex(&event_context, value, row as u32);
                 }
-                let text = format!("{:X} {value:016X}", row % 16);
+                let text = format!("{row:02X}{value:016X}");
                 let first_x = 16 + row / 16 * HEX_COLUMN_STEP;
                 let first_y = 16 + HEX_Y + row % 16 * HEX_ROW_STEP;
                 for (offset, &pixel) in pixels.iter().enumerate() {
@@ -3368,7 +3374,13 @@ mod visual {
                                     & (1 << (2 - glyph_x / 2))
                                     != 0
                         });
-                        if lit { u32::MAX } else { 0 }
+                        if !lit {
+                            0
+                        } else if cell < 2 {
+                            0x00ff_ff00
+                        } else {
+                            u32::MAX
+                        }
                     } else {
                         BACKGROUND
                     };

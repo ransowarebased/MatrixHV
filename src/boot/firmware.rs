@@ -27,6 +27,7 @@ use crate::boot::config::{self, MatrixConfig, ParseError};
 use crate::logging;
 
 const CONFIG_FILE_PATH: &CStr16 = cstr16!(r"\MatrixConfig.bin");
+const BOOT_LOG_FILE_PATH: &CStr16 = cstr16!(r"\MatrixHV.log");
 const CONFIG_FILE_MAX_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +87,51 @@ pub fn load_from_boot_volume() -> Result<MatrixConfig, ConfigLoadError> {
         return Err(ConfigLoadError::TooLarge);
     }
     config::parse(&bytes[..length]).map_err(ConfigLoadError::Parse)
+}
+
+pub fn write_boot_log(bytes: &[u8]) -> Result<(), Status> {
+    if boot_services_exited() {
+        return Err(Status::UNSUPPORTED);
+    }
+    let params = OpenProtocolParams {
+        handle: boot::image_handle(),
+        agent: boot::image_handle(),
+        controller: None,
+    };
+    let loaded_image =
+        unsafe { boot::open_protocol::<LoadedImage>(params, OpenProtocolAttributes::GetProtocol) }
+            .map_err(|error| error.status())?;
+    let device_handle = loaded_image.device().ok_or(Status::NOT_FOUND)?;
+    drop(loaded_image);
+
+    let params = OpenProtocolParams {
+        handle: device_handle,
+        agent: boot::image_handle(),
+        controller: None,
+    };
+    let mut file_system = unsafe {
+        boot::open_protocol::<SimpleFileSystem>(params, OpenProtocolAttributes::GetProtocol)
+    }
+    .map_err(|error| error.status())?;
+    let mut root = file_system.open_volume().map_err(|error| error.status())?;
+    if let Ok(existing) = root.open(
+        BOOT_LOG_FILE_PATH,
+        FileMode::ReadWrite,
+        FileAttribute::empty(),
+    ) {
+        let _ = existing.delete();
+    }
+    let file = root
+        .open(
+            BOOT_LOG_FILE_PATH,
+            FileMode::CreateReadWrite,
+            FileAttribute::empty(),
+        )
+        .map_err(|error| error.status())?;
+    let mut file = file.into_regular_file().ok_or(Status::UNSUPPORTED)?;
+    file.write(bytes).map_err(|error| error.status())?;
+    file.flush().map_err(|error| error.status())?;
+    Ok(())
 }
 
 mod boot_order {
@@ -786,7 +832,7 @@ fn read_pci_bar_range(resources: *const u8) -> Result<Option<(u64, u64)>, PciDis
     }
     let start = u64::from_le_bytes(descriptor[14..22].try_into().unwrap());
     let length = u64::from_le_bytes(descriptor[38..46].try_into().unwrap());
-    if length == 0 {
+    if start == 0 || length == 0 {
         return Ok(None);
     }
     let end = start

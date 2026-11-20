@@ -48,6 +48,7 @@ def run_component(project, component, release=False):
         print("\n  resident::boot_state_layout", flush=True)
         prepare_boot_state(project)
         execute([sys.executable, str(project / "tests/run_flight_recorder_tests.py")], project)
+        execute([sys.executable, str(project / "tests/run_boot_diagnostics_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_intel_pt_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_exit_guard_tests.py")], project)
         execute([sys.executable, str(project / "tests/run_vmcall_snapshot_tests.py")], project)

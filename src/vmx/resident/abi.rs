@@ -100,6 +100,11 @@ pub struct ResidentEventContext {
     pub callback_image_bytes: u64,
     pub callback_image_version: u64,
     pub callback_image_hash: [u8; 32],
+    pub hyperv_reenlightenment_control: AtomicU64,
+    pub hyperv_tsc_emulation_control: AtomicU64,
+    pub hyperv_tsc_emulation_status: AtomicU64,
+    pub hyperv_tsc_frequency_hz: u64,
+    pub hyperv_apic_frequency_hz: u64,
 }
 
 #[repr(C, align(16))]
@@ -308,6 +313,8 @@ pub struct ResidentBootContext {
     pub(crate) intel_pt: crate::vmx::pt::TraceState,
     pub nmi_injected: u64,
     pub nmi_entry_retries: u64,
+    pub boot_diagnostic: [u64; 32],
+    pub boot_diagnostic_started_tsc: u64,
 }
 
 pub const RESIDENT_BOOT_CONTEXT_PAGES: usize = size_of::<ResidentBootContext>().div_ceil(PAGE_SIZE);
@@ -458,6 +465,8 @@ impl ResidentBootContext {
             intel_pt: crate::vmx::pt::TraceState::default(),
             nmi_injected: 0,
             nmi_entry_retries: 0,
+            boot_diagnostic: [0; 32],
+            boot_diagnostic_started_tsc: 0,
             cpuid_leaf0: [
                 cpuid_leaf0.eax,
                 cpuid_leaf0.ebx,

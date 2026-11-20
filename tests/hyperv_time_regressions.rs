@@ -1,5 +1,52 @@
 core::arch::global_asm!(include_str!("../builds/hyperv-time-tests/hypercall.S"));
 
+#[test]
+fn windows_reenlightenment_registration_is_shared_and_never_requests_outer_msrs() {
+    let mut scenario = Scenario::new();
+    for owner in [1, 4] {
+        scenario.context[1] = u64::from(owner == 1);
+        scenario.context[4] = u64::from(owner == 4);
+        for (write, read, value) in [(11, 10, 0x100e9), (13, 12, 1)] {
+            assert_eq!(scenario.msr(write, value).0, 1);
+            let mut peer = scenario.context;
+            peer[2] += 100;
+            let mut registers = [0; 2];
+            assert_eq!(unsafe { test_time_msr(peer.as_mut_ptr(), registers.as_mut_ptr(), read) }, 1);
+            assert_eq!(registers[0] | registers[1] << 32, value);
+        }
+        assert_eq!(scenario.msr(14, 0), (1, 0));
+        assert_eq!(scenario.msr(15, 0).0, 1);
+        assert_eq!(scenario.msr(14, 0), (1, 0));
+        assert_eq!(scenario.features(0x40000003)[0] & (1 << 13), 0);
+    }
+    scenario.context[1] = 0;
+    scenario.context[4] = 0;
+    for operation in 10..=15 {
+        assert_eq!(scenario.msr(operation, 0).0, 2);
+    }
+}
+
+#[test]
+fn reenlightenment_rejects_reserved_fields_invalid_vectors_and_unknown_vps() {
+    let mut scenario = Scenario::new();
+    assert_eq!(scenario.msr(11, 0x100e9).0, 1);
+    for value in [0x101e9, 0x300e9, 0x800100e9, 0x1000f, (8 << 32) | 0x100e9] {
+        assert_eq!(scenario.msr(11, value).0, 0, "value={value:#x}");
+        assert_eq!(scenario.msr(10, 0), (1, 0x100e9));
+    }
+    assert_eq!(scenario.msr(11, (7 << 32) | 0x100e9).0, 1);
+    assert_eq!(scenario.msr(10, 0), (1, (7 << 32) | 0x100e9));
+    assert_eq!(scenario.msr(11, 0).0, 1);
+    for value in [2, 1 << 32, u64::MAX] {
+        assert_eq!(scenario.msr(13, value).0, 0);
+        assert_eq!(scenario.msr(12, 0), (1, 0));
+    }
+    for value in [1, 2, u64::MAX] {
+        assert_eq!(scenario.msr(15, value).0, 0);
+        assert_eq!(scenario.msr(14, 0), (1, 0));
+    }
+}
+
 unsafe extern "win64" {
     fn test_hypercall(context: *mut u64, registers: *mut u64) -> u32;
 }
@@ -213,11 +260,38 @@ fn incomplete_cpuid_frequency_uses_calibration_and_never_nominal_cpuid16() {
                 edx: if leaf == 0x8000_0007 { 1 << 8 } else { 0 },
             }
         };
-        let (scale, offset) = native_hyperv_reference_tsc(cpuid, 2_500_000_000, || 2_500_000_000);
+        let (scale, offset) = native_hyperv_reference_tsc(cpuid, 2_500_000_000, 0, || 2_500_000_000);
         assert_eq!(scale, hyperv_reference_tsc_scale_from_hz(2_500_000_000));
         assert_eq!(offset.wrapping_add(9_999_999), 0);
-        assert_eq!(native_hyperv_reference_tsc(cpuid, 100, || 0), (0, 0));
+        assert_eq!(native_hyperv_reference_tsc(cpuid, 100, 0, || 0), (0, 0));
+        let (scale, _) = native_hyperv_reference_tsc(cpuid, 100, 2_496_000_000, || {
+            panic!("known virtual TSC frequency must not be recalibrated")
+        });
+        assert_eq!(scale, hyperv_reference_tsc_scale_from_hz(2_496_000_000));
     }
+}
+
+#[test]
+fn virtual_timer_frequency_msrs_match_the_advertised_pair() {
+    let mut scenario = Scenario::new();
+    assert_eq!(scenario.features(0x4000_0003)[0] & 0x800, 0);
+    assert_eq!(scenario.features(0x4000_0003)[3] & 0x100, 0);
+    assert_eq!(scenario.msr(16, 0).0, 0);
+    assert_eq!(scenario.msr(17, 0).0, 0);
+
+    scenario.shared[14] = 5_000_000_000;
+    scenario.shared[15] = 66_000_000;
+    let features = scenario.features(0x4000_0003);
+    assert_eq!(features[0] & 0x800, 0x800);
+    assert_eq!(features[3], 0x100);
+    assert_eq!(scenario.msr(16, 0), (1, 5_000_000_000));
+    assert_eq!(scenario.msr(17, 0), (1, 66_000_000));
+
+    scenario.context[1] = 0;
+    assert_eq!(scenario.features(0x4000_0003)[0] & 0x800, 0);
+    assert_eq!(scenario.features(0x4000_0003)[3] & 0x100, 0);
+    assert_eq!(scenario.msr(16, 0).0, 2);
+    assert_eq!(scenario.msr(17, 0).0, 2);
 }
 
 #[test]
@@ -393,4 +467,19 @@ fn acpi_timer_discovery_skips_bad_children_and_rejects_partial_root_entries() {
     xsdt[4..8].copy_from_slice(&61_u32.to_le_bytes());
     checksum(&mut xsdt, 9);
     assert_eq!(unsafe { acpi_pm_timer(root.as_ptr() as usize) }, None);
+}
+
+#[test]
+fn cpuid15_timer_frequencies_cover_crystal_and_calibrated_ratios() {
+    assert_eq!(
+        hyperv_cpuid15_timer_frequencies(2, 208, 24_000_000, 0),
+        Some((2_496_000_000, 24_000_000))
+    );
+    assert_eq!(
+        hyperv_cpuid15_timer_frequencies(2, 208, 0, 2_496_000_000),
+        Some((2_496_000_000, 24_000_000))
+    );
+    assert_eq!(hyperv_cpuid15_timer_frequencies(0, 208, 24_000_000, 0), None);
+    assert_eq!(hyperv_cpuid15_timer_frequencies(2, 0, 24_000_000, 0), None);
+    assert_eq!(hyperv_cpuid15_timer_frequencies(2, 208, 0, 0), None);
 }

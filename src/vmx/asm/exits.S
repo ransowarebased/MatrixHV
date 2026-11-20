@@ -76,6 +76,7 @@ resident_telemetry_counter inc, {b_cpuid_count}, {b_telemetry_active}
 mov eax, dword ptr [rsp + 0]
 mov ecx, dword ptr [rsp + 8]
 mov r8d, eax
+mov r9d, ecx
 test eax, eax
 jz .Lresident_dispatch_cpuid_leaf0
 cmp r8d, {memory_leaf}
@@ -117,7 +118,30 @@ jmp .Lresident_dispatch_cpuid_advance
 .macro matrixhv_island_cpuid_standard
 .Lresident_dispatch_cpuid_standard:
 cmp r8d, 1
+je .Lresident_dispatch_cpuid_leaf1
+cmp qword ptr [r12 + {b_nested_expose_vmx}], 0
+je .Lresident_dispatch_cpuid_advance
+cmp r8d, 7
+je .Lresident_dispatch_cpuid_leaf7
+cmp r8d, 13
 jne .Lresident_dispatch_cpuid_advance
+test r9d, r9d
+jz .Lresident_dispatch_cpuid_leafd_sub0
+cmp r9d, 1
+jne .Lresident_dispatch_cpuid_advance
+and dword ptr [rsp + 8], {cpuid_leafd1_ecx_nested_clear_mask}
+jmp .Lresident_dispatch_cpuid_advance
+.Lresident_dispatch_cpuid_leafd_sub0:
+and dword ptr [rsp + 0], {cpuid_leafd0_eax_nested_clear_mask}
+jmp .Lresident_dispatch_cpuid_advance
+.Lresident_dispatch_cpuid_leaf7:
+test r9d, r9d
+jnz .Lresident_dispatch_cpuid_advance
+and dword ptr [rsp + 24], {cpuid_leaf7_ebx_nested_clear_mask}
+and dword ptr [rsp + 8], {cpuid_leaf7_ecx_nested_clear_mask}
+and dword ptr [rsp + 16], {cpuid_leaf7_edx_nested_clear_mask}
+jmp .Lresident_dispatch_cpuid_advance
+.Lresident_dispatch_cpuid_leaf1:
 resident_telemetry_counter inc, {b_cpuid_leaf1_count}, {b_telemetry_active}
 matrixhv_nested_cpuid_feature_base
 // SMX is outside the resident L1 contract; GETSEC is not emulated.
@@ -267,11 +291,21 @@ mov eax, dword ptr [r12 + {b_last_reason}]
 sub eax, {rdmsr_reason}
 cmp eax, 1
 ja .Lresident_dispatch_inject_gp_event
-resident_telemetry_counter inc, {b_msr_gp_count}, {b_telemetry_active}
+mov r10d, dword ptr [rsp + 8]
 cmp qword ptr [r12 + {b_telemetry_active}], 0
-je .Lresident_dispatch_inject_gp_event
-mov eax, dword ptr [rsp + 8]
-mov qword ptr [r12 + {b_last_gp_msr}], rax
+jne .Lresident_dispatch_inject_gp_record
+test byte ptr [rip + matrixhv_resident_island_log_backend], {log_framebuffer_sink}
+jz .Lresident_dispatch_inject_gp_event
+.Lresident_dispatch_inject_gp_record:
+inc qword ptr [r12 + {b_msr_gp_count}]
+mov qword ptr [r12 + {b_last_gp_msr}], r10
+test byte ptr [rip + matrixhv_resident_island_log_backend], {log_framebuffer_sink}
+jz .Lresident_dispatch_inject_gp_event
+mov eax, r10d
+sub eax, {hv_msr_base}
+cmp eax, {hv_msr_range_span}
+ja .Lresident_dispatch_inject_gp_event
+call .Lresident_diagnostic_snapshot
 .Lresident_dispatch_inject_gp_event:
 cmp qword ptr [r12 + {b_nested_l2_active}], 1
 jne .Lresident_dispatch_inject_gp_vmcs

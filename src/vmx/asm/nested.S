@@ -168,6 +168,11 @@ mov qword ptr [r12 + {b_nested_l2_last_exit_reason}], r10
 mov qword ptr [r12 + {b_nested_vmcs12_exit_reason}], r10
 mov r11, qword ptr [r12 + {b_last_instruction_len}]
 mov qword ptr [r12 + {b_nested_vmcs12_exit_instruction_len}], r11
+// RDMSR and WRMSR have neither VM-exit instruction information nor a guest linear address.
+movzx eax, r10w
+sub eax, {rdmsr_reason}
+cmp eax, {wrmsr_reason} - {rdmsr_reason}
+jbe .Lresident_nested_l2_clear_instruction_context
 mov rax, {exit_instruction_info}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
@@ -176,6 +181,11 @@ mov rax, {guest_linear_address}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
 mov qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 116 * 8], r11
+jmp .Lresident_nested_l2_instruction_context_ready
+.Lresident_nested_l2_clear_instruction_context:
+mov qword ptr [r12 + {b_nested_vmcs12_exit_instruction_info}], 0
+mov qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 116 * 8], 0
+.Lresident_nested_l2_instruction_context_ready:
 mov r11, qword ptr [r12 + {b_last_qualification}]
 mov eax, r10d
 and eax, 0xffff
@@ -245,18 +255,28 @@ mov rax, {exit_intr_info}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
 mov qword ptr [r12 + {b_nested_vmcs12_vm_exit_intr_info}], r11
+and r11d, 0x80000800
+cmp r11d, 0x80000800
+mov r11d, 0
+jne .Lresident_nested_l2_exit_interrupt_error_ready
 mov rax, {exit_intr_error_code}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
+.Lresident_nested_l2_exit_interrupt_error_ready:
 mov qword ptr [r12 + {b_nested_vmcs12_vm_exit_intr_error}], r11
 .Lresident_nested_l2_exit_interrupt_ready:
 mov rax, {idt_vectoring_info_field}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
 mov qword ptr [r12 + {b_nested_vmcs12_idt_vectoring_info}], r11
+and r11d, 0x80000800
+cmp r11d, 0x80000800
+mov r11d, 0
+jne .Lresident_nested_l2_vectoring_error_ready
 mov rax, {idt_vectoring_error_code}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
+.Lresident_nested_l2_vectoring_error_ready:
 mov qword ptr [r12 + {b_nested_vmcs12_idt_vectoring_error}], r11
 call .Lresident_nested_capture_vmcs02_guest_state
 mov r10, qword ptr [r12 + {b_nested_vmcs12_exit_reason}]
@@ -3710,11 +3730,22 @@ btr qword ptr [r12 + {b_nested_vmcs12_vm_entry_controls}], 9
 or qword ptr [r12 + {b_nested_vmcs12_vm_entry_controls}], r11
 .Lresident_nested_capture_vmcs02_entry_mode_done:
 call .Lresident_nested_capture_vmcs02_debug_state
+.Lresident_nested_capture_vmcs02_fields:
+// eVMCS publishes the full guest state on exit, while VMCS02 is still current.
+xor eax, eax
+xor edx, edx
+cmp qword ptr [r12 + {b_nested_evmcs_active}], 0
+jne .Lresident_nested_capture_vmcs02_set_pending
+mov rax, qword ptr [rip + .Lresident_nested_rare_guest_fields]
+mov rdx, qword ptr [rip + .Lresident_nested_rare_guest_fields + 8]
+.Lresident_nested_capture_vmcs02_set_pending:
+mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], rax
+mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending} + 8], rdx
 lea rsi, [rip + .Lresident_nested_guest_state_table]
 mov ecx, {nested_guest_state_table_count}
 .Lresident_nested_capture_vmcs02_guest_state_loop:
 mov edx, dword ptr [rsi]
-bt qword ptr [rip + .Lresident_nested_rare_guest_fields], rdx
+bt qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], rdx
 jc .Lresident_nested_capture_vmcs02_guest_field_done
 mov rax, qword ptr [rsi + 8]
 vmread r11, rax
@@ -3725,14 +3756,17 @@ mov qword ptr [r12 + {b_nested_vmcs12_extended_fields} + rdx * 8], r11
 add rsi, 16
 dec ecx
 jnz .Lresident_nested_capture_vmcs02_guest_state_loop
+// eVMCS already captured the GS base in the guest-state loop.
+bt qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], 55
+jc .Lresident_nested_capture_vmcs02_read_gs_base
+mov r11, qword ptr [r12 + {b_nested_vmcs12_extended_fields} + 55 * 8]
+jmp .Lresident_nested_capture_vmcs02_record_gs_base
+.Lresident_nested_capture_vmcs02_read_gs_base:
 mov rax, {guest_gs_base}
 vmread r11, rax
 jna .Lresident_dispatch_vmread_failed
+.Lresident_nested_capture_vmcs02_record_gs_base:
 mov qword ptr [r12 + {b_nested_last_captured_guest_gs_base}], r11
-mov rax, qword ptr [rip + .Lresident_nested_rare_guest_fields]
-mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], rax
-mov rax, qword ptr [rip + .Lresident_nested_rare_guest_fields + 8]
-mov qword ptr [r12 + {b_nested_vmcs02_rare_state_pending} + 8], rax
 ret
 .Lresident_nested_materialize_guest_field:
 bt qword ptr [r12 + {b_nested_vmcs02_rare_state_pending}], rax

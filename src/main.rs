@@ -45,6 +45,7 @@ fn main() -> Status {
 
     if uefi::helpers::init().is_err() {
         crate::logging::error(format_args!("UEFI helper initialization failed"));
+        crate::logging::flush_pre_ebs_file();
         crate::diagnostics::hold_on_failure();
         return Status::ABORTED;
     }
@@ -53,6 +54,7 @@ fn main() -> Status {
         Ok(()) => Status::SUCCESS,
         Err(status) => {
             crate::logging::error_status("boot.run", status);
+            crate::logging::flush_pre_ebs_file();
             crate::diagnostics::hold_on_failure();
             status
         }

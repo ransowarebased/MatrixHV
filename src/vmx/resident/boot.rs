@@ -106,6 +106,9 @@ pub fn run_boot_loader(
     )?;
     let pci_bar_ranges = crate::boot::firmware::pci_bar_ranges()?;
     ept.map_pci_bars(&pci_bar_ranges)?;
+    crate::logging::info(format_args!(
+        "EPT cache policy: reserved WB-capable firmware memory follows MTRRs and guest PAT; PCI BARs remain UC"
+    ));
     let high_address_end = ept.map_high_address_gaps()?;
     crate::diagnostics::message(format_args!(
         "resident high address EPT coverage to={high_address_end:#x} UC gaps"
@@ -333,6 +336,7 @@ pub fn run_boot_loader(
     crate::diagnostics::message(format_args!("resident APs starting={}", launches.len()));
     if let Err(error) = crate::boot::smp::launch_all(&mut launches) {
         crate::diagnostics::error(format_args!("resident AP batch failed: {error:?}"));
+        crate::logging::flush_pre_ebs_file();
         resident_startup_halt();
     }
     drop(launches);
@@ -399,8 +403,7 @@ pub fn run_boot_loader(
             nested.l2_last_exit_rip,
             nested.l2_last_exit_rsp
         ));
-        if started != 1
-            || nested.vmxon_count != 2
+        let nested_probe_failed = nested.vmxon_count != 2
             || nested.vmxoff_count != 1
             || nested.active != 0
             || nested.failure_count != 7
@@ -476,12 +479,13 @@ pub fn run_boot_loader(
             || nested.last_restored_host_sysenter_eip != nested.vmcs12.extended_fields[90]
             || nested.inherited_l1_pat != nested.l2_saved_pat
             || nested.inherited_l1_efer != nested.l2_saved_efer
-            || nested.vmcs12.extended_fields[16] != nested.ept12_pointer
-        {
+            || nested.vmcs12.extended_fields[16] != nested.ept12_pointer;
+        if started != 1 || (options.vt_nested && nested_probe_failed) {
             crate::diagnostics::error(format_args!(
                 "resident AP {} failed: started={started} complete={} vmx_failures={}",
                 processor_number, nested.probe_complete, nested.failure_count
             ));
+            crate::logging::flush_pre_ebs_file();
             resident_startup_halt();
         }
         unsafe {
@@ -546,6 +550,98 @@ pub fn run_boot_loader(
         first_high_bar.0,
         first_high_bar.1
     ));
+    let low_ram_cache_type = ept.memory_type_at_gpa(0x20_0000).unwrap_or(0xf);
+    let high_ram_cache_type = ept.memory_type_at_gpa(0x1_0000_0000).unwrap_or(0xf);
+    let mtrr_def_type = unsafe { arch::read_msr(crate::vmx::msr::IA32_MTRR_DEF_TYPE_MSR) };
+    crate::diagnostics::message(format_args!(
+        "EPT01 RAM cache low2m={} high4g={} mtrr_def={:#x}",
+        low_ram_cache_type, high_ram_cache_type, mtrr_def_type
+    ));
+    if crate::logging::enabled() {
+        let mtrr_cap = unsafe { arch::read_msr(0xfe) };
+        let ia32_pat = unsafe { arch::read_msr(0x277) };
+        let perf_status = unsafe { arch::read_msr(0x198) };
+        let clock_mod = unsafe { arch::read_msr(0x19a) };
+        let misc_enable = unsafe { arch::read_msr(0x1a0) };
+        let physical_bits = arch::leaf(0x8000_0008).eax & 0xff;
+        crate::logging::info(format_args!(
+            "pre_ebs hardware mtrr_cap={mtrr_cap:#x} mtrr_def={mtrr_def_type:#x} phys_bits={physical_bits} pat={ia32_pat:#x} vmx_basic={vmx_basic:#x}"
+        ));
+        crate::logging::info(format_args!(
+            "pre_ebs cpu perf_status={perf_status:#x} clock_mod={clock_mod:#x} misc_enable={misc_enable:#x}"
+        ));
+        let variable_count = (mtrr_cap & 0xff) as u32;
+        for index in 0..variable_count {
+            let base = unsafe { arch::read_msr(0x200 + index * 2) };
+            let mask = unsafe { arch::read_msr(0x201 + index * 2) };
+            crate::logging::info(format_args!(
+                "pre_ebs mtrr[{index}] base={base:#x} mask={mask:#x} valid={}",
+                (mask >> 11) & 1
+            ));
+        }
+        for (index, &(start, end)) in pci_bar_ranges.iter().enumerate() {
+            crate::logging::info(format_args!(
+                "pre_ebs pci_bar[{index}] range={start:#x}..{end:#x}"
+            ));
+        }
+        crate::logging::info(format_args!(
+            "pre_ebs ept01_samples 1m={} 2m={} 256m={} 2g={} 4g={} 8g={} 16g={} 32g={} 33g={}",
+            ept.memory_type_at_gpa(0x10_0000).unwrap_or(0xf),
+            low_ram_cache_type,
+            ept.memory_type_at_gpa(0x1000_0000).unwrap_or(0xf),
+            ept.memory_type_at_gpa(0x8000_0000).unwrap_or(0xf),
+            high_ram_cache_type,
+            ept.memory_type_at_gpa(0x2_0000_0000).unwrap_or(0xf),
+            ept.memory_type_at_gpa(0x4_0000_0000).unwrap_or(0xf),
+            ept.memory_type_at_gpa(0x8_0000_0000).unwrap_or(0xf),
+            ept.memory_type_at_gpa(0x8_4000_0000).unwrap_or(0xf),
+        ));
+        if let Ok(descriptors) = crate::boot::firmware::memory_descriptors() {
+            let mut non_wb_conventional = 0_usize;
+            for (index, descriptor) in descriptors.iter().enumerate() {
+                if descriptor.page_count == 0 {
+                    continue;
+                }
+                let start = descriptor.phys_start;
+                let end = start.saturating_add(descriptor.page_count.saturating_mul(4096));
+                let ept_start = ept.memory_type_at_gpa(start).unwrap_or(0xf);
+                let ept_end = ept
+                    .memory_type_at_gpa(end.saturating_sub(4096))
+                    .unwrap_or(0xf);
+                if descriptor.ty == uefi::mem::memory_map::MemoryType::CONVENTIONAL
+                    && (ept_start != 6 || ept_end != 6)
+                {
+                    non_wb_conventional += 1;
+                }
+                crate::logging::info(format_args!(
+                    "pre_ebs mem[{index}] ty={} att={:#x} range={start:#x}..{end:#x} ept={ept_start}/{ept_end}",
+                    descriptor.ty.0,
+                    descriptor.att.bits(),
+                ));
+            }
+            crate::logging::info(format_args!(
+                "pre_ebs ept01_ram_audit descriptors={} non_wb_conventional={non_wb_conventional}",
+                descriptors.len()
+            ));
+        }
+        if let Ok(bench_pages) = ResidentPages::allocate(4096, AddressConstraint::Any) {
+            let base = bench_pages.pointer().as_ptr().cast::<u64>();
+            let qwords = 4096 * 512;
+            let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            for index in 0..qwords {
+                unsafe { base.add(index).write_volatile(index as u64) };
+            }
+            let elapsed_tsc = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc);
+            let elapsed_us = elapsed_tsc
+                .saturating_mul(1_000_000)
+                .checked_div(watchdog_tsc_hz)
+                .unwrap_or(0);
+            crate::logging::info(format_args!(
+                "pre_ebs native_16m_write pa={:#x} tsc={elapsed_tsc} us={elapsed_us}",
+                bench_pages.physical_address()
+            ));
+        }
+    }
     crate::logging::describe_resident_diagnostics();
     let mut expected_mask = 1_u64;
     for (processor_number, _) in &ap_resources {
@@ -576,6 +672,8 @@ pub fn run_boot_loader(
     crate::diagnostics::message(format_args!(
         "EPT halt hex at right: GPA / guest RIP / qualification"
     ));
+    crate::logging::info(format_args!("pre_ebs flushing boot log to \\MatrixHV.log"));
+    crate::logging::flush_pre_ebs_file();
     let session = match vmxon::enter_vmx_root_with_borrowed_region(
         vmx_basic,
         &mut cpu_resources.vmxon_region,
@@ -583,6 +681,7 @@ pub fn run_boot_loader(
         Ok(session) => session,
         Err(error) => {
             crate::diagnostics::error(format_args!("resident BSP VMXON failed: {error:?}"));
+            crate::logging::flush_pre_ebs_file();
             resident_startup_halt();
         }
     };
@@ -590,6 +689,7 @@ pub fn run_boot_loader(
     if load != VmxInstructionResult::Succeeded {
         drop(session);
         crate::diagnostics::error(format_args!("resident BSP VMPTRLD failed: {load:?}"));
+        crate::logging::flush_pre_ebs_file();
         resident_startup_halt();
     }
     let raw_path =

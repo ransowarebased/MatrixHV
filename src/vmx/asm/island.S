@@ -181,6 +181,7 @@ matrixhv_resident_msr_validation
 matrixhv_island_host_exceptions
 matrixhv_island_bridge
 matrixhv_island_output
+matrixhv_boot_diagnostics
 matrixhv_resident_ept_cache
 matrixhv_resident_eptp_switch
 matrixhv_island_flight_recorder

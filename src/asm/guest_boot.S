@@ -590,12 +590,19 @@ matrixhv_boot_loader_start_guest_asm:
 
 .endm
 
-// AP guest contract: resumes with the nested operand page in rax and the firmware continuation stack. Uses virtual VMX only, restores original CR4 and saved FPU/GPR/flags state via .Lap_restore, or reports failure by VMCALL. Expanded by the AP launch translation unit, outside the resident island.
+// The AP resumes with the nested operand page in RAX and the firmware stack.
+// Probe virtual VMX only when enabled, then restore the firmware state.
 .macro matrixhv_ap_guest_probe
 .Lap_guest_return:
+    mov rbx, rax
+    sub rsp, 32
+    call matrixhv_vt_nested_enabled
+    add rsp, 32
+    test rax, rax
+    jz .Lap_check_hidden_vmx
+    mov rax, rbx
     mov r8, qword ptr [rax + 8]
     mov r9, qword ptr [rax + 16]
-    mov rbx, rax
     mov r10, cr4
     mov r12, r10
     or r10, 0x2000
@@ -1107,9 +1114,8 @@ matrixhv_boot_loader_start_guest_asm:
     vmxoff
     jna .Lap_nested_probe_failed
     mov cr4, r12
-    call matrixhv_vt_nested_enabled
-    test rax, rax
-    jnz .Lap_cpuid_done
+    jmp .Lap_cpuid_done
+.Lap_check_hidden_vmx:
     mov eax, 1
     xor ecx, ecx
     cpuid

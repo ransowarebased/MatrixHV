@@ -1,12 +1,17 @@
+use alloc::vec::Vec;
 use core::arch::asm;
+use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 const LOG_BUFFER_CAPACITY: usize = 512;
+const PRE_EBS_LOG_CAPACITY: usize = 131072;
 pub(crate) const SERIAL_SINK: u8 = 1;
 pub(crate) const FRAMEBUFFER_SINK: u8 = 2;
 static BACKEND: AtomicU8 = AtomicU8::new(LogBackend::Disabled as u8);
 static LOG_ADAPTER: LogAdapter = LogAdapter;
+static PRE_EBS_LOG_LOCK: AtomicU64 = AtomicU64::new(0);
+static PRE_EBS_LOG: PreEbsLogStorage = PreEbsLogStorage::new();
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,7 +107,8 @@ pub(crate) fn framebuffer_enabled() -> bool {
 }
 
 pub fn phase(name: &str) {
-    write_record("PHASE", format_args!("{name}"));
+    let tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    write_record("PHASE", format_args!("{name} tsc={tsc:#x}"));
 }
 
 pub fn info(arguments: fmt::Arguments<'_>) {
@@ -125,12 +131,104 @@ fn write_record(level: &str, arguments: fmt::Arguments<'_>) {
     let mut buffer = LogBuffer::new();
     let _ = write!(buffer, "[MATRIXHV][{level}] {arguments}");
     if let Some(message) = buffer.as_str() {
+        if !crate::boot::firmware::boot_services_exited() {
+            append_pre_ebs_log(message);
+        }
         let sinks = backend() as u8;
         if sinks & FRAMEBUFFER_SINK != 0 {
             crate::diagnostics::write_record(message);
         }
         if sinks & SERIAL_SINK != 0 {
             write_line(message);
+        }
+    }
+}
+
+struct PreEbsLogStorage {
+    bytes: UnsafeCell<[u8; PRE_EBS_LOG_CAPACITY]>,
+    length: UnsafeCell<usize>,
+    truncated: UnsafeCell<bool>,
+}
+
+unsafe impl Sync for PreEbsLogStorage {}
+
+impl PreEbsLogStorage {
+    const fn new() -> Self {
+        Self {
+            bytes: UnsafeCell::new([0; PRE_EBS_LOG_CAPACITY]),
+            length: UnsafeCell::new(0),
+            truncated: UnsafeCell::new(false),
+        }
+    }
+}
+
+fn acquire_pre_ebs_log_lock() -> bool {
+    for _ in 0..TX_WAIT_LIMIT {
+        if PRE_EBS_LOG_LOCK
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+fn append_pre_ebs_log(message: &str) {
+    if !acquire_pre_ebs_log_lock() {
+        return;
+    }
+    unsafe {
+        let length = &mut *PRE_EBS_LOG.length.get();
+        let bytes = &mut *PRE_EBS_LOG.bytes.get();
+        let needed = message.len().saturating_add(2);
+        if *length + needed <= bytes.len() {
+            let start = *length;
+            bytes[start..start + message.len()].copy_from_slice(message.as_bytes());
+            bytes[start + message.len()] = b'\r';
+            bytes[start + message.len() + 1] = b'\n';
+            *length = start + needed;
+        } else {
+            *PRE_EBS_LOG.truncated.get() = true;
+        }
+    }
+    PRE_EBS_LOG_LOCK.store(0, Ordering::Release);
+}
+
+pub fn flush_pre_ebs_file() {
+    if !enabled() || crate::boot::firmware::boot_services_exited() {
+        return;
+    }
+    if !acquire_pre_ebs_log_lock() {
+        return;
+    }
+    let (mut snapshot, truncated) = unsafe {
+        let length = *PRE_EBS_LOG.length.get();
+        let bytes = core::slice::from_raw_parts(PRE_EBS_LOG.bytes.get().cast::<u8>(), length);
+        let mut copy = Vec::with_capacity(length + 48);
+        copy.extend_from_slice(bytes);
+        (copy, *PRE_EBS_LOG.truncated.get())
+    };
+    PRE_EBS_LOG_LOCK.store(0, Ordering::Release);
+
+    if snapshot.is_empty() {
+        return;
+    }
+    if truncated {
+        snapshot.extend_from_slice(b"[MATRIXHV][INFO] pre-ebs log truncated\r\n");
+    }
+    if let Err(status) = crate::boot::firmware::write_boot_log(&snapshot) {
+        let mut buffer = LogBuffer::new();
+        let _ = write!(buffer, "[MATRIXHV][ERROR] write \\MatrixHV.log failed: {status:?}");
+        if let Some(message) = buffer.as_str() {
+            let sinks = backend() as u8;
+            if sinks & FRAMEBUFFER_SINK != 0 {
+                crate::diagnostics::write_record(message);
+            }
+            if sinks & SERIAL_SINK != 0 {
+                write_line(message);
+            }
         }
     }
 }
@@ -307,25 +405,27 @@ unsafe fn in8(port: u16) -> u8 {
 
 pub(crate) fn describe_resident_diagnostics() {
     crate::diagnostics::message(format_args!(
-        "runtime framebuffer diagnostics stop 40 seconds after ExitBootServices"
+        "runtime framebuffer diagnostics v2: four columns 00-3F; stop 20 seconds after ExitBootServices"
     ));
     crate::diagnostics::message(format_args!(
         "mark rows: first reason bits, VMRESUME error bits, first eight exits"
     ));
     crate::diagnostics::message(format_args!(
-        "hex rows: 0 exits 1 reason 2 RIP 3 RCX 4 MSR GP count 5 last GP MSR"
+        "hex 00-0F: exits reason RIP RCX GP-count GP-MSR GPA qualification CPU-mask CPU host-vector host-RIP error CR2 samples previous-reason"
     ));
     crate::diagnostics::message(format_args!(
-        "hex rows: 6 GPA 7 qualification 8 CPU mask 9 CPU A host fault B host RIP"
+        "hex 10-1F: CR0 CR3 CR4 EFER flags activity cache-state PAT RSP interruptibility previous-RIP previous-MSR perf-state previous-flags nested-error expired (telemetry off)"
     ));
-    crate::diagnostics::message(format_args!("hex rows: C host error code D host CR2"));
     crate::diagnostics::message(format_args!(
-        "hex left E timer samples F last normal reason; right 0 CR0 1 CR3 2 CR4 3 EFER"
+        "hex 20-2F: version+validity root-CR0 root-PAT previous-render-TSC RAX RCX RDX RBX RBP RSI RDI R8 R9 R10 R11 code[0]"
+    ));
+    crate::diagnostics::message(format_args!(
+        "hex 30-3F: code[1] stack[0..7] selected-CPU CPU-exits CPU-RIP CPU-reason INIT-mask SIPI-mask halted-mask"
     ));
     crate::diagnostics::message(format_args!(
         "hex right 4 flags 5 activity 6 normal RIP 7 EFER write 8 RSP 9 interruptibility"
     ));
     crate::diagnostics::message(format_args!(
-        "hex right A RDMSR B WRMSR C L2 entries D nested failures E nested error F expired"
+        "code bytes are little-endian qwords at exact RIP; invalid reads are FFFFFFFFFFFFFFFF; validity bits 0-1=code, 2-9=stack; L2 memory capture is skipped"
     ));
 }

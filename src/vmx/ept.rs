@@ -115,20 +115,20 @@ impl MtrrState {
             };
             return decode_memory_type((self.fixed_types[register as usize] >> shift) as u8);
         }
+        let offset_mask = (size - 1) & self.physical_mask;
+        let page_mask = self.physical_mask & !offset_mask;
         let mut selected = None;
         for &[base, mask] in &self.variable_ranges[..(self.capability & 0xff) as usize] {
             if mask & (1 << 11) == 0 {
                 continue;
             }
             let address_mask = mask & self.physical_mask;
-            let start = base & address_mask;
-            let end = start + ((!address_mask & self.physical_mask) | 0xfff) + 1;
-            if start >= address + size || end <= address {
+            if ((address ^ base) & address_mask & page_mask) != 0 {
                 continue;
             }
             // A later MTRR boundary may bisect an existing large EPT leaf.
             // UC for that leaf is safe and requires no post-EBS table allocation.
-            if start > address || end < address + size {
+            if address_mask & offset_mask != 0 {
                 return EptMemoryType::Uncacheable;
             }
             let memory_type = decode_memory_type(base as u8);
@@ -665,6 +665,12 @@ impl IdentityEpt {
         Ok(read_entry(table, index))
     }
 
+    pub fn memory_type_at_gpa(&self, guest_physical_address: u64) -> Option<u8> {
+        self.translate(guest_physical_address)
+            .ok()
+            .map(|translation| translation.memory_type as u8)
+    }
+
     pub fn compose_page(
         &mut self,
         ept12: &Self,
@@ -1139,8 +1145,16 @@ fn descriptor_memory_type(descriptor: MemoryDescriptor) -> EptMemoryType {
         }
         return EptMemoryType::Uncacheable;
     }
+    if descriptor.ty == MemoryType::RESERVED {
+        // Reserved DRAM can contain firmware AP code and mailboxes. Keep its
+        // advertised WB ceiling; MTRRs and guest PAT still restrict the type.
+        return if descriptor.att.contains(MemoryAttribute::WRITE_BACK) {
+            EptMemoryType::WriteBack
+        } else {
+            EptMemoryType::Uncacheable
+        };
+    }
     if descriptor.ty == MemoryType::MMIO_PORT_SPACE
-        || descriptor.ty == MemoryType::RESERVED
         || descriptor.ty == MemoryType::UNUSABLE
         || descriptor.ty == MemoryType::UNACCEPTED
     {

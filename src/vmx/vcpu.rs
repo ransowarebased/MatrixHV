@@ -1017,8 +1017,7 @@ impl ResidentApLaunch<'_> {
             state.intel_pt = trace.state();
         }
         state.processor_number = self.processor_number as u64;
-        // The AP startup probe explicitly collects diagnostics for its validation.
-        state.telemetry_probe_active = 1;
+        state.telemetry_probe_active = u64::from(self.options.vt_nested);
         state.watchdog_tsc_hz =
             unsafe { (*(self.event_context as *const ResidentEventContext)).watchdog_tsc_hz };
         state.hyperv_timing_supported = u64::from(hyperv::timing_supported(

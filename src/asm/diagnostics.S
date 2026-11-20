@@ -736,6 +736,8 @@ jb .Lresident_sample_framebuffer_done
 add rax, qword ptr [r8 + {event_tsc_hz}]
 mov qword ptr [r12 + {b_diagnostic_deadline}], rax
 inc qword ptr [r12 + {b_diagnostic_samples}]
+lea rsi, [rsp + 8]
+call .Lresident_boot_diagnostic_capture
 jmp .Lresident_diagnostic_snapshot
 .Lresident_sample_framebuffer_expired:
 mov qword ptr [r12 + {b_diagnostic_expired}], 1
@@ -915,7 +917,15 @@ jz .Lresident_diagnostic_snapshot_restore
 cmp qword ptr [r8 + {event_ebs_seen}], 0
 je .Lresident_diagnostic_snapshot_restore
 .Lresident_diagnostic_snapshot_ready:
+rdtsc
+shl rdx, 32
+or rax, rdx
+mov qword ptr [r12 + {b_boot_diagnostic_started_tsc}], rax
 mov rax, qword ptr [r12 + {b_post_ebs_count}]
+cmp qword ptr [r12 + {b_telemetry_active}], 0
+jne .Lresident_snapshot_row0_ready
+mov rax, qword ptr [r12 + {b_flight_sequence}]
+.Lresident_snapshot_row0_ready:
 mov ecx, 0
 call .Lresident_diagnostic_emit_value
 mov rax, qword ptr [r12 + {b_last_reason}]
@@ -966,6 +976,14 @@ mov rax, qword ptr [r12 + {b_diagnostic_samples}]
 mov ecx, 14
 call .Lresident_diagnostic_emit_value
 mov rax, qword ptr [r12 + {b_last_normal_reason}]
+cmp qword ptr [r12 + {b_telemetry_active}], 0
+jne .Lresident_snapshot_row15_ready
+call .Lresident_snapshot_prev_flight
+xor eax, eax
+test r9, r9
+jz .Lresident_snapshot_row15_ready
+mov rax, qword ptr [r9 + 16]
+.Lresident_snapshot_row15_ready:
 mov ecx, 15
 call .Lresident_diagnostic_emit_value
 mov rax, {guest_cr0}
@@ -997,9 +1015,36 @@ call .Lresident_snapshot_vmread
 mov ecx, 21
 call .Lresident_diagnostic_emit_value
 mov rax, qword ptr [r12 + {b_last_normal_rip}]
+cmp qword ptr [r12 + {b_telemetry_active}], 0
+jne .Lresident_snapshot_row22_ready
+push rbx
+mov eax, 0x200000
+call .Lresident_snapshot_ept01_memory_type
+mov rbx, rax
+mov rax, 0x100000000
+call .Lresident_snapshot_ept01_memory_type
+shl rax, 8
+or rbx, rax
+mov rax, qword ptr [r12 + {b_last_guest_cr3}]
+and rax, -4096
+call .Lresident_snapshot_ept01_memory_type
+shl rax, 16
+or rbx, rax
+mov ecx, {mtrr_def_type_msr}
+rdmsr
+and eax, 0xffff
+shl rax, 32
+or rax, rbx
+pop rbx
+.Lresident_snapshot_row22_ready:
 mov ecx, 22
 call .Lresident_diagnostic_emit_value
 mov rax, qword ptr [r12 + {b_last_efer_write}]
+cmp qword ptr [r12 + {b_telemetry_active}], 0
+jne .Lresident_snapshot_row23_ready
+mov rax, {guest_pat}
+call .Lresident_snapshot_vmread
+.Lresident_snapshot_row23_ready:
 mov ecx, 23
 call .Lresident_diagnostic_emit_value
 mov rax, {guest_rsp}
@@ -1011,15 +1056,58 @@ call .Lresident_snapshot_vmread
 mov ecx, 25
 call .Lresident_diagnostic_emit_value
 mov rax, qword ptr [r12 + {b_rdmsr_count}]
+cmp qword ptr [r12 + {b_telemetry_active}], 0
+jne .Lresident_snapshot_row26_ready
+call .Lresident_snapshot_prev_flight
+xor eax, eax
+test r9, r9
+jz .Lresident_snapshot_row26_ready
+mov rax, qword ptr [r9 + 24]
+.Lresident_snapshot_row26_ready:
 mov ecx, 26
 call .Lresident_diagnostic_emit_value
 mov rax, qword ptr [r12 + {b_wrmsr_count}]
+cmp qword ptr [r12 + {b_telemetry_active}], 0
+jne .Lresident_snapshot_row27_ready
+call .Lresident_snapshot_prev_flight
+xor eax, eax
+test r9, r9
+jz .Lresident_snapshot_row27_ready
+mov rax, qword ptr [r9 + 72]
+.Lresident_snapshot_row27_ready:
 mov ecx, 27
 call .Lresident_diagnostic_emit_value
 mov rax, qword ptr [r12 + {b_nested_l2_entry_count}]
+cmp qword ptr [r12 + {b_telemetry_active}], 0
+jne .Lresident_snapshot_row28_ready
+push rbx
+mov ecx, 0x198
+call .Lresident_guarded_rdmsr
+mov ebx, eax
+jnc .Lresident_snapshot_perf_ready
+mov ebx, 0xffff
+.Lresident_snapshot_perf_ready:
+mov ecx, 0x19a
+call .Lresident_guarded_rdmsr
+jnc .Lresident_snapshot_clk_ready
+mov eax, 0xffff
+.Lresident_snapshot_clk_ready:
+mov eax, eax
+shl rax, 32
+or rax, rbx
+pop rbx
+.Lresident_snapshot_row28_ready:
 mov ecx, 28
 call .Lresident_diagnostic_emit_value
 mov rax, qword ptr [r12 + {b_nested_failure_count}]
+cmp qword ptr [r12 + {b_telemetry_active}], 0
+jne .Lresident_snapshot_row29_ready
+call .Lresident_snapshot_prev_flight
+xor eax, eax
+test r9, r9
+jz .Lresident_snapshot_row29_ready
+mov rax, qword ptr [r9 + 56]
+.Lresident_snapshot_row29_ready:
 mov ecx, 29
 call .Lresident_diagnostic_emit_value
 mov rax, qword ptr [r12 + {b_nested_instruction_error}]
@@ -1042,6 +1130,24 @@ mov ecx, 35
 call .Lresident_diagnostic_emit_value
 mov al, 0x0a
 call .Lresident_serial_char
+test r8, r8
+jz .Lresident_boot_diagnostic_painted
+push rbx
+xor ebx, ebx
+.Lresident_boot_diagnostic_paint:
+mov rax, qword ptr [r12 + {b_boot_diagnostic} + rbx * 8]
+lea ecx, [rbx + 32]
+call .Lresident_paint_hex
+inc ebx
+cmp ebx, 32
+jb .Lresident_boot_diagnostic_paint
+pop rbx
+.Lresident_boot_diagnostic_painted:
+rdtsc
+shl rdx, 32
+or rax, rdx
+sub rax, qword ptr [r12 + {b_boot_diagnostic_started_tsc}]
+mov qword ptr [r12 + {b_boot_diagnostic} + 24], rax
 .Lresident_diagnostic_snapshot_restore:
 pop r8
 .Lresident_diagnostic_snapshot_done:
@@ -1061,6 +1167,50 @@ jna .Lresident_snapshot_vmread_done
 mov rax, r11
 .Lresident_snapshot_vmread_done:
 ret
+.Lresident_snapshot_ept01_memory_type:
+mov r9, qword ptr [r12 + {b_cache_ept_pointer}]
+mov r10, {host_page_address_mask}
+and r9, r10
+jz .Lresident_snapshot_ept01_unmapped
+mov rdx, rax
+shr rdx, 48
+jnz .Lresident_snapshot_ept01_unmapped
+mov r11, rax
+mov ecx, 39
+.Lresident_snapshot_ept01_walk:
+mov rdx, r11
+shr rdx, cl
+and edx, 0x1ff
+mov rax, qword ptr [r9 + rdx * 8]
+test al, 7
+jz .Lresident_snapshot_ept01_unmapped
+cmp ecx, 12
+je .Lresident_snapshot_ept01_leaf
+test al, 0x80
+jnz .Lresident_snapshot_ept01_leaf
+and rax, r10
+mov r9, rax
+sub ecx, 9
+jmp .Lresident_snapshot_ept01_walk
+.Lresident_snapshot_ept01_leaf:
+shr eax, 3
+and eax, 7
+ret
+.Lresident_snapshot_ept01_unmapped:
+mov eax, 0xf
+ret
+.Lresident_snapshot_prev_flight:
+mov r9, qword ptr [r12 + {b_flight_sequence}]
+cmp r9, 2
+jb .Lresident_snapshot_prev_flight_none
+sub r9, 2
+and r9d, {flight_capacity_mask}
+imul r9, r9, {flight_record_bytes}
+lea r9, [r12 + r9 + {b_flight_records}]
+ret
+.Lresident_snapshot_prev_flight_none:
+xor r9d, r9d
+ret
 .Lresident_diagnostic_emit_value:
 push rax
 push rcx
@@ -1068,6 +1218,8 @@ test byte ptr [rip + matrixhv_resident_island_log_backend], {log_framebuffer_sin
 jz .Lresident_diagnostic_emit_serial
 test r8, r8
 jz .Lresident_diagnostic_emit_serial
+cmp ecx, 31
+ja .Lresident_diagnostic_emit_serial
 call .Lresident_paint_hex
 .Lresident_diagnostic_emit_serial:
 pop rcx
@@ -1126,7 +1278,6 @@ push r13
 push r14
 mov rsi, rax
 mov edi, ecx
-and edi, 15
 mov rbx, qword ptr [r8 + {event_visual_stride_bytes}]
 mov r13d, ecx
 shr r13d, 4
@@ -1140,9 +1291,11 @@ add r13, rcx
 xor r14d, r14d
 .Lresident_paint_hex_cell:
 mov eax, edi
+shr eax, 4
 test r14d, r14d
 jz .Lresident_paint_hex_glyph
-mov eax, 16
+mov eax, edi
+and eax, 15
 cmp r14d, 1
 je .Lresident_paint_hex_glyph
 mov ecx, 17
@@ -1173,6 +1326,10 @@ add eax, 2
 bt r9d, eax
 sbb eax, eax
 .Lresident_paint_hex_pixel:
+cmp r14d, 2
+jae .Lresident_paint_hex_store
+and eax, 0x00ffff00
+.Lresident_paint_hex_store:
 mov dword ptr [r11 + rcx * 4], eax
 inc ecx
 cmp ecx, 8
@@ -1771,6 +1928,8 @@ jmp .Lresident_boot_timer_retry_event
 .Lresident_boot_timer_snapshot:
 cmp qword ptr [r8 + {event_diagnostic_halted}], 0
 jne .Lresident_boot_timer_retry_event
+mov rsi, rsp
+call .Lresident_boot_diagnostic_capture
 call .Lresident_diagnostic_snapshot
 .endm
 
@@ -1865,6 +2024,8 @@ jmp .Lresident_dispatch_resume
 
 // VMCS12 probe observation: R12=context, R11=guest RIP, R13=instruction operands. Preserve R13 with one balanced push/pop and reload R11 after serial output; other scratch GPRs/flags change. Disabled output jumps directly to the nested result packer.
 .macro matrixhv_diagnostic_vmcs12_probe
+cmp qword ptr [r12 + {b_telemetry_probe_active}], 0
+je .Lresident_nested_vmread_value
 test byte ptr [rip + matrixhv_resident_island_log_backend], {log_serial_sink}
 jz .Lresident_nested_vmread_value
 push r13

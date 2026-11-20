@@ -15,6 +15,8 @@ pub const HYPERV_INTERFACE_SIGNATURE: u32 = 0x3123_7648;
 pub const HYPERV_BASE_ACCESS: u32 = 0x60;
 pub const HYPERV_APIC_ACCESS: u32 = 0x10;
 pub const HYPERV_TIME_ACCESS: u32 = 0x202;
+pub const HYPERV_FREQUENCY_ACCESS: u32 = 0x800;
+pub const HYPERV_FREQUENCY_QUERY: u32 = 0x100;
 pub const HYPERV_INVARIANT_TSC_ACCESS: u32 = 0x8000;
 pub const HYPERV_EVMCS_RECOMMENDATION: u32 = 0x4000;
 pub const HYPERV_EVMCS_VERSIONS: u32 = 0x101;
@@ -39,6 +41,10 @@ pub const HYPERV_VP_INDEX_MSR: u32 = 0x4000_0002;
 pub const HYPERV_REFERENCE_COUNT_MSR: u32 = 0x4000_0020;
 pub const HYPERV_REFERENCE_TSC_MSR: u32 = 0x4000_0021;
 pub const HYPERV_TSC_INVARIANT_CONTROL_MSR: u32 = 0x4000_0118;
+pub const HYPERV_REENLIGHTENMENT_CONTROL_MSR: u32 = 0x4000_0106;
+pub const HYPERV_TSC_EMULATION_CONTROL_MSR: u32 = 0x4000_0107;
+pub const HYPERV_TSC_EMULATION_STATUS_MSR: u32 = 0x4000_0108;
+pub const HYPERV_TSC_FREQUENCY_MSR: u32 = 0x4000_0022;
 pub const HYPERV_APIC_FREQUENCY_MSR: u32 = 0x4000_0023;
 pub const HYPERV_REFERENCE_TIME_MSR_SPAN: u32 =
     HYPERV_APIC_FREQUENCY_MSR - HYPERV_REFERENCE_TSC_MSR;
@@ -67,13 +73,40 @@ pub fn hyperv_reference_tsc_scale_from_hz(tsc_hz: u64) -> u64 {
     ((10_000_000_u128 << 64) / u128::from(tsc_hz)) as u64
 }
 
-pub fn native_hyperv_reference_tsc(calibrate: impl FnOnce() -> u64) -> (u64, u64) {
+pub fn hyperv_cpuid15_timer_frequencies(
+    denominator: u32,
+    numerator: u32,
+    crystal_hz: u32,
+    calibrated_tsc_hz: u64,
+) -> Option<(u64, u64)> {
+    if denominator == 0 || numerator == 0 {
+        return None;
+    }
+    let (tsc_hz, apic_hz) = if crystal_hz != 0 {
+        let tsc = (u128::from(crystal_hz) * u128::from(numerator)) / u128::from(denominator);
+        (u64::try_from(tsc).ok()?, u64::from(crystal_hz))
+    } else if calibrated_tsc_hz != 0 {
+        let apic =
+            (u128::from(calibrated_tsc_hz) * u128::from(denominator)) / u128::from(numerator);
+        (calibrated_tsc_hz, u64::try_from(apic).ok()?)
+    } else {
+        return None;
+    };
+    ((10_000_001..=100_000_000_000).contains(&tsc_hz)
+        && (1_000_000..=10_000_000_000).contains(&apic_hz))
+    .then_some((tsc_hz, apic_hz))
+}
+
+pub fn native_hyperv_reference_tsc(
+    tsc_frequency_hz: u64,
+    calibrate: impl FnOnce() -> u64,
+) -> (u64, u64) {
     let cpuid = core::arch::x86_64::__cpuid;
     if !native_hyperv_invariant_tsc() {
         return (0, 0);
     }
-    let mut scale = 0;
-    if cpuid(0).eax >= 0x15 {
+    let mut scale = hyperv_reference_tsc_scale_from_hz(tsc_frequency_hz);
+    if scale == 0 && cpuid(0).eax >= 0x15 {
         let frequency = cpuid(0x15);
         scale = hyperv_reference_tsc_scale(frequency.eax, frequency.ebx, frequency.ecx);
     }

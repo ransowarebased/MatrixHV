@@ -230,6 +230,9 @@ call .Lresident_interception_callback
     jmp .Lresident_cache_validate_type
 .Lresident_cache_variable_type:
     mov r8d, -1
+    sub r10, rdi
+    dec r10
+    and r10, [r15 + 16]
     movzx ecx, byte ptr [r15]
     lea rdx, [r15 + 112]
     test ecx, ecx
@@ -239,21 +242,15 @@ call .Lresident_interception_callback
     test eax, 0x800
     jz .Lresident_cache_variable_next
     and rax, [r15 + 16]
-    mov r9, [rdx]
+    mov r9, r10
+    not r9
     and r9, rax
-    mov r11, rax
-    not r11
-    and r11, [r15 + 16]
-    or r11, 0xfff
-    lea r11, [r11 + r9 + 1]
-    cmp r9, r10
-    jae .Lresident_cache_variable_next
-    cmp r11, rdi
-    jbe .Lresident_cache_variable_next
-    cmp r9, rdi
-    ja .Lresident_cache_type_uc
-    cmp r11, r10
-    jb .Lresident_cache_type_uc
+    mov r11, [rdx]
+    xor r11, rdi
+    test r11, r9
+    jnz .Lresident_cache_variable_next
+    test rax, r10
+    jnz .Lresident_cache_type_uc
     movzx eax, byte ptr [rdx]
     call .Lresident_cache_validate_type
     test eax, eax

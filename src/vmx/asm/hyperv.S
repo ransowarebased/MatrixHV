@@ -106,6 +106,10 @@ or qword ptr [rsp], {hv_invariant_tsc_access}
 cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
 je .Lresident_dispatch_cpuid_advance
 or qword ptr [rsp + 0], {hv_time_access}
+cmp qword ptr [r9 + {event_hyperv_apic_frequency_hz}], 0
+je .Lresident_dispatch_cpuid_advance
+or qword ptr [rsp + 0], {hv_frequency_access}
+or qword ptr [rsp + 16], {hv_frequency_query}
 jmp .Lresident_dispatch_cpuid_advance
 .Lresident_dispatch_cpuid_evmcs_recommendation:
 cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
@@ -123,6 +127,23 @@ jmp .Lresident_dispatch_cpuid_advance
 .endm
 
 .macro matrixhv_resident_hyperv_rdmsr
+.Lresident_dispatch_rdmsr_reenlightenment:
+mov r10d, {event_hyperv_reenlightenment_control}
+jmp .Lresident_dispatch_rdmsr_migration_state
+.Lresident_dispatch_rdmsr_tsc_emulation_control:
+mov r10d, {event_hyperv_tsc_emulation_control}
+jmp .Lresident_dispatch_rdmsr_migration_state
+.Lresident_dispatch_rdmsr_tsc_emulation_status:
+mov r10d, {event_hyperv_tsc_emulation_status}
+.Lresident_dispatch_rdmsr_migration_state:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+jne .Lresident_dispatch_rdmsr_migration_owned
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_rdmsr_passthrough
+.Lresident_dispatch_rdmsr_migration_owned:
+mov r9, qword ptr [r12 + {b_event_context}]
+mov r11, qword ptr [r9 + r10]
+jmp .Lresident_dispatch_rdmsr_nested_value
 .Lresident_dispatch_rdmsr_vp_assist:
 cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
 je .Lresident_dispatch_rdmsr_passthrough
@@ -238,6 +259,19 @@ je .Lresident_dispatch_rdmsr_passthrough
 mov r9, qword ptr [r12 + {b_event_context}]
 mov r11, qword ptr [r9 + {event_hyperv_reference_tsc_msr}]
 jmp .Lresident_dispatch_rdmsr_nested_value
+.Lresident_dispatch_rdmsr_tsc_frequency:
+mov r10d, {event_hyperv_tsc_frequency_hz}
+jmp .Lresident_dispatch_rdmsr_frequency
+.Lresident_dispatch_rdmsr_apic_frequency:
+mov r10d, {event_hyperv_apic_frequency_hz}
+.Lresident_dispatch_rdmsr_frequency:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+je .Lresident_dispatch_rdmsr_passthrough
+mov r9, qword ptr [r12 + {b_event_context}]
+cmp qword ptr [r9 + {event_hyperv_apic_frequency_hz}], 0
+je .Lresident_dispatch_inject_gp
+mov r11, qword ptr [r9 + r10]
+jmp .Lresident_dispatch_rdmsr_nested_value
 .Lresident_dispatch_rdmsr_tsc_invariant:
 cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
 jne .Lresident_dispatch_rdmsr_tsc_invariant_value
@@ -269,6 +303,54 @@ ret
 .endm
 
 .macro matrixhv_resident_hyperv_wrmsr
+.Lresident_dispatch_wrmsr_reenlightenment:
+mov r10d, {event_hyperv_reenlightenment_control}
+jmp .Lresident_dispatch_wrmsr_migration_state
+.Lresident_dispatch_wrmsr_tsc_emulation_control:
+mov r10d, {event_hyperv_tsc_emulation_control}
+jmp .Lresident_dispatch_wrmsr_migration_state
+.Lresident_dispatch_wrmsr_tsc_emulation_status:
+mov r10d, {event_hyperv_tsc_emulation_status}
+.Lresident_dispatch_wrmsr_migration_state:
+cmp qword ptr [r12 + {b_hyperv_timing_supported}], 0
+jne .Lresident_dispatch_wrmsr_migration_owned
+cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
+je .Lresident_dispatch_wrmsr_passthrough
+.Lresident_dispatch_wrmsr_migration_owned:
+mov r9, qword ptr [r12 + {b_event_context}]
+mov r11d, dword ptr [rsp]
+mov eax, dword ptr [rsp + 16]
+shl rax, 32
+or r11, rax
+cmp ecx, {hyperv_reenlightenment_control_msr}
+jne .Lresident_dispatch_wrmsr_tsc_emulation_state
+test r11d, 0xfffeff00
+jnz .Lresident_dispatch_inject_gp
+bt r11, 16
+jnc .Lresident_dispatch_wrmsr_migration_store
+cmp r11b, 16
+jb .Lresident_dispatch_inject_gp
+mov rax, r11
+shr rax, 32
+cmp rax, qword ptr [r9 + {event_control_processor_count}]
+jae .Lresident_dispatch_inject_gp
+jmp .Lresident_dispatch_wrmsr_migration_store
+.Lresident_dispatch_wrmsr_tsc_emulation_state:
+cmp ecx, {hyperv_tsc_emulation_status_msr}
+je .Lresident_dispatch_wrmsr_tsc_emulation_ack
+test r11, -2
+jnz .Lresident_dispatch_inject_gp
+jmp .Lresident_dispatch_wrmsr_migration_store
+.Lresident_dispatch_wrmsr_tsc_emulation_ack:
+// This resident partition does not migrate or change its TSC frequency.
+// Guests may arm notifications/emulation and acknowledge an inactive status;
+// no migration interrupt or emulation-in-progress state is manufactured.
+test r11, r11
+jnz .Lresident_dispatch_inject_gp
+.Lresident_dispatch_wrmsr_migration_store:
+mov qword ptr [r9 + r10], r11
+call .Lresident_advance_guest_rip
+jmp .Lresident_dispatch_resume
 .Lresident_dispatch_wrmsr_vp_assist:
 cmp qword ptr [r12 + {b_nested_evmcs_enabled}], 0
 je .Lresident_dispatch_wrmsr_passthrough
@@ -632,6 +714,16 @@ jmp .Lresident_dispatch_resume
 .endm
 
 .macro matrixhv_resident_hyperv_rdmsr_route
+cmp ecx, {hyperv_tsc_frequency_msr}
+je .Lresident_dispatch_rdmsr_tsc_frequency
+cmp ecx, {hyperv_apic_frequency_msr}
+je .Lresident_dispatch_rdmsr_apic_frequency
+cmp ecx, {hyperv_reenlightenment_control_msr}
+je .Lresident_dispatch_rdmsr_reenlightenment
+cmp ecx, {hyperv_tsc_emulation_control_msr}
+je .Lresident_dispatch_rdmsr_tsc_emulation_control
+cmp ecx, {hyperv_tsc_emulation_status_msr}
+je .Lresident_dispatch_rdmsr_tsc_emulation_status
 cmp ecx, {hyperv_tsc_invariant_control_msr}
 je .Lresident_dispatch_rdmsr_tsc_invariant
 cmp ecx, {hyperv_reference_count_msr}
@@ -653,6 +745,12 @@ jbe .Lresident_dispatch_rdmsr_hyperv_apic
 .endm
 
 .macro matrixhv_resident_hyperv_wrmsr_route
+cmp ecx, {hyperv_reenlightenment_control_msr}
+je .Lresident_dispatch_wrmsr_reenlightenment
+cmp ecx, {hyperv_tsc_emulation_control_msr}
+je .Lresident_dispatch_wrmsr_tsc_emulation_control
+cmp ecx, {hyperv_tsc_emulation_status_msr}
+je .Lresident_dispatch_wrmsr_tsc_emulation_status
 cmp ecx, {hyperv_tsc_invariant_control_msr}
 je .Lresident_dispatch_wrmsr_tsc_invariant
 cmp ecx, {hyperv_reference_count_msr}
@@ -738,6 +836,12 @@ test eax, eax
 jz .Lresident_hyperv_evmcs_select_page_invalid
 mov eax, dword ptr [r11]
 cmp eax, {evmcs_version}
+je .Lresident_hyperv_evmcs_select_version_ready
+// Hyper-V writes IA32_VMX_BASIC[30:0] into allocated eVMCS headers instead of
+// EVMCS_VERSION=1; bare-metal Intel revisions differ from VMware's revision 1.
+test eax, eax
+jz .Lresident_hyperv_evmcs_select_page_invalid
+cmp eax, dword ptr [r12 + {b_nested_vmcs12_revision_id}]
 jne .Lresident_hyperv_evmcs_select_page_invalid
 .Lresident_hyperv_evmcs_select_version_ready:
 push r13
@@ -831,7 +935,6 @@ ret
 .Lresident_hyperv_evmcs_store:
 cmp qword ptr [r12 + {b_nested_evmcs_active}], 0
 je .Lresident_hyperv_evmcs_store_done
-call .Lresident_nested_materialize_vmcs02_rare_state
 mov r11, qword ptr [r12 + {b_nested_current_vmcs}]
 call .Lresident_hyperv_evmcs_page
 test eax, eax

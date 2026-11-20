@@ -30,6 +30,7 @@ pub mod mem {
         pub struct MemoryAttribute(u64);
 
         impl MemoryAttribute {
+            pub const NONE: Self = Self(0);
             pub const UNCACHEABLE: Self = Self(1);
             pub const WRITE_COMBINE: Self = Self(2);
             pub const WRITE_THROUGH: Self = Self(4);
@@ -38,6 +39,14 @@ pub mod mem {
 
             pub fn contains(self, value: Self) -> bool {
                 self.0 & value.0 == value.0
+            }
+        }
+
+        impl core::ops::BitOr for MemoryAttribute {
+            type Output = Self;
+
+            fn bitor(self, other: Self) -> Self {
+                Self(self.0 | other.0)
             }
         }
 
@@ -52,6 +61,25 @@ pub mod mem {
 }
 
 mod arch {
+    use std::cell::RefCell;
+
+    std::thread_local! {
+        static MSR_OVERRIDES: RefCell<Vec<(u32, u64)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub fn with_msr_overrides<R>(values: &[(u32, u64)], action: impl FnOnce() -> R) -> R {
+        struct Restore(Vec<(u32, u64)>);
+
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MSR_OVERRIDES.with(|overrides| overrides.replace(core::mem::take(&mut self.0)));
+            }
+        }
+
+        let _restore = Restore(MSR_OVERRIDES.with(|overrides| overrides.replace(values.to_vec())));
+        action()
+    }
+
     pub const IA32_VMX_EPT_VPID_CAP: u32 = 0x48c;
 
     pub struct Leaf {
@@ -67,6 +95,14 @@ mod arch {
     }
 
     pub unsafe fn read_msr(register: u32) -> u64 {
+        if let Some(value) = MSR_OVERRIDES.with(|overrides| {
+            overrides
+                .borrow()
+                .iter()
+                .find_map(|&(index, value)| (index == register).then_some(value))
+        }) {
+            return value;
+        }
         match register {
             IA32_VMX_EPT_VPID_CAP => {
                 (1 << 6) | (1 << 8) | (1 << 14) | (1 << 16) | (1 << 17) | (1 << 20) | (1 << 25)
@@ -127,6 +163,121 @@ mod memory {
 
 mod ept {
     include!("../src/vmx/ept.rs");
+
+    #[test]
+    fn reserved_write_back_capability_preserves_cacheable_firmware_ram() {
+        let attributes = MemoryAttribute::UNCACHEABLE
+            | MemoryAttribute::WRITE_COMBINE
+            | MemoryAttribute::WRITE_THROUGH
+            | MemoryAttribute::WRITE_BACK;
+        let start = 0x9900_0000;
+        let mut ept = IdentityEpt::build(
+            vec![MemoryDescriptor {
+                phys_start: start,
+                page_count: 512,
+                ty: MemoryType::RESERVED,
+                att: attributes,
+            }],
+            0,
+        )
+        .unwrap();
+        for address in [start, start + 4096, start + EPT_2MB_PAGE_SIZE - 1] {
+            let translation = ept.translate(address).unwrap();
+            assert_eq!(translation.physical_address, address);
+            assert_eq!(translation.permissions, EPT_PERMISSIONS);
+            assert_eq!(ept.memory_type_at_gpa(address), Some(6));
+            assert!(!translation.ignore_pat);
+            assert_eq!(
+                ept.leaf_entry_value(address & !0xfff).unwrap() & EPT_FIRMWARE_TYPE_MASK,
+                6 << EPT_FIRMWARE_TYPE_SHIFT
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_write_back_ram_still_honors_uncacheable_mtrr_ranges() {
+        let start = 0x9900_0000;
+        let uc_start = start + EPT_2MB_PAGE_SIZE;
+        let mask = (((1_u64 << 48) - 1) & !(EPT_2MB_PAGE_SIZE - 1)) | (1 << 11);
+        crate::arch::with_msr_overrides(&[(0xfe, 1), (0x200, uc_start), (0x201, mask)], || {
+            let mut ept = IdentityEpt::build(
+                vec![MemoryDescriptor {
+                    phys_start: start,
+                    page_count: 1024,
+                    ty: MemoryType::RESERVED,
+                    att: MemoryAttribute::WRITE_BACK,
+                }],
+                0,
+            )
+            .unwrap();
+            assert_eq!(ept.memory_type_at_gpa(start), Some(6));
+            assert_eq!(ept.memory_type_at_gpa(uc_start - 1), Some(6));
+            for address in [uc_start, uc_start + EPT_2MB_PAGE_SIZE - 1] {
+                assert_eq!(ept.memory_type_at_gpa(address), Some(0));
+                let entry = ept.leaf_entry_value(address & !0xfff).unwrap();
+                assert_eq!(entry & EPT_IGNORE_PAT, 0);
+                assert_eq!(entry & EPT_FIRMWARE_TYPE_MASK, 6 << EPT_FIRMWARE_TYPE_SHIFT);
+            }
+        });
+    }
+
+    #[test]
+    fn device_or_unusable_memory_does_not_become_write_back_from_attributes() {
+        for ty in [
+            MemoryType::MMIO,
+            MemoryType::MMIO_PORT_SPACE,
+            MemoryType::UNUSABLE,
+            MemoryType::UNACCEPTED,
+        ] {
+            for attributes in [
+                MemoryAttribute::WRITE_BACK,
+                MemoryAttribute::WRITE_BACK
+                    | MemoryAttribute::UNCACHEABLE
+                    | MemoryAttribute::WRITE_THROUGH
+                    | MemoryAttribute::WRITE_COMBINE,
+            ] {
+                let start = 0x9900_0000;
+                let mut ept = IdentityEpt::build(
+                    vec![MemoryDescriptor {
+                        phys_start: start,
+                        page_count: 512,
+                        ty,
+                        att: attributes,
+                    }],
+                    0,
+                )
+                .unwrap();
+                assert_eq!(ept.memory_type_at_gpa(start), Some(0));
+                assert_eq!(ept.memory_type_at_gpa(start + EPT_2MB_PAGE_SIZE - 1), Some(0));
+                assert_eq!(ept.leaf_entry_value(start).unwrap() & EPT_IGNORE_PAT, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_memory_without_write_back_capability_remains_uncacheable() {
+        for attributes in [
+            MemoryAttribute::NONE,
+            MemoryAttribute::UNCACHEABLE,
+            MemoryAttribute::UNCACHABLE_EXPORTED,
+            MemoryAttribute::WRITE_COMBINE,
+            MemoryAttribute::WRITE_THROUGH,
+        ] {
+            let start = 0x9900_0000;
+            let mut ept = IdentityEpt::build(
+                vec![MemoryDescriptor {
+                    phys_start: start,
+                    page_count: 512,
+                    ty: MemoryType::RESERVED,
+                    att: attributes,
+                }],
+                0,
+            )
+            .unwrap();
+            assert_eq!(ept.memory_type_at_gpa(start), Some(0));
+            assert_eq!(ept.leaf_entry_value(start).unwrap() & EPT_IGNORE_PAT, 0);
+        }
+    }
 
     #[test]
     fn accessed_dirty_control_requires_the_hardware_capability() {
@@ -300,13 +451,16 @@ mod ept {
             let value = ept.leaf_entry_value(address + offset).unwrap();
             assert_eq!(value & EPT_ADDRESS_MASK, address + offset + (1 << 32));
             assert_eq!(value & !EPT_ADDRESS_MASK, EPT_READ | EPT_EXECUTE | (1 << 6));
+            assert_eq!(ept.memory_type_at_gpa(address + offset), Some(0));
         }
         for neighbor in [address - 4096, address + 8192] {
             assert_eq!(
                 ept.leaf_entry_value(neighbor).unwrap() & !EPT_ADDRESS_MASK,
                 attributes
             );
+            assert_eq!(ept.memory_type_at_gpa(neighbor), Some(6));
         }
+        assert_eq!(ept.memory_type_at_gpa(EPT_GUEST_PHYSICAL_LIMIT), None);
     }
 
     #[test]

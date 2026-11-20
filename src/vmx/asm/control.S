@@ -962,7 +962,7 @@ mov r8, rdx
 cmp qword ptr [r8 + {event_ebs_seen}], 0
 jne .Lresident_ebs_callback_done
 mov r9, qword ptr [r8 + {event_tsc_hz}]
-imul r9, 40
+imul r9, 20
 rdtsc
 shl rdx, 32
 or rax, rdx

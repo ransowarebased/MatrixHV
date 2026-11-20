@@ -190,8 +190,14 @@ fn enlightened_vmcs_accepts_page_zero_when_distinct_from_vmxon_and_assist_pages(
 }
 
 #[test]
-fn evmcs_rejects_native_revisions_and_overlapping_roles_without_publishing() {
-    for version in [0_u32, 0x42, 0x8000_0001] {
+fn evmcs_accepts_native_revision_and_rejects_invalid_headers_or_overlapping_roles() {
+    let mut native = EnlightenedScenario::new();
+    native.state.vmcs12.revision_id = 0x42;
+    native.page.0[..4].copy_from_slice(&0x42_u32.to_le_bytes());
+    assert_eq!(native.select(), 1);
+    assert_eq!(native.state.evmcs_active, 1);
+
+    for version in [0_u32, 0x43, 0x8000_0001, 0x8000_0042] {
         let mut scenario = EnlightenedScenario::new();
         scenario.state.vmcs12.revision_id = 0x42;
         scenario.page.0[..4].copy_from_slice(&version.to_le_bytes());

@@ -1020,6 +1020,20 @@ mod policy {
         assert_eq!(CPUID_VMX_BIT, 1 << 5);
         assert_eq!(CPUID_OSXSAVE_BIT, 1 << 27);
         assert_eq!(CPUID_HYPERVISOR_PRESENT_BIT, 1 << 31);
+        assert_eq!(nested::CPUID_LEAF7_EBX_NESTED_UNSUPPORTED_MASK, (1 << 2) | (1 << 14));
+        assert_eq!(
+            nested::CPUID_LEAF7_ECX_NESTED_UNSUPPORTED_MASK,
+            (1 << 5) | (1 << 7) | (1 << 16)
+        );
+        assert_eq!(nested::CPUID_LEAF7_EDX_NESTED_UNSUPPORTED_MASK, 1 << 20);
+        assert_eq!(
+            nested::CPUID_LEAFD_SUBLEAF0_EAX_NESTED_UNSUPPORTED_MASK,
+            (1 << 3) | (1 << 4)
+        );
+        assert_eq!(
+            nested::CPUID_LEAFD_SUBLEAF1_ECX_NESTED_UNSUPPORTED_MASK,
+            (1 << 11) | (1 << 12)
+        );
         assert!((0x4000_0000..=0x4fff_ffff).contains(&MATRIXHV_STATUS_LEAF));
         assert_eq!(MATRIXHV_STATUS_SIGNATURE_EAX, 0x4d48_5631);
         assert_eq!(MATRIXHV_STATUS_SIGNATURE_EBX.to_le_bytes(), *b"MATR");
@@ -2034,7 +2048,7 @@ mod policy {
         evmcs.0[..4].copy_from_slice(&2u32.to_le_bytes());
         assert_eq!(unsafe { test_select_evmcs(&mut state) }, -1);
         evmcs.0[..4].copy_from_slice(&(state.vmcs12.revision_id as u32).to_le_bytes());
-        assert_eq!(unsafe { test_select_evmcs(&mut state) }, -1);
+        assert_eq!(unsafe { test_select_evmcs(&mut state) }, 1);
         assist.0[crate::hyperv::VP_ASSIST_ENLIGHTEN_VM_ENTRY_OFFSET..][..4]
             .copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(unsafe { test_select_evmcs(&mut state) }, 0);
@@ -4975,6 +4989,8 @@ mod ept {
         hardware: [u64; 117],
         writes: u64,
         rare_pending: [u64; 2],
+        evmcs_active: u64,
+        last_captured_guest_gs_base: u64,
         vmcs01: u64,
         vmcs02: u64,
         selected_vmcs: u64,
@@ -5054,8 +5070,7 @@ mod ept {
         ".globl capture_test_guest",
         "capture_test_guest:",
         "push r12", "push rsi", "mov r12, rcx",
-        "lea rsi, [rip + .Lresident_nested_guest_state_table]", "mov ecx, 49",
-        "call .Lresident_nested_capture_vmcs02_guest_state_loop",
+        "call .Lresident_nested_capture_vmcs02_fields",
         "pop rsi", "pop r12", "ret",
         ".globl materialize_test_guest",
         "materialize_test_guest:",
@@ -5085,6 +5100,9 @@ mod ept {
         b_nested_vmcs01_region = const std::mem::offset_of!(GuestContext,vmcs01),
         b_nested_vmcs02_region = const std::mem::offset_of!(GuestContext,vmcs02),
         b_nested_vmcs02_rare_state_pending = const std::mem::offset_of!(GuestContext,rare_pending),
+        b_nested_evmcs_active = const std::mem::offset_of!(GuestContext,evmcs_active),
+        b_nested_last_captured_guest_gs_base = const std::mem::offset_of!(GuestContext,last_captured_guest_gs_base),
+        guest_gs_base = const 0x6810,
         nested_rare_guest_fields_low = const (0xff_u64 << 35) | (0x3ff_u64 << 50),
         nested_rare_guest_fields_high = const (0xffff_u64 << 1) | (1_u64 << 28),
         nested_guest_state_table_count = const 49,
@@ -5143,6 +5161,8 @@ mod ept {
             hardware: [u64::MAX; 117],
             writes: 0,
             rare_pending: [0; 2],
+            evmcs_active: 0,
+            last_captured_guest_gs_base: 0,
             vmcs01: 1,
             vmcs02: 2,
             selected_vmcs: 2,
@@ -5176,6 +5196,8 @@ mod ept {
             hardware: [u64::MAX; 117],
             writes: 0,
             rare_pending: [0; 2],
+            evmcs_active: 0,
+            last_captured_guest_gs_base: 0,
             vmcs01: 1,
             vmcs02: 2,
             selected_vmcs: 2,
@@ -5200,7 +5222,8 @@ mod ept {
             state.hardware[index] = 0x10000 + index as u64;
         }
         capture_test_guest(&mut state);
-        assert_eq!(state.reads, 14);
+        assert_eq!(state.reads, 15);
+        assert_eq!(state.last_captured_guest_gs_base, state.hardware[55]);
         let pending = [
             (0xff_u64 << 35) | (0x3ff_u64 << 50),
             (0xffff_u64 << 1) | (1_u64 << 28),
@@ -5228,7 +5251,7 @@ mod ept {
         }
         state.selected_vmcs = 1;
         materialize_test_guest(&mut state, 50, 0xfeed_dead_beef, 0x6806);
-        assert_eq!(state.reads, 15);
+        assert_eq!(state.reads, 16);
         assert_eq!(state.switches, 2);
         assert_eq!(state.selected_vmcs, 1);
         assert_eq!(state.rare_pending, [pending[0] & !(1 << 50), pending[1]]);
@@ -5242,7 +5265,7 @@ mod ept {
             assert_eq!(state.cache[index], expected);
         }
         materialize_test_guest(&mut state, 50, 0, 0x6806);
-        assert_eq!(state.reads, 15);
+        assert_eq!(state.reads, 16);
         assert_eq!(state.switches, 2);
         state.values[50] = 0x87654000;
         state.selected_vmcs = 2;
@@ -5257,12 +5280,30 @@ mod ept {
         state.selected_vmcs = 1;
         materialize_test_all_guest(&mut state);
         materialize_test_all_guest(&mut state);
-        assert_eq!(state.reads, 64);
+        assert_eq!(state.reads, 66);
         assert_eq!(state.switches, 4);
         assert_eq!(state.selected_vmcs, 1);
         assert_eq!(state.rare_pending, [0; 2]);
         for &index in &fields {
             assert_eq!(state.values[index], state.hardware[index]);
+        }
+
+        // eVMCS publishes all guest fields while VMCS02 is already selected.
+        state.evmcs_active = 1;
+        state.selected_vmcs = 2;
+        state.rare_pending = pending;
+        for &index in &fields {
+            state.hardware[index] = 0x30000 + index as u64;
+        }
+        capture_test_guest(&mut state);
+        assert_eq!(state.reads, 66 + 49);
+        assert_eq!(state.last_captured_guest_gs_base, state.hardware[55]);
+        assert_eq!(state.switches, 4);
+        assert_eq!(state.selected_vmcs, 2);
+        assert_eq!(state.rare_pending, [0; 2]);
+        for &index in &fields {
+            assert_eq!(state.values[index], state.hardware[index]);
+            assert_eq!(state.cache[index], state.hardware[index]);
         }
     }
 
@@ -5321,6 +5362,8 @@ mod ept {
             hardware: [0; 117],
             writes: 0,
             rare_pending: [u64::MAX; 2],
+            evmcs_active: 0,
+            last_captured_guest_gs_base: 0,
             vmcs01: 1,
             vmcs02: 2,
             selected_vmcs: 2,
@@ -5381,6 +5424,8 @@ mod ept {
             hardware: [u64::MAX; 117],
             writes: 0,
             rare_pending: [0; 2],
+            evmcs_active: 0,
+            last_captured_guest_gs_base: 0,
             vmcs01: 1,
             vmcs02: 2,
             selected_vmcs: 2,
